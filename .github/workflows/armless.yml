@@ -110,3 +110,30 @@ jobs:
               exit 1
             fi
           done
+
+  alpine:
+    # A real arm64 Alpine (linux-virt + OpenRC), prepared and booted the way
+    # snowglobe does it, through the V86 JS API.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Toolchain
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang lld
+          sudo pip install --break-system-packages zstandard
+          rustup target add wasm32-unknown-unknown
+      - name: Build armless.wasm
+        run: sh arm/build-wasm.sh
+      - name: Build the Alpine arm64 guest as a 9p filesystem
+        run: sh tests/arm/alpine/build.sh "$RUNNER_TEMP/alpine"
+      - name: Boot Alpine, run commands, save and restore a snapshot
+        run: node tests/arm/alpine.mjs "$RUNNER_TEMP/alpine"
