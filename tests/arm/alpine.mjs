@@ -11,7 +11,11 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const { V86 } = await import(path.resolve(root, process.env.V86_MODULE || "src/main.js"));
 const dir = path.resolve(process.argv[2] || ".");
 const t0 = Date.now();
-const log = msg => console.log(`\n[alpine.mjs +${((Date.now() - t0) / 1000).toFixed(1)}s] ${msg}`);
+const log = msg => {
+    const line = `+${((Date.now() - t0) / 1000).toFixed(1)}s ${msg}`;
+    console.log(`\n[alpine.mjs ${line}]`);
+    if(process.env.GITHUB_ACTIONS) console.log(`::notice title=alpine::${line.replace(/[\r\n%]/g, " ")}`);
+};
 
 let serial = "";
 function fail(msg)
