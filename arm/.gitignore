@@ -1,3 +1,4 @@
 build-guest/
 build-linux/
+build-difftest/
 armless.wasm
