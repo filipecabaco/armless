@@ -100,31 +100,58 @@ the saved value, so timers neither jump nor stall after a snapshot restore.
 
 ## Status
 
-Done (`arm/`, tested by `cargo test`):
+Done:
 
 - [x] A64 integer instruction set, loads/stores, exclusives, system instructions
 - [x] EL0/EL1, vectors, SVC/BRK/undefined/aborts, ERET
 - [x] MMU: 4K granule, TTBR0/1, blocks/pages, permissions, AF, TBI, AT, DC ZVA
 - [x] GICv2, generic timer (virtual + physical), PL031 RTC, PSCI 1.0 over HVC
+- [x] FP and Advanced SIMD (ARMv8.0, no crypto), bit-exact with QEMU incl. FPSR
 - [x] DTB generator, arm64 Image loader, CPU state save/restore
-- [x] Native runner `armless-run`; bare-metal self-test guest (65 checks)
-- [x] wasm export layer (`arm/src/wasm.rs`)
+- [x] Linux 6.8 boots; static glibc and busybox userspace match qemu-aarch64
+- [x] armless.wasm (core + v86's zstd decoder), `make armless`
+- [x] v86 JS integration: `new V86({ arch: "arm64", ... })` (`src/arm/cpu.js`),
+      UART/PCI/virtio devices reused unchanged, gzip and EFI-zboot kernels
+- [x] snowglobe flow end to end, also with the Closure-compiled `libv86.mjs`:
+      9p root (zstd blobs), virtio console, `save_state`, zstd `initial_state`
+
+Testing (all in CI, `.github/workflows/armless.yml`):
+
+- `cargo test`: unit tests and a bare-metal self-test guest
+- `tests/difftest`: random instructions vs `qemu-aarch64 -cpu cortex-a53`
+- `tests/linux`: kernel boot, glibc/busybox userspace vs qemu-aarch64
+- `tests/arm/boot.mjs`, `tests/arm/snowglobe.mjs`: through the V86 JS API
 
 Next:
 
-1. **Boot Linux** to an EL0 init with the native runner (kernel config in
-   `arm/tests/linux/armless.config`).
-2. **FP/AdvSIMD** (scalar FP, NEON integer + FP ops, FPCR/FPSR). Required by
-   all real userspace (musl and glibc use NEON for memcpy/strlen).
-3. **JS integration**: `src/cpu.js` gains an ARM mode that loads `armless.wasm`,
-   creates `mem8` over its RAM, implements the MMIO imports (ECAM, PIO, UART),
-   routes `pci.raise_irq` to `armless_set_irq`, and skips x86-only devices
-   (PIC, PIT, RTC/CMOS, PS/2, VGA, IDE, floppy, DMA, ACPI).
-   Selected with `new V86({ arch: "arm64", … })`.
-4. **snowglobe**: `FROM arm64v8/alpine`, boot layer installs `linux-virt` for
-   aarch64, cmdline unchanged except the console (`console=hvc0`).
-5. **Performance**: a basic-block JIT to wasm, modelled on v86's `jit.rs`
-   (block cache keyed by physical page, invalidated on writes to code pages).
+1. **snowglobe**: `FROM arm64v8/alpine`, boot layer installs `linux-virt` for
+   aarch64, `new V86({ arch: "arm64", wasm_path: "v86/armless.wasm", ... })`;
+   the BIOS files are no longer needed. See "Using it from snowglobe" below.
+2. **Performance**: the interpreter runs at ~40 MIPS natively. A basic-block
+   JIT to wasm (like v86's `jit.rs`) is the next big step.
+3. Networking test with the `fetch` relay (virtio-net is wired the same way
+   as virtio console and 9p, but not yet exercised in a test).
+
+## Using it from snowglobe
+
+```js
+const emulator = new V86({
+  arch: "arm64",                       // new: selects armless.wasm
+  wasm_path: "v86/armless.wasm",
+  memory_size: 512 * 1024 * 1024,
+  filesystem: { basefs: "system/filesystem.json", baseurl: "system/filesystem/" },
+  bzimage_initrd_from_filesystem: true, // finds /boot/vmlinuz-virt (gzip or zboot)
+  cmdline: "rw root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose modules=virtio_pci console=hvc0",
+  virtio_console: true,
+  net_device: { type: "virtio", relay_url: "fetch" },
+  initial_state: { url: "system/state.bin.zst" },
+  autostart: true,
+});
+```
+
+Everything else (events, `serial0_send`, `virtio-console0-*`, `save_state`,
+`fs9p.storage`, `v86.cpu.devices.virtio_console.virtio.queues`) is unchanged.
+The serial console is `ttyS0` (16550 at `0xF0100000`, `earlycon=uart8250,mmio,0xf0100000`).
 
 ## Building and testing
 
@@ -133,5 +160,6 @@ cd arm
 cargo test                        # unit tests + bare-metal guest (needs clang/lld)
 cargo run --release --bin armless-run -- --raw build-guest/tests.bin
 cargo run --release --bin armless-run -- --kernel Image --initrd initrd.cpio
-cargo build --release --target wasm32-unknown-unknown   # → armless.wasm
+make armless                      # → build/armless.wasm (from the repo root)
+node tests/arm/snowglobe.mjs DIR  # DIR from tests/arm/make-9pfs.sh
 ```

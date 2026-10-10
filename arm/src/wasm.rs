@@ -274,8 +274,23 @@ pub extern "C" fn armless_state_ptr() -> u32 {
 /// `ptr` must reference `len` readable bytes in wasm memory.
 #[no_mangle]
 pub unsafe extern "C" fn armless_load_state(ptr: u32, len: u32) -> i32 {
-    match cpu().load_cpu_state(slice(ptr, len)) {
-        Ok(()) => 0,
+    let c = cpu();
+    match c.load_cpu_state(slice(ptr, len)) {
+        Ok(()) => {
+            // Re-base the JS-driven line bookkeeping on the restored GIC lines.
+            for w in 1..IRQ_WORDS {
+                let mut bits = 0u32;
+                for b in 0..32 {
+                    if c.gic.line_level((w * 32 + b) as u32) {
+                        bits |= 1 << b;
+                    }
+                }
+                IRQ_LEVELS[w].store(bits, Ordering::Relaxed);
+                c.host.reported[w] = bits;
+            }
+            IRQ_CHANGED.store(0, Ordering::Relaxed);
+            0
+        }
         Err(_) => -1,
     }
 }

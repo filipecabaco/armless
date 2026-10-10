@@ -25,6 +25,8 @@ pub mod sysreg;
 
 #[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
 pub mod wasm;
+#[cfg(target_arch = "wasm32")]
+pub mod zstd;
 
 pub use board::Host;
 pub use cpu::{Cpu, Exit, StopReason};

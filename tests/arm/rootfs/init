@@ -1,0 +1,16 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+echo "[init] root on $(awk '$2=="/"{print $1" "$3}' /proc/mounts)"
+grep Features /proc/cpuinfo
+# The app console: like snowglobe, a shell loop on the virtio console (hvc0),
+# kept open so input is never dropped between commands.
+exec < /dev/hvc0 > /dev/hvc0 2>&1
+stty -echo
+echo READY
+while read -r line; do
+    [ "$line" = "poweroff" ] && break
+    sh -c "$line"
+done
+poweroff -f

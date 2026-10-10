@@ -68,6 +68,11 @@ impl Gic {
         self.line[i] = level;
     }
 
+    /// Current level of a device input line.
+    pub fn line_level(&self, irq: u32) -> bool {
+        (irq as usize) < NUM_IRQS && self.line[irq as usize]
+    }
+
     fn pending(&self, i: usize) -> bool {
         self.latched[i] || (!self.edge[i] && self.line[i])
     }

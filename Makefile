@@ -83,7 +83,8 @@ CORE_FILES=cjs.js const.js io.js main.js lib.js buffer.js ide.js pci.js floppy.j
 	   acpi.js iso9660.js \
 	   state.js ne2k.js sb16.js virtio.js virtio_console.js virtio_net.js virtio_balloon.js \
 	   bus.js log.js cpu.js \
-	   elf.js kernel.js
+	   elf.js kernel.js \
+	   arm/cpu.js arm/board.js arm/kernel.js
 LIB_FILES=9p.js filesystem.js marshall.js
 BROWSER_FILES=screen.js keyboard.js mouse.js speaker.js serial.js \
 	      network.js starter.js worker_bus.js dummy_screen.js ansi_screen.js \
@@ -99,7 +100,7 @@ CORE_FILES:=$(addprefix src/,$(CORE_FILES))
 LIB_FILES:=$(addprefix lib/,$(LIB_FILES))
 BROWSER_FILES:=$(addprefix src/browser/,$(BROWSER_FILES))
 
-build/v86_all.js: $(CLOSURE) src/*.js src/browser/*.js lib/*.js
+build/v86_all.js: $(CLOSURE) src/*.js src/arm/*.js src/browser/*.js lib/*.js
 	mkdir -p build
 	-ls -lh build/v86_all.js
 	java -jar $(CLOSURE) \
@@ -114,7 +115,7 @@ build/v86_all.js: $(CLOSURE) src/*.js src/browser/*.js lib/*.js
 		--js src/browser/main.js
 	ls -lh build/v86_all.js
 
-build/v86_all_debug.js: $(CLOSURE) src/*.js src/browser/*.js lib/*.js
+build/v86_all_debug.js: $(CLOSURE) src/*.js src/arm/*.js src/browser/*.js lib/*.js
 	mkdir -p build
 	java -jar $(CLOSURE) \
 		--js_output_file build/v86_all_debug.js\
@@ -127,7 +128,7 @@ build/v86_all_debug.js: $(CLOSURE) src/*.js src/browser/*.js lib/*.js
 		--js $(BROWSER_FILES)\
 		--js src/browser/main.js
 
-build/libv86.js: $(CLOSURE) src/*.js lib/*.js src/browser/*.js
+build/libv86.js: $(CLOSURE) src/*.js src/arm/*.js lib/*.js src/browser/*.js
 	mkdir -p build
 	-ls -lh build/libv86.js
 	java -jar $(CLOSURE) \
@@ -142,7 +143,7 @@ build/libv86.js: $(CLOSURE) src/*.js lib/*.js src/browser/*.js
 		--js $(LIB_FILES)
 	ls -lh build/libv86.js
 
-build/libv86.mjs: $(CLOSURE) src/*.js lib/*.js src/browser/*.js
+build/libv86.mjs: $(CLOSURE) src/*.js src/arm/*.js lib/*.js src/browser/*.js
 	mkdir -p build
 	-ls -lh build/libv86.js
 	java -jar $(CLOSURE) \
@@ -159,7 +160,7 @@ build/libv86.mjs: $(CLOSURE) src/*.js lib/*.js src/browser/*.js
 		--emit_use_strict=false
 	ls -lh build/libv86.mjs
 
-build/libv86-debug.js: $(CLOSURE) src/*.js lib/*.js src/browser/*.js
+build/libv86-debug.js: $(CLOSURE) src/*.js src/arm/*.js lib/*.js src/browser/*.js
 	mkdir -p build
 	java -jar $(CLOSURE) \
 		--js_output_file build/libv86-debug.js\
@@ -174,7 +175,7 @@ build/libv86-debug.js: $(CLOSURE) src/*.js lib/*.js src/browser/*.js
 		--js $(LIB_FILES)
 	ls -lh build/libv86-debug.js
 
-build/libv86-debug.mjs: $(CLOSURE) src/*.js lib/*.js src/browser/*.js
+build/libv86-debug.mjs: $(CLOSURE) src/*.js src/arm/*.js lib/*.js src/browser/*.js
 	mkdir -p build
 	java -jar $(CLOSURE) \
 		--js_output_file build/libv86-debug.mjs\
@@ -238,6 +239,12 @@ with-profiler: $(RUST_FILES) build/softfloat.o build/zstddeclib.o Cargo.toml
 
 watch:
 	cargo watch -x 'rustc $(CARGO_FLAGS)' -s 'cp build/wasm32-unknown-unknown/debug/v86.wasm build/v86-debug.wasm'
+
+# armless: the AArch64 machine (see docs/armless.md)
+armless: build/armless.wasm
+
+build/armless.wasm: $(wildcard arm/src/*.rs) arm/Cargo.toml arm/build-wasm.sh lib/zstd/zstddeclib.c
+	sh arm/build-wasm.sh
 
 build/softfloat.o: lib/softfloat/softfloat.c
 	mkdir -p build

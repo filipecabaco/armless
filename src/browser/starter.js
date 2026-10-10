@@ -23,6 +23,7 @@ import { Modem } from "./modem.js";
 import { MemoryFileStorage, ServerFileStorageWrapper } from "./filestorage.js";
 import { SyncBuffer, buffer_from_object } from "../buffer.js";
 import { FS } from "../../lib/filesystem.js";
+import { prepare_arm64_kernel } from "../arm/kernel.js";
 
 /**
  * Constructor for emulator instances.
@@ -41,6 +42,9 @@ import { FS } from "../../lib/filesystem.js";
  */
 export function V86(options)
 {
+    // "arm64" selects the armless AArch64 machine (armless.wasm); default x86.
+    const arch = options.arch === "arm64" ? "arm64" : "x86";
+
     if(typeof options.log_level === "number")
     {
         // XXX: Shared between all emulator instances
@@ -109,6 +113,14 @@ export function V86(options)
         "__indirect_function_table": wasm_table,
     };
 
+    // armless.wasm imports: MMIO forwarded to v86's devices, and clocks
+    const arm_shared_funcs = {
+        "mmio_read": (addr, size) => cpu.mmio_read(addr, size),
+        "mmio_write": (addr, size, value) => cpu.mmio_write(addr, size, value),
+        "microtick": v86.microtick,
+        "wall_clock_ms": () => Date.now(),
+    };
+
     let wasm_fn = options.wasm_fn;
 
     if(!wasm_fn)
@@ -118,13 +130,13 @@ export function V86(options)
             /* global __dirname */
 
             return new Promise(resolve => {
-                let v86_bin = DEBUG ? "v86-debug.wasm" : "v86.wasm";
-                let v86_bin_fallback = "v86-fallback.wasm";
+                let v86_bin = arch === "arm64" ? "armless.wasm" : DEBUG ? "v86-debug.wasm" : "v86.wasm";
+                let v86_bin_fallback = arch === "arm64" ? v86_bin : "v86-fallback.wasm";
 
                 if(options.wasm_path)
                 {
                     v86_bin = options.wasm_path;
-                    v86_bin_fallback = v86_bin.replace("v86.wasm", "v86-fallback.wasm");
+                    v86_bin_fallback = arch === "arm64" ? v86_bin : v86_bin.replace("v86.wasm", "v86-fallback.wasm");
                 }
                 else if(typeof window === "undefined" && typeof __dirname === "string")
                 {
@@ -174,12 +186,15 @@ export function V86(options)
         };
     }
 
-    wasm_fn({ "env": wasm_shared_funcs })
+    wasm_fn({ "env": arch === "arm64" ? arm_shared_funcs : wasm_shared_funcs })
         .then((exports) => {
             wasm_memory = exports.memory;
-            exports["rust_init"]();
+            if(exports["rust_init"])
+            {
+                exports["rust_init"]();
+            }
 
-            const emulator = this.v86 = new v86(this.emulator_bus, { exports, wasm_table });
+            const emulator = this.v86 = new v86(this.emulator_bus, { exports, wasm_table, arch });
             cpu = emulator.cpu;
 
             this.continue_init(emulator, options);
@@ -469,8 +484,12 @@ V86.prototype.continue_init = async function(emulator, options)
         console.warn("Warning: Unknown option 'state'. Did you mean 'initial_state'?");
     }
 
-    add_file("bios", options.bios);
-    add_file("vga_bios", options.vga_bios);
+    if(options.arch !== "arm64")
+    {
+        // armless boots the kernel directly (device tree, no BIOS)
+        add_file("bios", options.bios);
+        add_file("vga_bios", options.vga_bios);
+    }
     add_file("cdrom", options.cdrom);
     add_file("hda", options.hda);
     add_file("hdb", options.hdb);
@@ -646,6 +665,11 @@ V86.prototype.continue_init = async function(emulator, options)
             }
         }
 
+        if(options.arch === "arm64" && settings.bzimage)
+        {
+            settings.bzimage = await prepare_arm64_kernel(settings.bzimage, this.zstd_decompress.bind(this));
+        }
+
         this.v86.init(settings);
 
         this.modem && this.modem.initialize();
@@ -710,16 +734,11 @@ V86.prototype.zstd_decompress_worker = async function(decompressed_size, src)
             {
                 if(!wasm)
                 {
-                    const env = Object.fromEntries([
-                        "cpu_exception_hook", "run_hardware_timers",
-                        "cpu_event_halt", "microtick", "get_rand_int", "stop_idling",
-                        "io_port_read8", "io_port_read16", "io_port_read32",
-                        "io_port_write8", "io_port_write16", "io_port_write32",
-                        "mmap_read8", "mmap_read32",
-                        "mmap_write8", "mmap_write16", "mmap_write32", "mmap_write64", "mmap_write128",
-                        "codegen_finalize",
-                        "jit_clear_func", "jit_clear_all_funcs",
-                    ].map(f => [f, () => console.error("zstd worker unexpectedly called " + f)]));
+                    const module = new WebAssembly.Module(e.data);
+                    // Stub every function import (v86.wasm and armless.wasm differ)
+                    const env = Object.fromEntries(WebAssembly.Module.imports(module)
+                        .filter(i => i.kind === "function")
+                        .map(i => [i.name, () => console.error("zstd worker unexpectedly called " + i.name)]));
 
                     env["__indirect_function_table"] = new WebAssembly.Table({ element: "anyfunc", initial: 1024 });
                     env["abort"] = () => { throw new Error("zstd worker aborted"); };
@@ -728,7 +747,7 @@ V86.prototype.zstd_decompress_worker = async function(decompressed_size, src)
                     };
                     env["dbg_trace_from_wasm"] = () => console.trace();
 
-                    wasm = new WebAssembly.Instance(new WebAssembly.Module(e.data), { "env": env });
+                    wasm = new WebAssembly.Instance(module, { "env": env });
                     return;
                 }
 

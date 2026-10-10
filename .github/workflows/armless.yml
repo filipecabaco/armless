@@ -65,6 +65,23 @@ jobs:
           sh tests/linux/build-rootfs.sh "$RUNNER_TEMP/busybox" build-linux
       - name: Userspace matches qemu-aarch64
         run: sh tests/linux/userspace.sh build-linux
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build armless.wasm
+        run: |
+          sudo apt-get install -y clang lld
+          rustup target add wasm32-unknown-unknown
+          sh build-wasm.sh
+      - name: Boot through the V86 JS API (arch arm64, gzip kernel)
+        run: |
+          gzip -9 -k -f build-linux/Image
+          node ../tests/arm/boot.mjs build-linux/Image.gz build-linux/initrd.cpio --expect ARMLESS-BOOT-OK
+      - name: snowglobe flow (9p root, virtio console, save/restore zstd snapshot)
+        run: |
+          pip install --break-system-packages zstandard
+          sh ../tests/arm/make-9pfs.sh build-linux/busybox build-linux/Image.gz build-linux/9pfs
+          node ../tests/arm/snowglobe.mjs build-linux/9pfs
 
   difftest:
     runs-on: ubuntu-24.04
