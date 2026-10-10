@@ -274,6 +274,8 @@ pub struct Devices {
 /// PCI slots: fixed, so snapshots line up.
 pub const SLOT_CONSOLE: u8 = 1;
 pub const SLOT_FS: u8 = 2;
+/// Snapshot extension: the 9p fids' owners
+const EXT_P9_OWNERS: u32 = u32::from_le_bytes(*b"P9OW");
 pub const SLOT_NET: u8 = 3;
 
 impl Devices {
@@ -368,10 +370,23 @@ impl Devices {
     pub fn save(&self, w: &mut W) {
         self.uart.save(w);
         self.pci.save(w);
+        // Additions to the format go last, each tagged, so older snapshots (which end here)
+        // still load
+        if let Some((_, virtio::Device::P9(p))) = self.pci.slot(SLOT_FS) {
+            w.u32(EXT_P9_OWNERS);
+            p.save_owners(w);
+        }
     }
 
     pub fn load(&mut self, r: &mut R) -> Option<()> {
         self.uart.load(r)?;
-        self.pci.load(r)
+        self.pci.load(r)?;
+        while r.0.len() >= 4 {
+            match r.u32()? {
+                EXT_P9_OWNERS => self.p9()?.1.load_owners(r)?,
+                _ => return None,
+            }
+        }
+        Some(())
     }
 }

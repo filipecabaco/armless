@@ -51,7 +51,13 @@ const AT_REMOVEDIR: u32 = 0x200;
 struct Fid {
     ino: Ino,
     open: bool,
+    /// Who the client attached as (Tattach's n_uname), inherited by walks: the owner of what
+    /// this fid creates
+    uid: u32,
 }
+
+/// n_uname when the client gives none
+const NONUNAME: u32 = !0;
 
 struct Parked {
     chain: Chain,
@@ -227,9 +233,16 @@ impl P9 {
         self.fids.get(&fid).ok_or(Fail::Errno(fs::EBADF))
     }
 
-    fn set_fid(&mut self, fid: u32, ino: Ino) {
+    fn set_fid(&mut self, fid: u32, ino: Ino, uid: u32) {
         self.fs.add_ref(ino);
-        if let Some(old) = self.fids.insert(fid, Fid { ino, open: false }) {
+        if let Some(old) = self.fids.insert(
+            fid,
+            Fid {
+                ino,
+                open: false,
+                uid,
+            },
+        ) {
             self.fs.drop_ref(old.ino);
         }
     }
@@ -266,7 +279,12 @@ impl P9 {
             },
             TATTACH => {
                 let fid = r.u32()?;
-                self.set_fid(fid, fs::ROOT);
+                let _afid = r.u32()?;
+                let _uname = r.str()?;
+                let _aname = r.str()?;
+                // Linux attaches once per user (access=client) and says who in n_uname
+                let uid = r.u32().ok().filter(|&u| u != NONUNAME).unwrap_or(0);
+                self.set_fid(fid, fs::ROOT, uid);
                 self.qid(w, fs::ROOT)?;
             },
             TFLUSH => {}, // see serve()
@@ -274,7 +292,7 @@ impl P9 {
                 let fid = r.u32()?;
                 let newfid = r.u32()?;
                 let n = r.u16()?;
-                let mut ino = self.fid(fid)?.ino;
+                let Fid { mut ino, uid, .. } = *self.fid(fid)?;
                 let mut qids = W::new();
                 let mut count = 0u16;
                 for i in 0..n {
@@ -290,7 +308,7 @@ impl P9 {
                     }
                 }
                 if count == n {
-                    self.set_fid(newfid, ino);
+                    self.set_fid(newfid, ino, uid);
                 }
                 w.u16(count);
                 w.0.extend_from_slice(&qids.0);
@@ -313,12 +331,11 @@ impl P9 {
                 let mode = r.u32()?;
                 let gid = r.u32()?;
                 let _ = flags;
-                let dir = self.fid(fid)?.ino;
-                let uid = self.fs.inode(dir)?.uid;
+                let Fid { ino: dir, uid, .. } = *self.fid(fid)?;
                 let ino =
                     self.fs
                         .create(dir, name, fs::S_IFREG | (mode & 0o7777), uid, gid, now)?;
-                self.set_fid(fid, ino);
+                self.set_fid(fid, ino, uid);
                 self.fids.get_mut(&fid).unwrap().open = true;
                 self.qid(w, ino)?;
                 w.u32(self.msize - 24);
@@ -328,8 +345,7 @@ impl P9 {
                 let name = r.str()?;
                 let target = r.str()?;
                 let gid = r.u32()?;
-                let dir = self.fid(fid)?.ino;
-                let uid = self.fs.inode(dir)?.uid;
+                let Fid { ino: dir, uid, .. } = *self.fid(fid)?;
                 let ino = self.fs.symlink(dir, name, target, uid, gid, now)?;
                 self.qid(w, ino)?;
             },
@@ -340,8 +356,7 @@ impl P9 {
                 let major = r.u32()?;
                 let minor = r.u32()?;
                 let gid = r.u32()?;
-                let dir = self.fid(fid)?.ino;
-                let uid = self.fs.inode(dir)?.uid;
+                let Fid { ino: dir, uid, .. } = *self.fid(fid)?;
                 let ino = self.fs.create(dir, name, mode, uid, gid, now)?;
                 self.fs.get_mut(ino).unwrap().rdev = (major as u64) << 8 | minor as u64;
                 self.qid(w, ino)?;
@@ -351,8 +366,7 @@ impl P9 {
                 let name = r.str()?;
                 let mode = r.u32()?;
                 let gid = r.u32()?;
-                let dir = self.fid(fid)?.ino;
-                let uid = self.fs.inode(dir)?.uid;
+                let Fid { ino: dir, uid, .. } = *self.fid(fid)?;
                 let ino =
                     self.fs
                         .create(dir, name, fs::S_IFDIR | (mode & 0o7777), uid, gid, now)?;
@@ -563,6 +577,26 @@ impl P9 {
         }
     }
 
+    /// Each fid's owner: saved after all the devices, so snapshots from before it still load.
+    pub fn save_owners(&self, w: &mut W) {
+        w.u32(self.fids.len() as u32);
+        for (&id, f) in &self.fids {
+            w.u32(id);
+            w.u32(f.uid);
+        }
+    }
+
+    pub fn load_owners(&mut self, r: &mut R) -> Option<()> {
+        for _ in 0..r.u32()? {
+            let id = r.u32()?;
+            let uid = r.u32()?;
+            if let Some(f) = self.fids.get_mut(&id) {
+                f.uid = uid;
+            }
+        }
+        Some(())
+    }
+
     pub fn load(&mut self, r: &mut R) -> Option<()> {
         self.fs = Fs::load(r)?;
         self.msize = r.u32()?;
@@ -572,7 +606,9 @@ impl P9 {
             let ino = r.u64()?;
             let open = r.bool()?;
             self.fs.add_ref(ino);
-            self.fids.insert(id, Fid { ino, open });
+            // Who each fid belongs to comes after the devices (load_owners); older snapshots
+            // don't say, and then everything is root's, as it used to be
+            self.fids.insert(id, Fid { ino, open, uid: 0 });
         }
         self.fs.collect();
         self.parked.clear();

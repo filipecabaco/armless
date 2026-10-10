@@ -167,6 +167,13 @@ impl Bus {
         self.functions.push(Function::new(slot, device));
     }
 
+    pub fn slot(&self, slot: u8) -> Option<(&Transport, &Device)> {
+        self.functions
+            .iter()
+            .find(|f| f.slot == slot)
+            .map(|f| (&f.transport, &f.device))
+    }
+
     pub fn slot_mut(&mut self, slot: u8) -> Option<(&mut Transport, &mut Device)> {
         self.functions
             .iter_mut()

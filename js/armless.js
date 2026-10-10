@@ -491,9 +491,27 @@
 
     _cancel() {
       if (this._timer === null) return;
-      if (this._immediate) clearImmediate(this._timer);
+      // A posted message can't be taken back: _on_message ignores it once _timer moved on
+      if (this._immediate === "message") {}
+      else if (this._immediate) clearImmediate(this._timer);
       else clearTimeout(this._timer);
       this._timer = null;
+    }
+
+    // Browsers clamp nested setTimeout(0) to 4 ms, which left one CPU idle about a third of
+    // the time between 10 ms slices. A posted message runs as soon as the page has handled
+    // input and painted, with no clamp.
+    _post_slice() {
+      if (!this._channel) {
+        this._channel = new MessageChannel();
+        this._channel.port1.onmessage = ({ data }) => {
+          if (this._timer === "message" && data === this._posted) this._slice();
+        };
+      }
+      this._posted = (this._posted | 0) + 1;
+      this._timer = "message";
+      this._immediate = "message";
+      this._channel.port2.postMessage(this._posted);
     }
 
     _schedule(delay) {
@@ -502,6 +520,8 @@
       if (delay <= 0 && typeof setImmediate === "function") {
         this._timer = setImmediate(() => this._slice());
         this._immediate = true;
+      } else if (delay <= 0 && typeof MessageChannel === "function") {
+        this._post_slice();
       } else {
         this._timer = setTimeout(() => this._slice(), Math.max(0, delay));
         this._immediate = false;
@@ -671,6 +691,7 @@
       this.running = false;
       this.stopped = true;
       this._cancel();
+      this._channel?.port1.close();
       clearInterval(this._interval);
       if (this._ctrl) {
         Atomics.store(this._ctrl, CTRL_QUIT, 1);

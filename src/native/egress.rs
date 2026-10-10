@@ -4,7 +4,7 @@
 //! intercept TLS with their own CA work too.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -127,17 +127,14 @@ impl Egress {
                 ));
             }
         }
-        let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{host}: no address"));
-        for a in addrs {
-            match TcpStream::connect_timeout(&a, TIMEOUT) {
-                Ok(s) => {
-                    let _ = s.set_nodelay(true);
-                    return Ok(s);
-                },
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
+        reach(host, &addrs)
+    }
+
+    /// The proxy itself: wherever the environment says it is (often loopback or a private
+    /// address), with the same connect timeout as everything else.
+    fn proxy(&self, p: &Proxy) -> io::Result<TcpStream> {
+        let addrs: Vec<_> = (p.host.as_str(), p.port).to_socket_addrs()?.collect();
+        reach(&p.host, &addrs)
     }
 
     /// A TCP stream to host:port: direct, or tunnelled through the proxy with CONNECT.
@@ -145,8 +142,7 @@ impl Egress {
         let Some(p) = self.proxy_for(host, true) else {
             return self.direct(host, port);
         };
-        let mut s = TcpStream::connect((p.host.as_str(), p.port))?;
-        let _ = s.set_nodelay(true);
+        let mut s = self.proxy(p)?;
         s.set_read_timeout(Some(TIMEOUT))?;
         let target =
             if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
@@ -182,14 +178,38 @@ impl Egress {
     }
 }
 
+/// Connect to the first of `addrs` that answers within TIMEOUT.
+fn reach(host: &str, addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{host}: no address"));
+    for a in addrs {
+        match TcpStream::connect_timeout(a, TIMEOUT) {
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            },
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 fn private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
+            let [a, b, ..] = v.octets();
             v.is_loopback()
                 || v.is_private()
                 || v.is_link_local()
-                || v.is_unspecified()
-                || v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64
+                || v.is_broadcast()
+                // "this network", 0.0.0.0/8: Docker Desktop's host.docker.internal is 0.250.250.254
+                || a == 0
+                // carrier-grade NAT, and the reserved 240.0.0.0/4
+                || a == 100 && (b & 0xc0) == 64
+                || a >= 240
+        },
+        // An IPv4 address written as IPv6 is that IPv4 address
+        IpAddr::V6(v) if v.to_ipv4_mapped().is_some() => {
+            private(IpAddr::V4(v.to_ipv4_mapped().unwrap()))
         },
         IpAddr::V6(v) => {
             v.is_loopback()
@@ -313,8 +333,7 @@ impl Egress {
     pub fn open(&self, t: &Target) -> io::Result<(Conn, String)> {
         if !t.secure {
             if let Some(p) = self.proxy_for(&t.host, false) {
-                let s = TcpStream::connect((p.host.as_str(), p.port))?;
-                let _ = s.set_nodelay(true);
+                let s = self.proxy(p)?;
                 return Ok((
                     Conn::Plain(s),
                     format!("http://{}{}", t.authority(), t.path),
@@ -593,4 +612,42 @@ pub fn client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
     f.extend_from_slice(&mask);
     f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::private;
+
+    #[test]
+    fn private_addresses() {
+        for a in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.65.254",
+            "169.254.169.254",
+            "0.250.250.254",
+            "0.0.0.0",
+            "100.64.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:0.250.250.254",
+        ] {
+            assert!(private(a.parse().unwrap()), "{a} should be private");
+        }
+        for a in [
+            "140.82.121.6",
+            "1.1.1.1",
+            "100.128.0.1",
+            "2606:4700::1111",
+            "::ffff:1.1.1.1",
+        ] {
+            assert!(!private(a.parse().unwrap()), "{a} should be reachable");
+        }
+    }
 }

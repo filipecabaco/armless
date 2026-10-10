@@ -122,12 +122,15 @@ as idle, so a running CPU waiting for TLB acknowledgements does not wait for it.
 "ARMLESS\x03"  u64 RAM size  u32 CPUs  u64 meta length
 meta: CPUs, GIC, timers, RTC (state.rs), then the devices (UART, PCI functions,
       virtio queues, console, the filesystem tree with files the guest wrote,
-      open 9p fids, waiting requests, network names)
+      open 9p fids, waiting requests, network names), then tagged extensions
+      (u32 tag + data; "P9OW": who each 9p fid belongs to)
 RAM:  (u32 page, 4096 bytes) for every non-zero page, then u32 0xffffffff
 ```
 
 `StateLoader` streams this, zstd-compressed or not, straight into guest memory.
 Blobs are not saved; the guest's unmodified files are fetched again after a restore.
+Extensions go after the devices, so snapshots without them still load (9p fids then
+belong to root, as they used to).
 
 ## SMP in the browser
 
