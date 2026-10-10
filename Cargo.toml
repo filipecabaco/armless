@@ -1,6 +1,6 @@
 [package]
 name = "armless"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 publish = false
 description = "An AArch64 virtual machine (CPU, JIT, devices) for the browser and native hosts"

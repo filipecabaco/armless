@@ -195,9 +195,20 @@ impl Board {
         Ok(())
     }
 
-    /// Randomness for TLS (call once at start-up, and after restoring a snapshot).
+    /// Fresh randomness from the host: call once at start-up, and after every restore. It seeds
+    /// the machine's TLS, and gives the guest a new VM generation ID, which makes Linux reseed its
+    /// random generator at once: without it, every restore of a snapshot would draw the same
+    /// "random" numbers (UUIDs, keys, nonces) as the machine that was saved.
     pub fn seed(&self, entropy: &[u8]) {
         self.with_net(|s, _| s.rng.seed(entropy));
+        let mut id = [0u8; 16];
+        for (i, b) in entropy.iter().enumerate() {
+            id[i % 16] ^= b.rotate_left((i / 16) as u32);
+        }
+        self.devices.lock().vmgenid = id;
+        // The guest configured the line as edge-triggered: a rising edge latches it
+        self.io.set_irq(crate::board::SPI_VMGENID, true);
+        self.io.set_irq(crate::board::SPI_VMGENID, false);
     }
 
     fn with_web(&self, id: u32, f: impl FnOnce(&mut crate::dev::web::Web) -> crate::dev::web::Out) {

@@ -269,6 +269,8 @@ impl Default for DeviceConfig {
 pub struct Devices {
     pub uart: uart::Uart,
     pub pci: pci::Bus,
+    /// The VM generation ID (see `Board::seed`)
+    pub vmgenid: [u8; 16],
 }
 
 /// PCI slots: fixed, so snapshots line up.
@@ -276,6 +278,8 @@ pub const SLOT_CONSOLE: u8 = 1;
 pub const SLOT_FS: u8 = 2;
 /// Snapshot extension: the 9p fids' owners
 const EXT_P9_OWNERS: u32 = u32::from_le_bytes(*b"P9OW");
+/// Snapshot extension: the VM generation ID
+const EXT_VMGENID: u32 = u32::from_le_bytes(*b"VGID");
 pub const SLOT_NET: u8 = 3;
 
 impl Devices {
@@ -299,12 +303,21 @@ impl Devices {
         Devices {
             uart: uart::Uart::default(),
             pci,
+            vmgenid: [0; 16],
         }
     }
 
     pub fn mmio_read(&mut self, io: &Io, addr: u64, size: u32) -> Option<u64> {
         if (board::UART_BASE..board::UART_BASE + board::UART_SIZE).contains(&addr) {
             return Some(self.uart.read(io, (addr - board::UART_BASE) & 7) as u64);
+        }
+        if (board::VMGENID_BASE..board::VMGENID_BASE + board::VMGENID_SIZE).contains(&addr) {
+            let off = (addr - board::VMGENID_BASE) as usize;
+            let mut v = 0u64;
+            for i in (0..size as usize).rev() {
+                v = v << 8 | *self.vmgenid.get(off + i).unwrap_or(&0) as u64;
+            }
+            return Some(v);
         }
         if (board::PCI_ECAM_BASE..board::PCI_ECAM_BASE + board::PCI_ECAM_SIZE).contains(&addr) {
             return Some(self.pci.config_read(addr - board::PCI_ECAM_BASE, size) as u64);
@@ -324,6 +337,9 @@ impl Devices {
     }
 
     pub fn mmio_write(&mut self, io: &Io, addr: u64, size: u32, value: u64) -> bool {
+        if (board::VMGENID_BASE..board::VMGENID_BASE + board::VMGENID_SIZE).contains(&addr) {
+            return true; // read-only
+        }
         if (board::UART_BASE..board::UART_BASE + board::UART_SIZE).contains(&addr) {
             self.uart
                 .write(io, (addr - board::UART_BASE) & 7, value as u8);
@@ -376,6 +392,8 @@ impl Devices {
             w.u32(EXT_P9_OWNERS);
             p.save_owners(w);
         }
+        w.u32(EXT_VMGENID);
+        w.bytes(&self.vmgenid);
     }
 
     pub fn load(&mut self, r: &mut R) -> Option<()> {
@@ -384,6 +402,7 @@ impl Devices {
         while r.0.len() >= 4 {
             match r.u32()? {
                 EXT_P9_OWNERS => self.p9()?.1.load_owners(r)?,
+                EXT_VMGENID => self.vmgenid = r.bytes()?.try_into().ok()?,
                 _ => return None,
             }
         }

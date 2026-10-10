@@ -303,6 +303,18 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.prop_str("clock-names", "apb_pclk");
     f.end();
 
+    // A new ID after every restore: Linux reseeds its random generator at once (add_vmfork_randomness),
+    // so restored machines don't all draw the same "random" numbers. Edge-triggered: the device has
+    // nothing to acknowledge.
+    f.begin(&format!("vmgenid@{:x}", board::VMGENID_BASE));
+    f.prop_str("compatible", "microsoft,vmgenid");
+    f.prop_cells(
+        "reg",
+        &[hi(board::VMGENID_BASE), lo(board::VMGENID_BASE), 0, 16],
+    );
+    f.prop_cells("interrupts", &[0, board::SPI_VMGENID - 32, 1]);
+    f.end();
+
     f.begin(&format!("pcie@{:x}", board::PCI_ECAM_BASE));
     f.prop_str("compatible", "pci-host-ecam-generic");
     f.prop_str("device_type", "pci");

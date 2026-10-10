@@ -7,6 +7,7 @@
 0xE000_0000 .. 0xEFFF_FFFF   PCI MMIO window (virtio BARs, 0x10000 per slot)
 0xF000_0000                  GICv2 distributor     0xF001_0000  GICv2 CPU interface
 0xF010_0000                  16550 UART (ttyS0)    0xF011_0000  PL031 RTC
+0xF012_0000                  VM generation ID (16 bytes, SPI 40, edge)
 0xF100_0000 .. +0x10_0000    PCI ECAM, bus 0
 ```
 
@@ -91,6 +92,11 @@ Randomness for TLS comes from the host (`Board::seed`): the browser uses
 `crypto.getRandomValues`, natively it comes from `/dev/urandom`. It is seeded again
 after every restore.
 
+The same seed gives the guest a new VM generation ID (`microsoft,vmgenid` in the device
+tree) and raises its interrupt: Linux reseeds its random generator at once
+(`add_vmfork_randomness`). Without it, every restore of a snapshot would draw the same
+"random" numbers (UUIDs, keys, nonces) as the machine that was saved.
+
 ### Other TCP
 
 Other ports reach the host as `TcpOpen` streams:
@@ -123,7 +129,7 @@ as idle, so a running CPU waiting for TLB acknowledgements does not wait for it.
 meta: CPUs, GIC, timers, RTC (state.rs), then the devices (UART, PCI functions,
       virtio queues, console, the filesystem tree with files the guest wrote,
       open 9p fids, waiting requests, network names), then tagged extensions
-      (u32 tag + data; "P9OW": who each 9p fid belongs to)
+      (u32 tag + data; "P9OW": who each 9p fid belongs to, "VGID": the VM generation ID)
 RAM:  (u32 page, 4096 bytes) for every non-zero page, then u32 0xffffffff
 ```
 

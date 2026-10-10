@@ -10,6 +10,7 @@
 //! 0xF001_0000 .. +0x1_0000     GICv2 CPU interface
 //! 0xF010_0000 .. +0x1000       16550 UART (ttyS0)
 //! 0xF011_0000 .. +0x1000       PL031 RTC
+//! 0xF012_0000 .. +0x1000       VM generation ID (16 bytes)
 //! 0xF020_0000 .. +0x1_0000     PCI I/O window (unused)
 //! 0xF100_0000 .. +0x10_0000    PCI ECAM, bus 0 (virtio devices)
 //! ```
@@ -29,6 +30,8 @@ pub const UART_BASE: u64 = 0xF010_0000;
 pub const UART_SIZE: u64 = 0x1000;
 pub const RTC_BASE: u64 = 0xF011_0000;
 pub const RTC_SIZE: u64 = 0x1000;
+pub const VMGENID_BASE: u64 = 0xF012_0000;
+pub const VMGENID_SIZE: u64 = 0x1000;
 pub const PCI_PIO_BASE: u64 = 0xF020_0000;
 pub const PCI_PIO_SIZE: u64 = 0x1_0000;
 pub const PCI_ECAM_BASE: u64 = 0xF100_0000;
@@ -42,6 +45,8 @@ pub const SPI_UART: u32 = 32 + 1;
 pub const SPI_RTC: u32 = 32 + 2;
 /// PCI INTA..INTD of slot 0 map to these four SPIs; other slots are swizzled.
 pub const SPI_PCI_BASE: u32 = 32 + 3;
+/// After SPI_PCI_BASE..+4
+pub const SPI_VMGENID: u32 = 32 + 8;
 
 /// Generic timer frequency, same as QEMU's virt board.
 pub const TIMER_FREQ_HZ: u64 = 62_500_000;

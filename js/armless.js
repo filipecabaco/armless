@@ -394,10 +394,11 @@
       } else if (o.boot) {
         await this._boot(o.boot);
       }
+      // Fresh randomness for the guest (a new VM generation ID) and for TLS
+      this._seed();
       if (o.network) {
         this._web_options = web_options(o.network);
         this._web = new Map();
-        this._seed();
         if (this._web_options.tls) {
           const tls = this._web_options.tls;
           const json = typeof tls === "object" && !(tls instanceof ArrayBuffer) && !ArrayBuffer.isView(tls) ?
@@ -682,7 +683,7 @@
       const was_running = this.running;
       await this.stop();
       await this._restore(src);
-      if (this.options.network) this._seed();
+      this._seed();
       this._drain();
       if (was_running) this.run();
     }
