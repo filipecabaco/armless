@@ -1,0 +1,61 @@
+name: armless
+
+on:
+  push:
+    paths: ["arm/**", ".github/workflows/armless.yml"]
+  pull_request:
+    paths: ["arm/**", ".github/workflows/armless.yml"]
+  workflow_dispatch:
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
+          rustup target add wasm32-unknown-unknown
+      - name: Unit tests and bare-metal guest
+        run: cargo test
+      - name: Type-check the wasm layer natively
+        run: cargo check --features wasm-api
+      - name: Build armless.wasm
+        run: |
+          cargo build --release --lib --target wasm32-unknown-unknown
+          cp ../build/wasm32-unknown-unknown/release/armless.wasm .
+          ls -la armless.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: armless-wasm
+          path: arm/armless.wasm
+
+  linux-boot:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu flex bison bc linux-source-6.8.0
+      - name: Cache kernel
+        id: kcache
+        uses: actions/cache@v4
+        with:
+          path: arm/build-linux
+          key: linux-6.8-${{ hashFiles('arm/tests/linux/armless_defconfig', 'arm/tests/linux/init.c', 'arm/tests/linux/mkcpio.py') }}
+      - name: Build kernel and initramfs
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/linux"
+          tar xjf /usr/src/linux-source-6.8.0/linux-source-6.8.0.tar.bz2 -C "$RUNNER_TEMP/linux"
+          sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-source-6.8.0" build-linux
+      - name: Boot Linux to userspace
+        run: sh tests/linux/boot.sh build-linux

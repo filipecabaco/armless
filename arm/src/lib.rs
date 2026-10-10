@@ -19,7 +19,7 @@ pub mod rtc;
 pub mod state;
 pub mod sysreg;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
 pub mod wasm;
 
 pub use board::Host;

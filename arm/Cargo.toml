@@ -10,6 +10,10 @@ license = "BSD-2-Clause"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
+[features]
+# Compile the wasm export layer natively, to type-check it without a wasm target.
+wasm-api = []
+
 [[bin]]
 name = "armless-run"
 path = "src/bin/armless-run.rs"
