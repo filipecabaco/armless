@@ -157,6 +157,9 @@ fork fixed these in the shared code, so x86 benefits too:
   receive buffer posted, instead of dropping them.
 - **Uploads.** POST/PUT bodies are joined once instead of being re-copied on
   every TCP segment.
+- **9p snapshots.** The 9p server's fid table could have holes. Saved state
+  turned them into nulls, and restoring that snapshot crashed. Several CPUs
+  make holes likely, but one CPU can hit it too.
 
 `tests/arm/netfs.mjs` checks integrity on both sides (checksums of downloads,
 uploads, parallel requests, 9p reads of zstd blobs, writes the host reads

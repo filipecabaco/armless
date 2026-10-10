@@ -123,7 +123,8 @@ function check(name, ok, detail, secs, bytes)
     if(!ok) failures++;
 }
 
-process.on("uncaughtException", e => { console.log("FAIL: " + e.message); process.exit(1); });
+process.on("uncaughtException", e => { console.log("FAIL: " + e.message + "\n" + e.stack); process.exit(1); });
+process.on("unhandledRejection", e => { console.log("FAIL: " + (e && e.message) + "\n" + (e && e.stack)); process.exit(1); });
 
 // ------------------------------------------------------------------ boot
 const t0 = performance.now();
