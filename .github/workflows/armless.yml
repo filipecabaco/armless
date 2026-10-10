@@ -111,15 +111,7 @@ jobs:
           sh ../tests/arm/make-9pfs.sh build-linux/busybox build-linux/Image.gz build-linux/9pfs
           node ../tests/arm/snowglobe.mjs build-linux/9pfs
       - name: Two CPUs through the V86 JS API (vCPU workers; SMP stress and snowglobe flow)
-        run: |
-          ARMLESS_CPUS=2 node ../tests/arm/boot.mjs --cmdline "console=ttyS0 rdinit=/init quiet" \
-              --expect ARMLESS-SMP-DONE build-linux/Image build-linux/smp.cpio > v86-smp.log
-          grep -E "^smp:" v86-smp.log || true
-          sed -n '/^== smp ==/,/^ARMLESS-SMP-DONE/p' v86-smp.log \
-              | grep -v -e '^== ' -e '^ARMLESS-SMP-DONE' -e '^smp:' -e 'SERIAL:' | tr -d '\r' > v86-smp-dut.txt
-          diff -u build-linux/smp-ref.txt v86-smp-dut.txt
-          ARMLESS_CPUS=2 node ../tests/arm/snowglobe.mjs build-linux/9pfs
-          ARMLESS_CPUS=2 NETFS_ONLY=net node ../tests/arm/netfs.mjs build-linux/9pfs
+        run: sh ../tests/arm/ci-smp.sh build-linux
       - name: Network and 9p stress (integrity and throughput)
         run: |
           node ../tests/arm/netfs.mjs build-linux/9pfs
