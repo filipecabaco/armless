@@ -415,8 +415,8 @@ impl<H: Host> Cpu<H> {
                                 self.spsel = crm & 1 != 0;
                             },
                             (3, 6) => {
+                                // Masking never makes an interrupt takeable.
                                 self.daif |= (crm << 6) & (0xf << 6);
-                                self.irq_dirty = true;
                             },
                             (3, 7) => {
                                 self.daif &= !((crm << 6) & (0xf << 6));
@@ -578,7 +578,9 @@ impl<H: Host> Cpu<H> {
             sr::NZCV => self.set_nzcv(v),
             sr::DAIF => {
                 self.daif = (v as u32) & (0xf << 6);
-                self.irq_dirty = true;
+                if self.daif & (1 << 7) == 0 {
+                    self.irq_dirty = true;
+                }
             },
             sr::FPCR => self.sys.fpcr = v,
             sr::FPSR => self.sys.fpsr = v,
@@ -837,7 +839,7 @@ impl<H: Host> Cpu<H> {
             self.set_excl(Some(pa));
         } else {
             let pa = self.translate(addr, crate::mmu::Access::Write, false)?;
-            let ok = self.excl.is_some_and(|e| e & !0x3f == pa & !0x3f);
+            let ok = self.excl().is_some_and(|e| e & !0x3f == pa & !0x3f);
             if ok {
                 if o1 {
                     let (a, b) = (self.xr(rt), self.xr(rt2));

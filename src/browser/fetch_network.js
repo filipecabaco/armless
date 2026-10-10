@@ -107,14 +107,20 @@ async function on_data_http(data)
     // Content-Length is satisfied, then fire the deferred fetch.
     if(this.pendingBody)
     {
+        // Collect the chunks and join them once (re-copying the body for
+        // every TCP segment made large uploads quadratic).
         const chunk = data instanceof Uint8Array ? data : new Uint8Array(data);
-        const combined = new Uint8Array(this.pendingBody.buf.length + chunk.length);
-        combined.set(this.pendingBody.buf);
-        combined.set(chunk, this.pendingBody.buf.length);
-        this.pendingBody.buf = combined;
-        if(this.pendingBody.buf.length >= this.pendingBody.cl)
+        this.pendingBody.chunks.push(chunk.slice());
+        this.pendingBody.length += chunk.length;
+        if(this.pendingBody.length >= this.pendingBody.cl)
         {
-            const body = this.pendingBody.buf;
+            const body = new Uint8Array(this.pendingBody.length);
+            let offset = 0;
+            for(const c of this.pendingBody.chunks)
+            {
+                body.set(c, offset);
+                offset += c.length;
+            }
             const done = this.pendingBody.done;
             this.pendingBody = null;
             done(body);
@@ -217,7 +223,8 @@ async function on_data_http(data)
         if(content_length > 0 && body_bytes.length < content_length)
         {
             this.pendingBody = {
-                buf: body_bytes,
+                chunks: [body_bytes],
+                length: body_bytes.length,
                 cl: content_length,
                 done: (body) => {
                     opts.body = body;

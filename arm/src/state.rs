@@ -84,8 +84,8 @@ impl<H: Host> Cpu<H> {
             w.u32(k);
             w.u64(v);
         }
-        w.u8(self.excl.is_some() as u8);
-        w.u64(self.excl.unwrap_or(0));
+        w.u8(self.excl().is_some() as u8);
+        w.u64(self.excl().unwrap_or(0));
         self.gic.save(&mut w.0);
         w.u64(self.rtc.offset as u64);
         w.u32(self.rtc.match_value);

@@ -454,6 +454,14 @@ impl<H: Host> Cpu<H> {
             pending: a(std::ptr::addr_of!(self.jit_pending_flag) as *const u8),
             excl_armed: a(std::ptr::addr_of!(self.excl_armed) as *const u8),
             limit: a(std::ptr::addr_of!(self.jit_limit) as *const u8),
+            excl_addr: a(std::ptr::addr_of!(self.excl_addr) as *const u8),
+            tpidr_el0: a(std::ptr::addr_of!(self.sys.tpidr_el0) as *const u8),
+            tpidr_el1: a(std::ptr::addr_of!(self.sys.tpidr_el1) as *const u8),
+            tpidrro_el0: a(std::ptr::addr_of!(self.sys.tpidrro_el0) as *const u8),
+            sp_el0: a(std::ptr::addr_of!(self.sp_el0) as *const u8),
+            daif: a(std::ptr::addr_of!(self.daif) as *const u8),
+            el: el as u32,
+            spsel: spsel as u32,
             irq_dirty: a(std::ptr::addr_of!(self.irq_dirty) as *const u8),
             mem: a(self.mem.as_ptr()),
             read_tag: a(f.read_tag_ptr()),
@@ -553,11 +561,9 @@ impl<H: Host> Cpu<H> {
         let system = insn & 0xffc0_0000 == 0xd500_0000;
         match self.execute(insn) {
             Ok(()) => {
-                if self.next_pc != pc.wrapping_add(4) {
-                    self.pc = self.next_pc;
-                    1
-                } else if system {
-                    // System state may have changed (SPSel, translation...):
+                if self.next_pc != pc.wrapping_add(4) || (system && !self.system_continues(insn)) {
+                    // Control flow or state that translated code depends on
+                    // (EL, SPSel, translation, unmasked interrupts) changed:
                     // end the block and continue in the run loop.
                     self.pc = self.next_pc;
                     1
@@ -575,6 +581,38 @@ impl<H: Host> Cpu<H> {
                 self.jit_pending_flag = 1;
                 2
             },
+        }
+    }
+
+    /// After a system instruction ran in the interpreter: can the block
+    /// continue? Reads, cache/TLB maintenance, barriers and hints change
+    /// nothing translated code depends on (it reads the fast TLB from memory),
+    /// nor do writes of a few plain registers, or of DAIF that keep IRQs
+    /// masked. Anything else ends the block.
+    fn system_continues(&self, insn: u32) -> bool {
+        use crate::sysreg::{self as sr};
+        if insn & (1 << 21) != 0 {
+            return true; // MRS, SYSL
+        }
+        let op0 = (insn >> 19) & 3;
+        let crn = (insn >> 12) & 0xf;
+        match op0 {
+            1 => true, // SYS: DC, IC, TLBI, AT
+            0 => match crn {
+                2 | 3 => true, // hints, barriers, CLREX
+                // MSR (immediate): DAIFSet/DAIFClr may continue while IRQs stay masked
+                4 => (insn >> 16) & 7 == 3 && matches!((insn >> 5) & 7, 6 | 7) && self.daif & (1 << 7) != 0,
+                _ => false,
+            },
+            _ => {
+                let key = (insn >> 5) & 0xffff;
+                match key {
+                    sr::DAIF => self.daif & (1 << 7) != 0,
+                    sr::NZCV | sr::FPCR | sr::FPSR | sr::TPIDR_EL0 | sr::TPIDR_EL1 | sr::TPIDRRO_EL0 | sr::SP_EL0 => true,
+                    sr::SPSR_EL1 | sr::ELR_EL1 | sr::ESR_EL1 | sr::FAR_EL1 | sr::PAR_EL1 | sr::CONTEXTIDR_EL1 => true,
+                    _ => false,
+                }
+            }
         }
     }
 

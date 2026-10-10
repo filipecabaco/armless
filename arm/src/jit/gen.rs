@@ -19,6 +19,7 @@
 
 use super::wasm::{self, Code, FuncType, Import, EMPTY, I32, I64};
 use crate::bits::{bit, decode_bit_masks, field, sext};
+use crate::sysreg::sr;
 
 /// Linear-memory addresses the generated code uses (all wasm32 pointers).
 #[derive(Clone, Copy, Debug, Default)]
@@ -38,6 +39,17 @@ pub struct Layout {
     pub excl_armed: u32,
     /// u64: blocks stop chaining once insn_count reaches this.
     pub limit: u32,
+    /// u64: physical address watched by the exclusive monitor.
+    pub excl_addr: u32,
+    /// System registers translated inline (u64 each; DAIF is u32).
+    pub tpidr_el0: u32,
+    pub tpidr_el1: u32,
+    pub tpidrro_el0: u32,
+    pub sp_el0: u32,
+    pub daif: u32,
+    /// Values (not addresses): the exception level and SPSel of this code.
+    pub el: u32,
+    pub spsel: u32,
     /// Byte: non-zero when interrupt state must be re-examined.
     pub irq_dirty: u32,
     /// Guest RAM base.
@@ -99,11 +111,18 @@ const ST: u32 = 10;
 
 const LOCALS: &[(u32, u8)] = &[(8, I64), (4, I32)];
 
-/// Whether an instruction ends a block (control flow or system state change).
+/// Whether an instruction ends a block: branches, exception generation and
+/// WFI/WFE. Other system instructions don't: the interpreter helper ends the
+/// block when one changed state that translated code depends on.
 pub fn ends_block(insn: u32) -> bool {
     let op0 = (insn >> 25) & 0xf;
-    // Branches, exception generation and system instructions
-    op0 == 0b1010 || op0 == 0b1011
+    if op0 != 0b1010 && op0 != 0b1011 {
+        return false;
+    }
+    if insn & 0xffc0_0000 == 0xd500_0000 {
+        return insn & 0xffff_f01f == 0xd503_201f && matches!(field(insn, 5, 7), 2 | 3);
+    }
+    true
 }
 
 struct Gen<'a> {
@@ -534,9 +553,21 @@ impl Gen<'_> {
     /// Translate one instruction. Returns false if it needs the interpreter.
     fn insn(&mut self, insn: u32) -> bool {
         match (insn >> 25) & 0xf {
-            0b1000 | 0b1001 => self.dp_imm(insn),
-            0b0101 | 0b1101 => self.dp_reg(insn),
-            0b1010 | 0b1011 => self.branch(insn),
+            0b1000 | 0b1001 => {
+                let start = self.c.b.len();
+                self.dp_imm(insn) || {
+                    self.c.b.truncate(start);
+                    self.dp_extra(insn)
+                }
+            },
+            0b0101 | 0b1101 => {
+                let start = self.c.b.len();
+                self.dp_reg(insn) || {
+                    self.c.b.truncate(start);
+                    self.dp_extra(insn)
+                }
+            },
+            0b1010 | 0b1011 => self.branch(insn) || self.system(insn),
             0b0100 | 0b0110 | 0b1100 | 0b1110 => self.ldst(insn),
             _ => false,
         }
@@ -1090,9 +1121,416 @@ impl Gen<'_> {
         false
     }
 
+    // ------------------------------------------------- system instructions
+
+    /// Barriers (no-ops on one core) and MRS/MSR of registers kept in the
+    /// CPU struct. Everything else in the system space is interpreted.
+    fn system(&mut self, insn: u32) -> bool {
+        if insn & 0xffff_f01f == 0xd503_301f && matches!(field(insn, 5, 3), 4 | 5 | 6) && insn & 0xf00 != 0 {
+            // DSB/DMB (CRm != 0) and ISB
+            return true;
+        }
+        if insn & 0xffff_f0ff == 0xd503_30df {
+            return true; // ISB (any CRm)
+        }
+        let l = *self.l;
+        let mrs = insn & 0xfff0_0000 == 0xd530_0000;
+        let msr = insn & 0xfff0_0000 == 0xd510_0000;
+        if !mrs && !msr {
+            return false;
+        }
+        let key = field(insn, 5, 16);
+        let rt = insn & 31;
+        let el1 = l.el == 1;
+        let (addr, wide) = match key {
+            k if k == sr(3, 3, 13, 0, 2) => (l.tpidr_el0, true),
+            k if k == sr(3, 3, 13, 0, 3) && (mrs || el1) => (l.tpidrro_el0, true),
+            k if k == sr(3, 0, 13, 0, 4) && el1 => (l.tpidr_el1, true),
+            k if k == sr(3, 0, 4, 1, 0) && el1 && l.spsel != 0 => (l.sp_el0, true),
+            k if k == sr(3, 3, 4, 2, 1) && el1 && mrs => (l.daif, false),
+            _ => return false,
+        };
+        if mrs {
+            self.wr(rt, |g| {
+                g.c.i32c(0);
+                if wide {
+                    g.c.i64_load(addr);
+                } else {
+                    g.c.i64_load32_u(addr);
+                }
+            });
+        } else {
+            self.c.i32c(0);
+            self.xr(rt);
+            self.c.i64_store(addr);
+        }
+        true
+    }
+
+    // ---------------------------------------------- exclusives and acquire/release
+
+    /// Push the zero-extended `size`-byte value at host offset ST (relative to mem).
+    fn load_at_st(&mut self, size: u32) {
+        let l = *self.l;
+        self.c.get(ST);
+        match size {
+            1 => self.c.i64_load8_u(l.mem),
+            2 => self.c.i64_load16_u(l.mem),
+            4 => self.c.i64_load32_u(l.mem),
+            _ => self.c.i64_load(l.mem),
+        }
+    }
+
+    /// Store the value pushed by `f` (low `size` bytes) at host offset ST.
+    fn store_at_st(&mut self, size: u32, f: impl FnOnce(&mut Self)) {
+        let l = *self.l;
+        self.c.get(ST);
+        f(self);
+        match size {
+            1 => self.c.i64_store8(l.mem),
+            2 => self.c.i64_store16(l.mem),
+            4 => self.c.i64_store32(l.mem),
+            _ => self.c.i64_store(l.mem),
+        }
+    }
+
+    /// LDXR/LDAXR/STXR/STLXR (single register) and LDAR/STLR. The fast TLB
+    /// path is inline; anything else (a miss, a page-crossing access) runs the
+    /// interpreter for the instruction, so faults and corner cases match it.
+    fn ldst_exclusive(&mut self, insn: u32) -> bool {
+        let size = 1u32 << field(insn, 30, 2);
+        let o2 = bit(insn, 23);
+        let load = bit(insn, 22);
+        let o1 = bit(insn, 21);
+        let rs = field(insn, 16, 5);
+        let o0 = bit(insn, 15);
+        let rt2 = field(insn, 10, 5);
+        let rn = field(insn, 5, 5);
+        let rt = insn & 31;
+        if o1 || rt2 != 31 {
+            return false; // pairs, CAS, UNDEFINED encodings
+        }
+        if o2 && (rs != 31 || !o0) {
+            return false;
+        }
+        if !o2 && load && rs != 31 {
+            return false;
+        }
+        if !o2 && !load && (rs == rt || (rs == rn && rn != 31)) {
+            return false; // CONSTRAINED UNPREDICTABLE: leave to the interpreter
+        }
+        let l = *self.l;
+        self.xs(rn);
+        self.c.set(VA);
+        if o2 {
+            // LDAR/STLR: ordinary accesses on one core
+            if load {
+                self.load(size);
+                self.c.set(T0);
+                self.wr(rt, |g| g.c.get(T0));
+            } else {
+                self.xr(rt);
+                self.c.set(DATA);
+                self.store(size);
+            }
+            return true;
+        }
+        if load {
+            self.tlb_probe(l.read_tag, size);
+            self.c.if_(EMPTY);
+            self.host_addr(l.read_base);
+            self.c.set(ST);
+            self.load_at_st(size);
+            self.c.set(T0);
+            self.wr(rt, |g| g.c.get(T0));
+            self.c.i32c(0);
+            self.c.get(ST);
+            self.c.i64_extend_i32_u();
+            self.c.i64_store(l.excl_addr);
+            self.c.i32c(0);
+            self.c.i32c(1);
+            self.c.i32_store8(l.excl_armed);
+            self.c.else_();
+            self.interp(insn);
+            self.c.end();
+        } else {
+            self.tlb_probe(l.write_tag, size);
+            self.c.if_(EMPTY);
+            self.host_addr(l.write_base);
+            self.c.set(ST);
+            // ok = armed && same 64-byte granule
+            self.c.i32c(0);
+            self.c.i32_load8_u(l.excl_armed);
+            self.c.i32c(0);
+            self.c.i64_load(l.excl_addr);
+            self.c.get(ST);
+            self.c.i64_extend_i32_u();
+            self.c.i64_xor();
+            self.c.i64c(!0x3f);
+            self.c.i64_and();
+            self.c.i64_eqz();
+            self.c.i32_and();
+            self.c.if_(EMPTY);
+            self.store_at_st(size, |g| g.xr(rt));
+            self.wr(rs, |g| g.c.i64c(0));
+            self.c.else_();
+            self.wr(rs, |g| g.c.i64c(1));
+            self.c.end();
+            self.c.i32c(0);
+            self.c.i32c(0);
+            self.c.i32_store8(l.excl_armed);
+            self.c.else_();
+            self.interp(insn);
+            self.c.end();
+        }
+        true
+    }
+
+    // ------------------------------------------------ more data processing
+
+    /// EXTR/ROR, CLZ, REV*, UDIV/SDIV, UMULH/SMULH, [SU]M{ADD,SUB}L.
+    fn dp_extra(&mut self, insn: u32) -> bool {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        let rm = field(insn, 16, 5);
+        if insn & 0x7fa0_0000 == 0x1380_0000 {
+            // EXTR (N must equal sf; imms < 32 for 32-bit)
+            let n = bit(insn, 22);
+            let lsb = field(insn, 10, 6);
+            if n != sf || (!sf && lsb >= 32) {
+                return false;
+            }
+            let width = if sf { 64 } else { 32 };
+            self.wr(rd, |g| {
+                if lsb == 0 {
+                    g.xr(rm);
+                    g.trunc32(sf);
+                } else {
+                    g.xr(rm);
+                    g.trunc32(sf);
+                    g.c.i64c(lsb as i64);
+                    g.c.i64_shr_u();
+                    g.xr(rn);
+                    g.c.i64c((width - lsb) as i64);
+                    g.c.i64_shl();
+                    g.c.i64_or();
+                    g.trunc32(sf);
+                }
+            });
+            return true;
+        }
+        if insn & 0x7fff_c000 == 0x5ac0_0000 {
+            // Data-processing (1 source): RBIT/REV16/REV/REV32/CLZ/CLS
+            let opc = field(insn, 10, 6);
+            match (opc, sf) {
+                (4, _) => {
+                    // CLZ
+                    self.wr(rd, |g| {
+                        g.xr(rn);
+                        if sf {
+                            g.c.i64_clz();
+                        } else {
+                            g.c.i32_wrap_i64();
+                            g.c.i32_clz();
+                            g.c.i64_extend_i32_u();
+                        }
+                    });
+                },
+                (1, _) | (2, _) | (3, true) => {
+                    // REV16 (1), REV32 / REV(32-bit) (2), REV (64-bit) (3)
+                    self.xr(rn);
+                    self.c.set(T0);
+                    // swap bytes within 16-bit units
+                    self.swap_units(T0, 8, 0x00ff_00ff_00ff_00ff);
+                    if opc >= 2 {
+                        self.swap_units(T0, 16, 0x0000_ffff_0000_ffff);
+                    }
+                    if opc == 3 {
+                        self.c.get(T0);
+                        self.c.i64c(32);
+                        self.c.i64_rotr();
+                        self.c.set(T0);
+                    }
+                    self.wr(rd, |g| {
+                        g.c.get(T0);
+                        g.trunc32(sf);
+                    });
+                },
+                _ => return false,
+            }
+            return true;
+        }
+        if insn & 0x7fe0_f800 == 0x1ac0_0800 {
+            // UDIV / SDIV (division by zero gives 0; INT_MIN / -1 wraps)
+            let signed = bit(insn, 10);
+            self.xr(rn);
+            self.ext_operand(sf, signed);
+            self.c.set(T0);
+            self.xr(rm);
+            self.ext_operand(sf, signed);
+            self.c.set(T1);
+            self.wr(rd, |g| {
+                g.c.get(T1);
+                g.c.i64_eqz();
+                g.c.if_(I64);
+                g.c.i64c(0);
+                g.c.else_();
+                if signed {
+                    g.c.get(T1);
+                    g.c.i64c(-1);
+                    g.c.i64_eq();
+                    g.c.if_(I64);
+                    g.c.i64c(0);
+                    g.c.get(T0);
+                    g.c.i64_sub();
+                    g.c.else_();
+                    g.c.get(T0);
+                    g.c.get(T1);
+                    g.c.i64_div_s();
+                    g.c.end();
+                } else {
+                    g.c.get(T0);
+                    g.c.get(T1);
+                    g.c.i64_div_u();
+                }
+                g.c.end();
+                g.trunc32(sf);
+            });
+            return true;
+        }
+        if insn & 0xff60_8000 == 0x9b40_0000 && field(insn, 10, 5) == 31 {
+            // UMULH (U=1) / SMULH
+            let unsigned = bit(insn, 23);
+            self.xr(rn);
+            self.c.set(T0);
+            self.xr(rm);
+            self.c.set(T1);
+            self.umulh(T0, T1);
+            if !unsigned {
+                // signed high = unsigned high - (a < 0 ? b : 0) - (b < 0 ? a : 0)
+                self.c.get(T1);
+                self.c.i64c(0);
+                self.c.get(T0);
+                self.c.i64c(0);
+                self.c.i64_lt_s();
+                self.c.select();
+                self.c.i64_sub();
+                self.c.get(T0);
+                self.c.i64c(0);
+                self.c.get(T1);
+                self.c.i64c(0);
+                self.c.i64_lt_s();
+                self.c.select();
+                self.c.i64_sub();
+            }
+            self.c.set(T2);
+            self.wr(rd, |g| g.c.get(T2));
+            return true;
+        }
+        if insn & 0xff60_0000 == 0x9b20_0000 {
+            // SMADDL/SMSUBL (U=0), UMADDL/UMSUBL (U=1): Xa +/- Wn * Wm
+            let unsigned = bit(insn, 23);
+            let sub = bit(insn, 15);
+            let ra = field(insn, 10, 5);
+            self.wr(rd, |g| {
+                g.xr(ra);
+                g.xr(rn);
+                g.ext_operand(false, !unsigned);
+                g.xr(rm);
+                g.ext_operand(false, !unsigned);
+                g.c.i64_mul();
+                if sub {
+                    g.c.i64_sub();
+                } else {
+                    g.c.i64_add();
+                }
+            });
+            return true;
+        }
+        false
+    }
+
+    /// For 32-bit operations, reduce the i64 on the stack to its low 32 bits,
+    /// sign- or zero-extended.
+    fn ext_operand(&mut self, sf: bool, signed: bool) {
+        if !sf {
+            if signed {
+                self.c.i64_extend32_s();
+            } else {
+                self.c.i64c(0xffff_ffff);
+                self.c.i64_and();
+            }
+        }
+    }
+
+    /// local t = ((t >> n) & mask) | ((t & mask) << n)
+    fn swap_units(&mut self, t: u32, n: i64, mask: i64) {
+        self.c.get(t);
+        self.c.i64c(n);
+        self.c.i64_shr_u();
+        self.c.i64c(mask);
+        self.c.i64_and();
+        self.c.get(t);
+        self.c.i64c(mask);
+        self.c.i64_and();
+        self.c.i64c(n);
+        self.c.i64_shl();
+        self.c.i64_or();
+        self.c.set(t);
+    }
+
+    /// Push the high 64 bits of the unsigned product of locals a and b.
+    /// Uses T2..T4 and DATA as scratch.
+    fn umulh(&mut self, a: u32, b: u32) {
+        let lo = |g: &mut Self, x: u32| {
+            g.c.get(x);
+            g.c.i64c(0xffff_ffff);
+            g.c.i64_and();
+        };
+        let hi = |g: &mut Self, x: u32| {
+            g.c.get(x);
+            g.c.i64c(32);
+            g.c.i64_shr_u();
+        };
+        // T2 = lo(a)*hi(b), T3 = hi(a)*lo(b)
+        lo(self, a);
+        hi(self, b);
+        self.c.i64_mul();
+        self.c.set(T2);
+        hi(self, a);
+        lo(self, b);
+        self.c.i64_mul();
+        self.c.set(T3);
+        // T4 = (lo(a)*lo(b) >> 32) + lo(T2) + lo(T3)   (the middle column)
+        lo(self, a);
+        lo(self, b);
+        self.c.i64_mul();
+        self.c.i64c(32);
+        self.c.i64_shr_u();
+        lo(self, T2);
+        self.c.i64_add();
+        lo(self, T3);
+        self.c.i64_add();
+        self.c.set(T4);
+        // hi(a)*hi(b) + hi(T2) + hi(T3) + hi(T4)
+        hi(self, a);
+        hi(self, b);
+        self.c.i64_mul();
+        hi(self, T2);
+        self.c.i64_add();
+        hi(self, T3);
+        self.c.i64_add();
+        hi(self, T4);
+        self.c.i64_add();
+    }
+
     fn ldst(&mut self, insn: u32) -> bool {
         if bit(insn, 26) {
             return false; // SIMD&FP
+        }
+        if insn & 0x3f00_0000 == 0x0800_0000 {
+            return self.ldst_exclusive(insn);
         }
         if insn & 0x3800_0000 == 0x2800_0000 {
             return self.ldst_pair(insn);

@@ -148,10 +148,10 @@ pub struct Cpu<H: Host> {
     /// a direct-mapped read and write TLB, and the current code page.
     pub(crate) fast: [FastTlb; 2],
 
-    /// Exclusive monitor: physical address of the last load-exclusive.
-    pub(crate) excl: Option<u64>,
-    /// Mirror of `excl.is_some()` read by JIT-generated stores.
+    /// Exclusive monitor: armed (non-zero) by a load-exclusive of physical
+    /// address `excl_addr`. Plain fields so JIT-generated code can use them.
     pub(crate) excl_armed: u8,
+    pub(crate) excl_addr: u64,
     /// The PC is a block entry (target of a taken branch, exception or
     /// return, or the instruction after a JIT block): only there does the
     /// JIT look for or count blocks.
@@ -178,6 +178,8 @@ pub struct Cpu<H: Host> {
 }
 
 const FAST_ENTRIES: usize = 256;
+/// Executable pages remembered besides the current one (`code_page`).
+const CODE_ENTRIES: usize = 64;
 
 /// Virtual page -> offset of the page in `mem`, for pages known to be RAM
 /// with the needed permission at one exception level.
@@ -188,6 +190,8 @@ pub(crate) struct FastTlb {
     write_base: Vec<usize>,
     pub(crate) code_page: u64,
     pub(crate) code_base: usize,
+    code_tag: Vec<u64>,
+    code_bases: Vec<usize>,
 }
 
 impl FastTlb {
@@ -199,6 +203,8 @@ impl FastTlb {
             write_base: vec![0; FAST_ENTRIES],
             code_page: u64::MAX,
             code_base: 0,
+            code_tag: vec![u64::MAX; CODE_ENTRIES],
+            code_bases: vec![0; CODE_ENTRIES],
         }
     }
 
@@ -206,6 +212,7 @@ impl FastTlb {
         self.read_tag.fill(u64::MAX);
         self.write_tag.fill(u64::MAX);
         self.code_page = u64::MAX;
+        self.code_tag.fill(u64::MAX);
     }
 
     /// Remove write entries mapping to the physical page at `base`.
@@ -238,8 +245,18 @@ impl<H: Host> Cpu<H> {
     /// Arm or clear the exclusive monitor (keeps the JIT's mirror in sync).
     #[inline]
     pub(crate) fn set_excl(&mut self, e: Option<u64>) {
-        self.excl = e;
         self.excl_armed = e.is_some() as u8;
+        self.excl_addr = e.unwrap_or(0);
+    }
+
+    /// The monitored physical address, if the exclusive monitor is armed.
+    #[inline(always)]
+    pub(crate) fn excl(&self) -> Option<u64> {
+        if self.excl_armed != 0 {
+            Some(self.excl_addr)
+        } else {
+            None
+        }
     }
 
     pub fn new(memory_size: usize, host: H) -> Cpu<H> {
@@ -267,8 +284,8 @@ impl<H: Host> Cpu<H> {
             host,
             tlb: Tlb::new(),
             fast: [FastTlb::new(), FastTlb::new()],
-            excl: None,
             excl_armed: 0,
+            excl_addr: 0,
             jit_entry: true,
             jit_limit: 0,
             next_pc: 0,
@@ -672,6 +689,14 @@ impl<H: Host> Cpu<H> {
                 ret_next: false,
             });
         }
+        let f = &mut self.fast[self.el as usize];
+        let i = (pc >> 12) as usize & (CODE_ENTRIES - 1);
+        if f.code_tag[i] == pc >> 12 {
+            f.code_page = pc >> 12;
+            f.code_base = f.code_bases[i];
+            let a = f.code_base + (pc & 0xffc) as usize;
+            return Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()));
+        }
         let pa = self.translate(pc, crate::mmu::Access::Exec, false)?;
         let a = pa as usize;
         if a + 4 <= self.mem.len() {
@@ -680,6 +705,8 @@ impl<H: Host> Cpu<H> {
                 let f = &mut self.fast[self.el as usize];
                 f.code_page = pc >> 12;
                 f.code_base = page;
+                f.code_tag[i] = pc >> 12;
+                f.code_bases[i] = page;
             }
             Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()))
         } else {
@@ -825,7 +852,7 @@ impl<H: Host> Cpu<H> {
     #[inline(always)]
     pub fn write(&mut self, va: u64, size: u32, value: u64, unpriv: bool) -> Res<()> {
         let off = va & 0xfff;
-        if !unpriv && off + size as u64 <= 0x1000 && self.excl.is_none() {
+        if !unpriv && off + size as u64 <= 0x1000 && self.excl_armed == 0 {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
@@ -851,7 +878,7 @@ impl<H: Host> Cpu<H> {
                 f.write_tag[i] = va >> 12;
                 f.write_base[i] = page;
             }
-            if let Some(e) = self.excl {
+            if let Some(e) = self.excl() {
                 if e & !0x3f == pa & !0x3f {
                     self.set_excl(None);
                 }

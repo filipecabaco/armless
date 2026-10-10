@@ -108,5 +108,8 @@ shared.
   on x86 v86 takes longer, but sites start from the snapshot, so visitors
   only pay for what the app does after that. `disable_jit` and
   `jit_threshold` work as V86 options.
+- **Network speed.** `net_device: { type: "virtio", relay_url: "fetch", mtu: 65520 }`
+  makes downloads about 1.5× faster than the default MTU of 1500 (the guest
+  picks the MTU up from the virtio device). This works on x86 too.
 - **Snapshots.** The snapshot is only valid for the same `memory_size`, as on x86.
   armless refuses to restore an x86 snapshot and vice versa.

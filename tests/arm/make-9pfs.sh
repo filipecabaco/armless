@@ -21,6 +21,18 @@ done
 cp "$here/rootfs/init" "$tree/init"
 chmod +x "$tree/init"
 echo "hello from 9p" > "$tree/etc/motd"
+# Data for tests/arm/netfs.mjs: an 8 MiB incompressible file and many small ones.
+mkdir -p "$tree/data/small"
+python3 - "$tree/data" <<'PY'
+import hashlib, os, sys
+d = sys.argv[1]
+with open(os.path.join(d, "big.bin"), "wb") as f:
+    for i in range(8 * 1024 * 1024 // 32):
+        f.write(hashlib.sha256(i.to_bytes(8, "little")).digest())
+for i in range(300):
+    with open(os.path.join(d, "small", "f%03d" % i), "w") as f:
+        f.write("small file %d\n" % i * (i % 7 + 1))
+PY
 
 rm -rf "$out/blobs"
 mkdir -p "$out/blobs"

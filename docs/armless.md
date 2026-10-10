@@ -112,12 +112,21 @@ module per physical code page (`arm/src/jit`).
   PC with a `br_table`. A direct branch to another compiled entry of the same
   page loops back to that dispatch instead of returning, for up to 1024
   instructions or until interrupt state changes.
-- **What is translated.** Integer data processing, branches, conditional
-  select/compare and plain loads/stores. Loads and stores probe the
-  interpreter's fast TLB inline. Everything else (FP/SIMD, exclusives,
-  system instructions) calls back into the interpreter for that one
-  instruction. Guest state stays in the CPU struct in linear memory, so it is
-  exact at every instruction boundary and exceptions need no recovery.
+- **What is translated.**
+  - Integer data processing, including divide, `UMULH`/`SMULH`, `EXTR`,
+    `CLZ` and `REV`.
+  - Branches, and conditional select/compare.
+  - Loads/stores, `LDAR`/`STLR`, and the single-register exclusives. Loads
+    and stores probe the interpreter's fast TLB inline.
+  - Barriers (no-ops on one core) and `MRS`/`MSR` of the thread and stack
+    registers.
+
+  Everything else (FP/SIMD, other system instructions) calls back into the
+  interpreter for that one instruction. A system instruction only ends the
+  block if it changed something translated code depends on: translation
+  regime, EL/SPSel, or unmasking interrupts. Guest state stays in the CPU
+  struct in linear memory, so it is exact at every instruction boundary and
+  exceptions need no recovery.
 - **Compiling.** The module is emitted as wasm bytes. JavaScript compiles it
   asynchronously and installs it in armless.wasm's function table. Until then
   the interpreter keeps running. When more entries of a page get hot, the
@@ -129,9 +138,38 @@ module per physical code page (`arm/src/jit`).
   the threshold.
 
 On the glibc/busybox userspace test (about 235M guest instructions, through
-the V86 API in Node), the JIT takes the run from 6.3 s to 4.4 s; about 80% of
+the V86 API in Node), the JIT takes the run from 6.3 s to 4.0 s; about 80% of
 instructions execute in translated code. The JIT difftest (`DUT=jit`) compiles
 every entry on first use and compares against QEMU like the interpreter tests.
+
+### Networking and 9p
+
+The guest uses v86's own virtio-net, fetch relay and 9p server. The armless
+fork fixed these in the shared code, so x86 benefits too:
+
+- **Sliding window.** The relay's TCP sends as many segments as the guest's
+  window allows. Before, it sent one segment and waited for its ACK.
+- **Recovery.** Duplicate ACKs and a retransmission timer recover lost
+  segments, and sequence numbers wrap correctly. A segment larger than the
+  guest's window (any MTU above ~64 KB minus headers) used to wedge the
+  connection forever.
+- **No drops.** Virtio-net queues received frames while the guest has no
+  receive buffer posted, instead of dropping them.
+- **Uploads.** POST/PUT bodies are joined once instead of being re-copied on
+  every TCP segment.
+
+`tests/arm/netfs.mjs` checks integrity on both sides (checksums of downloads,
+uploads, parallel requests, 9p reads of zstd blobs, writes the host reads
+back, file semantics, files surviving `save_state`) and prints throughput.
+In Node:
+
+| | MTU 1500 (default) | `mtu: 65520` |
+|---|---|---|
+| HTTP download | ~3.6 MiB/s (was 1.6) | ~5.3 MiB/s (used to hang) |
+| 9p read / write | ~3.5 / ~2.3 MiB/s | |
+
+Both are bound by guest CPU (the kernel's copies and checksums), not by the
+devices. A larger 9p `msize` makes no difference with `cache=loose`.
 
 ## Status
 

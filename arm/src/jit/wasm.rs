@@ -173,6 +173,9 @@ impl Code {
     pub fn i64_store(&mut self, off: u32) {
         self.mem(0x37, 3, off)
     }
+    pub fn i32_clz(&mut self) {
+        self.op(0x67)
+    }
     pub fn i32_store8(&mut self, off: u32) {
         self.mem(0x3a, 0, off)
     }
@@ -307,6 +310,9 @@ impl Code {
     }
     pub fn i64_shr_u(&mut self) {
         self.op(0x88)
+    }
+    pub fn i64_rotl(&mut self) {
+        self.op(0x89)
     }
     pub fn i64_rotr(&mut self) {
         self.op(0x8a)

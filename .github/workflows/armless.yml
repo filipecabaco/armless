@@ -94,6 +94,10 @@ jobs:
           pip install --break-system-packages zstandard
           sh ../tests/arm/make-9pfs.sh build-linux/busybox build-linux/Image.gz build-linux/9pfs
           node ../tests/arm/snowglobe.mjs build-linux/9pfs
+      - name: Network and 9p stress (integrity and throughput)
+        run: |
+          node ../tests/arm/netfs.mjs build-linux/9pfs
+          NETFS_ONLY=net NET_MTU=65520 node ../tests/arm/netfs.mjs build-linux/9pfs
       - name: Userspace through the V86 JS API with the JIT matches qemu-aarch64
         run: |
           node ../tests/arm/boot.mjs --cmdline "console=ttyS0 rdinit=/init quiet" \

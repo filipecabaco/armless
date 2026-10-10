@@ -1,6 +1,7 @@
 // https://docs.oasis-open.org/virtio/virtio/v1.2/csd01/virtio-v1.2-csd01.html#x1-2900003
 
-import { dbg_assert } from "./log.js";
+import { dbg_assert, dbg_log } from "./log.js";
+import { LOG_NET } from "./const.js";
 import { VirtIO, VIRTIO_F_VERSION_1 } from "./virtio.js";
 import { format_mac } from "./ne2k.js";
 import * as marshall from "../lib/marshall.js";
@@ -10,6 +11,9 @@ import { CPU } from "./cpu.js";
 import { BusConnector } from "./bus.js";
 
 const MTU_DEFAULT = 1500;
+
+/** Received frames kept while the driver has no receive buffer posted. */
+const RX_BACKLOG_MAX = 1024;
 
 const VIRTIO_NET_F_MAC = 5;
 const VIRTIO_NET_F_CTRL_VQ = 17;
@@ -34,6 +38,8 @@ export function VirtioNet(cpu, bus, preserve_mac_from_state_image, mtu = MTU_DEF
     this.bus = bus;
     this.id = cpu.devices.net ? 1 : 0;
     this.pairs = 1;
+    /** @type {!Array<!Uint8Array>} */
+    this.rx_backlog = [];
     this.status = 1;
     this.preserve_mac_from_state_image = preserve_mac_from_state_image;
     this.mac = new Uint8Array([
@@ -88,7 +94,8 @@ export function VirtioNet(cpu, bus, preserve_mac_from_state_image, mtu = MTU_DEF
             [
                 (queue_id) =>
                 {
-
+                    // The driver posted receive buffers: deliver what waited for them.
+                    this.flush_rx_backlog();
                 },
                 (queue_id) =>
                 {
@@ -194,15 +201,24 @@ export function VirtioNet(cpu, bus, preserve_mac_from_state_image, mtu = MTU_DEF
         view.setInt16(10, 1);
         with_header.set(data, 12);
 
-        const queue = this.virtio.queues[0];
-        if(queue.has_request()) {
-            const bufchain = queue.pop_request();
-            bufchain.set_next_blob(with_header);
-            this.virtio.queues[0].push_reply(bufchain);
-            this.virtio.queues[0].flush_replies();
-        } else {
-            console.log("No buffer to write into!");
+        // Frames that arrive while the driver has no receive buffer posted
+        // wait for one instead of being dropped (the relays' TCP depends on
+        // lossless delivery); beyond RX_BACKLOG_MAX they are dropped.
+        if(this.rx_backlog.length || !this.virtio.queues[0].has_request()) {
+            if(this.rx_backlog.length < RX_BACKLOG_MAX) {
+                this.rx_backlog.push(with_header);
+            }
+            else {
+                dbg_log("virtio-net: receive backlog full, frame dropped", LOG_NET);
+            }
+            this.flush_rx_backlog();
+            return;
         }
+        const queue = this.virtio.queues[0];
+        const bufchain = queue.pop_request();
+        bufchain.set_next_blob(with_header);
+        queue.push_reply(bufchain);
+        queue.flush_replies();
     }, this);
 
 }
@@ -221,6 +237,7 @@ VirtioNet.prototype.set_state = function(state)
 {
     this.virtio.set_state(state[0]);
     this.id = state[1];
+    this.rx_backlog = [];
     if(this.preserve_mac_from_state_image)
     {
         this.mac = state[2];
@@ -229,7 +246,22 @@ VirtioNet.prototype.set_state = function(state)
 };
 
 VirtioNet.prototype.reset = function() {
+    this.rx_backlog = [];
     this.virtio.reset();
+};
+
+/** Deliver backlogged frames into the receive buffers the driver posted. */
+VirtioNet.prototype.flush_rx_backlog = function()
+{
+    const queue = this.virtio.queues[0];
+    if(!this.rx_backlog.length || !queue.has_request()) return;
+    while(this.rx_backlog.length && queue.has_request())
+    {
+        const bufchain = queue.pop_request();
+        bufchain.set_next_blob(this.rx_backlog.shift());
+        queue.push_reply(bufchain);
+    }
+    queue.flush_replies();
 };
 
 VirtioNet.prototype.Send = function (queue_id, bufchain, blob)
