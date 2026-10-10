@@ -68,7 +68,7 @@ fn main() {
                     Some((f, addr)) => (f.to_string(), parse_num(addr)),
                     None => (v, armless::board::KERNEL_OFFSET),
                 });
-            }
+            },
             "-m" => mem_mb = parse_num(&val()),
             "--max-insns" => max_insns = parse_num(&val()),
             "--timeout" => timeout = Some(Duration::from_secs(parse_num(&val()))),
@@ -100,7 +100,10 @@ fn main() {
     let code = loop {
         let budget = (max_insns - cpu.insn_count).min(100_000);
         if budget == 0 {
-            eprintln!("\narmless-run: instruction limit reached at pc={:#x}", cpu.pc);
+            eprintln!(
+                "\narmless-run: instruction limit reached at pc={:#x}",
+                cpu.pc
+            );
             break 3;
         }
         let exit = cpu.run(budget);
@@ -114,7 +117,7 @@ fn main() {
             break 3;
         }
         match exit {
-            Exit::Budget => {}
+            Exit::Budget => {},
             Exit::Idle { wake_ns } => {
                 // Nothing to do until the timer fires: skip ahead in time
                 // instead of sleeping, so idle loops don't slow tests down.
@@ -124,24 +127,33 @@ fn main() {
                         cpu.host.skew_ns += w - host_now;
                     }
                 } else if cpu.host.uart.input.is_empty() {
-                    eprintln!("\narmless-run: guest idle with no wakeup source at pc={:#x}", cpu.pc);
+                    eprintln!(
+                        "\narmless-run: guest idle with no wakeup source at pc={:#x}",
+                        cpu.pc
+                    );
                     break 4;
                 }
-            }
+            },
             Exit::Stop(StopReason::PowerOff) => break 0,
             Exit::Stop(StopReason::Reset) => {
                 eprintln!("\narmless-run: guest requested reset");
                 break 0;
-            }
+            },
             Exit::Stop(StopReason::Halt(code)) => break code as i32,
             Exit::Stop(r) => {
                 eprintln!("\narmless-run: stopped: {r:x?}");
                 eprintln!(
                     "pc={:#x} el={} sp={:#x} lr={:#x} esr={:#x} far={:#x} elr={:#x}",
-                    cpu.pc, cpu.el, cpu.sp(), cpu.x[30], cpu.sys.esr, cpu.sys.far, cpu.sys.elr
+                    cpu.pc,
+                    cpu.el,
+                    cpu.sp(),
+                    cpu.x[30],
+                    cpu.sys.esr,
+                    cpu.sys.far,
+                    cpu.sys.elr
                 );
                 break 5;
-            }
+            },
         }
     };
     if stats {

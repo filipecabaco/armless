@@ -69,4 +69,10 @@ pub trait Host {
     /// as (GIC INTID, level). Device code must not call into the CPU while it
     /// is running, so lines are latched by the host and collected here.
     fn sync_irqs(&mut self, _set_line: &mut dyn FnMut(u32, bool)) {}
+    /// Compile a JIT block (a wasm module) into function table slot
+    /// `table_index`, asynchronously; call `Jit::ready` when done. Returns
+    /// false if the host cannot run generated code.
+    fn jit_compile(&mut self, _table_index: u32, _wasm: &[u8]) -> bool {
+        false
+    }
 }

@@ -123,7 +123,7 @@ impl Gic {
                 self.latched[u] = false;
                 self.active_stack.push(i);
                 i
-            }
+            },
             _ => SPURIOUS,
         }
     }
@@ -195,7 +195,7 @@ impl Gic {
                     }
                 }
                 v
-            }
+            },
             0x300..=0x37c | 0x380..=0x3fc => Self::bitmap_read(&self.active, word),
             0xc00..=0xcfc => {
                 let base = ((off - 0xc00) >> 2) * 16;
@@ -207,7 +207,7 @@ impl Gic {
                     }
                 }
                 v
-            }
+            },
             0xfe8 => 0x20, // PIDR2: GICv2
             _ => 0,
         };
@@ -242,7 +242,7 @@ impl Gic {
                         self.group[i] = v & (1 << b) != 0;
                     }
                 }
-            }
+            },
             0x100..=0x17c => Self::bitmap_apply(&mut self.enabled, word, v, true),
             0x180..=0x1fc => Self::bitmap_apply(&mut self.enabled, word, v, false),
             0x200..=0x27c => Self::bitmap_apply(&mut self.latched, word, v, true),
@@ -258,7 +258,7 @@ impl Gic {
                         self.edge[i] = (v >> (2 * k)) & 2 != 0;
                     }
                 }
-            }
+            },
             0xf00 => {
                 // GICD_SGIR: single CPU, so any target list hits us.
                 let id = (v & 0xf) as usize;
@@ -267,8 +267,8 @@ impl Gic {
                 if filter == 2 || (filter == 0 && targets & 1 != 0) {
                     self.latched[id] = true;
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 
@@ -292,8 +292,8 @@ impl Gic {
             0x04 => self.pmr = v & 0xff,
             0x08 => self.bpr = v & 7,
             0x10 => self.end_of_interrupt(v),
-            0x1000 => {} // GICC_DIR: only used with EOImode=1
-            _ => {}
+            0x1000 => {}, // GICC_DIR: only used with EOImode=1
+            _ => {},
         }
     }
 

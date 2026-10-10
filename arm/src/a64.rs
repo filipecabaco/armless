@@ -128,7 +128,7 @@ impl<H: Host> Cpu<H> {
                     self.pc.wrapping_add(imm as u64)
                 };
                 self.wr(rd, v);
-            }
+            },
             0b010 => {
                 // ADD/ADDS/SUB/SUBS (immediate)
                 let sub = bit(insn, 30);
@@ -150,7 +150,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     self.ws(rd, r);
                 }
-            }
+            },
             0b100 => {
                 // Logical (immediate)
                 let opc = field(insn, 29, 2);
@@ -175,7 +175,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     self.ws(rd, r);
                 }
-            }
+            },
             0b101 => {
                 // MOVN / MOVZ / MOVK
                 let opc = field(insn, 29, 2);
@@ -192,7 +192,7 @@ impl<H: Host> Cpu<H> {
                     _ => return Err(Event::undefined()),
                 };
                 self.wr(rd, trunc(r, sf));
-            }
+            },
             0b110 => {
                 // SBFM / BFM / UBFM
                 let opc = field(insn, 29, 2);
@@ -209,7 +209,7 @@ impl<H: Host> Cpu<H> {
                 let src = trunc(self.xr(rn), sf);
                 let r = self.bitfield(opc, src, self.xr(rd), immr, imms, size);
                 self.wr(rd, trunc(r, sf));
-            }
+            },
             _ => {
                 // EXTR
                 if field(insn, 29, 2) != 0 || bit(insn, 22) != sf || bit(insn, 21) {
@@ -229,14 +229,10 @@ impl<H: Host> Cpu<H> {
                         return Err(Event::undefined());
                     }
                     let (hi, lo) = (hi as u32, lo as u32);
-                    (if lsb == 0 {
-                        lo
-                    } else {
-                        (lo >> lsb) | (hi << (32 - lsb))
-                    }) as u64
+                    (if lsb == 0 { lo } else { (lo >> lsb) | (hi << (32 - lsb)) }) as u64
                 };
                 self.wr(rd, r);
-            }
+            },
         }
         Ok(())
     }
@@ -261,7 +257,7 @@ impl<H: Host> Cpu<H> {
                 1 => {
                     let mask = ones(width) << pos;
                     (dst & !mask) | f
-                }
+                },
                 _ => f,
             }
         }
@@ -328,7 +324,7 @@ impl<H: Host> Cpu<H> {
                     return Err(Event::undefined());
                 }
                 self.psci_call()
-            }
+            },
             (1, 0) => Err(Event::Sync {
                 ec: ec::BRK64,
                 iss: imm16,
@@ -356,14 +352,14 @@ impl<H: Host> Cpu<H> {
                     self.x[30] = self.pc.wrapping_add(4);
                 }
                 self.next_pc = target;
-            }
+            },
             4 if op3 == 0 && rn == 31 && op4 == 0 => {
                 // ERET
                 if self.el == 0 {
                     return Err(Event::undefined());
                 }
                 self.eret();
-            }
+            },
             _ => return Err(Event::undefined()),
         }
         Ok(())
@@ -397,45 +393,49 @@ impl<H: Host> Cpu<H> {
                             return Err(Event::Wfi);
                         }
                         Ok(())
-                    }
+                    },
                     3 => {
                         // Barriers and CLREX
                         if op2 == 2 {
-                            self.excl = None;
+                            self.set_excl(None);
                         }
                         Ok(())
-                    }
+                    },
                     4 => {
                         // MSR (immediate) to PSTATE fields
-                        if self.el == 0 && !(op1 == 3 && (op2 == 6 || op2 == 7) && self.sys.sctlr & (1 << 9) != 0) {
+                        if self.el == 0
+                            && !(op1 == 3
+                                && (op2 == 6 || op2 == 7)
+                                && self.sys.sctlr & (1 << 9) != 0)
+                        {
                             return Err(Event::undefined());
                         }
                         match (op1, op2) {
                             (0, 5) => {
                                 self.spsel = crm & 1 != 0;
-                            }
+                            },
                             (3, 6) => {
                                 self.daif |= (crm << 6) & (0xf << 6);
                                 self.irq_dirty = true;
-                            }
+                            },
                             (3, 7) => {
                                 self.daif &= !((crm << 6) & (0xf << 6));
                                 self.irq_dirty = true;
-                            }
-                            _ => {} // PAN/UAO/DIT/SSBS... not implemented: ignore
+                            },
+                            _ => {}, // PAN/UAO/DIT/SSBS... not implemented: ignore
                         }
                         Ok(())
-                    }
+                    },
                     _ => Ok(()),
                 }
-            }
+            },
             1 => {
                 if l {
                     // SYSL: nothing implemented
                     return Err(Event::undefined());
                 }
                 self.sys_insn(sr::key_of(insn), rt, op1, crn)
-            }
+            },
             _ => {
                 let key = sr::key_of(insn);
                 if self.el == 0 && op1 != 3 {
@@ -449,7 +449,7 @@ impl<H: Host> Cpu<H> {
                     self.write_sysreg(key, v)?;
                 }
                 Ok(())
-            }
+            },
         }
     }
 
@@ -472,9 +472,9 @@ impl<H: Host> Cpu<H> {
                 sr::AT_S1E1W => self.address_translate(self.xr(rt), true, false),
                 sr::AT_S1E0R => self.address_translate(self.xr(rt), false, true),
                 sr::AT_S1E0W => self.address_translate(self.xr(rt), true, true),
-                _ => {} // IC/DC maintenance: caches are coherent
+                _ => {}, // IC/DC maintenance: caches are coherent
             },
-            _ => {}
+            _ => {},
         }
         Ok(())
     }
@@ -506,7 +506,7 @@ impl<H: Host> Cpu<H> {
                     return Err(Event::undefined());
                 }
                 self.sp_el0
-            }
+            },
             sr::SPSEL => self.spsel as u64,
             sr::CURRENT_EL => (self.el as u64) << 2,
             sr::NZCV => self.nzcv(),
@@ -534,13 +534,13 @@ impl<H: Host> Cpu<H> {
                 } else {
                     self.sys.cntp_ctl
                 }
-            }
+            },
             sr::CNTV_CVAL_EL0 => s.cntv_cval,
             sr::CNTP_CVAL_EL0 => s.cntp_cval,
             sr::CNTV_TVAL_EL0 | sr::CNTP_TVAL_EL0 => {
                 let cval = if key == sr::CNTV_TVAL_EL0 { s.cntv_cval } else { s.cntp_cval };
                 cval.wrapping_sub(self.counter()) & 0xffff_ffff
-            }
+            },
             sr::OSLSR_EL1 => 0x8, // OS lock implemented, unlocked
             _ => *s.other.get(&key).unwrap_or(&0),
         })
@@ -551,20 +551,20 @@ impl<H: Host> Cpu<H> {
             sr::SCTLR_EL1 => {
                 self.sys.sctlr = v;
                 self.tlb_flush();
-            }
+            },
             sr::CPACR_EL1 => self.sys.cpacr = v,
             sr::TTBR0_EL1 => {
                 self.sys.ttbr0 = v;
                 self.tlb_flush();
-            }
+            },
             sr::TTBR1_EL1 => {
                 self.sys.ttbr1 = v;
                 self.tlb_flush();
-            }
+            },
             sr::TCR_EL1 => {
                 self.sys.tcr = v;
                 self.tlb_flush();
-            }
+            },
             sr::SPSR_EL1 => self.sys.spsr = v,
             sr::ELR_EL1 => self.sys.elr = v,
             sr::SP_EL0 => {
@@ -572,14 +572,14 @@ impl<H: Host> Cpu<H> {
                     return Err(Event::undefined());
                 }
                 self.sp_el0 = v;
-            }
+            },
             sr::SP_EL1 => return Err(Event::undefined()),
             sr::SPSEL => self.spsel = v & 1 != 0,
             sr::NZCV => self.set_nzcv(v),
             sr::DAIF => {
                 self.daif = (v as u32) & (0xf << 6);
                 self.irq_dirty = true;
-            }
+            },
             sr::FPCR => self.sys.fpcr = v,
             sr::FPSR => self.sys.fpsr = v,
             sr::ESR_EL1 => self.sys.esr = v,
@@ -595,25 +595,25 @@ impl<H: Host> Cpu<H> {
                     return Err(Event::undefined());
                 }
                 self.sys.tpidrro_el0 = v
-            }
+            },
             sr::CNTKCTL_EL1 => self.sys.cntkctl = v,
             sr::CSSELR_EL1 => self.sys.csselr = v,
             sr::CNTV_CTL_EL0 => {
                 self.sys.cntv_ctl = (self.sys.cntv_ctl & 4) | (v & 3);
                 self.update_timers();
-            }
+            },
             sr::CNTP_CTL_EL0 => {
                 self.sys.cntp_ctl = (self.sys.cntp_ctl & 4) | (v & 3);
                 self.update_timers();
-            }
+            },
             sr::CNTV_CVAL_EL0 => {
                 self.sys.cntv_cval = v;
                 self.update_timers();
-            }
+            },
             sr::CNTP_CVAL_EL0 => {
                 self.sys.cntp_cval = v;
                 self.update_timers();
-            }
+            },
             sr::CNTV_TVAL_EL0 | sr::CNTP_TVAL_EL0 => {
                 let cval = self.counter().wrapping_add(v as u32 as i32 as i64 as u64);
                 if key == sr::CNTV_TVAL_EL0 {
@@ -622,13 +622,20 @@ impl<H: Host> Cpu<H> {
                     self.sys.cntp_cval = cval;
                 }
                 self.update_timers();
-            }
+            },
             // Read-only identification and status registers ignore writes.
-            sr::MIDR_EL1 | sr::MPIDR_EL1 | sr::CTR_EL0 | sr::DCZID_EL0 | sr::CURRENT_EL | sr::ISR_EL1
-            | sr::CNTFRQ_EL0 | sr::CNTPCT_EL0 | sr::CNTVCT_EL0 => {}
+            sr::MIDR_EL1
+            | sr::MPIDR_EL1
+            | sr::CTR_EL0
+            | sr::DCZID_EL0
+            | sr::CURRENT_EL
+            | sr::ISR_EL1
+            | sr::CNTFRQ_EL0
+            | sr::CNTPCT_EL0
+            | sr::CNTVCT_EL0 => {},
             _ => {
                 self.sys.other.insert(key, v);
-            }
+            },
         }
         Ok(())
     }
@@ -650,16 +657,16 @@ impl<H: Host> Cpu<H> {
                 0 => {
                     let v = self.read(addr, 4, false)?;
                     self.wr(rt, v);
-                }
+                },
                 1 => {
                     let v = self.read(addr, 8, false)?;
                     self.wr(rt, v);
-                }
+                },
                 2 => {
                     let v = self.read(addr, 4, false)?;
                     self.wr(rt, v as u32 as i32 as i64 as u64);
-                }
-                _ => {} // PRFM
+                },
+                _ => {}, // PRFM
             }
             Ok(())
         } else if insn & 0x3800_0000 == 0x2800_0000 {
@@ -686,11 +693,7 @@ impl<H: Host> Cpu<H> {
         };
         let imm = sext(field(insn, 15, 7) as u64, 7) * size as i64;
         let base = self.xs(rn);
-        let addr = if mode == 1 {
-            base
-        } else {
-            base.wrapping_add(imm as u64)
-        };
+        let addr = if mode == 1 { base } else { base.wrapping_add(imm as u64) };
         if load {
             let a = self.read(addr, size, false)?;
             let b = self.read(addr.wrapping_add(size as u64), size, false)?;
@@ -726,16 +729,16 @@ impl<H: Host> Cpu<H> {
                 1 => {
                     writeback = Some(base.wrapping_add(imm));
                     base
-                }
+                },
                 2 => {
                     unpriv = true; // LDTR/STTR
                     base.wrapping_add(imm)
-                }
+                },
                 _ => {
                     let a = base.wrapping_add(imm);
                     writeback = Some(a);
                     a
-                }
+                },
             }
         } else if field(insn, 10, 2) == 2 {
             // Register offset
@@ -755,11 +758,11 @@ impl<H: Host> Cpu<H> {
             0 => {
                 let v = self.xr(rt);
                 self.write(addr, bytes, v, unpriv)?;
-            }
+            },
             1 => {
                 let v = self.read(addr, bytes, unpriv)?;
                 self.wr(rt, v);
-            }
+            },
             2 => {
                 if size_log == 3 {
                     // PRFM/PRFUM: only without writeback or unprivileged access
@@ -771,14 +774,14 @@ impl<H: Host> Cpu<H> {
                     let v = self.read(addr, bytes, unpriv)?;
                     self.wr(rt, sext(v, bytes * 8) as u64);
                 }
-            }
+            },
             _ => {
                 if size_log >= 2 {
                     return Err(Event::undefined());
                 }
                 let v = self.read(addr, bytes, unpriv)?;
                 self.wr(rt, sext(v, bytes * 8) as u64 & 0xffff_ffff);
-            }
+            },
         }
         if let Some(wb) = writeback {
             self.ws(rn, wb);
@@ -831,7 +834,7 @@ impl<H: Host> Cpu<H> {
                 let v = self.read(addr, bytes, false)?;
                 self.wr(rt, v);
             }
-            self.excl = Some(pa);
+            self.set_excl(Some(pa));
         } else {
             let pa = self.translate(addr, crate::mmu::Access::Write, false)?;
             let ok = self.excl.is_some_and(|e| e & !0x3f == pa & !0x3f);
@@ -845,7 +848,7 @@ impl<H: Host> Cpu<H> {
                     self.write(addr, bytes, v, false)?;
                 }
             }
-            self.excl = None;
+            self.set_excl(None);
             self.wr(rs, (!ok) as u64);
         }
         Ok(())
@@ -993,7 +996,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     (a as u32).checked_div(b as u32).unwrap_or(0) as u64
                 }
-            }
+            },
             0b000011 => {
                 if sf {
                     if b == 0 {
@@ -1006,7 +1009,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     (a as i32).wrapping_div(b as i32) as u32 as u64
                 }
-            }
+            },
             0b001000 => shift_reg(a, 0, b as u32, sf),
             0b001001 => shift_reg(a, 1, b as u32, sf),
             0b001010 => shift_reg(a, 2, b as u32, sf),
@@ -1029,26 +1032,26 @@ impl<H: Host> Cpu<H> {
                 // REV16: swap bytes in each halfword
                 let m = 0x00ff_00ff_00ff_00ffu64;
                 ((a >> 8) & m) | ((a & m) << 8)
-            }
+            },
             (2, false) => (a as u32).swap_bytes() as u64,
             (2, true) => {
                 // REV32: swap bytes in each word
                 let lo = (a as u32).swap_bytes() as u64;
                 let hi = ((a >> 32) as u32).swap_bytes() as u64;
                 (hi << 32) | lo
-            }
+            },
             (3, true) => a.swap_bytes(),
             (4, true) => a.leading_zeros() as u64,
             (4, false) => (a as u32).leading_zeros() as u64,
             (5, true) => {
                 let s = a ^ ((a as i64 >> 1) as u64);
                 (s.leading_zeros() as u64).saturating_sub(1)
-            }
+            },
             (5, false) => {
                 let w = a as u32;
                 let s = w ^ ((w as i32 >> 1) as u32);
                 (s.leading_zeros() as u64).saturating_sub(1)
-            }
+            },
             _ => return Err(Event::undefined()),
         };
         self.wr(rd, trunc(r, sf));
@@ -1071,7 +1074,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     acc.wrapping_add(p)
                 }
-            }
+            },
             (1, true) => {
                 let p = (n as i32 as i64).wrapping_mul(m as i32 as i64) as u64;
                 if o0 {
@@ -1079,7 +1082,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     acc.wrapping_add(p)
                 }
-            }
+            },
             (5, true) => {
                 let p = (n as u32 as u64).wrapping_mul(m as u32 as u64);
                 if o0 {
@@ -1087,7 +1090,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     acc.wrapping_add(p)
                 }
-            }
+            },
             (2, true) if !o0 => ((n as i64 as i128 * m as i64 as i128) >> 64) as u64,
             (6, true) if !o0 => ((n as u128 * m as u128) >> 64) as u64,
             _ => return Err(Event::undefined()),

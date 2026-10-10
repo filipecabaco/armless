@@ -119,12 +119,12 @@ impl<H: Host> Cpu<H> {
                 1 => {
                     writeback = Some(base.wrapping_add(imm));
                     base
-                }
+                },
                 3 => {
                     let a = base.wrapping_add(imm);
                     writeback = Some(a);
                     a
-                }
+                },
                 _ => return Err(Event::undefined()), // no unprivileged SIMD forms
             }
         } else if field(insn, 10, 2) == 2 {
@@ -239,7 +239,7 @@ impl<H: Host> Cpu<H> {
                     return Err(Event::undefined());
                 }
                 index = (q as u32) << 2 | s << 1 | (size >> 1);
-            }
+            },
             2 => {
                 if size & 2 != 0 {
                     return Err(Event::undefined());
@@ -253,7 +253,7 @@ impl<H: Host> Cpu<H> {
                     index = q as u32;
                     scale = 3;
                 }
-            }
+            },
             _ => {
                 if !load || s != 0 {
                     return Err(Event::undefined());
@@ -261,7 +261,7 @@ impl<H: Host> Cpu<H> {
                 scale = size;
                 replicate = true;
                 index = 0;
-            }
+            },
         }
         let ebytes = 1u64 << scale;
         let ebits = (ebytes * 8) as u32;

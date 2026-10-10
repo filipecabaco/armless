@@ -106,7 +106,7 @@ impl<H: Host> Cpu<H> {
                     } else {
                         self.across(insn)
                     }
-                }
+                },
                 _ => Err(Event::undefined()), // crypto and later extensions
             };
         }
@@ -186,7 +186,12 @@ impl<H: Host> Cpu<H> {
             return Err(Event::undefined());
         }
         // Halving, min/max, absolute difference: no 64-bit element forms.
-        if size == 3 && matches!(opcode, 0b00000 | 0b00010 | 0b00100 | 0b01100 | 0b01101 | 0b01110 | 0b01111) {
+        if size == 3
+            && matches!(
+                opcode,
+                0b00000 | 0b00010 | 0b00100 | 0b01100 | 0b01101 | 0b01110 | 0b01111
+            )
+        {
             return Err(Event::undefined());
         }
         if scalar {
@@ -217,11 +222,19 @@ impl<H: Host> Cpu<H> {
                 let v = match opcode {
                     0b10111 => x.wrapping_add(y),
                     0b10100 => {
-                        if ext(x, esize, u) >= ext(y, esize, u) { x } else { y }
-                    }
+                        if ext(x, esize, u) >= ext(y, esize, u) {
+                            x
+                        } else {
+                            y
+                        }
+                    },
                     _ => {
-                        if ext(x, esize, u) <= ext(y, esize, u) { x } else { y }
-                    }
+                        if ext(x, esize, u) <= ext(y, esize, u) {
+                            x
+                        } else {
+                            y
+                        }
+                    },
                 };
                 set_elem(&mut r, i, esize, v);
             }
@@ -241,20 +254,28 @@ impl<H: Host> Cpu<H> {
                     let (v, s) = sat(xs + ys, esize, u);
                     qc |= s;
                     v
-                }
+                },
                 0b00010 => ((xs + ys + 1) >> 1) as u64,
                 0b00100 => ((xs - ys) >> 1) as u64,
                 0b00101 => {
                     let (v, s) = sat(xs - ys, esize, u);
                     qc |= s;
                     v
-                }
+                },
                 0b00110 => {
-                    if xs > ys { u64::MAX } else { 0 }
-                }
+                    if xs > ys {
+                        u64::MAX
+                    } else {
+                        0
+                    }
+                },
                 0b00111 => {
-                    if xs >= ys { u64::MAX } else { 0 }
-                }
+                    if xs >= ys {
+                        u64::MAX
+                    } else {
+                        0
+                    }
+                },
                 0b01000..=0b01011 => {
                     let shift = (y as u8 as i8) as i64;
                     let round = opcode & 2 != 0;
@@ -267,29 +288,53 @@ impl<H: Host> Cpu<H> {
                     } else {
                         wide as u64
                     }
-                }
+                },
                 0b01100 => {
-                    if xs >= ys { x } else { y }
-                }
+                    if xs >= ys {
+                        x
+                    } else {
+                        y
+                    }
+                },
                 0b01101 => {
-                    if xs <= ys { x } else { y }
-                }
+                    if xs <= ys {
+                        x
+                    } else {
+                        y
+                    }
+                },
                 0b01110 => (xs - ys).unsigned_abs() as u64,
                 0b01111 => dd.wrapping_add((xs - ys).unsigned_abs() as u64),
                 0b10000 => {
-                    if u { x.wrapping_sub(y) } else { x.wrapping_add(y) }
-                }
+                    if u {
+                        x.wrapping_sub(y)
+                    } else {
+                        x.wrapping_add(y)
+                    }
+                },
                 0b10001 => {
-                    let t = if u { x & ones(esize) == y & ones(esize) } else { x & y & ones(esize) != 0 };
-                    if t { u64::MAX } else { 0 }
-                }
+                    let t = if u {
+                        x & ones(esize) == y & ones(esize)
+                    } else {
+                        x & y & ones(esize) != 0
+                    };
+                    if t {
+                        u64::MAX
+                    } else {
+                        0
+                    }
+                },
                 0b10010 => {
                     if size == 3 {
                         return Err(Event::undefined());
                     }
                     let p = x.wrapping_mul(y);
-                    if u { dd.wrapping_sub(p) } else { dd.wrapping_add(p) }
-                }
+                    if u {
+                        dd.wrapping_sub(p)
+                    } else {
+                        dd.wrapping_add(p)
+                    }
+                },
                 0b10011 => {
                     if size == 3 || (u && size != 0) {
                         return Err(Event::undefined());
@@ -299,7 +344,7 @@ impl<H: Host> Cpu<H> {
                     } else {
                         x.wrapping_mul(y)
                     }
-                }
+                },
                 0b10110 => {
                     if size == 0 || size == 3 {
                         return Err(Event::undefined());
@@ -309,7 +354,7 @@ impl<H: Host> Cpu<H> {
                     let (v, s) = sat((2 * xs * ys + round) >> esize, esize, false);
                     qc |= s;
                     v
-                }
+                },
                 _ => return Err(Event::undefined()),
             };
             set_elem(&mut r, i, esize, v);
@@ -387,7 +432,12 @@ impl<H: Host> Cpu<H> {
             (0b11111, true, false) => Div,
             _ => return Err(Event::undefined()),
         };
-        if scalar && !matches!(op, Mulx | Cmeq | Cmge | Cmgt | Acge | Acgt | Recps | Rsqrts | Abd) {
+        if scalar
+            && !matches!(
+                op,
+                Mulx | Cmeq | Cmge | Cmgt | Acge | Acgt | Recps | Rsqrts | Abd
+            )
+        {
             return Err(Event::undefined());
         }
         let lanes = if scalar { 1 } else { (if q { 128 } else { 64 }) / esize };
@@ -397,13 +447,18 @@ impl<H: Host> Cpu<H> {
             let mut r = 0u128;
             for i in 0..lanes {
                 let (x, y) = if pairwise {
-                    let (src, j) = if i < lanes / 2 { (a, 2 * i) } else { (b, 2 * (i - lanes / 2)) };
+                    let (src, j) =
+                        if i < lanes / 2 { (a, 2 * i) } else { (b, 2 * (i - lanes / 2)) };
                     (elem(src, j, esize), elem(src, j + 1, esize))
                 } else {
                     (elem(a, i, esize), elem(b, i, esize))
                 };
                 let dd = elem(d, i, esize);
-                let v = if esize == 32 { fp3::<f32>(st, op as u32, x, y, dd) } else { fp3::<f64>(st, op as u32, x, y, dd) };
+                let v = if esize == 32 {
+                    fp3::<f32>(st, op as u32, x, y, dd)
+                } else {
+                    fp3::<f64>(st, op as u32, x, y, dd)
+                };
                 set_elem(&mut r, i, esize, v);
             }
             r
@@ -441,11 +496,25 @@ impl<H: Host> Cpu<H> {
             return Err(Event::undefined());
         }
         let (a, b, d) = (self.v(rn), self.v(rm), self.v(rd));
-        let half = if scalar { 0 } else if q { 64 } else { 0 };
+        let half = if scalar {
+            0
+        } else if q {
+            64
+        } else {
+            0
+        };
         let lanes = if scalar { 1 } else { 64 / esize };
         let mut qc = false;
         let narrowing = matches!(opcode, 0b0100 | 0b0110);
-        let mut r = if narrowing { if q { d & u64::MAX as u128 } else { 0 } } else { 0u128 };
+        let mut r = if narrowing {
+            if q {
+                d & u64::MAX as u128
+            } else {
+                0
+            }
+        } else {
+            0u128
+        };
         for i in 0..lanes {
             let x = elem(a >> half, i, esize);
             let y = elem(b >> half, i, esize);
@@ -459,12 +528,13 @@ impl<H: Host> Cpu<H> {
                 0b0011 => (ext(xw, wsize, u) - ys) as u64,
                 0b0100 | 0b0110 => {
                     let (aw, bw) = (elem(a, i, wsize) as u128, elem(b, i, wsize) as u128);
-                    let sum = if opcode == 0b0100 { aw.wrapping_add(bw) } else { aw.wrapping_sub(bw) };
+                    let sum =
+                        if opcode == 0b0100 { aw.wrapping_add(bw) } else { aw.wrapping_sub(bw) };
                     let round = if u { 1u128 << (esize - 1) } else { 0 };
                     let n = (sum.wrapping_add(round) >> esize) as u64;
                     set_elem(&mut r, i + if q { 64 / esize } else { 0 }, esize, n);
                     continue;
-                }
+                },
                 0b0101 => dw.wrapping_add((xs - ys).unsigned_abs() as u64),
                 0b0111 => (xs - ys).unsigned_abs() as u64,
                 0b1000 => dw.wrapping_add((xs * ys) as u64),
@@ -478,11 +548,15 @@ impl<H: Host> Cpu<H> {
                     } else {
                         let acc = sx(dw, wsize);
                         let pv = sx(p, wsize);
-                        let (v, s2) = sat(if opcode == 0b1001 { acc + pv } else { acc - pv }, wsize, false);
+                        let (v, s2) = sat(
+                            if opcode == 0b1001 { acc + pv } else { acc - pv },
+                            wsize,
+                            false,
+                        );
                         qc |= s2;
                         v
                     }
-                }
+                },
                 0b1110 => poly_mul(x, y, 8) as u64,
                 _ => return Err(Event::undefined()),
             };
@@ -544,7 +618,7 @@ impl<H: Host> Cpu<H> {
                     let src = base + (per - 1 - i % per);
                     set_elem(&mut r, i, esize, elem(a, src, esize));
                 }
-            }
+            },
             0b00010 | 0b00110 => {
                 // SADDLP/UADDLP, SADALP/UADALP
                 if scalar || size == 3 {
@@ -552,11 +626,12 @@ impl<H: Host> Cpu<H> {
                 }
                 let w = esize * 2;
                 for i in 0..lanes / 2 {
-                    let s = ext(elem(a, 2 * i, esize), esize, u) + ext(elem(a, 2 * i + 1, esize), esize, u);
+                    let s = ext(elem(a, 2 * i, esize), esize, u)
+                        + ext(elem(a, 2 * i + 1, esize), esize, u);
                     let acc = if opcode == 0b00110 { elem(d, i, w) as i128 } else { 0 };
                     set_elem(&mut r, i, w, (s + acc) as u64);
                 }
-            }
+            },
             0b00011 => {
                 // SUQADD / USQADD
                 if size == 3 && !q && !scalar {
@@ -573,7 +648,7 @@ impl<H: Host> Cpu<H> {
                     qc |= s;
                     set_elem(&mut r, i, esize, v);
                 }
-            }
+            },
             0b00100 => {
                 // CLS / CLZ
                 if scalar || size == 3 {
@@ -591,7 +666,7 @@ impl<H: Host> Cpu<H> {
                     };
                     set_elem(&mut r, i, esize, v);
                 }
-            }
+            },
             0b00101 => {
                 if scalar {
                     return Err(Event::undefined());
@@ -601,17 +676,17 @@ impl<H: Host> Cpu<H> {
                         for i in 0..lanes {
                             set_elem(&mut r, i, 8, elem(a, i, 8).count_ones() as u64);
                         }
-                    }
+                    },
                     (true, 0) => r = !a,
                     (true, 1) => {
                         let lanes8 = if q { 16 } else { 8 };
                         for i in 0..lanes8 {
                             set_elem(&mut r, i, 8, (elem(a, i, 8) as u8).reverse_bits() as u64);
                         }
-                    }
+                    },
                     _ => return Err(Event::undefined()),
                 }
-            }
+            },
             0b00111 | 0b01011 => {
                 // SQABS/SQNEG, ABS/NEG
                 if size == 3 && !q && !scalar {
@@ -632,10 +707,11 @@ impl<H: Host> Cpu<H> {
                     };
                     set_elem(&mut r, i, esize, out);
                 }
-            }
+            },
             0b01000 | 0b01001 | 0b01010 => {
                 // CMGT/CMGE #0, CMEQ/CMLE #0, CMLT #0
-                if (scalar && size != 3) || (size == 3 && !q && !scalar) || (opcode == 0b01010 && u) {
+                if (scalar && size != 3) || (size == 3 && !q && !scalar) || (opcode == 0b01010 && u)
+                {
                     return Err(Event::undefined());
                 }
                 for i in 0..lanes {
@@ -649,7 +725,7 @@ impl<H: Host> Cpu<H> {
                     };
                     set_elem(&mut r, i, esize, if t { u64::MAX } else { 0 });
                 }
-            }
+            },
             0b10010 | 0b10100 => {
                 // XTN/SQXTN/UQXTN/SQXTUN (narrow into lower or upper half)
                 if size == 3 {
@@ -670,17 +746,17 @@ impl<H: Host> Cpu<H> {
                             let (v, s) = sat(sx(x, w), esize, true);
                             qc |= s;
                             v
-                        }
+                        },
                         (_, false) => {
                             let (v, s) = sat(sx(x, w), esize, false);
                             qc |= s;
                             v
-                        }
+                        },
                         (_, true) => {
                             let (v, s) = sat(ux(x, w), esize, true);
                             qc |= s;
                             v
-                        }
+                        },
                     };
                     set_elem(&mut r, base + i, esize, v);
                 }
@@ -693,7 +769,7 @@ impl<H: Host> Cpu<H> {
                     self.vset(rd, r, q);
                 }
                 return Ok(());
-            }
+            },
             0b10011 => {
                 // SHLL/SHLL2
                 if !u || scalar || size == 3 {
@@ -706,7 +782,7 @@ impl<H: Host> Cpu<H> {
                 }
                 self.vreg[rd as usize] = r;
                 return Ok(());
-            }
+            },
             _ => return Err(Event::undefined()),
         }
         if qc {
@@ -785,7 +861,12 @@ impl<H: Host> Cpu<H> {
             _ => return Err(Event::undefined()),
         };
         // Scalar availability
-        if scalar && matches!(m, Rint(..) | RintCur(_) | Abs | Neg | Sqrt | Urecpe | Ursqrte) {
+        if scalar
+            && matches!(
+                m,
+                Rint(..) | RintCur(_) | Abs | Neg | Sqrt | Urecpe | Ursqrte
+            )
+        {
             return Err(Event::undefined());
         }
         if !scalar && matches!(m, Recpx) {
@@ -803,8 +884,14 @@ impl<H: Host> Cpu<H> {
                     Urecpe | Ursqrte => {
                         let x = x as u32;
                         (if matches!(m, Urecpe) { urecpe(x) } else { ursqrte(x) }) as u64
-                    }
-                    _ => if esize == 32 { fp_misc::<f32>(st, m_code(&m), x) } else { fp_misc::<f64>(st, m_code(&m), x) },
+                    },
+                    _ => {
+                        if esize == 32 {
+                            fp_misc::<f32>(st, m_code(&m), x)
+                        } else {
+                            fp_misc::<f64>(st, m_code(&m), x)
+                        }
+                    },
                 };
                 set_elem(&mut r, i, esize, v);
             }
@@ -943,7 +1030,9 @@ impl<H: Host> Cpu<H> {
         }
         let esize = 8u32 << size;
         let lanes = (if q { 128 } else { 64 }) / esize;
-        let vals: Vec<i128> = (0..lanes).map(|i| ext(elem(a, i, esize), esize, u)).collect();
+        let vals: Vec<i128> = (0..lanes)
+            .map(|i| ext(elem(a, i, esize), esize, u))
+            .collect();
         let (v, osize) = match (opcode, u) {
             (0b00011, _) => (vals.iter().sum::<i128>(), esize * 2),
             (0b01010, _) => (*vals.iter().max().unwrap(), esize),
@@ -981,7 +1070,11 @@ impl<H: Host> Cpu<H> {
             _ => return Err(Event::undefined()),
         };
         let r = self.fpst_run(|st| {
-            if esize == 32 { pair_op::<f32>(st, code, x, y) } else { pair_op::<f64>(st, code, x, y) }
+            if esize == 32 {
+                pair_op::<f32>(st, code, x, y)
+            } else {
+                pair_op::<f64>(st, code, x, y)
+            }
         });
         self.vreg[rd as usize] = r as u128;
         Ok(())
@@ -1026,14 +1119,18 @@ impl<H: Host> Cpu<H> {
                 if size == 3 && !q {
                     return Err(Event::undefined());
                 }
-                let v = if imm4 == 0 { elem(self.v(rn), index, esize) } else { self.xr(rn) & ones(esize) };
+                let v = if imm4 == 0 {
+                    elem(self.v(rn), index, esize)
+                } else {
+                    self.xr(rn) & ones(esize)
+                };
                 let lanes = (if q { 128 } else { 64 }) / esize;
                 let mut r = 0u128;
                 for i in 0..lanes {
                     set_elem(&mut r, i, esize, v);
                 }
                 self.vset(rd, r, q);
-            }
+            },
             0b0011 => {
                 // INS (general)
                 if !q {
@@ -1042,7 +1139,7 @@ impl<H: Host> Cpu<H> {
                 let mut d = self.v(rd);
                 set_elem(&mut d, index, esize, self.xr(rn));
                 self.vreg[rd as usize] = d;
-            }
+            },
             0b0101 => {
                 // SMOV
                 if (q && size >= 3) || (!q && size >= 2) {
@@ -1050,7 +1147,7 @@ impl<H: Host> Cpu<H> {
                 }
                 let v = crate::bits::sext(elem(self.v(rn), index, esize), esize) as u64;
                 self.wr(rd, if q { v } else { v & 0xffff_ffff });
-            }
+            },
             0b0111 => {
                 // UMOV
                 if (q && size != 3) || (!q && size == 3) {
@@ -1058,7 +1155,7 @@ impl<H: Host> Cpu<H> {
                 }
                 let v = elem(self.v(rn), index, esize);
                 self.wr(rd, v);
-            }
+            },
             _ => return Err(Event::undefined()),
         }
         Ok(())
@@ -1097,7 +1194,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     rep((imm8 << 16) | 0xffff, 32)
                 }
-            }
+            },
             _ => match (cmode & 1, op) {
                 (0, false) => rep(imm8, 8),
                 (0, true) => {
@@ -1108,24 +1205,32 @@ impl<H: Host> Cpu<H> {
                         }
                     }
                     r
-                }
+                },
                 (_, false) => rep(vfp_expand_imm(imm8, 32), 32),
                 (_, true) => {
                     if !q {
                         return Err(Event::undefined());
                     }
                     vfp_expand_imm(imm8, 64)
-                }
+                },
             },
         };
         let imm = (imm64 as u128) | (imm64 as u128) << 64;
         let d = self.v(rd);
         let orr_bic = cmode & 1 == 1 && cmode < 0b1100;
         let r = if orr_bic {
-            if op { d & !imm } else { d | imm }
+            if op {
+                d & !imm
+            } else {
+                d | imm
+            }
         } else {
             let mvn = op && cmode != 0b1110 && cmode != 0b1111;
-            if mvn { !imm } else { imm }
+            if mvn {
+                !imm
+            } else {
+                imm
+            }
         };
         self.vset(rd, r, q);
         Ok(())
@@ -1166,9 +1271,17 @@ impl<H: Host> Cpu<H> {
                     let x = elem(a, i, esize);
                     let v = if opcode == 0b11100 {
                         let xv = if u { x } else { crate::bits::sext(x, esize) as u64 };
-                        if esize == 32 { fp::from_int::<f32>(st, xv, !u, fbits).bits() } else { fp::from_int::<f64>(st, xv, !u, fbits).bits() }
+                        if esize == 32 {
+                            fp::from_int::<f32>(st, xv, !u, fbits).bits()
+                        } else {
+                            fp::from_int::<f64>(st, xv, !u, fbits).bits()
+                        }
                     } else {
-                        if esize == 32 { fp::to_int(st, f32::from_bits64(x), esize, u, fbits, Round::Zero) } else { fp::to_int(st, f64::from_bits64(x), esize, u, fbits, Round::Zero) }
+                        if esize == 32 {
+                            fp::to_int(st, f32::from_bits64(x), esize, u, fbits, Round::Zero)
+                        } else {
+                            fp::to_int(st, f64::from_bits64(x), esize, u, fbits, Round::Zero)
+                        }
                     };
                     set_elem(&mut r, i, esize, v);
                 }
@@ -1251,8 +1364,12 @@ impl<H: Host> Cpu<H> {
                     let round = opcode & 4 != 0;
                     let acc = opcode & 2 != 0;
                     let s = shl_signed(ext(x, esize, u), -(rshift as i64), round, esize) as u64;
-                    if acc { dd.wrapping_add(s) } else { s }
-                }
+                    if acc {
+                        dd.wrapping_add(s)
+                    } else {
+                        s
+                    }
+                },
                 0b01000 => {
                     // SRI
                     if !u {
@@ -1264,7 +1381,7 @@ impl<H: Host> Cpu<H> {
                         let mask = ones(esize) >> rshift;
                         (dd & !mask) | ((x & ones(esize)) >> rshift)
                     }
-                }
+                },
                 0b01010 => {
                     // SHL / SLI
                     let s = x << lshift;
@@ -1274,7 +1391,7 @@ impl<H: Host> Cpu<H> {
                     } else {
                         s
                     }
-                }
+                },
                 0b01100 | 0b01110 => {
                     // SQSHLU / SQSHL / UQSHL (immediate)
                     let (src_u, dst_u) = match (opcode, u) {
@@ -1285,7 +1402,7 @@ impl<H: Host> Cpu<H> {
                     let (o, s) = sat(ext(x, esize, src_u) << lshift, esize, dst_u);
                     qc |= s;
                     o
-                }
+                },
                 _ => return Err(Event::undefined()),
             };
             set_elem(&mut r, i, esize, v);
@@ -1313,7 +1430,10 @@ impl<H: Host> Cpu<H> {
         let opcode = field(insn, 12, 4);
         let h = field(insn, 11, 1);
         let (rd, rn) = (insn & 31, field(insn, 5, 5));
-        let fp_op = matches!((u, opcode), (false, 0b0001) | (false, 0b0101) | (false, 0b1001) | (true, 0b1001));
+        let fp_op = matches!(
+            (u, opcode),
+            (false, 0b0001) | (false, 0b0101) | (false, 0b1001) | (true, 0b1001)
+        );
         if fp_op {
             if size & 2 == 0 {
                 return Err(Event::undefined()); // FP16
@@ -1345,7 +1465,11 @@ impl<H: Host> Cpu<H> {
                 for i in 0..lanes {
                     let x = elem(a, i, esize);
                     let dd = elem(d, i, esize);
-                    let v = if esize == 32 { fp3::<f32>(st, code, x, y, dd) } else { fp3::<f64>(st, code, x, y, dd) };
+                    let v = if esize == 32 {
+                        fp3::<f32>(st, code, x, y, dd)
+                    } else {
+                        fp3::<f64>(st, code, x, y, dd)
+                    };
                     set_elem(&mut r, i, esize, v);
                 }
                 r
@@ -1395,11 +1519,12 @@ impl<H: Host> Cpu<H> {
                         } else {
                             let acc = sx(dw, w);
                             let pv = sx(pp, w);
-                            let (o, s2) = sat(if opcode == 0b0011 { acc + pv } else { acc - pv }, w, false);
+                            let (o, s2) =
+                                sat(if opcode == 0b0011 { acc + pv } else { acc - pv }, w, false);
                             qc |= s2;
                             o
                         }
-                    }
+                    },
                 };
                 set_elem(&mut r, i, w, v);
             }
@@ -1420,10 +1545,14 @@ impl<H: Host> Cpu<H> {
                 (false, 0b1000) => x.wrapping_mul(y),
                 (false, 0b1100) | (false, 0b1101) => {
                     let round = if opcode == 0b1101 { 1i128 << (esize - 1) } else { 0 };
-                    let (o, s) = sat((2 * sx(x, esize) * sx(y, esize) + round) >> esize, esize, false);
+                    let (o, s) = sat(
+                        (2 * sx(x, esize) * sx(y, esize) + round) >> esize,
+                        esize,
+                        false,
+                    );
                     qc |= s;
                     o
-                }
+                },
                 _ => return Err(Event::undefined()),
             };
             set_elem(&mut r, i, esize, v);
@@ -1463,14 +1592,14 @@ impl<H: Host> Cpu<H> {
                     let v = if j < lanes { elem(a, j, esize) } else { elem(b, j - lanes, esize) };
                     set_elem(&mut r, i, esize, v);
                 }
-            }
+            },
             2 => {
                 // TRN
                 for p in 0..pairs {
                     set_elem(&mut r, 2 * p, esize, elem(a, 2 * p + part, esize));
                     set_elem(&mut r, 2 * p + 1, esize, elem(b, 2 * p + part, esize));
                 }
-            }
+            },
             3 => {
                 // ZIP
                 let base = part * pairs;
@@ -1478,7 +1607,7 @@ impl<H: Host> Cpu<H> {
                     set_elem(&mut r, 2 * p, esize, elem(a, base + p, esize));
                     set_elem(&mut r, 2 * p + 1, esize, elem(b, base + p, esize));
                 }
-            }
+            },
             _ => return Err(Event::undefined()),
         }
         self.vset(rd, r, q);
@@ -1539,13 +1668,13 @@ fn fp3<F: Float>(st: &mut Fpst, op: u32, x: u64, y: u64, d: u64) -> u64 {
     let (a, b, acc) = (F::from_bits64(x), F::from_bits64(y), F::from_bits64(d));
     let all = |t: bool| if t { ones(F::BITS) } else { 0 };
     match op {
-        0 | 2 => fp::maxmin_num(st, a, b, true).bits(),  // MaxNm, MaxNmP
+        0 | 2 => fp::maxmin_num(st, a, b, true).bits(), // MaxNm, MaxNmP
         1 | 3 => fp::maxmin_num(st, a, b, false).bits(), // MinNm, MinNmP
-        4 => fp::muladd(st, acc, a, b).bits(),           // FMLA
+        4 => fp::muladd(st, acc, a, b).bits(),          // FMLA
         5 => fp::muladd(st, acc, F::from_bits64(a.bits() ^ F::SIGN), b).bits(), // FMLS
-        6 | 8 => fp::add(st, a, b).bits(),               // Add, AddP
+        6 | 8 => fp::add(st, a, b).bits(),              // Add, AddP
         7 => fp::sub(st, a, b).bits(),
-        9 => fp::sub(st, a, b).bits() & !F::SIGN,        // FABD
+        9 => fp::sub(st, a, b).bits() & !F::SIGN, // FABD
         10 => fp::mulx(st, a, b).bits(),
         11 => fp::mul(st, a, b).bits(),
         12 => all(fp::cmp_eq(st, a, b)),
@@ -1595,12 +1724,12 @@ fn fp_misc<F: Float>(st: &mut Fpst, op: MiscOp, x: u64) -> u64 {
         MiscOp::RintCur(exact) => {
             let m = st.rmode();
             fp::round_int(st, a, m, exact).bits()
-        }
+        },
         MiscOp::ToInt(r, unsigned) => fp::to_int(st, a, F::BITS, unsigned, 0, r),
         MiscOp::FromInt(unsigned) => {
             let v = if unsigned { x } else { crate::bits::sext(x, F::BITS) as u64 };
             fp::from_int::<F>(st, v, !unsigned, 0).bits()
-        }
+        },
         MiscOp::Cmp(c) => {
             let z = F::zero();
             all(match c {
@@ -1610,7 +1739,7 @@ fn fp_misc<F: Float>(st: &mut Fpst, op: MiscOp, x: u64) -> u64 {
                 3 => fp::cmp_ge(st, a, z),
                 _ => fp::cmp_ge(st, z, a),
             })
-        }
+        },
         MiscOp::Abs => a.bits() & !F::SIGN,
         MiscOp::Neg => a.bits() ^ F::SIGN,
         MiscOp::Sqrt => fp::sqrt(st, a).bits(),

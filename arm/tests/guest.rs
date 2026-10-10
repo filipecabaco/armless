@@ -35,16 +35,23 @@ fn bare_metal_suite() {
         let exit = cpu.run(100_000);
         output.extend(cpu.host.take_output());
         match exit {
-            Exit::Budget if cpu.insn_count < 50_000_000 => {}
+            Exit::Budget if cpu.insn_count < 50_000_000 => {},
             Exit::Idle { wake_ns: Some(w) } => {
                 let now = cpu.host.now_ns();
                 cpu.host.skew_ns += w.saturating_sub(now);
-            }
+            },
             other => break other,
         }
     };
     let text = String::from_utf8_lossy(&output);
     println!("{text}");
-    assert_eq!(exit, Exit::Stop(StopReason::PowerOff), "guest did not finish cleanly:\n{text}");
-    assert!(text.contains(", failed 0"), "guest reported failures:\n{text}");
+    assert_eq!(
+        exit,
+        Exit::Stop(StopReason::PowerOff),
+        "guest did not finish cleanly:\n{text}"
+    );
+    assert!(
+        text.contains(", failed 0"),
+        "guest reported failures:\n{text}"
+    );
 }

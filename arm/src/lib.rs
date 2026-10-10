@@ -16,7 +16,9 @@ pub mod devices;
 pub mod dtb;
 pub mod fp;
 pub mod gic;
+pub mod jit;
 pub mod mmu;
+pub mod ram;
 pub mod rtc;
 pub mod simd;
 pub mod simd_ls;
@@ -95,7 +97,7 @@ pub fn boot_linux<H: Host>(
                 return Err("not enough RAM for kernel + initrd".into());
             }
             Some((start, start + rd.len() as u64))
-        }
+        },
         None => None,
     };
     let dtb = dtb::board_dtb(&dtb::BoardConfig {

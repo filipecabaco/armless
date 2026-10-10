@@ -32,7 +32,7 @@ armless keeps the JavaScript device layer and replaces what sits underneath.
             v86 JavaScript (kept)                         armless (new)
  ┌───────────────────────────────────────┐      ┌──────────────────────────────┐
  │ starter.js  V86 API, events, state    │      │ arm/  Rust → wasm            │
- │ 9p.js  virtio.js  virtio_console.js   │      │  A64 interpreter (→ JIT)     │
+ │ 9p.js  virtio.js  virtio_console.js   │      │  A64 interpreter + wasm JIT  │
  │ virtio_net.js  fetch_network.js       │◄────►│  MMU, exceptions, EL0/EL1    │
  │ uart.js  pci.js  io.js                │ MMIO │  GICv2, generic timer, PL031 │
  └───────────────────────────────────────┘ IRQs │  PSCI, DTB, Image loader     │
@@ -98,6 +98,41 @@ the CPU contributes one opaque blob (`armless_save_state`: registers, system
 registers, GIC, RTC, timer counter). Restoring continues the guest counter from
 the saved value, so timers neither jump nor stall after a snapshot restore.
 
+### JIT
+
+Hot code is translated to WebAssembly, the same way v86 does it for x86: one
+module per physical code page (`arm/src/jit`).
+
+- **Entries.** The run loop counts executions of block *entries* (targets of
+  taken branches, exceptions and returns). An entry that runs
+  `jit_threshold` times (default 1024) gets its page compiled. Other entries
+  of the page that got warm (a quarter of the threshold) are compiled with it.
+- **Modules.** Each entry gets the basic block starting there (up to 96
+  instructions, never past the page). The module's function dispatches on the
+  PC with a `br_table`. A direct branch to another compiled entry of the same
+  page loops back to that dispatch instead of returning, for up to 1024
+  instructions or until interrupt state changes.
+- **What is translated.** Integer data processing, branches, conditional
+  select/compare and plain loads/stores. Loads and stores probe the
+  interpreter's fast TLB inline. Everything else (FP/SIMD, exclusives,
+  system instructions) calls back into the interpreter for that one
+  instruction. Guest state stays in the CPU struct in linear memory, so it is
+  exact at every instruction boundary and exceptions need no recovery.
+- **Compiling.** The module is emitted as wasm bytes. JavaScript compiles it
+  asynchronously and installs it in armless.wasm's function table. Until then
+  the interpreter keeps running. When more entries of a page get hot, the
+  page is recompiled and the new module replaces the old one when ready.
+- **Self-modifying code.** Pages holding code are kept out of the fast write
+  TLB, so every store to them takes the slow path, which drops the page's
+  modules. Device DMA does the same through `armless_jit_dirty`.
+- **Options.** `disable_jit: true` turns it off. `jit_threshold: N` changes
+  the threshold.
+
+On the glibc/busybox userspace test (about 235M guest instructions, through
+the V86 API in Node), the JIT takes the run from 6.3 s to 4.4 s; about 80% of
+instructions execute in translated code. The JIT difftest (`DUT=jit`) compiles
+every entry on first use and compares against QEMU like the interpreter tests.
+
 ## Status
 
 Done:
@@ -114,23 +149,26 @@ Done:
       UART/PCI/virtio devices reused unchanged, gzip and EFI-zboot kernels
 - [x] snowglobe flow end to end, also with the Closure-compiled `libv86.mjs`:
       9p root (zstd blobs), virtio console, `save_state`, zstd `initial_state`
+- [x] Page JIT to wasm, enabled by default (see "JIT" above)
 
 Testing (all in CI, `.github/workflows/armless.yml`):
 
 - `cargo test`: unit tests and a bare-metal self-test guest
-- `tests/difftest`: random instructions vs `qemu-aarch64 -cpu cortex-a53`
+- `tests/difftest`: random instructions vs `qemu-aarch64 -cpu cortex-a53`,
+  natively and on armless.wasm with every entry JIT-compiled (`DUT=jit`)
 - `tests/linux`: kernel boot, glibc/busybox userspace vs qemu-aarch64
-- `tests/arm/boot.mjs`, `tests/arm/snowglobe.mjs`: through the V86 JS API
+- `tests/arm/boot.mjs`, `tests/arm/snowglobe.mjs`: through the V86 JS API,
+  with the JIT on (`ARMLESS_JIT=0` turns it off, `ARMLESS_STATS=1` prints
+  JIT statistics)
 
 Next:
 
 1. **snowglobe**: `FROM arm64v8/alpine`, boot layer installs `linux-virt` for
    aarch64, `new V86({ arch: "arm64", wasm_path: "v86/armless.wasm", ... })`;
    the BIOS files are no longer needed. See "Using it from snowglobe" below.
-2. **Performance**: the interpreter runs at ~40 MIPS natively. A basic-block
-   JIT to wasm (like v86's `jit.rs`) is the next big step.
-3. Networking test with the `fetch` relay (virtio-net is wired the same way
-   as virtio console and 9p, but not yet exercised in a test).
+2. **Performance**: translate more in the JIT (FP/SIMD, exclusives), keep
+   guest registers in wasm locals within a block, and cache code translations
+   for the dispatcher.
 
 ## Using it from snowglobe
 

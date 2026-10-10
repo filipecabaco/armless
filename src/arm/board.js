@@ -13,3 +13,9 @@ export const PCI_ECAM_BASE = 0xF1000000;
 export const PCI_ECAM_SIZE = 0x100000;
 
 export const SPI_UART = 32 + 1;
+
+// Function table for armless.wasm: Rust's own entries stay below
+// JIT_SLOT_BASE, JIT-compiled blocks use the JIT_SLOTS entries above it.
+// Must match arm/src/jit/mod.rs.
+export const JIT_SLOT_BASE = 1024;
+export const JIT_SLOTS = 4096;

@@ -22,6 +22,8 @@ const [kernel, initrd] = args;
 
 const emulator = new V86({
     arch: "arm64",
+    disable_jit: process.env.ARMLESS_JIT === "0",
+    jit_threshold: Number(process.env.ARMLESS_JIT_THRESHOLD || 0),
     wasm_path: path.join(root, "build/armless.wasm"),
     memory_size: memory * 1024 * 1024,
     bzimage: { url: kernel },
@@ -43,6 +45,14 @@ emulator.add_listener("serial0-output-byte", byte => {
 emulator.add_listener("cpu-event-halt", () => {
     const secs = ((Date.now() - start) / 1000).toFixed(1);
     console.log(`\n[boot.mjs] guest powered off after ${secs}s`);
+    if(process.env.ARMLESS_STATS)
+    {
+        const e = emulator.v86.arm_cpu.exports;
+        const insns = Number(e["armless_insn_count"]());
+        console.log(`[boot.mjs] ${(insns / 1e6).toFixed(0)}M instructions, ` +
+            `${(insns / 1e6 / secs).toFixed(1)} MIPS; jit: ${e["armless_jit_stat"](0)} compiled, ` +
+            `${e["armless_jit_stat"](1)} invalidated, ${e["armless_jit_stat"](2)} block runs, ${e["armless_jit_stat"](3)} flushes, ${e["armless_jit_stat"](4)} pages written; ${(e["armless_jit_stat"](5)/1e6).toFixed(1)}M insns in blocks, ${(e["armless_jit_stat"](6)/1e6).toFixed(1)}M via interp helper`);
+    }
     emulator.destroy();
     const ok = !expect || out.includes(expect);
     console.log(ok ? "[boot.mjs] OK" : `[boot.mjs] FAIL: did not see "${expect}"`);

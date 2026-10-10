@@ -2,9 +2,9 @@ name: armless
 
 on:
   push:
-    paths: ["arm/**", ".github/workflows/armless.yml"]
+    paths: ["arm/**", "src/arm/**", "tests/arm/**", "src/browser/starter.js", ".github/workflows/armless.yml"]
   pull_request:
-    paths: ["arm/**", ".github/workflows/armless.yml"]
+    paths: ["arm/**", "src/arm/**", "tests/arm/**", "src/browser/starter.js", ".github/workflows/armless.yml"]
   workflow_dispatch:
 
 jobs:
@@ -28,6 +28,14 @@ jobs:
         run: |
           sh build-wasm.sh
           cp ../build/armless.wasm .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Bare-metal guest on armless.wasm (interpreter, and every entry JIT-compiled)
+        run: |
+          OUT="$RUNNER_TEMP/guest" sh guest/build.sh
+          node ../tests/arm/run-bare.mjs "$RUNNER_TEMP/guest/tests.bin" -m 512 --no-jit
+          node ../tests/arm/run-bare.mjs "$RUNNER_TEMP/guest/tests.bin" -m 512 --jit-threshold 1 --jit-sync
       - uses: actions/upload-artifact@v4
         with:
           name: armless-wasm
@@ -86,6 +94,17 @@ jobs:
           pip install --break-system-packages zstandard
           sh ../tests/arm/make-9pfs.sh build-linux/busybox build-linux/Image.gz build-linux/9pfs
           node ../tests/arm/snowglobe.mjs build-linux/9pfs
+      - name: Userspace through the V86 JS API with the JIT matches qemu-aarch64
+        run: |
+          node ../tests/arm/boot.mjs --cmdline "console=ttyS0 rdinit=/init quiet" \
+              --expect ARMLESS-USERSPACE-OK build-linux/Image build-linux/rootfs.cpio > v86-userspace.log
+          sed -n '/^== userspace ==/,/^ARMLESS-USERSPACE-OK/p' v86-userspace.log \
+              | grep -v -e '^== ' -e '^ARMLESS-USERSPACE-OK' -e '^dc' -e 'SERIAL:' | tr -d '\r' > v86-dut.txt
+          if ! diff -u build-linux/ref.txt v86-dut.txt > v86-diff.txt; then
+            cat v86-diff.txt
+            echo "::error title=userspace (V86 + JIT)::$(head -c 1500 v86-diff.txt | tr -d '\r%' | tr '\n' ';')"
+            exit 1
+          fi
 
   difftest:
     runs-on: ubuntu-24.04
@@ -101,12 +120,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu qemu-user
+          rustup target add wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Differential test against qemu-aarch64
         run: |
           for seed in 1 2 3; do
             if ! sh tests/difftest/run.sh ${{ matrix.classes }} 10000 $seed; then
               # surface the mismatches as an annotation (visible without logs)
               echo "::error title=difftest ${{ matrix.classes }} seed $seed::$(grep -E '^[-+][0-9]' ../build-difftest/diff.txt | head -12 | tr '\n' ';')"
+              exit 1
+            fi
+          done
+      - name: Differential test of the wasm JIT against qemu-aarch64
+        run: |
+          sh build-wasm.sh
+          for seed in 1 2; do
+            if ! DUT=jit sh tests/difftest/run.sh ${{ matrix.classes }} 5000 $seed; then
+              echo "::error title=difftest jit ${{ matrix.classes }} seed $seed::$(grep -E '^[-+][0-9]' ../build-difftest/diff.txt | head -12 | tr '\n' ';')"
               exit 1
             fi
           done

@@ -88,7 +88,8 @@ pub mod id {
     pub const AA64DFR0: u64 = 0x6;
     /// 64-byte lines (DminLine/IminLine/ERG/CWG = 16 words), PIPT I-cache,
     /// IDC/DIC set: no cache maintenance needed.
-    pub const CTR: u64 = (1 << 31) | (1 << 29) | (1 << 28) | (4 << 24) | (4 << 20) | (4 << 16) | (3 << 14) | 4;
+    pub const CTR: u64 =
+        (1 << 31) | (1 << 29) | (1 << 28) | (4 << 24) | (4 << 20) | (4 << 16) | (3 << 14) | 4;
     /// DC ZVA permitted, 64-byte block.
     pub const DCZID: u64 = 4;
     pub const CLIDR: u64 = 0;

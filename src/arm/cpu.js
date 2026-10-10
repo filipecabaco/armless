@@ -72,6 +72,17 @@ export function ArmCPU(bus, wm, stop_idling, microtick)
     this.halted = false;
     this.boot = null;
 
+    // JIT: generated block modules import the memory and these helpers
+    this.wasm_table = wm.wasm_table;
+    this.jit_imports = {
+        "m": this.exports["memory"],
+        "armless_jit_read": this.exports["armless_jit_read"],
+        "armless_jit_write": this.exports["armless_jit_write"],
+        "armless_jit_interp": this.exports["armless_jit_interp"],
+    };
+    /** @type {!Uint8Array} non-zero for RAM pages holding translated code */
+    this.jit_code_pages = new Uint8Array(0);
+
     // zstd decoder exported by armless.wasm, same names as v86.wasm
     for(const name of ["zstd_create_ctx", "zstd_get_src_ptr", "zstd_free_ctx", "zstd_read", "zstd_read_free"])
     {
@@ -89,7 +100,45 @@ ArmCPU.prototype.refresh_memory = function()
     if(this.mem8.byteLength === 0 && this.memory_size[0])
     {
         this.mem8 = new Uint8Array(this.wasm_memory.buffer, this.exports["armless_mem_ptr"](), this.memory_size[0]);
+        this.jit_code_pages = new Uint8Array(this.wasm_memory.buffer, this.exports["armless_jit_code_pages"](),
+            Math.ceil(this.memory_size[0] / 4096));
     }
+};
+
+/**
+ * Host writes to guest RAM (DMA) must drop JIT translations of those pages.
+ * @param {number} addr
+ * @param {number} length
+ */
+ArmCPU.prototype.jit_dirty = function(addr, length)
+{
+    const pages = this.jit_code_pages;
+    const last = addr + length - 1 >>> 12;
+    for(let page = addr >>> 12; page <= last; page++)
+    {
+        if(pages[page])
+        {
+            this.exports["armless_jit_dirty"](addr, length);
+            return;
+        }
+    }
+};
+
+/**
+ * Called by armless.wasm: compile a JIT block module into a table slot.
+ * Compilation is asynchronous; the interpreter keeps running meanwhile.
+ * @return {number}
+ */
+ArmCPU.prototype.jit_compile = function(table_index, ptr, len)
+{
+    const code = new Uint8Array(this.wasm_memory.buffer, ptr >>> 0, len >>> 0).slice();
+    WebAssembly.instantiate(code, { "e": this.jit_imports }).then(result => {
+        this.wasm_table.set(table_index, result.instance.exports["f"]);
+        this.exports["armless_jit_ready"](table_index);
+    }, err => {
+        dbg_log("armless: JIT module failed to compile: " + err, LOG_CPU);
+    });
+    return 1;
 };
 
 // ------------------------------------------------------------------ memory
@@ -117,6 +166,7 @@ ArmCPU.prototype.write8 = function(addr, value)
 {
     this.refresh_memory();
     this.mem8[addr] = value;
+    this.jit_dirty(addr, 1);
 };
 ArmCPU.prototype.write16 = function(addr, value)
 {
@@ -124,6 +174,7 @@ ArmCPU.prototype.write16 = function(addr, value)
     const m = this.mem8;
     m[addr] = value;
     m[addr + 1] = value >> 8;
+    this.jit_dirty(addr, 2);
 };
 ArmCPU.prototype.write32 = function(addr, value)
 {
@@ -133,12 +184,14 @@ ArmCPU.prototype.write32 = function(addr, value)
     m[addr + 1] = value >> 8;
     m[addr + 2] = value >> 16;
     m[addr + 3] = value >> 24;
+    this.jit_dirty(addr, 4);
 };
 ArmCPU.prototype.write_blob = function(blob, offset)
 {
     this.refresh_memory();
     dbg_assert(offset + blob.length <= this.memory_size[0]);
     this.mem8.set(blob, offset);
+    this.jit_dirty(offset, blob.length);
 };
 ArmCPU.prototype.read_blob = function(offset, length)
 {
@@ -149,6 +202,7 @@ ArmCPU.prototype.zero_memory = function(offset, length)
 {
     this.refresh_memory();
     this.mem8.fill(0, offset, offset + length);
+    this.jit_dirty(offset, length);
 };
 ArmCPU.prototype.reset_memory = function()
 {
@@ -348,6 +402,8 @@ ArmCPU.prototype.init = function(settings, device_bus)
     this.memory_size[0] = size;
     this.mem8 = new Uint8Array(0);
     this.refresh_memory();
+    // JIT on unless disabled (disable_jit, as for the x86 machine)
+    this.exports["armless_jit_config"](settings.disable_jit ? 0 : 1, settings.jit_threshold || 0);
 
     this.io = new IO(cpu);
 

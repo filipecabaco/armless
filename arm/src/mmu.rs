@@ -129,7 +129,7 @@ impl<H: Host> Cpu<H> {
                 } else {
                     Err(self.abort(va, acc, Fault::Permission(w.level)))
                 }
-            }
+            },
             Err(f) => Err(self.abort(va, acc, f)),
         }
     }
@@ -144,11 +144,7 @@ impl<H: Host> Cpu<H> {
             return va;
         }
         let upper = va & (1 << 55) != 0;
-        let tbi = if upper {
-            self.sys.tcr & (1 << 38) != 0
-        } else {
-            self.sys.tcr & (1 << 37) != 0
-        };
+        let tbi = if upper { self.sys.tcr & (1 << 38) != 0 } else { self.sys.tcr & (1 << 37) != 0 };
         if tbi {
             if upper {
                 va | 0xff00_0000_0000_0000
@@ -181,9 +177,19 @@ impl<H: Host> Cpu<H> {
         let tcr = self.sys.tcr;
         let upper = va & (1 << 55) != 0;
         let (tsz, epd, tg, ttbr) = if upper {
-            ((tcr >> 16) & 0x3f, tcr & (1 << 23) != 0, (tcr >> 30) & 3, self.sys.ttbr1)
+            (
+                (tcr >> 16) & 0x3f,
+                tcr & (1 << 23) != 0,
+                (tcr >> 30) & 3,
+                self.sys.ttbr1,
+            )
         } else {
-            (tcr & 0x3f, tcr & (1 << 7) != 0, (tcr >> 14) & 3, self.sys.ttbr0)
+            (
+                tcr & 0x3f,
+                tcr & (1 << 7) != 0,
+                (tcr >> 14) & 3,
+                self.sys.ttbr0,
+            )
         };
         // Only the 4K granule is implemented (TG0=0b00, TG1=0b10).
         let tg_ok = if upper { tg == 2 } else { tg == 0 };

@@ -89,12 +89,15 @@ impl<H: Host> Cpu<H> {
         self.gic.save(&mut w.0);
         w.u64(self.rtc.offset as u64);
         w.u32(self.rtc.match_value);
-        w.u8(self.rtc.enabled as u8 | (self.rtc.irq_mask as u8) << 1 | (self.rtc.raw_irq as u8) << 2);
+        w.u8(self.rtc.enabled as u8
+            | (self.rtc.irq_mask as u8) << 1
+            | (self.rtc.raw_irq as u8) << 2);
         w.0
     }
 
     pub fn load_cpu_state(&mut self, data: &[u8]) -> Result<(), String> {
-        self.try_load(data).ok_or_else(|| "corrupt or truncated CPU state".to_string())?
+        self.try_load(data)
+            .ok_or_else(|| "corrupt or truncated CPU state".to_string())?
     }
 
     fn try_load(&mut self, data: &[u8]) -> Option<Result<(), String>> {
@@ -142,7 +145,7 @@ impl<H: Host> Cpu<H> {
         self.sys = s;
         let has_excl = r.u8()? != 0;
         let excl = r.u64()?;
-        self.excl = if has_excl { Some(excl) } else { None };
+        self.set_excl(if has_excl { Some(excl) } else { None });
         let mut rest = r.0;
         self.gic.load(&mut rest)?;
         let mut r = R(rest);
@@ -161,16 +164,18 @@ impl<H: Host> Cpu<H> {
             4 => {
                 self.el = 1;
                 self.spsel = false
-            }
+            },
             _ => {
                 self.el = 1;
                 self.spsel = true
-            }
+            },
         }
         // The guest's counter continues from where it was saved.
         self.timer_ns_base = self.host.now_ns();
         self.timer_cnt_base = counter;
         self.tlb_flush();
+        // RAM was replaced: no translated block can be trusted.
+        self.jit.flush_all();
         self.irq_dirty = true;
         Some(Ok(()))
     }

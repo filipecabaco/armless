@@ -157,14 +157,14 @@ impl<H: Host> Cpu<H> {
                             // half -> single is exact
                             fp::f64_to_f32(st, v).to_bits() as u64
                         }
-                    }
+                    },
                     1 => {
                         if ty == 0 {
                             fp::f32_to_f64(st, f32::from_bits(a as u32)).to_bits()
                         } else {
                             v.to_bits()
                         }
-                    }
+                    },
                     _ => {
                         if ty == 0 {
                             // single -> half: NaN conversion must use the single payload
@@ -179,7 +179,7 @@ impl<H: Host> Cpu<H> {
                             // double -> half rounds once from the double value
                             f64_to_f16_direct(st, v, ahp) as u64
                         }
-                    }
+                    },
                 }
             });
             self.vreg[rd as usize] = r as u128;
@@ -189,17 +189,13 @@ impl<H: Host> Cpu<H> {
             return Err(Event::undefined());
         }
         let r = self.with_fp(|st| -> Option<u64> {
-            Some(if ty == 0 {
-                fp_un::<f32>(st, op, a)?
-            } else {
-                fp_un::<f64>(st, op, a)?
-            })
+            Some(if ty == 0 { fp_un::<f32>(st, op, a)? } else { fp_un::<f64>(st, op, a)? })
         });
         match r {
             Some(v) => {
                 self.vreg[rd as usize] = v as u128;
                 Ok(())
-            }
+            },
             None => Err(Event::undefined()),
         }
     }
@@ -267,7 +263,12 @@ impl<H: Host> Cpu<H> {
 
     fn fp_dp3(&mut self, insn: u32) -> Res<()> {
         let ty = Self::fp_type(insn)?;
-        let (rd, rn, rm, ra) = (insn & 31, field(insn, 5, 5), field(insn, 16, 5), field(insn, 10, 5));
+        let (rd, rn, rm, ra) = (
+            insn & 31,
+            field(insn, 5, 5),
+            field(insn, 16, 5),
+            field(insn, 10, 5),
+        );
         let o1 = bit(insn, 21);
         let o0 = bit(insn, 15);
         let (a, n, m) = (self.vr(ra) as u64, self.vr(rn) as u64, self.vr(rm) as u64);
@@ -277,9 +278,21 @@ impl<H: Host> Cpu<H> {
         let a = if o1 { a ^ sign } else { a };
         let r = self.with_fp(|st| {
             if ty == 32 {
-                fp::muladd(st, f32::from_bits64(a), f32::from_bits64(n), f32::from_bits64(m)).bits()
+                fp::muladd(
+                    st,
+                    f32::from_bits64(a),
+                    f32::from_bits64(n),
+                    f32::from_bits64(m),
+                )
+                .bits()
             } else {
-                fp::muladd(st, f64::from_bits64(a), f64::from_bits64(n), f64::from_bits64(m)).bits()
+                fp::muladd(
+                    st,
+                    f64::from_bits64(a),
+                    f64::from_bits64(n),
+                    f64::from_bits64(m),
+                )
+                .bits()
             }
         });
         self.vreg[rd as usize] = r as u128;
@@ -306,7 +319,7 @@ impl<H: Host> Cpu<H> {
                         } else {
                             self.vreg[rd as usize] = (self.xr(rn) & ones(bits)) as u128;
                         }
-                    }
+                    },
                     (true, 2, 1) => {
                         if to_gen {
                             let v = (self.vr(rn) >> 64) as u64;
@@ -315,11 +328,11 @@ impl<H: Host> Cpu<H> {
                             let lo = self.vr(rd) & u64::MAX as u128;
                             self.vreg[rd as usize] = lo | (self.xr(rn) as u128) << 64;
                         }
-                    }
+                    },
                     _ => return Err(Event::undefined()),
                 }
                 Ok(())
-            }
+            },
             _ => {
                 if ty > 1 {
                     return Err(Event::undefined());
@@ -359,7 +372,7 @@ impl<H: Host> Cpu<H> {
                     self.vreg[rd as usize] = r as u128;
                 }
                 Ok(())
-            }
+            },
         }
     }
 
@@ -387,7 +400,7 @@ impl<H: Host> Cpu<H> {
                     }
                 });
                 self.wr(rd, r);
-            }
+            },
             (0, 2) | (0, 3) => {
                 let unsigned = opcode == 3;
                 let mut x = self.xr(rn) & ones(ibits);
@@ -402,7 +415,7 @@ impl<H: Host> Cpu<H> {
                     }
                 });
                 self.vreg[rd as usize] = r as u128;
-            }
+            },
             _ => return Err(Event::undefined()),
         }
         Ok(())
@@ -441,11 +454,11 @@ fn fp_un<F: Float>(st: &mut Fpst, op: u32, a: u64) -> Option<u64> {
         14 => {
             let m = st.rmode();
             fp::round_int(st, x, m, true).bits()
-        }
+        },
         15 => {
             let m = st.rmode();
             fp::round_int(st, x, m, false).bits()
-        }
+        },
         _ => return None,
     })
 }

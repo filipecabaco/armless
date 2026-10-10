@@ -49,7 +49,9 @@ pub enum Exit {
     Budget,
     /// The guest executed WFI with nothing pending. The host should wait until
     /// `wake_ns` (host clock) or until a device raises an interrupt.
-    Idle { wake_ns: Option<u64> },
+    Idle {
+        wake_ns: Option<u64>,
+    },
     Stop(StopReason),
 }
 
@@ -137,7 +139,7 @@ pub struct Cpu<H: Host> {
     pub vreg: [u128; 32],
 
     /// Guest physical RAM, starting at physical address 0 (= v86's mem8).
-    pub mem: Vec<u8>,
+    pub mem: crate::ram::Ram,
     pub gic: Gic,
     pub rtc: Rtc,
     pub host: H,
@@ -148,6 +150,14 @@ pub struct Cpu<H: Host> {
 
     /// Exclusive monitor: physical address of the last load-exclusive.
     pub(crate) excl: Option<u64>,
+    /// Mirror of `excl.is_some()` read by JIT-generated stores.
+    pub(crate) excl_armed: u8,
+    /// The PC is a block entry (target of a taken branch, exception or
+    /// return, or the instruction after a JIT block): only there does the
+    /// JIT look for or count blocks.
+    pub(crate) jit_entry: bool,
+    /// insn_count at which a JIT module stops chaining blocks.
+    pub(crate) jit_limit: u64,
     pub(crate) next_pc: u64,
     /// Instructions retired since reset.
     pub insn_count: u64,
@@ -156,6 +166,11 @@ pub struct Cpu<H: Host> {
     /// Generic timer: counter value at `timer_ns_base` (host ns).
     pub(crate) timer_cnt_base: u64,
     pub(crate) timer_ns_base: u64,
+    /// Basic-block JIT state (enabled only where the host can compile wasm).
+    pub jit: crate::jit::Jit,
+    /// Exception raised inside a JIT helper, and its flag (read by blocks).
+    pub(crate) jit_pending: Option<Event>,
+    pub(crate) jit_pending_flag: u8,
     /// Stop instead of raising an exception on undefined instructions.
     pub trap_undefined: bool,
     /// Last undefined instruction seen (for diagnostics), as (pc, insn).
@@ -192,14 +207,46 @@ impl FastTlb {
         self.write_tag.fill(u64::MAX);
         self.code_page = u64::MAX;
     }
+
+    /// Remove write entries mapping to the physical page at `base`.
+    pub(crate) fn forget_write_page(&mut self, base: usize) {
+        for i in 0..FAST_ENTRIES {
+            if self.write_tag[i] != u64::MAX && self.write_base[i] == base {
+                self.write_tag[i] = u64::MAX;
+            }
+        }
+    }
+
+    pub(crate) fn read_tag_ptr(&self) -> *const u8 {
+        self.read_tag.as_ptr() as *const u8
+    }
+    pub(crate) fn read_base_ptr(&self) -> *const u8 {
+        self.read_base.as_ptr() as *const u8
+    }
+    pub(crate) fn write_tag_ptr(&self) -> *const u8 {
+        self.write_tag.as_ptr() as *const u8
+    }
+    pub(crate) fn write_base_ptr(&self) -> *const u8 {
+        self.write_base.as_ptr() as *const u8
+    }
 }
 
 const DAIF_ALL: u32 = 0xf << 6;
 const DAIF_I: u32 = 1 << 7;
 
 impl<H: Host> Cpu<H> {
+    /// Arm or clear the exclusive monitor (keeps the JIT's mirror in sync).
+    #[inline]
+    pub(crate) fn set_excl(&mut self, e: Option<u64>) {
+        self.excl = e;
+        self.excl_armed = e.is_some() as u8;
+    }
+
     pub fn new(memory_size: usize, host: H) -> Cpu<H> {
-        assert!(memory_size as u64 <= board::RAM_MAX, "RAM would overlap the MMIO window");
+        assert!(
+            memory_size as u64 <= board::RAM_MAX,
+            "RAM would overlap the MMIO window"
+        );
         let mut cpu = Cpu {
             x: [0; 31],
             pc: 0,
@@ -214,13 +261,16 @@ impl<H: Host> Cpu<H> {
             spsel: true,
             sys: SysRegs::default(),
             vreg: [0; 32],
-            mem: vec![0; memory_size],
+            mem: crate::ram::Ram::zeroed(memory_size),
             gic: Gic::new(),
             rtc: Rtc::default(),
             host,
             tlb: Tlb::new(),
             fast: [FastTlb::new(), FastTlb::new()],
             excl: None,
+            excl_armed: 0,
+            jit_entry: true,
+            jit_limit: 0,
             next_pc: 0,
             insn_count: 0,
             irq_dirty: true,
@@ -228,6 +278,9 @@ impl<H: Host> Cpu<H> {
             timer_ns_base: 0,
             trap_undefined: false,
             last_undefined: None,
+            jit: crate::jit::Jit::new(memory_size),
+            jit_pending: None,
+            jit_pending_flag: 0,
         };
         cpu.reset();
         cpu
@@ -254,7 +307,8 @@ impl<H: Host> Cpu<H> {
         };
         self.gic = Gic::new();
         self.tlb_flush();
-        self.excl = None;
+        self.jit.flush_all();
+        self.set_excl(None);
         self.irq_dirty = true;
         self.timer_ns_base = self.host.now_ns();
         self.timer_cnt_base = 0;
@@ -319,7 +373,10 @@ impl<H: Host> Cpu<H> {
     }
 
     pub fn nzcv(&self) -> u64 {
-        ((self.n as u64) << 31) | ((self.z as u64) << 30) | ((self.c as u64) << 29) | ((self.v as u64) << 28)
+        ((self.n as u64) << 31)
+            | ((self.z as u64) << 30)
+            | ((self.c as u64) << 29)
+            | ((self.v as u64) << 28)
     }
 
     pub fn set_nzcv(&mut self, v: u64) {
@@ -341,20 +398,20 @@ impl<H: Host> Cpu<H> {
         match spsr & 0xf {
             0b0000 => {
                 self.el = 0;
-            }
+            },
             0b0100 => {
                 self.el = 1;
                 self.spsel = false;
-            }
+            },
             0b0101 => {
                 self.el = 1;
                 self.spsel = true;
-            }
+            },
             _ => {
                 // Illegal return (EL2/EL3 or AArch32): stay at EL1h.
                 self.el = 1;
                 self.spsel = true;
-            }
+            },
         }
         self.irq_dirty = true;
     }
@@ -376,12 +433,29 @@ impl<H: Host> Cpu<H> {
         self.el = 1;
         self.spsel = true;
         self.daif = DAIF_ALL;
-        self.excl = None;
+        self.set_excl(None);
         self.pc = self.sys.vbar.wrapping_add(offset + kind * 0x80);
         self.irq_dirty = true;
     }
 
-    fn sync_exception(&mut self, ec: u32, iss: u32, far: Option<u64>, ret: u64) -> Result<(), StopReason> {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn sync_exception_pub(
+        &mut self,
+        ec: u32,
+        iss: u32,
+        far: Option<u64>,
+        ret: u64,
+    ) -> Result<(), StopReason> {
+        self.sync_exception(ec, iss, far, ret)
+    }
+
+    fn sync_exception(
+        &mut self,
+        ec: u32,
+        iss: u32,
+        far: Option<u64>,
+        ret: u64,
+    ) -> Result<(), StopReason> {
         self.sys.esr = ((ec as u64) << 26) | (1 << 25) | (iss as u64 & 0x1ff_ffff);
         if let Some(f) = far {
             self.sys.far = f;
@@ -404,7 +478,7 @@ impl<H: Host> Cpu<H> {
         let elr = self.sys.elr;
         self.set_pstate(spsr);
         self.next_pc = elr;
-        self.excl = None;
+        self.set_excl(None);
     }
 
     // --------------------------------------------------------------- timers
@@ -464,9 +538,14 @@ impl<H: Host> Cpu<H> {
         self.irq_dirty = true;
     }
 
+    pub(crate) fn sync_host_irqs_pub(&mut self) {
+        self.sync_host_irqs();
+    }
+
     fn sync_host_irqs(&mut self) {
         let gic = &mut self.gic;
-        self.host.sync_irqs(&mut |intid, level| gic.set_line(intid, level));
+        self.host
+            .sync_irqs(&mut |intid, level| gic.set_line(intid, level));
     }
 
     fn irq_masked(&self) -> bool {
@@ -479,6 +558,7 @@ impl<H: Host> Cpu<H> {
     pub fn run(&mut self, budget: u64) -> Exit {
         self.update_timers();
         let mut executed = 0;
+        let mut last_poll = 0;
         while executed < budget {
             if self.irq_dirty {
                 self.irq_dirty = false;
@@ -486,10 +566,27 @@ impl<H: Host> Cpu<H> {
                 if !self.irq_masked() && self.gic.irq_asserted() {
                     let ret = self.pc;
                     self.take_exception(1, ret);
+                    self.jit_entry = true;
                 }
             }
-            match self.step() {
-                Ok(()) => {}
+            if self.jit.enabled && self.jit_entry {
+                match self.jit_dispatch(&mut executed, budget) {
+                    Some(Some(exit)) => return exit,
+                    Some(None) => {
+                        if executed - last_poll >= 0x400 {
+                            last_poll = executed;
+                            self.update_timers();
+                        }
+                        continue;
+                    },
+                    None => {},
+                }
+            }
+            let pc = self.pc;
+            let r = self.step();
+            self.jit_entry = self.pc != pc.wrapping_add(4);
+            match r {
+                Ok(()) => {},
                 Err(Event::Wfi) => {
                     self.update_timers();
                     self.sync_host_irqs();
@@ -498,13 +595,14 @@ impl<H: Host> Cpu<H> {
                             wake_ns: self.next_timer_deadline_ns(),
                         };
                     }
-                }
+                },
                 Err(Event::Stop(r)) => return Exit::Stop(r),
                 Err(Event::Sync { .. }) => unreachable!("handled in step"),
             }
             executed += 1;
             // Poll the timer every so often; it is cheap but not free.
-            if executed & 0x3ff == 0 {
+            if executed - last_poll >= 0x400 {
+                last_poll = executed;
                 self.update_timers();
             }
         }
@@ -524,7 +622,7 @@ impl<H: Host> Cpu<H> {
             Ok(()) => {
                 self.pc = self.next_pc;
                 Ok(())
-            }
+            },
             Err(Event::Sync {
                 ec,
                 iss,
@@ -541,11 +639,11 @@ impl<H: Host> Cpu<H> {
                     }
                 }
                 self.sync_exception(ec, iss, far, ret).map_err(Event::Stop)
-            }
+            },
             Err(Event::Wfi) => {
                 self.pc = self.next_pc;
                 Err(Event::Wfi)
-            }
+            },
             Err(e) => Err(e),
         }
     }
@@ -557,6 +655,10 @@ impl<H: Host> Cpu<H> {
             let a = f.code_base + (pc & 0xffc) as usize;
             return Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()));
         }
+        self.fetch_slow(pc)
+    }
+
+    pub(crate) fn fetch_slow_pub(&mut self, pc: u64) -> Res<u32> {
         self.fetch_slow(pc)
     }
 
@@ -707,7 +809,9 @@ impl<H: Host> Cpu<H> {
                 f.read_tag[i] = va >> 12;
                 f.read_base[i] = page;
             }
-            return self.phys_read(pa, size).ok_or_else(|| self.external_abort(va, false));
+            return self
+                .phys_read(pa, size)
+                .ok_or_else(|| self.external_abort(va, false));
         }
         // Crosses a page boundary: go byte by byte.
         let mut v = 0u64;
@@ -738,7 +842,10 @@ impl<H: Host> Cpu<H> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
             let pa = self.translate(va, crate::mmu::Access::Write, unpriv)?;
             let page = (pa & !0xfff) as usize;
-            if !unpriv && page + 0x1000 <= self.mem.len() {
+            let has_code = self.jit.code_page.get(page >> 12).is_some_and(|&b| b != 0);
+            if has_code {
+                self.jit.invalidate_page(page >> 12);
+            } else if !unpriv && page + 0x1000 <= self.mem.len() {
                 let f = &mut self.fast[self.el as usize];
                 let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
                 f.write_tag[i] = va >> 12;
@@ -746,7 +853,7 @@ impl<H: Host> Cpu<H> {
             }
             if let Some(e) = self.excl {
                 if e & !0x3f == pa & !0x3f {
-                    self.excl = None;
+                    self.set_excl(None);
                 }
             }
             return if self.phys_write(pa, size, value) {
@@ -788,8 +895,8 @@ impl<H: Host> Cpu<H> {
             0x8400_0008 => return Err(Event::Stop(StopReason::PowerOff)),
             0x8400_0009 => return Err(Event::Stop(StopReason::Reset)),
             0x8400_000A => match self.x[1] as u32 {
-                0x8400_0000 | 0x8400_0002 | 0x8400_0004 | 0xC400_0004 | 0x8400_0006 | 0x8400_0008
-                | 0x8400_0009 | 0x8400_000A => 0,
+                0x8400_0000 | 0x8400_0002 | 0x8400_0004 | 0xC400_0004 | 0x8400_0006
+                | 0x8400_0008 | 0x8400_0009 | 0x8400_000A => 0,
                 _ => NOT_SUPPORTED,
             },
             _ => NOT_SUPPORTED,

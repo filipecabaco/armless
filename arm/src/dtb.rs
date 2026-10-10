@@ -62,7 +62,8 @@ impl Fdt {
     pub fn prop(&mut self, name: &str, data: &[u8]) {
         let off = self.string_offset(name);
         self.token(FDT_PROP);
-        self.structs.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        self.structs
+            .extend_from_slice(&(data.len() as u32).to_be_bytes());
         self.structs.extend_from_slice(&off.to_be_bytes());
         self.structs.extend_from_slice(data);
         pad4(&mut self.structs);
@@ -186,7 +187,12 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.prop_str("device_type", "memory");
     f.prop_cells(
         "reg",
-        &[hi(board::RAM_BASE), lo(board::RAM_BASE), hi(cfg.memory_size), lo(cfg.memory_size)],
+        &[
+            hi(board::RAM_BASE),
+            lo(board::RAM_BASE),
+            hi(cfg.memory_size),
+            lo(cfg.memory_size),
+        ],
     );
     f.end();
 
@@ -212,8 +218,18 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.prop_cells(
         "interrupts",
         &[
-            1, 13, 0xf04, 1, board::PPI_PHYS_TIMER - 16, 0xf04, 1, board::PPI_VIRT_TIMER - 16, 0xf04, 1,
-            board::PPI_HYP_TIMER - 16, 0xf04,
+            1,
+            13,
+            0xf04,
+            1,
+            board::PPI_PHYS_TIMER - 16,
+            0xf04,
+            1,
+            board::PPI_VIRT_TIMER - 16,
+            0xf04,
+            1,
+            board::PPI_HYP_TIMER - 16,
+            0xf04,
         ],
     );
     f.prop_empty("always-on");
@@ -250,7 +266,15 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
 
     f.begin(&format!("uart@{:x}", board::UART_BASE));
     f.prop_str("compatible", "ns16550a");
-    f.prop_cells("reg", &[hi(board::UART_BASE), lo(board::UART_BASE), 0, lo(board::UART_SIZE)]);
+    f.prop_cells(
+        "reg",
+        &[
+            hi(board::UART_BASE),
+            lo(board::UART_BASE),
+            0,
+            lo(board::UART_SIZE),
+        ],
+    );
     f.prop_cells("interrupts", &spi(board::SPI_UART));
     f.prop_u32("clock-frequency", 1_843_200);
     f.prop_u32("reg-shift", 0);
@@ -259,7 +283,15 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
 
     f.begin(&format!("pl031@{:x}", board::RTC_BASE));
     f.prop_strs("compatible", &["arm,pl031", "arm,primecell"]);
-    f.prop_cells("reg", &[hi(board::RTC_BASE), lo(board::RTC_BASE), 0, lo(board::RTC_SIZE)]);
+    f.prop_cells(
+        "reg",
+        &[
+            hi(board::RTC_BASE),
+            lo(board::RTC_BASE),
+            0,
+            lo(board::RTC_SIZE),
+        ],
+    );
     f.prop_cells("interrupts", &spi(board::SPI_RTC));
     f.prop_u32("clocks", PHANDLE_APB_CLK);
     f.prop_str("clock-names", "apb_pclk");
@@ -276,7 +308,12 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.prop_empty("dma-coherent");
     f.prop_cells(
         "reg",
-        &[hi(board::PCI_ECAM_BASE), lo(board::PCI_ECAM_BASE), 0, lo(board::PCI_ECAM_SIZE)],
+        &[
+            hi(board::PCI_ECAM_BASE),
+            lo(board::PCI_ECAM_BASE),
+            0,
+            lo(board::PCI_ECAM_SIZE),
+        ],
     );
     f.prop_cells(
         "ranges",
@@ -337,7 +374,10 @@ mod tests {
         let total = u32::from_be_bytes(dtb[4..8].try_into().unwrap()) as usize;
         assert_eq!(total, dtb.len());
         let struct_off = u32::from_be_bytes(dtb[8..12].try_into().unwrap()) as usize;
-        assert_eq!(u32::from_be_bytes(dtb[struct_off..struct_off + 4].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_be_bytes(dtb[struct_off..struct_off + 4].try_into().unwrap()),
+            1
+        );
         // Must end with FDT_END in the structure block.
         let strings_off = u32::from_be_bytes(dtb[12..16].try_into().unwrap()) as usize;
         assert_eq!(

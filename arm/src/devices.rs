@@ -49,11 +49,11 @@ impl Uart16550 {
                     0x01
                 };
                 0xc0 | id
-            }
+            },
             3 => self.lcr,
             4 => self.mcr,
             5 => 0x60 | (!self.input.is_empty()) as u8, // THRE | TEMT | DR
-            6 => 0xb0,                                 // DCD | DSR | CTS
+            6 => 0xb0,                                  // DCD | DSR | CTS
             7 => self.scr,
             _ => 0,
         }
@@ -65,7 +65,7 @@ impl Uart16550 {
             0 => {
                 self.output.push(v);
                 self.thre_pending = true;
-            }
+            },
             1 if self.dlab() => self.dlm = v,
             1 => {
                 // Enabling the THRE interrupt raises it immediately (THR is empty).
@@ -73,11 +73,11 @@ impl Uart16550 {
                     self.thre_pending = true;
                 }
                 self.ier = v & 0x0f;
-            }
+            },
             3 => self.lcr = v,
             4 => self.mcr = v,
             7 => self.scr = v,
-            _ => {}
+            _ => {},
         }
     }
 }

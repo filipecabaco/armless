@@ -276,14 +276,14 @@ fn adjust<F: Float>(r: F, err: i32, mode: Round) -> F {
             } else {
                 r
             }
-        }
+        },
         Round::MinusInf => {
             if err < 0 {
                 r.next_down()
             } else {
                 r
             }
-        }
+        },
         Round::Zero => {
             if err > 0 && r.sign() {
                 r.next_up()
@@ -292,7 +292,7 @@ fn adjust<F: Float>(r: F, err: i32, mode: Round) -> F {
             } else {
                 r
             }
-        }
+        },
     }
 }
 
@@ -334,9 +334,8 @@ fn finish<F: Float>(st: &mut Fpst, r: F, err: i32, exact_overflow: bool) -> F {
     // Tininess is judged on the exact (unrounded) value: |exact| < MIN_NORMAL.
     // `r` is the round-to-nearest result and `err` the sign of exact - r.
     let toward_zero = (err < 0 && !r.sign()) || (err > 0 && r.sign());
-    let tiny = r.is_subnormal()
-        || (r.is_zero() && err != 0)
-        || (r.absf() == F::MIN_NORMAL && toward_zero);
+    let tiny =
+        r.is_subnormal() || (r.is_zero() && err != 0) || (r.absf() == F::MIN_NORMAL && toward_zero);
     // Flush-to-zero: a tiny result becomes a signed zero with only UFC set.
     if st.fz() && tiny {
         st.flag(UFC);
@@ -399,7 +398,11 @@ fn exact_sign(terms: &[(bool, u128, i32)]) -> i32 {
         return 0;
     }
     let min_e = terms.iter().map(|t| t.2).min().unwrap();
-    let max_bits = terms.iter().map(|t| (t.2 - min_e) as usize + 128).max().unwrap();
+    let max_bits = terms
+        .iter()
+        .map(|t| (t.2 - min_e) as usize + 128)
+        .max()
+        .unwrap();
     let limbs = max_bits / 64 + 2;
     let mut pos = vec![0u64; limbs];
     let mut negs = vec![0u64; limbs];
@@ -646,11 +649,7 @@ pub fn muladd<F: Float>(st: &mut Fpst, addend: F, b: F, c: F) -> F {
         let psign = b.sign() ^ c.sign();
         let both_zero = (b.is_zero() || c.is_zero()) && addend.is_zero();
         if both_zero {
-            let s = if psign == addend.sign() {
-                psign
-            } else {
-                st.rmode() == Round::MinusInf
-            };
+            let s = if psign == addend.sign() { psign } else { st.rmode() == Round::MinusInf };
             return F::from_bits64(if s { F::SIGN } else { 0 });
         }
     }
@@ -779,7 +778,14 @@ pub fn round_int<F: Float>(st: &mut Fpst, a: F, mode: Round, exact: bool) -> F {
 
 /// Float to signed/unsigned integer of `bits` width, saturating, with `fbits`
 /// fractional bits (fixed point). Returns the integer bit pattern.
-pub fn to_int<F: Float>(st: &mut Fpst, a: F, bits: u32, unsigned: bool, fbits: u32, mode: Round) -> u64 {
+pub fn to_int<F: Float>(
+    st: &mut Fpst,
+    a: F,
+    bits: u32,
+    unsigned: bool,
+    fbits: u32,
+    mode: Round,
+) -> u64 {
     let a = flush_in(st, a);
     if a.is_nan() {
         st.flag(IOC);
@@ -916,7 +922,13 @@ pub fn f64_to_f32(st: &mut Fpst, a: f64) -> f32 {
         return overflow_result::<f32>(a < 0.0, st.rmode());
     }
     let err = a - r as f64;
-    let s = if err == 0.0 { 0 } else if err > 0.0 { 1 } else { -1 };
+    let s = if err == 0.0 {
+        0
+    } else if err > 0.0 {
+        1
+    } else {
+        -1
+    };
     // Tininess before rounding
     if s != 0 && a.abs() < f32::MIN_POSITIVE as f64 {
         st.flag(UFC);
@@ -1011,7 +1023,13 @@ pub fn f64_to_f16(st: &mut Fpst, a: f64, ahp: bool) -> u16 {
     let mag = a.abs();
     // Scale so that the value is an integer number of half-precision ulps.
     let e = mag.log2().floor() as i32; // unbiased exponent (approximate, fixed below)
-    let e = if (2f64).powi(e) > mag { e - 1 } else if (2f64).powi(e + 1) <= mag { e + 1 } else { e };
+    let e = if (2f64).powi(e) > mag {
+        e - 1
+    } else if (2f64).powi(e + 1) <= mag {
+        e + 1
+    } else {
+        e
+    };
     let min_exp = -14;
     let ulp_exp = if e < min_exp { min_exp - 10 } else { e - 10 };
     let scaled = mag * (2f64).powi(-ulp_exp); // exact (power of two scaling)
@@ -1245,7 +1263,10 @@ pub fn rsqrt_step<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
     let exp = |x: F| (x.bits() >> F::MANT) & crate::bits::ones(ebits);
     let half = F::from_bits64(if F::BITS == 32 { 0x3f00_0000 } else { 0x3fe0_0000_0000_0000 });
     let mut tmp = 0u64;
-    let mut exact = Fpst { fpcr: 0, fpsr: &mut tmp };
+    let mut exact = Fpst {
+        fpcr: 0,
+        fpsr: &mut tmp,
+    };
     if exp(a) > 1 && !a.is_inf() {
         let ah = mul(&mut exact, a, half);
         return muladd(st, one_half, ah, b);
@@ -1277,7 +1298,11 @@ mod tests {
         let snan = f32::from_bits(0x7fa0_0001);
         let qnan = f32::from_bits(0xffc1_2345);
         let r = add(&mut s, qnan, snan);
-        assert_eq!(r.to_bits(), 0x7fe0_0001, "signalling NaN wins and is quieted");
+        assert_eq!(
+            r.to_bits(),
+            0x7fe0_0001,
+            "signalling NaN wins and is quieted"
+        );
         assert_eq!(f & IOC, IOC);
     }
 
@@ -1289,7 +1314,10 @@ mod tests {
         assert_eq!(r, 1.0);
         assert_eq!(f & IXC, IXC);
         let mut f2 = 0;
-        let mut s2 = Fpst { fpcr: 1 << 22, fpsr: &mut f2 }; // round to +inf
+        let mut s2 = Fpst {
+            fpcr: 1 << 22,
+            fpsr: &mut f2,
+        }; // round to +inf
         let r = add(&mut s2, 1.0f32, 1e-10);
         assert_eq!(r, 1.0f32.next_up());
     }
@@ -1299,8 +1327,14 @@ mod tests {
         let mut f = 0;
         let mut s = st(&mut f);
         assert_eq!(to_int(&mut s, 2.5f64, 32, false, 0, Round::Nearest), 2);
-        assert_eq!(to_int(&mut s, -2.5f64, 32, false, 0, Round::TiesAway), (-3i64 as u64) & 0xffff_ffff);
-        assert_eq!(to_int(&mut s, 1e20f64, 32, false, 0, Round::Zero), 0x7fff_ffff);
+        assert_eq!(
+            to_int(&mut s, -2.5f64, 32, false, 0, Round::TiesAway),
+            (-3i64 as u64) & 0xffff_ffff
+        );
+        assert_eq!(
+            to_int(&mut s, 1e20f64, 32, false, 0, Round::Zero),
+            0x7fff_ffff
+        );
         assert_eq!(to_int(&mut s, -1.0f64, 32, true, 0, Round::Zero), 0);
         let v: f32 = from_int(&mut s, u64::MAX, false, 0);
         assert_eq!(v, 18446744073709551616.0f32);

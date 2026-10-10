@@ -41,7 +41,7 @@ impl Rtc {
             0x0c => self.enabled = true,
             0x10 => self.irq_mask = v & 1 != 0,
             0x1c => self.raw_irq = false,
-            _ => {}
+            _ => {},
         }
         self.raw_irq && self.irq_mask
     }

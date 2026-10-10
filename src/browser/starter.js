@@ -24,6 +24,7 @@ import { MemoryFileStorage, ServerFileStorageWrapper } from "./filestorage.js";
 import { SyncBuffer, buffer_from_object } from "../buffer.js";
 import { FS } from "../../lib/filesystem.js";
 import { prepare_arm64_kernel } from "../arm/kernel.js";
+import { JIT_SLOT_BASE as ARM_JIT_SLOT_BASE, JIT_SLOTS as ARM_JIT_SLOTS } from "../arm/board.js";
 
 // For types only
 import { ArmCPU } from "../arm/cpu.js";
@@ -118,12 +119,16 @@ export function V86(options)
         "__indirect_function_table": wasm_table,
     };
 
-    // armless.wasm imports: MMIO forwarded to v86's devices, and clocks
+    // armless.wasm imports: MMIO forwarded to v86's devices, clocks, the JIT
+    const arm_table = arch === "arm64" ?
+        new WebAssembly.Table({ element: "anyfunc", initial: ARM_JIT_SLOT_BASE + ARM_JIT_SLOTS }) : null;
     const arm_shared_funcs = {
         "mmio_read": (addr, size) => arm_cpu.mmio_read(addr, size),
         "mmio_write": (addr, size, value) => arm_cpu.mmio_write(addr, size, value),
         "microtick": v86.microtick,
         "wall_clock_ms": () => Date.now(),
+        "jit_compile": (table_index, ptr, len) => arm_cpu.jit_compile(table_index, ptr, len),
+        "__indirect_function_table": arm_table,
     };
 
     let wasm_fn = options.wasm_fn;
@@ -199,7 +204,8 @@ export function V86(options)
                 exports["rust_init"]();
             }
 
-            const emulator = this.v86 = new v86(this.emulator_bus, { exports, wasm_table, arch });
+            const emulator = this.v86 = new v86(this.emulator_bus,
+                { exports, wasm_table: arch === "arm64" ? arm_table : wasm_table, arch });
             cpu = emulator.cpu;
             arm_cpu = emulator.arm_cpu;
 
@@ -250,6 +256,7 @@ V86.prototype.continue_init = async function(emulator, options)
 
     settings.acpi = options.acpi;
     settings.disable_jit = options.disable_jit;
+    settings.jit_threshold = options.jit_threshold;
     settings.load_devices = true;
     settings.memory_size = options.memory_size || 64 * 1024 * 1024;
     settings.vga_memory_size = options.vga_memory_size || 8 * 1024 * 1024;

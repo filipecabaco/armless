@@ -29,7 +29,8 @@ const MALLOC_ALIGN: usize = 16;
 /// Called by C code only.
 #[no_mangle]
 pub unsafe extern "C" fn v86_malloc(size: u32) -> u32 {
-    let layout = alloc::Layout::from_size_align(size as usize + MALLOC_ALIGN, MALLOC_ALIGN).unwrap();
+    let layout =
+        alloc::Layout::from_size_align(size as usize + MALLOC_ALIGN, MALLOC_ALIGN).unwrap();
     let addr = alloc::alloc(layout);
     *(addr as *mut u32) = size;
     addr as u32 + MALLOC_ALIGN as u32
@@ -44,7 +45,8 @@ pub unsafe extern "C" fn v86_free(addr: u32) {
     }
     let base = addr - MALLOC_ALIGN as u32;
     let size = *(base as *mut u32);
-    let layout = alloc::Layout::from_size_align(size as usize + MALLOC_ALIGN, MALLOC_ALIGN).unwrap();
+    let layout =
+        alloc::Layout::from_size_align(size as usize + MALLOC_ALIGN, MALLOC_ALIGN).unwrap();
     alloc::dealloc(base as *mut u8, layout)
 }
 
@@ -118,5 +120,8 @@ pub unsafe extern "C" fn zstd_read(ctx: *mut ZstdContext, length: u32) -> *mut u
 /// `ptr`/`length` must come from `zstd_read`.
 #[no_mangle]
 pub unsafe extern "C" fn zstd_read_free(ptr: *mut u8, length: u32) {
-    alloc::dealloc(ptr, alloc::Layout::from_size_align(length.max(1) as usize, 1).unwrap());
+    alloc::dealloc(
+        ptr,
+        alloc::Layout::from_size_align(length.max(1) as usize, 1).unwrap(),
+    );
 }

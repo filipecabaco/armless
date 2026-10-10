@@ -31,6 +31,9 @@ extern "C" {
     fn microtick() -> f64;
     /// Milliseconds since the Unix epoch (`Date.now()`).
     fn wall_clock_ms() -> f64;
+    /// Compile the JIT module at ptr/len into table slot `table_index`
+    /// (asynchronously; JS calls armless_jit_ready). Returns 0 if unsupported.
+    fn jit_compile(table_index: u32, ptr: u32, len: u32) -> u32;
 }
 
 // Native stand-ins so `cargo check --features wasm-api` type-checks this file.
@@ -47,6 +50,10 @@ unsafe fn microtick() -> f64 {
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn wall_clock_ms() -> f64 {
     0.0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn jit_compile(_table_index: u32, _ptr: u32, _len: u32) -> u32 {
+    0
 }
 
 const IRQ_WORDS: usize = crate::gic::NUM_IRQS / 32;
@@ -104,6 +111,16 @@ impl Host for JsHost {
 
     fn wall_clock_secs(&mut self) -> u64 {
         (unsafe { wall_clock_ms() } / 1000.0) as u64
+    }
+
+    fn jit_compile(&mut self, table_index: u32, wasm: &[u8]) -> bool {
+        unsafe {
+            jit_compile(
+                table_index,
+                wasm.as_ptr() as usize as u32,
+                wasm.len() as u32,
+            ) != 0
+        }
     }
 
     fn sync_irqs(&mut self, set_line: &mut dyn FnMut(u32, bool)) {
@@ -168,7 +185,10 @@ pub extern "C" fn armless_alloc(len: u32) -> u32 {
 /// `ptr`/`len` must come from `armless_alloc`.
 #[no_mangle]
 pub unsafe extern "C" fn armless_free(ptr: u32, len: u32) {
-    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr as *mut u8, len as usize)));
+    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+        ptr as *mut u8,
+        len as usize,
+    )));
 }
 
 unsafe fn slice<'a>(ptr: u32, len: u32) -> &'a [u8] {
@@ -202,6 +222,19 @@ pub unsafe extern "C" fn armless_boot_linux(
     }
 }
 
+/// Load a raw binary at `addr` and start there (bare-metal tests).
+/// Returns 0 on success.
+///
+/// # Safety
+/// `ptr` must reference `len` readable bytes in wasm memory.
+#[no_mangle]
+pub unsafe extern "C" fn armless_boot_raw(ptr: u32, len: u32, addr: u32) -> i32 {
+    match crate::boot_raw(cpu(), slice(ptr, len), addr as u64) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
 /// Run up to `budget` instructions. Returns:
 /// 0 = budget used, 1 = idle (see `armless_wake_ms`), 2 = power off,
 /// 3 = reset, 4 = halt instruction, 5 = other stop (see `armless_pc`).
@@ -212,7 +245,7 @@ pub extern "C" fn armless_run(budget: u32) -> i32 {
         Exit::Idle { wake_ns } => {
             unsafe { WAKE_MS = wake_ns.map_or(-1.0, |n| n as f64 / 1e6) };
             1
-        }
+        },
         Exit::Stop(StopReason::PowerOff) => 2,
         Exit::Stop(StopReason::Reset) => 3,
         Exit::Stop(StopReason::Halt(_)) => 4,
@@ -290,7 +323,7 @@ pub unsafe extern "C" fn armless_load_state(ptr: u32, len: u32) -> i32 {
             }
             IRQ_CHANGED.store(0, Ordering::Relaxed);
             0
-        }
+        },
         Err(_) => -1,
     }
 }
@@ -308,4 +341,82 @@ pub extern "C" fn armless_insn_count() -> f64 {
 #[no_mangle]
 pub extern "C" fn armless_reset() {
     cpu().reset();
+}
+
+// ------------------------------------------------------------------- JIT
+
+#[allow(static_mut_refs)]
+fn jit_cpu() -> &'static mut Cpu<JsHost> {
+    // Set by the run loop right before it calls a block (see jit::JIT_CPU).
+    unsafe { &mut *(crate::jit::JIT_CPU as *mut Cpu<JsHost>) }
+}
+
+/// Load helper for JIT blocks (fast-TLB miss path).
+#[no_mangle]
+pub extern "C" fn armless_jit_read(va: i64, size: i32) -> i64 {
+    jit_cpu().jit_helper_read(va as u64, size as u32) as i64
+}
+
+/// Store helper for JIT blocks (fast-TLB miss path).
+#[no_mangle]
+pub extern "C" fn armless_jit_write(va: i64, size: i32, value: i64) {
+    jit_cpu().jit_helper_write(va as u64, size as u32, value as u64)
+}
+
+/// Interpret one instruction on behalf of a JIT block.
+#[no_mangle]
+pub extern "C" fn armless_jit_interp(insn: i32, pc: i64) -> i32 {
+    jit_cpu().jit_helper_interp(insn as u32, pc as u64)
+}
+
+/// JS finished compiling the module for `table_index`.
+#[no_mangle]
+pub extern "C" fn armless_jit_ready(table_index: u32) {
+    cpu().jit.ready(table_index)
+}
+
+/// Turn the JIT on or off; `threshold` = executions before a block compiles.
+#[no_mangle]
+pub extern "C" fn armless_jit_config(enabled: u32, threshold: u32) {
+    let c = cpu();
+    c.jit.enabled = enabled != 0;
+    if threshold > 0 {
+        c.jit.threshold = threshold;
+    }
+    c.jit.flush_all();
+}
+
+/// Testing aid: return from armless_run after each JIT compile request, so a
+/// block is compiled before its first execution.
+#[no_mangle]
+pub extern "C" fn armless_jit_sync(on: u32) {
+    cpu().jit.sync_compile = on != 0;
+}
+
+/// Host code wrote guest RAM (DMA): drop translations of those pages.
+#[no_mangle]
+pub extern "C" fn armless_jit_dirty(addr: u32, len: u32) {
+    cpu().jit.invalidate_range(addr as u64, len as u64)
+}
+
+/// One byte per 4 KiB page of RAM, non-zero where translated code lives
+/// (lets JS skip armless_jit_dirty for pages without code).
+#[no_mangle]
+pub extern "C" fn armless_jit_code_pages() -> u32 {
+    cpu().jit.code_page.as_ptr() as u32
+}
+
+/// [blocks compiled, blocks invalidated, block executions]
+#[no_mangle]
+pub extern "C" fn armless_jit_stat(which: u32) -> f64 {
+    let j = &cpu().jit;
+    (match which {
+        0 => j.compiled,
+        1 => j.invalidated,
+        3 => j.flushes,
+        4 => j.page_invalidations,
+        5 => j.block_insns,
+        6 => j.helper_interps,
+        _ => j.block_runs,
+    }) as f64
 }

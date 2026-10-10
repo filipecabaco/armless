@@ -21,6 +21,7 @@ if [ "${BUILD_STD:-0}" = 1 ]; then
 fi
 cargo rustc --release --lib --target wasm32-unknown-unknown $extra -- \
     -C target-feature=+bulk-memory \
+    -C link-args="--import-table" \
     -C link-args="$root/build/armless-zstd.o"
 cp "$root/build/wasm32-unknown-unknown/release/armless.wasm" "$root/build/armless.wasm"
 ls -l "$root/build/armless.wasm"

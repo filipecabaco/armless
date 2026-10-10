@@ -61,11 +61,7 @@ pub fn decode_bit_masks(n: u32, imms: u32, immr: u32, sf: bool) -> Option<u64> {
     }
     let welem = ones(s + 1);
     let emask = ones(esize);
-    let rot = if r == 0 {
-        welem
-    } else {
-        ((welem >> r) | (welem << (esize - r))) & emask
-    };
+    let rot = if r == 0 { welem } else { ((welem >> r) | (welem << (esize - r))) & emask };
     let mut out = 0u64;
     let mut i = 0;
     while i < 64 {
@@ -86,7 +82,10 @@ mod tests {
         // orr w0, wzr, #0x55555555 -> N=0 immr=0 imms=0b111100
         assert_eq!(decode_bit_masks(0, 0b111100, 0, false), Some(0x5555_5555));
         // and x0, x0, #0xfffffffffffffff0 -> N=1 immr=60 imms=59
-        assert_eq!(decode_bit_masks(1, 59, 60, true), Some(0xffff_ffff_ffff_fff0));
+        assert_eq!(
+            decode_bit_masks(1, 59, 60, true),
+            Some(0xffff_ffff_ffff_fff0)
+        );
         // reserved: all ones
         assert_eq!(decode_bit_masks(1, 63, 0, true), None);
     }

@@ -4,6 +4,8 @@
 #   tests/difftest/run.sh [CLASSES] [COUNT] [SEED]      e.g. run.sh int 5000 7
 #
 # Needs: python3, aarch64-linux-gnu-gcc, qemu-aarch64, clang, ld.lld, llvm-objcopy.
+# DUT=jit runs armless.wasm under Node with every entry JIT-compiled (DUT=wasm:
+# wasm interpreter only); the default is the native armless-run.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 classes=${1:-int}
@@ -38,8 +40,15 @@ clang $CFLAGS -c harness.S -o "$out/harness.o"
 clang $CFLAGS -c "$out/cases.S" -o "$out/cases.o"
 ld.lld -T ../../guest/link.ld -o "$out/dut.elf" "$out/main_bare.o" "$out/report.o" "$out/harness.o" "$out/cases.o"
 llvm-objcopy -O binary "$out/dut.elf" "$out/dut.bin"
-(cd ../.. && cargo build --release -q --bin armless-run)
-../../../build/release/armless-run --raw "$out/dut.bin" -m 64 > "$out/dut.txt" || true
+if [ "${DUT:-native}" = jit ]; then
+    # armless.wasm in Node, every block JIT-compiled before it first runs
+    node ../../../tests/arm/run-bare.mjs "$out/dut.bin" -m 64 --jit-threshold 1 --jit-sync > "$out/dut.txt" || true
+elif [ "${DUT:-native}" = wasm ]; then
+    node ../../../tests/arm/run-bare.mjs "$out/dut.bin" -m 64 --no-jit > "$out/dut.txt" || true
+else
+    (cd ../.. && cargo build --release -q --bin armless-run)
+    ../../../build/release/armless-run --raw "$out/dut.bin" -m 64 > "$out/dut.txt" || true
+fi
 
 total=$(wc -l < "$out/ref.txt")
 undef=$(grep -c UNDEF "$out/ref.txt" || true)

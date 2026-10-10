@@ -102,9 +102,11 @@ shared.
   above (`tests/arm/alpine`), runs commands on the serial shell, and
   snapshots/restores it. `tests/arm/snowglobe.mjs` covers 9p with zstd blobs,
   the virtio console, a zstd `initial_state` restore and fetch networking.
-- **Speed.** armless is an interpreter today. It runs about 60 MIPS natively
-  and roughly half that in wasm. A boot-to-snapshot that takes seconds on x86
-  v86 takes longer, but sites start from the snapshot, so visitors only pay
-  for what the app does after that. A JIT is the planned next step.
+- **Speed.** armless.wasm has a JIT for hot code (on by default, like v86's).
+  Cold code such as boot runs in the interpreter, at about 40 MIPS in wasm.
+  Hot loops run several times faster. A boot-to-snapshot that takes seconds
+  on x86 v86 takes longer, but sites start from the snapshot, so visitors
+  only pay for what the app does after that. `disable_jit` and
+  `jit_threshold` work as V86 options.
 - **Snapshots.** The snapshot is only valid for the same `memory_size`, as on x86.
   armless refuses to restore an x86 snapshot and vice versa.
