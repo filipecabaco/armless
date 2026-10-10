@@ -1,0 +1,25 @@
+[package]
+name = "armless"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "AArch64 CPU core for the armless fork of v86"
+license = "BSD-2-Clause"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "armless-run"
+path = "src/bin/armless-run.rs"
+
+[profile.dev]
+opt-level = 2
+overflow-checks = true
+
+[profile.release]
+lto = true
+opt-level = 3
+panic = "abort"
+codegen-units = 1
