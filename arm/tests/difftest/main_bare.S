@@ -49,10 +49,20 @@ sync_handler:
     msr     tpidr_el1, x0
     mrs     x0, esr_el1
     lsr     x0, x0, #26
-    cbnz    x0, 1f                  // only "unknown" (EC 0) is expected
+    cmp     x0, #0x25               // data abort: FAULT
+    b.eq    2f
+    cbnz    x0, 1f                  // otherwise only "unknown" (EC 0) is expected
     adrp    x0, undef_flag
     add     x0, x0, :lo12:undef_flag
-    str     x0, [x0]                // any non-zero value
+    str     x0, [x0]                // any non-zero value other than 2
+    b       3f
+2:  adrp    x0, undef_flag
+    add     x0, x0, :lo12:undef_flag
+    msr     tpidr_el0, x1
+    mov     x1, #2
+    str     x1, [x0]
+    mrs     x1, tpidr_el0
+3:
     mrs     x0, elr_el1
     add     x0, x0, #4
     msr     elr_el1, x0

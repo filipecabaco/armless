@@ -32,12 +32,82 @@ INT = {
     "dp3": (0x1F000000, 0x1B000000, [0, 5, 16, 10], True, [(0x60000000, 0, 0.9)]),
 }
 
-CLASSES = {"int": INT}
+# Scalar floating point. General-register fields are limited (they may be
+# Wn/Xn in conversions); V-register fields are left random.
+FP = {
+    "dp1": (0xFF207C00, 0x1E204000, [], False, []),
+    "dp2": (0xFF200C00, 0x1E200800, [], False, []),
+    "dp3": (0xFF000000, 0x1F000000, [], False, []),
+    "cmp": (0xFF203C00, 0x1E202000, [], False, [(0xC007, 0, 0.9)]),
+    "ccmp": (0xFF200C00, 0x1E200400, [], False, []),
+    "csel": (0xFF200C00, 0x1E200C00, [], False, []),
+    "imm": (0xFF201C00, 0x1E201000, [], False, [(0x3E0, 0, 0.9)]),
+    "int": (0x7F20FC00, 0x1E200000, [0, 5], False, []),
+    "fixed": (0x7F200000, 0x1E000000, [0, 5], False, []),
+}
+
+# Advanced SIMD, vector forms
+SIMD = {
+    "same": (0x9F200400, 0x0E200400, [], False, []),
+    "diff": (0x9F200C00, 0x0E200000, [], False, []),
+    "misc": (0x9F3E0C00, 0x0E200800, [], False, []),
+    "across": (0x9F3E0C00, 0x0E300800, [], False, []),
+    "copy": (0x9FE08400, 0x0E000400, [0, 5], False, []),
+    "modimm": (0x9FF80400, 0x0F000400, [], False, [(0x800, 0, 0.9)]),
+    "shift": (0x9F800400, 0x0F000400, [], False, []),
+    "indexed": (0x9F000400, 0x0F000000, [], False, []),
+    "permute": (0xBF208C00, 0x0E000800, [], False, []),
+    "ext": (0xBF208400, 0x2E000000, [], False, []),
+    "tbl": (0xBF208C00, 0x0E000000, [], False, []),
+}
+
+# Advanced SIMD, scalar forms
+SIMDS = {
+    "same": (0xDF200400, 0x5E200400, [], False, []),
+    "diff": (0xDF200C00, 0x5E200000, [], False, []),
+    "misc": (0xDF3E0C00, 0x5E200800, [], False, []),
+    "pair": (0xDF3E0C00, 0x5E300800, [], False, []),
+    "copy": (0xDFE08400, 0x5E000400, [], False, []),
+    "shift": (0xDF800400, 0x5F000400, [], False, []),
+    "indexed": (0xDF000400, 0x5F000000, [], False, []),
+}
+
+# Loads and stores. The base register is always x28 (pointing into a scratch
+# buffer), register offsets use x27 (a small value), and transfer registers
+# are limited to x0..x26 so the base is never overwritten. Immediate offsets
+# are kept small so every access stays inside the buffer.
+SMALL_IMM12 = (0x003C0000, 0, 1.0)
+LDST = {
+    "v_uimm": (0x3F000000, 0x3D000000, [0], False, [SMALL_IMM12]),
+    "v_imm9": (0x3F200000, 0x3C000000, [], False, []),
+    "v_reg": (0x3F200C00, 0x3C200800, [], False, []),
+    "v_pair": (0x3E000000, 0x2C000000, [], False, []),
+    "v_multi": (0xBFBF0000, 0x0C000000, [], False, []),
+    "v_multi_post": (0xBFA00000, 0x0C800000, [], False, []),
+    "v_single": (0xBF9F0000, 0x0D000000, [], False, []),
+    "v_single_post": (0xBF800000, 0x0D800000, [], False, []),
+    "x_uimm": (0x3F000000, 0x39000000, [0], False, [SMALL_IMM12]),
+    "x_imm9": (0x3F200000, 0x38000000, [0], False, []),
+    "x_reg": (0x3F200C00, 0x38200800, [0], False, []),
+    "x_pair": (0x3E000000, 0x28000000, [0, 10], False, []),
+    "x_excl": (0x3F000000, 0x08000000, [0, 10, 16], False, [(0x00007C00, 0x00007C00, 0.5)]),
+}
+LDST_BASE = 5      # Rn field offset: forced to x28
+LDST_INDEX = 16    # Rm field offset for register-offset and post-index forms
+
+CLASSES = {"int": INT, "fp": FP, "simd": SIMD, "simds": SIMDS, "ldst": LDST}
 
 # Encodings QEMU's cortex-a53 implements but armless does not advertise.
 def excluded(enc):
     # CRC32/CRC32C: data-processing (2 source), opcode 010xxx
     if enc & 0x5FE00000 == 0x1AC00000 and (enc >> 13) & 7 == 0b010:
+        return True
+    # Crypto: AES, SHA1/SHA256 (2- and 3-register), PMULL with 64-bit elements
+    if enc & 0xFF3E0C00 == 0x4E280800:
+        return True
+    if enc & 0xFF208C00 == 0x5E000000 or enc & 0xFF3E0C00 == 0x5E280800:
+        return True
+    if enc & 0xBF20FC00 == 0x0E20E000 and (enc >> 22) & 3 == 3:
         return True
     return False
 
@@ -50,9 +120,15 @@ def gen_insn(rng, templates):
         for m, v, p in rules:
             if rng.random() < p:
                 enc = (enc & ~m) | v
+        limit = 27 if name.startswith("ldst:") else 29
         for off in regs:
-            r = 31 if (zr_ok and rng.random() < 0.08) else rng.randrange(29)
+            r = 31 if (zr_ok and rng.random() < 0.08) else rng.randrange(limit)
             enc = (enc & ~(31 << off)) | (r << off)
+        if name.startswith("ldst:"):
+            enc = (enc & ~(31 << LDST_BASE)) | (28 << LDST_BASE)
+            if name.endswith(("_reg", "_post")):
+                rm = 31 if (name.endswith("_post") and rng.random() < 0.5) else 27
+                enc = (enc & ~(31 << LDST_INDEX)) | (rm << LDST_INDEX)
         if not excluded(enc):
             return enc
 
@@ -96,11 +172,15 @@ def rand_q(rng):
     return rng.getrandbits(128)
 
 
-def state_block(rng):
+def state_block(rng, ldst=False):
     words = [rand_x(rng) for _ in range(29)]
+    if ldst:
+        words[27] = rng.randrange(0, 512) & ~7   # register offset
+        words[28] = 0                            # base: added to scratch+8192 at run time
     words.append(rng.getrandbits(4) << 28)  # nzcv
     words.append(0)  # fpsr
-    words.append(0)  # fpcr
+    # FPCR: mostly round-to-nearest, sometimes other rounding modes, FZ or DN
+    words.append(rng.choice([0, 0, 0, 0, 0x400000, 0x800000, 0xC00000, 0x1000000, 0x2000000, 0x3000000]))
     qs = [rand_q(rng) for _ in range(32)]
     for q in qs:
         words.append(q & ((1 << 64) - 1))
@@ -117,6 +197,7 @@ def main():
     args = ap.parse_args()
     rng = random.Random(args.seed)
     templates = {}
+    ldst = "ldst" in args.classes.split(",")
     for c in args.classes.split(","):
         for k, v in CLASSES[c].items():
             templates[c + ":" + k] = v
@@ -129,7 +210,13 @@ def main():
         enc = gen_insn(rng, templates)
         blk = i % args.blocks
         w("    adrp x29, init_%d\n    add x29, x29, :lo12:init_%d\n" % (blk, blk))
-        w("    bl load_state\n    .inst 0x%08x\n    bl save_state\n" % enc)
+        if ldst:
+            w("    bl reset_scratch\n")
+            w("    adrp x29, init_%d\n    add x29, x29, :lo12:init_%d\n" % (blk, blk))
+        w("    bl load_state\n")
+        if ldst:
+            w("    adrp x28, scratch\n    add x28, x28, :lo12:scratch\n    add x28, x28, #2, lsl #12\n")
+        w("    .inst 0x%08x\n    bl save_state\n" % enc)
         w("    ldr x0, =%d\n    ldr w1, =0x%08x\n    mov x2, sp\n    mov x3, x29\n    bl report\n" % (i, enc))
         if i % 64 == 63:
             w("    b 1f\n    .ltorg\n1:\n")
@@ -137,7 +224,7 @@ def main():
     w("    .data\n    .balign 16\n")
     for b in range(args.blocks):
         w("init_%d:\n" % b)
-        for word in state_block(rng):
+        for word in state_block(rng, ldst):
             w("    .quad 0x%016x\n" % word)
 
 

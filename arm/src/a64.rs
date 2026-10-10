@@ -72,13 +72,13 @@ impl<H: Host> Cpu<H> {
             0b1010 | 0b1011 => self.branch_sys(insn),
             0b0100 | 0b0110 | 0b1100 | 0b1110 => self.ldst(insn),
             0b0101 | 0b1101 => self.dp_reg(insn),
-            // Scalar FP and Advanced SIMD are not implemented yet.
+            0b0111 | 0b1111 => self.simd_fp(insn),
             _ => Err(Event::undefined()),
         }
     }
 
     #[inline(always)]
-    fn cond_holds(&self, cond: u32) -> bool {
+    pub(crate) fn cond_holds(&self, cond: u32) -> bool {
         let r = match cond >> 1 {
             0 => self.z,
             1 => self.c,
@@ -637,8 +637,7 @@ impl<H: Host> Cpu<H> {
 
     fn ldst(&mut self, insn: u32) -> Res<()> {
         if bit(insn, 26) {
-            // SIMD&FP loads/stores: the FP unit is not implemented yet.
-            return Err(Event::undefined());
+            return self.simd_ldst(insn);
         }
         if insn & 0x3f00_0000 == 0x0800_0000 {
             self.ldst_exclusive(insn)
@@ -682,7 +681,7 @@ impl<H: Host> Cpu<H> {
         let (size, signed) = match (opc, load) {
             (0, _) => (4u32, false),
             (2, _) => (8, false),
-            (1, true) => (4, true), // LDPSW
+            (1, true) if mode != 0 => (4, true), // LDPSW (there is no LDNPSW)
             _ => return Err(Event::undefined()),
         };
         let imm = sext(field(insn, 15, 7) as u64, 7) * size as i64;
@@ -763,7 +762,11 @@ impl<H: Host> Cpu<H> {
             }
             2 => {
                 if size_log == 3 {
-                    // PRFM
+                    // PRFM/PRFUM: only without writeback or unprivileged access
+                    if writeback.is_some() || unpriv {
+                        return Err(Event::undefined());
+                    }
+                    return Ok(());
                 } else {
                     let v = self.read(addr, bytes, unpriv)?;
                     self.wr(rt, sext(v, bytes * 8) as u64);
@@ -795,9 +798,13 @@ impl<H: Host> Cpu<H> {
         let rt = insn & 31;
         let bytes = 1u32 << size_log;
         let addr = self.xs(rn);
+        // LDAR/STLR: Rs and Rt2 must be all ones (UNDEFINED otherwise, as in QEMU).
+        if o2 && (rs != 31 || rt2 != 31) {
+            return Err(Event::undefined());
+        }
         if o2 {
-            if o1 {
-                // CAS family (LSE): not advertised.
+            if o1 || !bit(insn, 15) {
+                // CAS family (LSE) and LDLAR/STLLR (LORegions): not in ARMv8.0.
                 return Err(Event::undefined());
             }
             // LDAR/STLR (and LDLAR/STLLR): ordinary accesses on a single core.

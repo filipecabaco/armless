@@ -78,12 +78,12 @@ pub mod id {
     pub const MIDR: u64 = 0x410F_D034;
     /// Uniprocessor, affinity 0.
     pub const MPIDR: u64 = 0x8000_0000 | (1 << 30);
-    /// EL0/EL1 AArch64 only, no EL2/EL3. FP and AdvSIMD advertised as
-    /// "not implemented" (0xF) until the FP/SIMD unit lands; GIC system
-    /// register interface absent (memory-mapped GICv2 instead).
-    pub const AA64PFR0: u64 = 0x1 | (0x1 << 4) | (0xF << 16) | (0xF << 20);
+    /// EL0/EL1 AArch64 only, no EL2/EL3. FP and AdvSIMD implemented (0),
+    /// without half-precision arithmetic; GIC system register interface
+    /// absent (memory-mapped GICv2 instead).
+    pub const AA64PFR0: u64 = 0x1 | (0x1 << 4);
     /// PARange=32 bits, 8-bit ASIDs, 4K granule only (16K/64K unsupported).
-    pub const AA64MMFR0: u64 = 0x0 | (0xF << 24);
+    pub const AA64MMFR0: u64 = 0xF << 24;
     /// Debug architecture v8, no PMU.
     pub const AA64DFR0: u64 = 0x6;
     /// 64-byte lines (DminLine/IminLine/ERG/CWG = 16 words), PIPT I-cache,

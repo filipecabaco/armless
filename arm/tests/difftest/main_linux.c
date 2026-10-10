@@ -22,9 +22,8 @@ void out(const char *s, u64 n) { sys(64, 1, (long)s, (long)n, 0); }
 #define UC_PC_OFFSET 440
 
 static void on_sigill(int sig, void *info, void *uc) {
-    (void)sig;
     (void)info;
-    undef_flag = 1;
+    undef_flag = sig == 4 ? 1 : 2;
     *(u64 *)((char *)uc + UC_PC_OFFSET) += 4;
 }
 
@@ -42,6 +41,8 @@ void _start(void) {
     struct k_sigaction sa = {on_sigill, 4 /* SA_SIGINFO */ | 0x04000000 /* SA_RESTORER */ | 0x40000000 /* SA_NODEFER */,
                              sig_restorer, 0};
     sys(134, 4 /* SIGILL */, (long)&sa, 0, 8);
+    sys(134, 7 /* SIGBUS */, (long)&sa, 0, 8);
+    sys(134, 11 /* SIGSEGV */, (long)&sa, 0, 8);
     run_cases();
     sys(93, 0, 0, 0, 0);
 }

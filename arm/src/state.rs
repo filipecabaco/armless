@@ -64,6 +64,10 @@ impl<H: Host> Cpu<H> {
         for r in self.x {
             w.u64(r);
         }
+        for q in self.vreg {
+            w.u64(q as u64);
+            w.u64((q >> 64) as u64);
+        }
         w.u64(self.pc);
         w.u64(self.sp_el0);
         w.u64(self.sp_el1);
@@ -112,6 +116,11 @@ impl<H: Host> Cpu<H> {
         }
         for i in 0..31 {
             self.x[i] = r.u64()?;
+        }
+        for i in 0..32 {
+            let lo = r.u64()? as u128;
+            let hi = r.u64()? as u128;
+            self.vreg[i] = lo | hi << 64;
         }
         self.pc = r.u64()?;
         self.sp_el0 = r.u64()?;

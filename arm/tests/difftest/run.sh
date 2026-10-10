@@ -14,20 +14,26 @@ mkdir -p "$out"
 cd "$here"
 
 simd=""
-case "$classes" in *simd*|*fp*) simd="-DWITH_SIMD" ;; esac
+case "$classes" in *simd*|*fp*|*ldst*) simd="-DWITH_SIMD" ;; esac
+case "$classes" in *ldst*) simd="$simd -DLDST" ;; esac
 
 python3 gen.py --classes "$classes" --count "$count" --seed "$seed" > "$out/cases.S"
 
-# Reference: Linux user mode under QEMU (Cortex-A53 = plain ARMv8.0)
-aarch64-linux-gnu-gcc -static -nostdlib -ffreestanding -fno-stack-protector -mgeneral-regs-only -O1 \
-    $simd -o "$out/ref.elf" main_linux.c report.c harness.S "$out/cases.S"
+# Reference: Linux user mode under QEMU (Cortex-A53 = plain ARMv8.0).
+# C code avoids FP/SIMD registers; the assembly needs them for the harness.
+GCC=aarch64-linux-gnu-gcc
+GCFLAGS="-ffreestanding -fno-stack-protector -O1 $simd"
+$GCC $GCFLAGS -mgeneral-regs-only -c main_linux.c -o "$out/main_linux.o"
+$GCC $GCFLAGS -mgeneral-regs-only -c report.c -o "$out/report_ref.o"
+$GCC $GCFLAGS -c harness.S -o "$out/harness_ref.o"
+$GCC $GCFLAGS -c "$out/cases.S" -o "$out/cases_ref.o"
+$GCC -static -nostdlib -o "$out/ref.elf" "$out/main_linux.o" "$out/report_ref.o" "$out/harness_ref.o" "$out/cases_ref.o"
 qemu-aarch64 -cpu cortex-a53 "$out/ref.elf" > "$out/ref.txt"
 
 # armless: bare metal
-CFLAGS="--target=aarch64-none-elf -march=armv8-a -mgeneral-regs-only -ffreestanding -fno-builtin
-        -fno-stack-protector -fno-pic -O1 $simd"
+CFLAGS="--target=aarch64-none-elf -march=armv8-a -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -O1 $simd"
 clang $CFLAGS -c main_bare.S -o "$out/main_bare.o"
-clang $CFLAGS -c report.c -o "$out/report.o"
+clang $CFLAGS -mgeneral-regs-only -c report.c -o "$out/report.o"
 clang $CFLAGS -c harness.S -o "$out/harness.o"
 clang $CFLAGS -c "$out/cases.S" -o "$out/cases.o"
 ld.lld -T ../../guest/link.ld -o "$out/dut.elf" "$out/main_bare.o" "$out/report.o" "$out/harness.o" "$out/cases.o"

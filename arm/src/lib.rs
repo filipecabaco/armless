@@ -8,14 +8,18 @@
 //! See `docs/armless.md` at the repository root for the overall design.
 
 pub mod a64;
+pub mod advsimd;
 pub mod bits;
 pub mod board;
 pub mod cpu;
 pub mod devices;
 pub mod dtb;
+pub mod fp;
 pub mod gic;
 pub mod mmu;
 pub mod rtc;
+pub mod simd;
+pub mod simd_ls;
 pub mod state;
 pub mod sysreg;
 

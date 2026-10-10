@@ -133,6 +133,8 @@ pub struct Cpu<H: Host> {
     /// PSTATE.SPSel at EL1: true = SP_EL1, false = SP_EL0.
     pub spsel: bool,
     pub sys: SysRegs,
+    /// SIMD&FP registers V0..V31.
+    pub vreg: [u128; 32],
 
     /// Guest physical RAM, starting at physical address 0 (= v86's mem8).
     pub mem: Vec<u8>,
@@ -176,6 +178,7 @@ impl<H: Host> Cpu<H> {
             el: 1,
             spsel: true,
             sys: SysRegs::default(),
+            vreg: [0; 32],
             mem: vec![0; memory_size],
             gic: Gic::new(),
             rtc: Rtc::default(),
@@ -197,6 +200,7 @@ impl<H: Host> Cpu<H> {
     /// Architectural reset into EL1h with the MMU off.
     pub fn reset(&mut self) {
         self.x = [0; 31];
+        self.vreg = [0; 32];
         self.pc = board::RAM_BASE;
         self.sp_el0 = 0;
         self.sp_el1 = 0;
