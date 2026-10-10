@@ -1,0 +1,11 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+echo "== userspace =="
+/userspace
+echo "== busybox =="
+sh /tests.sh
+echo ARMLESS-USERSPACE-OK
+poweroff -f

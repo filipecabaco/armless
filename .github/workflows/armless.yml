@@ -44,7 +44,7 @@ jobs:
       - name: Toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu flex bison bc linux-source-6.8.0
+          sudo apt-get install -y gcc-aarch64-linux-gnu flex bison bc linux-source-6.8.0 qemu-user
       - name: Cache kernel
         id: kcache
         uses: actions/cache@v4
@@ -59,3 +59,29 @@ jobs:
           sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-source-6.8.0" build-linux
       - name: Boot Linux to userspace
         run: sh tests/linux/boot.sh build-linux
+      - name: Build busybox + glibc rootfs
+        run: |
+          git clone --depth 1 https://github.com/mirror/busybox "$RUNNER_TEMP/busybox"
+          sh tests/linux/build-rootfs.sh "$RUNNER_TEMP/busybox" build-linux
+      - name: Userspace matches qemu-aarch64
+        run: sh tests/linux/userspace.sh build-linux
+
+  difftest:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: arm
+    strategy:
+      matrix:
+        classes: [int, fp, simd, simds, ldst]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu qemu-user
+      - name: Differential test against qemu-aarch64
+        run: |
+          for seed in 1 2 3; do
+            sh tests/difftest/run.sh ${{ matrix.classes }} 10000 $seed
+          done

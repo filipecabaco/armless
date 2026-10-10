@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write a newc cpio archive (initramfs) from (path, mode, data) entries.
 
-usage: mkcpio.py OUT DEST=SRC [DEST=SRC ...]   (files are installed 0755)
+usage: mkcpio.py OUT DEST=SRC [DEST=SRC ...] [DIR/ ...]   (files are installed 0755)
 Directories in DEST paths are created automatically, plus /dev/console.
 """
 import os
@@ -27,6 +27,9 @@ def main():
     dirs = {"dev"}
     files = []
     for spec in specs:
+        if spec.endswith("/"):
+            dirs.add(spec.strip("/"))
+            continue
         dest, src = spec.split("=", 1)
         dest = dest.strip("/")
         parts = dest.split("/")[:-1]
