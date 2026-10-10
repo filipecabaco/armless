@@ -111,5 +111,15 @@ shared.
 - **Network speed.** `net_device: { type: "virtio", relay_url: "fetch", mtu: 65520 }`
   makes downloads about 1.5× faster than the default MTU of 1500 (the guest
   picks the MTU up from the virtio device). This works on x86 too.
+- **Several CPUs.** `cpu_count: 2` (or more) runs each vCPU in a Web
+  Worker, with `armless-smp.wasm` next to `armless.wasm`. This needs
+  `SharedArrayBuffer`, so the page must be cross-origin isolated. GitHub
+  Pages can't send the COOP/COEP headers itself; a service worker such as
+  [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) can add
+  them, using `COEP: credentialless` so the fetch relay can still reach other
+  origins. It pays off for parallel, CPU-bound apps (builds, several
+  processes); a single-threaded, I/O-heavy app is faster with one CPU. A
+  snapshot restores only with the `cpu_count` it was saved with.
+  `build-state.mjs` runs in Node, which supports this without any headers.
 - **Snapshots.** The snapshot is only valid for the same `memory_size`, as on x86.
   armless refuses to restore an x86 snapshot and vice versa.

@@ -23,6 +23,7 @@ const [kernel, initrd] = args;
 const emulator = new V86({
     arch: "arm64",
     disable_jit: process.env.ARMLESS_JIT === "0",
+    cpu_count: Number(process.env.ARMLESS_CPUS || 1),
     jit_threshold: Number(process.env.ARMLESS_JIT_THRESHOLD || 0),
     wasm_path: path.join(root, "build/armless.wasm"),
     memory_size: memory * 1024 * 1024,
@@ -52,6 +53,11 @@ emulator.add_listener("cpu-event-halt", () => {
         console.log(`[boot.mjs] ${(insns / 1e6).toFixed(0)}M instructions, ` +
             `${(insns / 1e6 / secs).toFixed(1)} MIPS; jit: ${e["armless_jit_stat"](0)} compiled, ` +
             `${e["armless_jit_stat"](1)} invalidated, ${e["armless_jit_stat"](2)} block runs, ${e["armless_jit_stat"](3)} flushes, ${e["armless_jit_stat"](4)} pages written; ${(e["armless_jit_stat"](5)/1e6).toFixed(1)}M insns in blocks, ${(e["armless_jit_stat"](6)/1e6).toFixed(1)}M via interp helper`);
+        if(e["armless_smp_stat"])
+        {
+            console.log(`[boot.mjs] smp: ${e["armless_smp_stat"](0)} broadcast TLBIs, ${e["armless_smp_stat"](1)} DSB waits, ` +
+                `${e["armless_smp_stat"](2)} IC page invalidations, ${e["armless_smp_stat"](3)} kicks (CPU 0 figures above)`);
+        }
     }
     emulator.destroy();
     const ok = !expect || out.includes(expect);

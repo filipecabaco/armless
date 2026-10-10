@@ -123,6 +123,15 @@ impl Host for JsHost {
         }
     }
 
+    fn yield_now(&mut self) {
+        // vCPU workers may block: sleep ~20 µs so the vCPU we wait for can run.
+        #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+        unsafe {
+            static NEVER: AtomicU32 = AtomicU32::new(0);
+            core::arch::wasm32::memory_atomic_wait32(NEVER.as_ptr() as *mut i32, 0, 20_000);
+        }
+    }
+
     fn sync_irqs(&mut self, set_line: &mut dyn FnMut(u32, bool)) {
         if IRQ_CHANGED.swap(0, Ordering::Relaxed) == 0 {
             return;
@@ -141,24 +150,113 @@ impl Host for JsHost {
     }
 }
 
-static mut CPU: Option<Cpu<JsHost>> = None;
+/// Every CPU of the machine. In the threaded build (`armless-smp.wasm`) the
+/// wasm memory, and so this list, is shared by all instances: one per vCPU
+/// worker plus one on the main thread for the devices.
+static mut CPUS: Vec<*mut Cpu<JsHost>> = Vec::new();
 static mut STATE: Vec<u8> = Vec::new();
+
+std::thread_local! {
+    /// The CPU this instance drives (`armless_smp_attach`); CPU 0 by default.
+    static CURRENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[allow(static_mut_refs)]
 fn cpu() -> &'static mut Cpu<JsHost> {
-    unsafe { CPU.as_mut().expect("armless_init not called") }
+    unsafe {
+        let p = *CPUS
+            .get(CURRENT.with(|c| c.get()))
+            .expect("armless_init not called");
+        &mut *p
+    }
 }
 
-/// Create the machine with `memory_size` bytes of RAM. Returns 0 on success.
+#[allow(static_mut_refs)]
+fn all_cpus() -> Vec<&'static mut Cpu<JsHost>> {
+    unsafe { CPUS.iter().map(|&p| &mut *p).collect() }
+}
+
+/// Create the machine with `memory_size` bytes of RAM and one CPU.
+/// Returns 0 on success.
 #[no_mangle]
 pub extern "C" fn armless_init(memory_size: u32) -> i32 {
-    if memory_size as u64 > board::RAM_MAX {
+    armless_init_smp(memory_size, 1)
+}
+
+/// Create the machine with `ncpus` CPUs (more than one needs armless-smp.wasm,
+/// with one worker per CPU calling `armless_smp_attach`). Returns 0 on success.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn armless_init_smp(memory_size: u32, ncpus: u32) -> i32 {
+    let n = ncpus as usize;
+    if memory_size as u64 > board::RAM_MAX || !(1..=crate::smp::MAX_CPUS).contains(&n) {
         return -1;
     }
+    if n > 1 && !cfg!(target_feature = "atomics") {
+        return -2; // the single-threaded build can't run several CPUs
+    }
+    let machine = std::sync::Arc::new(crate::smp::Machine::new(memory_size as usize, n));
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    {
+        let m = machine.clone();
+        machine.set_waker(Box::new(move |cpu| unsafe {
+            // Wake the worker waiting (Atomics.wait) on this CPU's counter.
+            core::arch::wasm32::memory_atomic_notify(
+                m.cpus[cpu].wake.as_ptr() as *mut i32,
+                u32::MAX,
+            );
+        }));
+    }
     unsafe {
-        CPU = Some(Cpu::new(memory_size as usize, JsHost::default()));
+        CPUS = (0..n)
+            .map(|i| {
+                Box::into_raw(Box::new(Cpu::new_smp(
+                    machine.clone(),
+                    i,
+                    JsHost::default(),
+                )))
+            })
+            .collect();
     }
     0
+}
+
+/// Make this instance (a vCPU worker) drive CPU `index`.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn armless_smp_attach(index: u32) -> i32 {
+    if (index as usize) < unsafe { CPUS.len() } {
+        CURRENT.with(|c| c.set(index as usize));
+        0
+    } else {
+        -1
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn armless_smp_ncpus() -> u32 {
+    unsafe { CPUS.len() as u32 }
+}
+
+/// Address of CPU `index`'s wake counter: a worker whose CPU is idle waits
+/// on it with Atomics.wait (read it before armless_run, wait while unchanged).
+#[no_mangle]
+pub extern "C" fn armless_smp_wake_addr(index: u32) -> u32 {
+    cpu().machine.cpus[index as usize].wake.as_ptr() as u32
+}
+
+/// How many host cores the vCPU workers can use (navigator.hardwareConcurrency):
+/// with fewer cores than CPUs, waiting CPUs yield instead of spinning.
+#[no_mangle]
+pub extern "C" fn armless_smp_host_cores(n: u32) {
+    cpu().machine.host_cores.store(n, Ordering::Relaxed);
+}
+
+/// Ask every CPU to stop (power off); workers' armless_run then returns 2.
+#[no_mangle]
+pub extern "C" fn armless_smp_stop() {
+    cpu().machine.request_stop(crate::smp::STOP_POWER_OFF);
 }
 
 /// Address of guest RAM inside wasm memory (v86: `mem8 = new Uint8Array(buffer, ptr, size)`).
@@ -179,6 +277,14 @@ pub extern "C" fn armless_alloc(len: u32) -> u32 {
     let p = v.as_mut_ptr();
     std::mem::forget(v);
     p as u32
+}
+
+/// Aligned allocation that is never freed (vCPU worker stacks and TLS blocks).
+#[no_mangle]
+pub extern "C" fn armless_alloc_aligned(len: u32, align: u32) -> u32 {
+    let layout =
+        std::alloc::Layout::from_size_align(len.max(1) as usize, align.max(1) as usize).unwrap();
+    unsafe { std::alloc::alloc_zeroed(layout) as u32 }
 }
 
 /// # Safety
@@ -270,6 +376,14 @@ pub extern "C" fn armless_set_irq(intid: u32, level: u32) {
     if w >= IRQ_WORDS || w == 0 {
         return;
     }
+    let m = &cpu().machine;
+    if m.ncpus > 1 {
+        // Devices run on the main thread, the CPUs in workers: update the
+        // shared GIC directly and wake the CPUs the interrupt targets.
+        let mask = m.gic.lock().set_line(0, intid, level != 0);
+        m.kick_mask(mask, usize::MAX);
+        return;
+    }
     if level != 0 {
         IRQ_LEVELS[w].fetch_or(1 << b, Ordering::Relaxed);
     } else {
@@ -288,7 +402,9 @@ pub extern "C" fn armless_pci_intx_intid(slot: u32, pin: u32) -> u32 {
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn armless_save_state() -> u32 {
-    let s = cpu().save_cpu_state();
+    // With several CPUs the workers must be paused (JS does that).
+    let mut cpus = all_cpus();
+    let s = Cpu::save_machine_state(&mut cpus);
     unsafe {
         STATE = s;
         STATE.len() as u32
@@ -307,9 +423,10 @@ pub extern "C" fn armless_state_ptr() -> u32 {
 /// `ptr` must reference `len` readable bytes in wasm memory.
 #[no_mangle]
 pub unsafe extern "C" fn armless_load_state(ptr: u32, len: u32) -> i32 {
-    let c = cpu();
-    match c.load_cpu_state(slice(ptr, len)) {
+    let mut cpus = all_cpus();
+    match Cpu::load_machine_state(&mut cpus, slice(ptr, len)) {
         Ok(()) => {
+            let c = cpu();
             // Re-base the JS-driven line bookkeeping on the restored GIC lines.
             let gic = c.machine.gic.lock();
             for w in 1..IRQ_WORDS {
@@ -346,10 +463,9 @@ pub extern "C" fn armless_reset() {
 
 // ------------------------------------------------------------------- JIT
 
-#[allow(static_mut_refs)]
 fn jit_cpu() -> &'static mut Cpu<JsHost> {
-    // Set by the run loop right before it calls a block (see jit::JIT_CPU).
-    unsafe { &mut *(crate::jit::JIT_CPU as *mut Cpu<JsHost>) }
+    // Blocks run on the instance's own CPU.
+    cpu()
 }
 
 /// Load helper for JIT blocks (fast-TLB miss path).
@@ -420,4 +536,14 @@ pub extern "C" fn armless_jit_stat(which: u32) -> f64 {
         6 => j.helper_interps,
         _ => j.block_runs,
     }) as f64
+}
+
+/// SMP statistics: 0 broadcast TLBIs, 1 DSB waits, 2 IC invalidations, 3 kicks.
+#[no_mangle]
+pub extern "C" fn armless_smp_stat(which: u32) -> f64 {
+    cpu()
+        .machine
+        .stats
+        .get(which as usize)
+        .map_or(0.0, |s| s.load(Ordering::Relaxed) as f64)
 }

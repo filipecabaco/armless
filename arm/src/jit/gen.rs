@@ -1116,9 +1116,12 @@ impl Gen<'_> {
             return true;
         }
         if insn & 0xffff_f01f == 0xd503_201f {
-            // Hints (NOP, YIELD, SEV, BTI, PAC* in the hint space) other than WFI/WFE
+            // Hints (NOP, YIELD, SEV, BTI, PAC* in the hint space) other than
+            // WFI/WFE, and with several CPUs other than SEV/SEVL
             let crm_op2 = field(insn, 5, 7);
-            return crm_op2 != 2 && crm_op2 != 3;
+            return crm_op2 != 2
+                && crm_op2 != 3
+                && !(self.l.smp != 0 && matches!(crm_op2, 1 | 4 | 5));
         }
         false
     }
@@ -1133,8 +1136,16 @@ impl Gen<'_> {
             && insn & 0xf00 != 0
         {
             // DSB/DMB (CRm != 0) and ISB. With several CPUs a DSB may have to
-            // wait for TLB shootdowns: interpreted.
-            return !(self.l.smp != 0 && field(insn, 5, 3) == 4);
+            // wait for TLB shootdowns (interpreted) and a DMB orders memory
+            // for the other threads (a fence).
+            if self.l.smp != 0 {
+                match field(insn, 5, 3) {
+                    4 => return false,
+                    5 => self.c.atomic_fence(),
+                    _ => {},
+                }
+            }
+            return true;
         }
         if insn & 0xffff_f0ff == 0xd503_30df {
             return true; // ISB (any CRm)
@@ -1232,14 +1243,21 @@ impl Gen<'_> {
         self.xs(rn);
         self.c.set(VA);
         if o2 {
-            // LDAR/STLR: ordinary accesses on one core
+            // LDAR/STLR: ordinary accesses on one core; with several, fenced
+            let smp = l.smp != 0;
             if load {
                 self.load(size);
                 self.c.set(T0);
+                if smp {
+                    self.c.atomic_fence();
+                }
                 self.wr(rt, |g| g.c.get(T0));
             } else {
                 self.xr(rt);
                 self.c.set(DATA);
+                if smp {
+                    self.c.atomic_fence();
+                }
                 self.store(size);
             }
             return true;
@@ -1793,7 +1811,7 @@ pub fn translate_page(
     g.c.ret();
     g.c.end(); // $top
     g.c.i32c(STATUS_DONE);
-    wasm::module(&imports(), LOCALS, &g.c)
+    wasm::module(&imports(), LOCALS, &g.c, layout.smp != 0)
 }
 
 fn translate_block(g: &mut Gen, insns: &[u32]) {

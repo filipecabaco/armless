@@ -7,6 +7,11 @@
 //!
 //! See `docs/armless.md` at the repository root for the overall design.
 
+#![cfg_attr(
+    all(target_arch = "wasm32", target_feature = "atomics"),
+    feature(stdarch_wasm_atomic_wait)
+)]
+
 pub mod a64;
 pub mod advsimd;
 pub mod bits;

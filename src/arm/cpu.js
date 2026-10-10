@@ -24,6 +24,7 @@ import { VirtioBalloon } from "../virtio_balloon.js";
 import { Virtio9p, Virtio9pHandler, Virtio9pProxy } from "../../lib/9p.js";
 
 import * as board from "./board.js";
+import * as smp from "./smp.js";
 
 // For types only
 import { CPU } from "../cpu.js";
@@ -33,7 +34,10 @@ import { CPU } from "../cpu.js";
 const RUN_BUDGET = 25000;
 const TIME_PER_FRAME = 1;
 
-const STATE_MARKER = "armless-arm64-v1";
+const STATE_MARKER = "armless-arm64-v2";
+
+// Per-vCPU worker stack (bytes)
+const SMP_STACK_SIZE = 1 << 20;
 
 /**
  * @constructor
@@ -50,7 +54,24 @@ export function ArmCPU(bus, wm, stop_idling, microtick)
     this.stop_idling = stop_idling;
     this.microtick = microtick;
 
-    this.wasm_memory = this.exports["memory"];
+    // Several CPUs: armless-smp.wasm, shared memory, one worker per CPU
+    this.cpu_count = wm.cpu_count || 1;
+    this.wasm_module = wm.module || null;
+    this.NodeWorker = wm.NodeWorker;
+    this.workers = [];
+    this.mailboxes = [];
+    this.smp_ctrl = null;
+    this.smp_started = false;
+    this.smp_resetting = false;
+    this.jit_settings = [1, 0];
+
+    this.wasm_memory = wm.memory || this.exports["memory"];
+    if(this.exports["__wasm_init_tls"])
+    {
+        // Threaded build: this instance needs its own thread-local storage.
+        const tls = this.exports["armless_alloc_aligned"](this.exports["__tls_size"].value, this.exports["__tls_align"].value);
+        this.exports["__wasm_init_tls"](tls);
+    }
     this.memory_size = new Uint32Array(1);
     /** @type {!Uint8Array} guest RAM, physical address 0 */
     this.mem8 = new Uint8Array(0);
@@ -75,7 +96,7 @@ export function ArmCPU(bus, wm, stop_idling, microtick)
     // JIT: generated block modules import the memory and these helpers
     this.wasm_table = wm.wasm_table;
     this.jit_imports = {
-        "m": this.exports["memory"],
+        "m": this.wasm_memory,
         "armless_jit_read": this.exports["armless_jit_read"],
         "armless_jit_write": this.exports["armless_jit_write"],
         "armless_jit_interp": this.exports["armless_jit_interp"],
@@ -112,6 +133,10 @@ ArmCPU.prototype.refresh_memory = function()
  */
 ArmCPU.prototype.jit_dirty = function(addr, length)
 {
+    // With several CPUs, other CPUs' JIT code follows the guest's IC
+    // instructions instead (the device DMA paths need none: Linux makes
+    // executable pages coherent itself).
+    if(this.cpu_count > 1) return;
     const pages = this.jit_code_pages;
     const last = addr + length - 1 >>> 12;
     for(let page = addr >>> 12; page <= last; page++)
@@ -395,15 +420,19 @@ ArmCPU.prototype.init = function(settings, device_bus)
     let size = settings.memory_size || 256 * 1024 * 1024;
     size = Math.ceil(size / 0x200000) * 0x200000; // whole 2 MiB blocks
     dbg_assert(size <= board.RAM_MAX, "armless: memory_size must be below " + h(board.RAM_MAX));
-    if(this.exports["armless_init"](size) !== 0)
+    const init = this.cpu_count > 1 ?
+        this.exports["armless_init_smp"](size, this.cpu_count) :
+        this.exports["armless_init"](size);
+    if(init !== 0)
     {
-        throw new Error("armless: cannot create a machine with " + size + " bytes of RAM");
+        throw new Error("armless: cannot create a machine with " + size + " bytes of RAM and " + this.cpu_count + " CPUs");
     }
     this.memory_size[0] = size;
     this.mem8 = new Uint8Array(0);
     this.refresh_memory();
     // JIT on unless disabled (disable_jit, as for the x86 machine)
-    this.exports["armless_jit_config"](settings.disable_jit ? 0 : 1, settings.jit_threshold || 0);
+    this.jit_settings = [settings.disable_jit ? 0 : 1, settings.jit_threshold || 0];
+    this.exports["armless_jit_config"](this.jit_settings[0], this.jit_settings[1]);
 
     this.io = new IO(cpu);
 
@@ -483,6 +512,7 @@ ArmCPU.prototype.load_kernel = function()
 
 ArmCPU.prototype.reboot_internal = function()
 {
+    const resume = this.smp_pause();
     for(const name of ["virtio_9p", "virtio_console", "virtio_net"])
     {
         if(this.devices[name]) this.devices[name].reset();
@@ -497,6 +527,7 @@ ArmCPU.prototype.reboot_internal = function()
     {
         this.exports["armless_reset"]();
     }
+    resume();
 };
 
 // -------------------------------------------------------------- main loop
@@ -508,6 +539,13 @@ ArmCPU.prototype.main_loop = function()
 {
     if(this.halted)
     {
+        return 100;
+    }
+    if(this.cpu_count > 1)
+    {
+        // The vCPUs run in workers; the main thread only serves devices.
+        if(!this.smp_started) this.smp_start();
+        this.smp_serve();
         return 100;
     }
     const start = this.microtick();
@@ -594,6 +632,19 @@ ArmCPU.prototype.unpack_memory = function(bitmap, packed_memory)
 
 ArmCPU.prototype.get_state = function()
 {
+    const resume = this.smp_pause();
+    try
+    {
+        return this.get_state_paused();
+    }
+    finally
+    {
+        resume();
+    }
+};
+
+ArmCPU.prototype.get_state_paused = function()
+{
     const state = [];
     state[0] = STATE_MARKER;
     state[1] = this.memory_size[0];
@@ -614,6 +665,7 @@ ArmCPU.prototype.get_state = function()
     state[9] = this.devices.virtio_9p;
     state[10] = this.devices.virtio_balloon;
     state[11] = Array.from(this.pci_irq_sources, ([intid, ids]) => [intid, Array.from(ids)]);
+    state[12] = this.cpu_count;
     return state;
 };
 
@@ -627,6 +679,11 @@ ArmCPU.prototype.set_state = function(state)
     {
         throw new Error("armless: state image needs memory_size " + state[1] + ", machine has " + this.memory_size[0]);
     }
+    if((state[12] || 1) !== this.cpu_count)
+    {
+        throw new Error("armless: state image needs cpu_count " + (state[12] || 1) + ", machine has " + this.cpu_count);
+    }
+    const resume = this.smp_pause();
 
     this.unpack_memory(new Bitmap(state[4].buffer), state[3]);
 
@@ -636,6 +693,7 @@ ArmCPU.prototype.set_state = function(state)
     this.exports["armless_free"](ptr, blob.length);
     if(ok !== 0)
     {
+        resume();
         throw new Error("armless: corrupt CPU state");
     }
 
@@ -648,6 +706,159 @@ ArmCPU.prototype.set_state = function(state)
 
     this.pci_irq_sources = new Map((state[11] || []).map(([intid, ids]) => [intid, new Set(ids)]));
     this.halted = false;
+    resume();
+};
+
+// ------------------------------------------------------------------- SMP
+
+/** Start one worker per vCPU (first main_loop call with cpu_count > 1). */
+ArmCPU.prototype.smp_start = function()
+{
+    this.smp_started = true;
+    const e = this.exports;
+    // With fewer host cores than vCPUs, waiting vCPUs yield instead of spinning.
+    e["armless_smp_host_cores"](typeof navigator !== "undefined" && navigator.hardwareConcurrency || 0);
+    this.smp_ctrl = new Int32Array(new SharedArrayBuffer(smp.CTRL_WORDS * 4));
+    for(let i = 0; i < this.cpu_count; i++)
+    {
+        const mbox = new Int32Array(new SharedArrayBuffer(smp.MBOX_WORDS * 4));
+        this.mailboxes.push(mbox);
+        const stack = e["armless_alloc_aligned"](SMP_STACK_SIZE, 16);
+        const tls = e["armless_alloc_aligned"](e["__tls_size"].value, e["__tls_align"].value);
+        const worker = smp.spawn_vcpu_worker(this.NodeWorker, msg => this.smp_message(i, msg));
+        this.workers.push(worker);
+        worker.post({
+            "module": this.wasm_module,
+            "memory": this.wasm_memory,
+            "index": i,
+            "stack_top": stack + SMP_STACK_SIZE,
+            "tls": tls,
+            "ctrl": this.smp_ctrl.buffer,
+            "mbox": mbox.buffer,
+            "time_origin": performance.timeOrigin,
+            "ecam_base": board.PCI_ECAM_BASE,
+            "ecam_size": board.PCI_ECAM_SIZE,
+            "table_size": board.JIT_SLOT_BASE + board.JIT_SLOTS,
+            "jit_enabled": this.jit_settings[0],
+            "jit_threshold": this.jit_settings[1],
+        });
+    }
+};
+
+/** Answer pending MMIO requests from the vCPU workers. */
+ArmCPU.prototype.smp_serve = function()
+{
+    for(const mbox of this.mailboxes)
+    {
+        Atomics.store(mbox, smp.MBOX_SIGNAL, 0);
+        // Posted writes first: they came before any pending read.
+        const head = Atomics.load(mbox, smp.MBOX_HEAD);
+        for(let tail = mbox[smp.MBOX_TAIL]; tail !== head; tail++)
+        {
+            const at = smp.MBOX_RING + 3 * (tail % smp.MBOX_RING_ENTRIES);
+            this.mmio_write(mbox[at] >>> 0, mbox[at + 1], mbox[at + 2]);
+            Atomics.store(mbox, smp.MBOX_TAIL, tail + 1);
+        }
+        if(Atomics.load(mbox, smp.MBOX_STATE) !== 1) continue;
+        const addr = mbox[smp.MBOX_ADDR] >>> 0;
+        const size = mbox[smp.MBOX_SIZE];
+        if(mbox[smp.MBOX_OP] === 0)
+        {
+            mbox[smp.MBOX_VALUE] = this.mmio_read(addr, size);
+        }
+        else
+        {
+            this.mmio_write(addr, size, mbox[smp.MBOX_VALUE]);
+        }
+        Atomics.store(mbox, smp.MBOX_STATE, 2);
+        Atomics.notify(mbox, smp.MBOX_STATE);
+    }
+};
+
+ArmCPU.prototype.smp_message = function(index, msg)
+{
+    const type = msg["t"];
+    if(type === "mmio")
+    {
+        this.smp_serve();
+    }
+    else if(type === "stop")
+    {
+        const result = msg["result"];
+        if(result === RUN_RESET)
+        {
+            if(!this.smp_resetting)
+            {
+                this.smp_resetting = true;
+                this.reboot_internal();
+                this.smp_resetting = false;
+            }
+        }
+        else if(!this.halted)
+        {
+            this.halted = true;
+            if(result !== RUN_POWER_OFF)
+            {
+                dbg_log("armless: CPU " + index + " stopped at pc=" + h(msg["pc"] >>> 0), LOG_CPU);
+            }
+            this.exports["armless_smp_stop"]();
+            this.bus.send("cpu-event-halt");
+        }
+    }
+    else if(type === "log" || type === "error")
+    {
+        dbg_log(msg["msg"], LOG_CPU);
+        if(type === "error") console.error(msg["msg"]);
+    }
+};
+
+/**
+ * Park every vCPU (no-op with one CPU or before they started). Returns the
+ * function that lets them run again.
+ * @return {function()}
+ */
+ArmCPU.prototype.smp_pause = function()
+{
+    const ctrl = this.smp_ctrl;
+    if(this.cpu_count === 1 || !ctrl || Atomics.load(ctrl, smp.CTRL_PAUSE))
+    {
+        return () => {};
+    }
+    Atomics.store(ctrl, smp.CTRL_PAUSE, 1);
+    // Wake idle vCPUs so they see the request.
+    const mem32 = new Int32Array(this.wasm_memory.buffer);
+    for(let i = 0; i < this.cpu_count; i++)
+    {
+        Atomics.notify(mem32, this.exports["armless_smp_wake_addr"](i) >>> 2);
+    }
+    const total = this.workers.length;
+    const deadline = performance.now() + 10000;
+    for(let i = 0; Atomics.load(ctrl, smp.CTRL_PARKED) + Atomics.load(ctrl, smp.CTRL_EXITED) < total; i++)
+    {
+        // A vCPU may be waiting for a device access before it can park.
+        this.smp_serve();
+        if((i & 0xFFF) === 0 && performance.now() > deadline)
+        {
+            dbg_log("armless: vCPUs did not pause", LOG_CPU);
+            break;
+        }
+    }
+    const paused = /** @type {!Int32Array} */ (ctrl);
+    return () => {
+        Atomics.store(paused, smp.CTRL_PAUSE, 0);
+        Atomics.notify(paused, smp.CTRL_PAUSE);
+    };
+};
+
+/** Stop and discard the vCPU workers. */
+ArmCPU.prototype.smp_destroy = function()
+{
+    if(!this.smp_ctrl) return;
+    Atomics.store(this.smp_ctrl, smp.CTRL_QUIT, 1);
+    Atomics.notify(this.smp_ctrl, smp.CTRL_PAUSE);
+    this.exports["armless_smp_stop"]();
+    for(const w of this.workers) w.terminate();
+    this.workers = [];
 };
 
 // Present for API compatibility with the x86 CPU (used by starter.js).

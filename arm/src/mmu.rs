@@ -1,6 +1,8 @@
 //! Stage-1 EL1&0 address translation: VMSAv8-64, 4 KiB granule, with a
-//! direct-mapped software TLB. Invalidation is coarse (any TLBI, or a write to
-//! SCTLR/TCR/TTBRx, flushes everything), which is simple and always correct.
+//! direct-mapped software TLB. TLBI by VA of a user page drops just that page
+//! when no user block mappings are cached; every other TLBI, and writes to
+//! SCTLR/TCR/TTBRx, flush everything. (Entries are not tagged with ASIDs, so
+//! invalidating more than asked is always correct.)
 
 use crate::board::Host;
 use crate::cpu::{ec, Cpu, Event, Res};
@@ -33,6 +35,9 @@ struct Entry {
 
 pub struct Tlb {
     entries: Vec<Entry>,
+    /// Cached entries for user (TTBR0) addresses that come from block
+    /// mappings: those cover many 4 KiB slots, so per-page TLBI can't be used.
+    user_blocks: u32,
 }
 
 impl Default for Tlb {
@@ -53,6 +58,7 @@ impl Tlb {
                 };
                 TLB_SIZE
             ],
+            user_blocks: 0,
         }
     }
 
@@ -60,8 +66,12 @@ impl Tlb {
         for e in self.entries.iter_mut() {
             e.tag = u64::MAX;
         }
+        self.user_blocks = 0;
     }
 }
+
+/// Page number ignoring the top byte (TBI) part of a TLB tag.
+const PAGE_MASK: u64 = 0x000f_ffff_ffff_ffff;
 
 /// Outcome of a table walk.
 pub struct Walk {
@@ -118,6 +128,9 @@ impl<H: Host> Cpu<H> {
         }
         match self.walk(va, acc) {
             Ok(w) => {
+                if w.level < 3 && va & (1 << 55) == 0 {
+                    self.tlb.user_blocks += 1;
+                }
                 self.tlb.entries[idx] = Entry {
                     tag: key,
                     pa_page: w.pa >> 12,
@@ -295,6 +308,34 @@ impl<H: Host> Cpu<H> {
         self.tlb.flush();
         self.fast[0].flush();
         self.fast[1].flush();
+    }
+
+    /// TLBI by VA: `page` is the canonical VA >> 12. Drops the translations
+    /// of that page only when that is enough, else everything.
+    pub fn tlb_flush_page(&mut self, page: u64) {
+        let user = page & (1 << 43) == 0;
+        if !user || self.tlb.user_blocks != 0 {
+            self.tlb_flush();
+            return;
+        }
+        let idx = page as usize & (TLB_SIZE - 1);
+        let e = &mut self.tlb.entries[idx];
+        if e.tag != u64::MAX && e.tag & PAGE_MASK == page & PAGE_MASK {
+            e.tag = u64::MAX;
+        }
+        for f in self.fast.iter_mut() {
+            f.forget_page(page & PAGE_MASK, PAGE_MASK);
+        }
+    }
+
+    /// The canonical VA page named by a TLBI operand (VA[55:12] in bits 43:0).
+    pub fn tlbi_operand_page(op: u64) -> u64 {
+        let page = op & 0x0fff_ffff_ffff;
+        if page & (1 << 43) != 0 {
+            page | 0xfff0_0000_0000_0000
+        } else {
+            page
+        }
     }
 
     /// AT S1E{0,1}{R,W}: translate and report through PAR_EL1.

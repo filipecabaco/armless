@@ -116,6 +116,10 @@ impl Code {
     pub fn drop_(&mut self) {
         self.b.push(0x1a);
     }
+    /// atomic.fence (threads proposal)
+    pub fn atomic_fence(&mut self) {
+        self.b.extend_from_slice(&[0xfe, 0x03, 0x00]);
+    }
     pub fn select(&mut self) {
         self.b.push(0x1b);
     }
@@ -341,8 +345,9 @@ impl Code {
 
 /// Assemble a module: `imports` are functions 0..n, the body is function n,
 /// exported as "f" with signature (i64) -> i32. Locals beyond the parameter
-/// are given as (count, type) runs.
-pub fn module(imports: &[Import], locals: &[(u32, u8)], code: &Code) -> Vec<u8> {
+/// are given as (count, type) runs. `shared`: the imported memory is the
+/// threaded build's shared memory (max 4 GiB).
+pub fn module(imports: &[Import], locals: &[(u32, u8)], code: &Code, shared: bool) -> Vec<u8> {
     let mut types: Vec<FuncType> = Vec::new();
     let mut type_of = |t: &FuncType| -> u32 {
         if let Some(i) = types.iter().position(|x| x == t) {
@@ -376,8 +381,14 @@ pub fn module(imports: &[Import], locals: &[(u32, u8)], code: &Code) -> Vec<u8> 
     name(&mut s, "e");
     name(&mut s, "m");
     s.push(0x02); // memory
-    s.push(0x00); // limits: min only
-    leb_u(&mut s, 1);
+    if shared {
+        s.push(0x03); // limits: min and max, shared
+        leb_u(&mut s, 1);
+        leb_u(&mut s, 65536);
+    } else {
+        s.push(0x00); // limits: min only
+        leb_u(&mut s, 1);
+    }
     for (imp, &t) in imports.iter().zip(&import_types) {
         name(&mut s, "e");
         name(&mut s, imp.name);
@@ -435,7 +446,7 @@ mod tests {
     fn minimal_module_is_well_formed() {
         let mut c = Code::new();
         c.i32c(7);
-        let m = module(&[], &[], &c);
+        let m = module(&[], &[], &c, false);
         assert_eq!(&m[0..4], b"\0asm");
     }
 }

@@ -252,7 +252,8 @@ export function restore_state(cpu, state)
         cpu.zstd_read_free(ptr, 16);
 
         ptr = cpu.zstd_read(ctx, info_block_len);
-        const info_block_buffer = new Uint8Array(cpu.wasm_memory.buffer, ptr >>> 0, info_block_len);
+        // copied: TextDecoder rejects views of shared memory
+        const info_block_buffer = new Uint8Array(cpu.wasm_memory.buffer, ptr >>> 0, info_block_len).slice();
         const info_block_obj = read_info_block(info_block_buffer);
         cpu.zstd_read_free(ptr, info_block_len);
 
@@ -293,7 +294,8 @@ export function restore_state(cpu, state)
             {
                 const ptr = cpu.zstd_read(ctx, front_padding + buffer_info.length);
                 const offset = (ptr >>> 0) + front_padding;
-                buffers.push(cpu.wasm_memory.buffer.slice(offset, offset + buffer_info.length));
+                // A copy, not a slice: the arm64 multi-CPU build's memory is shared.
+                buffers.push(new Uint8Array(cpu.wasm_memory.buffer, offset, buffer_info.length).slice().buffer);
                 cpu.zstd_read_free(ptr, front_padding + buffer_info.length);
             }
 

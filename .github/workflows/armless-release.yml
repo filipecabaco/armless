@@ -3,6 +3,7 @@ name: armless release
 # Builds everything a site needs to run either machine:
 #   libv86.js / libv86.mjs   the JS runtime (with arch: "arm64" support)
 #   armless.wasm             the AArch64 core
+#   armless-smp.wasm         its threaded build, for cpu_count > 1
 #   v86.wasm, v86-fallback.wasm, seabios/vgabios   the unchanged x86 machine
 # and publishes them as a GitHub release (a tarball laid out like the `v86`
 # npm package's build/ directory, plus the individual files).
@@ -26,6 +27,7 @@ jobs:
       - name: Toolchain
         run: |
           rustup target add wasm32-unknown-unknown
+          rustup component add rust-src
           sudo apt-get update -y
           sudo apt-get install -y clang lld nasm
       - name: Build
@@ -36,7 +38,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist/v86-armless/build dist/v86-armless/bios
-          cp build/libv86.js build/libv86.mjs build/v86.wasm build/v86-fallback.wasm build/armless.wasm dist/v86-armless/build/
+          cp build/libv86.js build/libv86.mjs build/v86.wasm build/v86-fallback.wasm build/armless.wasm build/armless-smp.wasm dist/v86-armless/build/
           cp bios/seabios.bin bios/vgabios.bin dist/v86-armless/bios/
           cp LICENSE package.json v86.d.ts docs/armless.md dist/v86-armless/
           tar -C dist -czf dist/v86-armless.tar.gz v86-armless
@@ -55,4 +57,4 @@ jobs:
             $( [ "$tag" = "armless-snapshot" ] && echo --prerelease ) \
             dist/v86-armless.tar.gz \
             dist/v86-armless/build/libv86.js dist/v86-armless/build/libv86.mjs \
-            dist/v86-armless/build/armless.wasm dist/v86-armless/build/v86.wasm
+            dist/v86-armless/build/armless.wasm dist/v86-armless/build/armless-smp.wasm dist/v86-armless/build/v86.wasm

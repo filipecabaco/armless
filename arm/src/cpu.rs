@@ -164,6 +164,12 @@ pub struct Cpu<H: Host> {
     pub(crate) excl_value2: u64,
     /// TLB generation that a DSB must wait for every CPU to apply (0: none).
     pub(crate) tlb_sync_gen: u64,
+    /// Instruction-cache invalidations (Machine::code_inval) applied so far.
+    pub(crate) code_seen: u64,
+    /// Size of the last load-exclusive (what WFE watches), and the WFE event
+    /// register (set by SEVL/SEV).
+    pub(crate) excl_size: u32,
+    pub(crate) event_register: bool,
     /// The PC is a block entry (target of a taken branch, exception or
     /// return, or the instruction after a JIT block): only there does the
     /// JIT look for or count blocks.
@@ -224,6 +230,25 @@ impl FastTlb {
         self.write_tag.fill(u64::MAX);
         self.code_page = u64::MAX;
         self.code_tag.fill(u64::MAX);
+    }
+
+    /// Remove entries for the virtual page `page` (compared under `mask`).
+    pub(crate) fn forget_page(&mut self, page: u64, mask: u64) {
+        let i = page as usize & (FAST_ENTRIES - 1);
+        // The slot is chosen by the low page bits, which `mask` keeps.
+        if self.read_tag[i] & mask == page {
+            self.read_tag[i] = u64::MAX;
+        }
+        if self.write_tag[i] & mask == page {
+            self.write_tag[i] = u64::MAX;
+        }
+        if self.code_page & mask == page {
+            self.code_page = u64::MAX;
+        }
+        let c = page as usize & (CODE_ENTRIES - 1);
+        if self.code_tag[c] & mask == page {
+            self.code_tag[c] = u64::MAX;
+        }
     }
 
     /// Remove write entries mapping to the physical page at `base`.
@@ -311,6 +336,9 @@ impl<H: Host> Cpu<H> {
             excl_value: 0,
             excl_value2: 0,
             tlb_sync_gen: 0,
+            code_seen: 0,
+            excl_size: 8,
+            event_register: false,
             jit_entry: true,
             jit_limit: 0,
             next_pc: 0,
@@ -762,7 +790,31 @@ impl<H: Host> Cpu<H> {
             },
         }
         self.apply_tlb_shootdowns();
+        self.apply_code_invalidations();
         None
+    }
+
+    /// Drop JIT code that another CPU's IC instructions invalidated.
+    pub(crate) fn apply_code_invalidations(&mut self) {
+        if self.machine.ncpus == 1 {
+            return;
+        }
+        let m = self.machine.clone();
+        let c = m.code_inval.lock();
+        if c.gen == self.code_seen {
+            return;
+        }
+        if c.gen - self.code_seen > smp::CODE_RING as u64 {
+            self.jit.flush_all();
+        } else {
+            for n in self.code_seen..c.gen {
+                match c.ring[n as usize % smp::CODE_RING] {
+                    smp::CODE_ALL => self.jit.flush_all(),
+                    page => self.jit.invalidate_page(page as usize),
+                }
+            }
+        }
+        self.code_seen = c.gen;
     }
 
     /// Flush the TLB if another CPU broadcast an invalidation since we last did.
@@ -770,30 +822,67 @@ impl<H: Host> Cpu<H> {
         if self.machine.ncpus == 1 {
             return;
         }
-        let gen = self.machine.tlb_gen.load(Ordering::SeqCst);
-        let me = &self.machine.cpus[self.index];
-        if me.tlb_seen.load(Ordering::Relaxed) != gen {
-            self.tlb_flush();
-            self.machine.cpus[self.index]
-                .tlb_seen
-                .store(gen, Ordering::SeqCst);
+        let m = self.machine.clone();
+        let seen = m.cpus[self.index].tlb_seen.load(Ordering::Relaxed);
+        if m.tlb_gen.load(Ordering::SeqCst) == seen {
+            return;
         }
+        let ring = m.tlb_ring.lock();
+        let gen = m.tlb_gen.load(Ordering::SeqCst);
+        if gen - seen > smp::TLB_RING as u64 {
+            self.tlb_flush();
+        } else {
+            for n in seen..gen {
+                match ring[n as usize % smp::TLB_RING] {
+                    smp::TLB_ALL => {
+                        self.tlb_flush();
+                        break;
+                    },
+                    page => self.tlb_flush_page(page),
+                }
+            }
+        }
+        drop(ring);
+        m.cpus[self.index].tlb_seen.store(gen, Ordering::SeqCst);
     }
 
     /// A TLBI ... IS: invalidate here and on every other CPU. The other CPUs
     /// flush at their next instruction boundary; a later DSB waits for that.
-    pub(crate) fn tlbi_broadcast(&mut self) {
-        self.tlb_flush();
+    /// `page`: the VA page (TLBI by VA), or TLB_ALL.
+    pub(crate) fn tlbi_broadcast(&mut self, page: u64) {
+        if page == smp::TLB_ALL {
+            self.tlb_flush();
+        } else {
+            self.tlb_flush_page(page);
+        }
         if self.machine.ncpus == 1 {
             return;
         }
-        let gen = self.machine.tlb_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        self.machine.cpus[self.index]
-            .tlb_seen
-            .store(gen, Ordering::SeqCst);
+        let m = self.machine.clone();
+        m.stats[0].fetch_add(1, Ordering::Relaxed);
+        let gen = {
+            let mut ring = m.tlb_ring.lock();
+            let n = m.tlb_gen.load(Ordering::SeqCst);
+            // Apply what other CPUs broadcast since we last looked, under the
+            // lock, so recording ours as seen skips nothing.
+            let seen = m.cpus[self.index].tlb_seen.load(Ordering::Relaxed);
+            if n - seen > smp::TLB_RING as u64 {
+                self.tlb_flush();
+            } else {
+                for k in seen..n {
+                    match ring[k as usize % smp::TLB_RING] {
+                        smp::TLB_ALL => self.tlb_flush(),
+                        p => self.tlb_flush_page(p),
+                    }
+                }
+            }
+            ring[n as usize % smp::TLB_RING] = page;
+            m.tlb_gen.store(n + 1, Ordering::SeqCst);
+            n + 1
+        };
+        m.cpus[self.index].tlb_seen.store(gen, Ordering::SeqCst);
         self.tlb_sync_gen = gen;
-        let all = self.machine.all_cpus_mask();
-        self.machine.kick_mask(all, self.index);
+        self.machine.poke_others(self.index);
     }
 
     /// DSB after a broadcast TLBI: wait until every other running CPU applied it.
@@ -818,8 +907,11 @@ impl<H: Host> Cpu<H> {
                 return;
             }
             // The CPUs we wait for may not have a host core right now.
+            if spins == 0 {
+                m.stats[1].fetch_add(1, Ordering::Relaxed);
+            }
             spins += 1;
-            if spins < 64 {
+            if spins < if m.oversubscribed() { 64 } else { 100_000 } {
                 std::hint::spin_loop();
             } else {
                 self.host.yield_now();
@@ -1033,6 +1125,43 @@ impl<H: Host> Cpu<H> {
             4 => m[a..a + 4].copy_from_slice(&(value as u32).to_le_bytes()),
             _ => m[a..a + 8].copy_from_slice(&value.to_le_bytes()),
         }
+    }
+
+    /// WFE with several CPUs: wait until something may have changed what the
+    /// guest waits for (the location it load-exclusived was written, an
+    /// interrupt or other request, SEV), polling briefly. Returning early is
+    /// always allowed; the guest re-checks and waits again.
+    pub(crate) fn wfe(&mut self) {
+        if std::mem::take(&mut self.event_register) {
+            return;
+        }
+        let m = self.machine.clone();
+        let sev = m.sev.load(Ordering::Relaxed);
+        let watch = self
+            .excl()
+            .filter(|&pa| pa + self.excl_size as u64 <= self.mem.len() as u64);
+        let oversubscribed = m.oversubscribed();
+        let spins = if oversubscribed { 32 } else { 4000 };
+        for _ in 0..spins {
+            if self.attn().load(Ordering::Relaxed) != 0 || m.sev.load(Ordering::Relaxed) != sev {
+                return;
+            }
+            if let Some(pa) = watch {
+                if self.ram_load(pa as usize, self.excl_size) != self.excl_value {
+                    return;
+                }
+            }
+            std::hint::spin_loop();
+        }
+        if oversubscribed {
+            self.host.yield_now();
+        }
+    }
+
+    /// SEV: set the event register on every CPU.
+    pub(crate) fn sev(&mut self) {
+        self.event_register = true;
+        self.machine.sev.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Atomic compare-and-swap of guest RAM at an aligned physical address

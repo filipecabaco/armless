@@ -154,7 +154,7 @@ static void *compute_worker(void *arg)
 {
     long id = (long)arg;
     uint64_t x = id + 1;
-    for(int i = 0; i < 3000000; i++)
+    for(int i = 0; i < 30000000; i++)
         x = x * 6364136223846793005ULL + 1442695040888963407ULL;
     sink[id] = x;
     return NULL;

@@ -84,7 +84,7 @@ CORE_FILES=cjs.js const.js io.js main.js lib.js buffer.js ide.js pci.js floppy.j
 	   state.js ne2k.js sb16.js virtio.js virtio_console.js virtio_net.js virtio_balloon.js \
 	   bus.js log.js cpu.js \
 	   elf.js kernel.js \
-	   arm/cpu.js arm/board.js arm/kernel.js
+	   arm/cpu.js arm/board.js arm/kernel.js arm/smp.js
 LIB_FILES=9p.js filesystem.js marshall.js
 BROWSER_FILES=screen.js keyboard.js mouse.js speaker.js serial.js \
 	      network.js starter.js worker_bus.js dummy_screen.js ansi_screen.js \
@@ -240,11 +240,18 @@ with-profiler: $(RUST_FILES) build/softfloat.o build/zstddeclib.o Cargo.toml
 watch:
 	cargo watch -x 'rustc $(CARGO_FLAGS)' -s 'cp build/wasm32-unknown-unknown/debug/v86.wasm build/v86-debug.wasm'
 
-# armless: the AArch64 machine (see docs/armless.md)
-armless: build/armless.wasm
+# armless: the AArch64 machine (see docs/armless.md). armless-smp.wasm is the
+# threaded build for cpu_count > 1; it builds std from source, so it needs the
+# rust-src component (rustup component add rust-src).
+ARMLESS_SRC=$(wildcard arm/src/*.rs arm/src/jit/*.rs) arm/Cargo.toml arm/build-wasm.sh lib/zstd/zstddeclib.c
 
-build/armless.wasm: $(wildcard arm/src/*.rs) arm/Cargo.toml arm/build-wasm.sh lib/zstd/zstddeclib.c
+armless: build/armless.wasm build/armless-smp.wasm
+
+build/armless.wasm: $(ARMLESS_SRC)
 	sh arm/build-wasm.sh
+
+build/armless-smp.wasm: $(ARMLESS_SRC)
+	SMP=1 sh arm/build-wasm.sh
 
 build/softfloat.o: lib/softfloat/softfloat.c
 	mkdir -p build

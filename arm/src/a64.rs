@@ -381,11 +381,25 @@ impl<H: Host> Cpu<H> {
                 match crn {
                     2 => {
                         // Hints: NOP, YIELD, WFE, WFI, SEV(L), BTI, PAC*, ...
-                        if crm == 0 && op2 == 2 && self.machine.ncpus > 1 {
-                            // WFE: the guest is spinning on a lock or flag that
-                            // another CPU will change; let that CPU's thread run.
-                            self.host.yield_now();
-                            return Ok(());
+                        if crm == 0 && self.machine.ncpus > 1 {
+                            match op2 {
+                                1 | 2 => {
+                                    // WFE: waiting for another CPU (a lock, a
+                                    // flag). YIELD (cpu_relax in spin loops)
+                                    // too: let the CPU we wait for run.
+                                    self.wfe();
+                                    return Ok(());
+                                },
+                                4 => {
+                                    self.sev();
+                                    return Ok(());
+                                },
+                                5 => {
+                                    self.event_register = true; // SEVL
+                                    return Ok(());
+                                },
+                                _ => {},
+                            }
                         }
                         if crm == 0 && op2 == 3 {
                             if self.el == 0 && self.sys.sctlr & (1 << 16) == 0 {
@@ -406,6 +420,10 @@ impl<H: Host> Cpu<H> {
                             2 => self.set_excl(None),
                             4 => self.tlb_sync(), // DSB completes broadcast TLBIs
                             _ => {},
+                        }
+                        if self.machine.ncpus > 1 && matches!(op2, 4 | 5) {
+                            // Order this CPU's memory accesses for the other threads.
+                            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                         }
                         Ok(())
                     },
@@ -475,11 +493,18 @@ impl<H: Host> Cpu<H> {
         }
         match crn {
             8 => {
-                // TLBI: the inner-shareable forms (CRm = 3) reach every CPU.
+                // TLBI: by VA (VAE1, VAAE1, VALE1, VAALE1) drops one page; the
+                // inner-shareable forms (CRm = 3) reach every CPU.
+                let page = match key & 7 {
+                    1 | 3 | 5 | 7 => Self::tlbi_operand_page(self.xr(rt)),
+                    _ => crate::smp::TLB_ALL,
+                };
                 if (key >> 3) & 0xf == 3 {
-                    self.tlbi_broadcast();
-                } else {
+                    self.tlbi_broadcast(page);
+                } else if page == crate::smp::TLB_ALL {
                     self.tlb_flush();
+                } else {
+                    self.tlb_flush_page(page);
                 }
             },
             7 => match key {
@@ -487,7 +512,20 @@ impl<H: Host> Cpu<H> {
                 sr::AT_S1E1W => self.address_translate(self.xr(rt), true, false),
                 sr::AT_S1E0R => self.address_translate(self.xr(rt), false, true),
                 sr::AT_S1E0W => self.address_translate(self.xr(rt), true, true),
-                _ => {}, // IC/DC maintenance: caches are coherent
+                // With several CPUs, other CPUs' JIT code must follow
+                // instruction-cache invalidations (CTR_EL0.DIC is 0 then).
+                sr::IC_IVAU if self.machine.ncpus > 1 => {
+                    if let Ok(pa) = self.translate(self.xr(rt), crate::mmu::Access::Read, false) {
+                        let page = (pa >> 12) as u32;
+                        self.jit.invalidate_page(page as usize);
+                        self.machine.invalidate_code(page, self.index);
+                    }
+                },
+                sr::IC_IALLU | sr::IC_IALLUIS if self.machine.ncpus > 1 => {
+                    self.jit.flush_all();
+                    self.machine.invalidate_code(smp_code_all(), self.index);
+                },
+                _ => {}, // other IC/DC maintenance: caches are coherent
             },
             _ => {},
         }
@@ -511,7 +549,18 @@ impl<H: Host> Cpu<H> {
             sr::ID_AA64MMFR0_EL1 => id::AA64MMFR0,
             sr::ID_AA64DFR0_EL1 => id::AA64DFR0,
             sr::ID_AA64ISAR0_EL1 | sr::ID_AA64MMFR1_EL1 | sr::ID_AA64MMFR2_EL1 => 0,
-            sr::CTR_EL0 => id::CTR,
+            // With several CPUs DIC is 0: software must invalidate the
+            // instruction cache after writing code, which tells other CPUs' JIT.
+            sr::CTR_EL0 => {
+                if self.machine.ncpus > 1 {
+                    // DIC = 0, and 4 KiB instruction-cache "lines" (IminLine
+                    // = log2(1024 words)): software then issues one IC IVAU
+                    // per page, the granule other CPUs' JIT code is dropped at.
+                    (id::CTR & !(1 << 29) & !0xf) | 10
+                } else {
+                    id::CTR
+                }
+            },
             sr::DCZID_EL0 => id::DCZID,
             sr::CLIDR_EL1 => id::CLIDR,
             sr::CCSIDR_EL1 => 0,
@@ -834,12 +883,20 @@ impl<H: Host> Cpu<H> {
                 // CAS family (LSE) and LDLAR/STLLR (LORegions): not in ARMv8.0.
                 return Err(Event::undefined());
             }
-            // LDAR/STLR (and LDLAR/STLLR): ordinary accesses on a single core.
+            // LDAR/STLR: ordinary accesses on a single core; with several, a
+            // fence after the load-acquire and before the store-release.
+            let smp = self.machine.ncpus > 1;
             if load {
                 let v = self.read(addr, bytes, false)?;
+                if smp {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                }
                 self.wr(rt, v);
             } else {
                 let v = self.xr(rt);
+                if smp {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                }
                 self.write(addr, bytes, v, false)?;
             }
             return Ok(());
@@ -862,6 +919,7 @@ impl<H: Host> Cpu<H> {
                 self.wr(rt, v);
                 self.excl_value = v;
             }
+            self.excl_size = bytes;
             self.set_excl(Some(pa));
         } else {
             let pa = self.translate(addr, crate::mmu::Access::Write, false)?;
@@ -1180,4 +1238,8 @@ impl<H: Host> Cpu<H> {
         self.wr(rd, trunc(r, sf));
         Ok(())
     }
+}
+
+fn smp_code_all() -> u32 {
+    crate::smp::CODE_ALL
 }

@@ -48,6 +48,9 @@ export function V86(options)
 {
     // "arm64" selects the armless AArch64 machine (armless.wasm); default x86.
     const arch = options.arch === "arm64" ? "arm64" : "x86";
+    // arm64 only: several vCPUs, each in a worker, with armless-smp.wasm
+    const cpu_count = arch === "arm64" ? Math.max(1, Math.min(8, options.cpu_count | 0 || 1)) : 1;
+    const smp = cpu_count > 1;
 
     if(typeof options.log_level === "number")
     {
@@ -122,6 +125,14 @@ export function V86(options)
     // armless.wasm imports: MMIO forwarded to v86's devices, clocks, the JIT
     const arm_table = arch === "arm64" ?
         new WebAssembly.Table({ element: "anyfunc", initial: ARM_JIT_SLOT_BASE + ARM_JIT_SLOTS }) : null;
+    // The threaded build imports its memory, shared with the vCPU workers.
+    // The maximum leaves room above guest RAM for the core's own allocations.
+    const arm_memory = smp ? new WebAssembly.Memory({
+        "initial": 256,
+        "maximum": Math.min(65536, Math.ceil(((options.memory_size || 256 << 20) + (256 << 20)) / 65536)),
+        "shared": true,
+    }) : null;
+    let arm_module = null;
     const arm_shared_funcs = {
         "mmio_read": (addr, size) => arm_cpu.mmio_read(addr, size),
         "mmio_write": (addr, size, value) => arm_cpu.mmio_write(addr, size, value),
@@ -130,6 +141,10 @@ export function V86(options)
         "jit_compile": (table_index, ptr, len) => arm_cpu.jit_compile(table_index, ptr, len),
         "__indirect_function_table": arm_table,
     };
+    if(smp)
+    {
+        arm_shared_funcs["memory"] = arm_memory;
+    }
 
     let wasm_fn = options.wasm_fn;
 
@@ -140,12 +155,14 @@ export function V86(options)
             /* global __dirname */
 
             return new Promise(resolve => {
-                let v86_bin = arch === "arm64" ? "armless.wasm" : DEBUG ? "v86-debug.wasm" : "v86.wasm";
+                const arm_bin = smp ? "armless-smp.wasm" : "armless.wasm";
+                let v86_bin = arch === "arm64" ? arm_bin : DEBUG ? "v86-debug.wasm" : "v86.wasm";
                 let v86_bin_fallback = arch === "arm64" ? v86_bin : "v86-fallback.wasm";
 
                 if(options.wasm_path)
                 {
-                    v86_bin = options.wasm_path;
+                    // For several CPUs, armless.wasm's threaded twin next to it
+                    v86_bin = smp ? options.smp_wasm_path || options.wasm_path.replace(/armless\.wasm$/, "armless-smp.wasm") : options.wasm_path;
                     v86_bin_fallback = arch === "arm64" ? v86_bin : v86_bin.replace("v86.wasm", "v86-fallback.wasm");
                 }
                 else if(typeof window === "undefined" && typeof __dirname === "string")
@@ -164,6 +181,17 @@ export function V86(options)
                     {
                         try
                         {
+                            if(smp)
+                            {
+                                // Keep the module: every vCPU worker instantiates it.
+                                arm_module = await WebAssembly.compile(bytes);
+                                // instantiate(Module) resolves to an Instance (missing from the externs)
+                                const instance = /** @type {!WebAssembly.Instance} */ (/** @type {?} */ (
+                                    await WebAssembly.instantiate(/** @type {?} */ (arm_module), env)));
+                                this.wasm_source = bytes;
+                                resolve(instance.exports);
+                                return;
+                            }
                             const { instance } = await WebAssembly.instantiate(bytes, env);
                             this.wasm_source = bytes;
                             resolve(instance.exports);
@@ -196,16 +224,25 @@ export function V86(options)
         };
     }
 
+    // vCPU workers in Node use worker_threads
+    // (string concat: closure compiler rejects node: module paths)
+    /* global require */
+    const node_worker = smp && typeof window === "undefined" && typeof process !== "undefined" ?
+        (typeof require === "function" ? Promise.resolve(require("worker_threads")) : import("node:" + "worker_threads"))
+            .then(m => m["Worker"]) : Promise.resolve(undefined);
+
     wasm_fn({ "env": arch === "arm64" ? arm_shared_funcs : wasm_shared_funcs })
-        .then((exports) => {
-            wasm_memory = exports.memory;
+        .then(async (exports) => {
+            const NodeWorker = await node_worker;
+            wasm_memory = smp ? arm_memory : exports.memory;
             if(exports["rust_init"])
             {
                 exports["rust_init"]();
             }
 
             const emulator = this.v86 = new v86(this.emulator_bus,
-                { exports, wasm_table: arch === "arm64" ? arm_table : wasm_table, arch });
+                { exports, wasm_table: arch === "arm64" ? arm_table : wasm_table, arch,
+                  cpu_count, module: arm_module, memory: arm_memory, NodeWorker });
             cpu = emulator.cpu;
             arm_cpu = emulator.arm_cpu;
 
@@ -721,7 +758,10 @@ V86.prototype.zstd_decompress = function(decompressed_size, src)
     new Uint8Array(cpu.wasm_memory.buffer).set(src, cpu.zstd_get_src_ptr(this.zstd_context));
 
     const ptr = cpu.zstd_read(this.zstd_context, decompressed_size);
-    const result = cpu.wasm_memory.buffer.slice(ptr, ptr + decompressed_size);
+    // Copy out into an ordinary ArrayBuffer (with several arm64 CPUs the wasm
+    // memory is shared, and slices of it would be SharedArrayBuffers).
+    const result = new ArrayBuffer(decompressed_size);
+    new Uint8Array(result).set(new Uint8Array(cpu.wasm_memory.buffer, ptr, decompressed_size));
     cpu.zstd_read_free(ptr, decompressed_size);
 
     cpu.zstd_free_ctx(this.zstd_context);

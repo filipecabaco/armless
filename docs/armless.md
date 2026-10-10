@@ -171,6 +171,54 @@ In Node:
 Both are bound by guest CPU (the kernel's copies and checksums), not by the
 devices. A larger 9p `msize` makes no difference with `cache=loose`.
 
+### Several CPUs
+
+`cpu_count: N` (up to 8) gives the guest N CPUs. The core supports this on
+any host: `armless-run --smp N` runs one native thread per CPU. In the browser
+and Node, each CPU runs in a worker with `armless-smp.wasm`, the threaded
+build: its memory is a shared `WebAssembly.Memory`, and each worker has its
+own instance on it, with its own stack, TLS and JIT function table. The
+devices stay on the main thread with v86's JS models.
+
+What the CPUs share, and how (`arm/src/smp.rs`):
+
+- **Memory and interrupts.** Guest RAM is shared. The GIC distributor
+  (behind a spinlock) has a CPU interface per CPU, banked SGIs/PPIs, SPI
+  targets and SGIs (IPIs).
+- **Timer and power.** One generic timer epoch for every CPU. PSCI
+  `CPU_ON`/`CPU_OFF`/`AFFINITY_INFO`; MPIDR carries the CPU number.
+- **Attention byte.** Each CPU has one, polled by its run loop and its JIT
+  code. Another CPU sets it to ask for a look at interrupts or shared state.
+  A *kick* also wakes an idle CPU (`Atomics.wait` on its wake counter in a
+  worker, a condvar natively).
+- **TLB shootdowns.** `TLBI ... IS` appends the page (or "all") to a ring
+  that the other running CPUs apply at their next instruction boundary. A
+  `DSB` waits until they have; idle CPUs apply it when they wake.
+- **Atomics and ordering.** `STXR` is an atomic compare-and-swap against the
+  value `LDXR` saw (as QEMU does); pairs are updated under a lock. `DMB` and
+  `LDAR`/`STLR` become fences.
+- **WFE, SEV and YIELD.** `WFE` waits until the watched location changes,
+  an interrupt or `SEV` arrives, or a short poll ends. `YIELD` does the
+  same. With no more host cores than vCPUs, a waiting CPU gives its host
+  thread away instead of spinning.
+- **JIT code coherence.** Each CPU has its own JIT. `CTR_EL0` reports
+  `DIC=0` and 4 KiB instruction-cache lines, so software issues one
+  `IC IVAU` per page it wrote code to; that drops the page's translations on
+  every CPU.
+- **Devices.** Workers reach them through a mailbox. Reads wait for the main
+  thread; writes are posted (arm64 maps device memory Device-nGnRE), except
+  PCI config space. `save_state`, reset and `stop()` park every vCPU first.
+
+`tests/linux/smp.c` checks atomics, futexes, a lock-free stack and mmap TLB
+shootdowns from 8 threads against `qemu-aarch64`. CI runs it natively with 2
+and 4 CPUs, and through the V86 API with 2. The snowglobe flow (9p, console,
+`save_state`/zstd restore, fetch networking) also runs with 2 CPUs.
+
+**When it helps.** Parallel, CPU-bound guest work scales (2 CPUs: up to ~2×).
+Device I/O from several CPUs pays a worker-to-main-thread round trip per
+synchronous device read, so a single-threaded, I/O-bound guest is faster
+with one CPU. Use at most `navigator.hardwareConcurrency - 1` CPUs.
+
 ## Status
 
 Done:
@@ -188,6 +236,7 @@ Done:
 - [x] snowglobe flow end to end, also with the Closure-compiled `libv86.mjs`:
       9p root (zstd blobs), virtio console, `save_state`, zstd `initial_state`
 - [x] Page JIT to wasm, enabled by default (see "JIT" above)
+- [x] Several CPUs: `cpu_count` (workers) and `armless-run --smp N`
 
 Testing (all in CI, `.github/workflows/armless.yml`):
 

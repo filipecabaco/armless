@@ -37,6 +37,7 @@ function make(extra)
     return new V86({
         arch: "arm64",
         disable_jit: process.env.ARMLESS_JIT === "0",
+        cpu_count: Number(process.env.ARMLESS_CPUS || 1),
         wasm_path: path.join(root, "build/armless.wasm"),
         memory_size: 256 * 1024 * 1024,
         filesystem: {

@@ -116,6 +116,26 @@ pub struct PerCpu {
     pub run_state: AtomicU32,
 }
 
+pub const CODE_RING: usize = 256;
+pub const TLB_RING: usize = 256;
+pub const TLB_ALL: u64 = u64::MAX;
+pub const CODE_ALL: u32 = u32::MAX;
+
+pub struct CodeInval {
+    /// Invalidations so far; entry `n` lives at `ring[n % CODE_RING]`.
+    pub gen: u64,
+    pub ring: [u32; CODE_RING],
+}
+
+impl Default for CodeInval {
+    fn default() -> Self {
+        CodeInval {
+            gen: 0,
+            ring: [0; CODE_RING],
+        }
+    }
+}
+
 /// Wakes an idle CPU's host thread after its `wake` counter changed.
 pub type Waker = Box<dyn Fn(usize) + Send + Sync>;
 
@@ -129,11 +149,24 @@ pub struct Machine {
     /// Generic timer: the counter was `timer_cnt_base` at host time `timer_ns_base`.
     pub timer_cnt_base: AtomicU64,
     pub timer_ns_base: AtomicU64,
-    /// Bumped by every broadcast TLB invalidation.
+    /// Bumped by every broadcast TLB invalidation; what was invalidated is in
+    /// `tlb_ring` (VA page numbers, or TLB_ALL).
     pub tlb_gen: AtomicU64,
+    pub tlb_ring: SpinLock<[u64; TLB_RING]>,
     pub stop: AtomicU32,
     /// Serialises STXP/LDXP-paired updates (no 128-bit atomics in wasm).
     pub pair_lock: SpinLock<()>,
+    /// Instruction-cache invalidations (IC IVAU / IC IALLU), for other CPUs'
+    /// JIT code: a ring of physical page numbers (CODE_ALL = everything).
+    pub code_inval: SpinLock<CodeInval>,
+    /// Bumped by SEV: wakes every CPU waiting in WFE.
+    pub sev: AtomicU32,
+    /// Host cores available to the vCPU threads (0: unknown). With more vCPUs
+    /// than cores, waits give up the host thread instead of spinning.
+    pub host_cores: AtomicU32,
+    /// Statistics: broadcast TLBIs, DSB waits that had to spin, IC
+    /// invalidations, kicks.
+    pub stats: [AtomicU64; 4],
     waker: SpinLock<Option<Waker>>,
 }
 
@@ -149,8 +182,13 @@ impl Machine {
             timer_cnt_base: AtomicU64::new(0),
             timer_ns_base: AtomicU64::new(0),
             tlb_gen: AtomicU64::new(0),
+            tlb_ring: SpinLock::new([TLB_ALL; TLB_RING]),
             stop: AtomicU32::new(STOP_NONE),
             pair_lock: SpinLock::new(()),
+            code_inval: SpinLock::new(CodeInval::default()),
+            stats: Default::default(),
+            sev: AtomicU32::new(0),
+            host_cores: AtomicU32::new(0),
             waker: SpinLock::new(None),
         };
         // CPU 0 starts running; the others wait for PSCI CPU_ON.
@@ -168,11 +206,40 @@ impl Machine {
 
     /// Ask CPU `cpu` to look at shared state, waking it if it is idle.
     pub fn kick(&self, cpu: usize) {
+        self.stats[3].fetch_add(1, Ordering::Relaxed);
         let c = &self.cpus[cpu];
         c.attn.store(1, Ordering::SeqCst);
         c.wake.fetch_add(1, Ordering::SeqCst);
         if let Some(w) = self.waker.lock().as_ref() {
             w(cpu);
+        }
+    }
+
+    /// Record an instruction-cache invalidation for every CPU's JIT and tell
+    /// the other CPUs (`page` = physical page number, or CODE_ALL).
+    pub fn invalidate_code(&self, page: u32, from: usize) {
+        self.stats[2].fetch_add(1, Ordering::Relaxed);
+        {
+            let mut c = self.code_inval.lock();
+            // IC IVAU comes once per cache line: record each page once.
+            if c.gen > 0 && c.ring[(c.gen as usize - 1) % CODE_RING] == page {
+                return;
+            }
+            let n = c.gen as usize % CODE_RING;
+            c.ring[n] = page;
+            c.gen += 1;
+        }
+        self.poke_others(from);
+    }
+
+    /// Ask the running CPUs other than `except` to apply broadcast TLB or
+    /// instruction-cache invalidations soon. Idle CPUs are not woken: they
+    /// hold no translations in flight and apply them when they run again.
+    pub fn poke_others(&self, except: usize) {
+        for i in 0..self.ncpus {
+            if i != except && self.cpus[i].run_state.load(Ordering::SeqCst) == RUN_RUNNING {
+                self.cpus[i].attn.store(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -183,6 +250,13 @@ impl Machine {
                 self.kick(i);
             }
         }
+    }
+
+    /// Not more host cores than vCPUs (one is needed for the devices / main
+    /// thread): waiting CPUs should yield the host thread, not spin.
+    pub fn oversubscribed(&self) -> bool {
+        let cores = self.host_cores.load(Ordering::Relaxed);
+        cores == 0 || self.ncpus as u32 >= cores
     }
 
     pub fn all_cpus_mask(&self) -> u32 {

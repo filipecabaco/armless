@@ -582,10 +582,37 @@ export interface V86Options {
     cpuid_level?: number;
 
     /**
-     * Turn off the x86-to-wasm jit
+     * Turn off the x86-to-wasm jit (with arch "arm64": the AArch64 JIT)
      * @default false
      */
     disable_jit?: boolean;
+
+    /**
+     * The emulated machine: "x86" (default), or "arm64" for the armless
+     * AArch64 machine (armless.wasm; see docs/armless.md).
+     * @default "x86"
+     */
+    arch?: "x86" | "arm64";
+
+    /**
+     * arm64 only: number of CPUs (1 to 8). More than one runs each CPU in a
+     * Web Worker with armless-smp.wasm (next to armless.wasm, or at
+     * smp_wasm_path); the page must be cross-origin isolated
+     * (SharedArrayBuffer). Snapshots need the same cpu_count to restore.
+     * @default 1
+     */
+    cpu_count?: number;
+
+    /**
+     * arm64 only: where armless-smp.wasm is, if not next to wasm_path.
+     */
+    smp_wasm_path?: string;
+
+    /**
+     * arm64 only: executions of a code location before the JIT compiles it.
+     * @default 1024
+     */
+    jit_threshold?: number;
 
     /**
      * The URL of a server running network relay.

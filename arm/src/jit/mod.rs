@@ -282,9 +282,6 @@ impl Jit {
     }
 }
 
-/// Type-erased pointer to the CPU running a JIT block, for the helpers.
-pub static mut JIT_CPU: *mut u8 = std::ptr::null_mut();
-
 /// Result of trying to run translated code at the current PC.
 pub enum JitStep {
     /// Nothing ran; interpret the next instruction.
@@ -482,9 +479,7 @@ impl<H: Host> Cpu<H> {
         let before = self.insn_count;
         self.jit_limit = before.wrapping_add(budget.clamp(1, CHAIN_BUDGET));
         let pc = self.pc;
-        let me = self as *mut Self;
         let status = unsafe {
-            JIT_CPU = me as *mut u8;
             let f: extern "C" fn(i64) -> i32 = std::mem::transmute((SLOT_BASE + slot) as usize);
             f(pc as i64)
         };

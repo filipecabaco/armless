@@ -67,6 +67,9 @@ pub const OSLSR_EL1: u32 = sr(2, 0, 1, 1, 4);
 
 // SYS instructions (op0 = 1)
 pub const DC_ZVA: u32 = sr(1, 3, 7, 4, 1);
+pub const IC_IALLUIS: u32 = sr(1, 0, 7, 1, 0);
+pub const IC_IALLU: u32 = sr(1, 0, 7, 5, 0);
+pub const IC_IVAU: u32 = sr(1, 3, 7, 5, 1);
 pub const AT_S1E1R: u32 = sr(1, 0, 7, 8, 0);
 pub const AT_S1E1W: u32 = sr(1, 0, 7, 8, 1);
 pub const AT_S1E0R: u32 = sr(1, 0, 7, 8, 2);

@@ -204,6 +204,8 @@ fn run_smp(
         std::process::exit(2);
     }
     let machine = Arc::new(Machine::new((mem_mb << 20) as usize, ncpus));
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    machine.host_cores.store(cores as u32, Ordering::Relaxed);
     let bus = SharedBus::new(NativeBus::new());
     bus.0.lock().unwrap().uart.input.extend(input.bytes());
 

@@ -25,6 +25,8 @@ export function v86(bus, wasm)
 
     /** @type {ArmCPU} the AArch64 CPU, when created with arch "arm64" */
     this.arm_cpu = null;
+    /** @type {?function()} resumes arm64 vCPU workers parked by stop() */
+    this.arm_resume = null;
 
     /** @type {CPU} */
     this.cpu = null;
@@ -47,6 +49,12 @@ export function v86(bus, wasm)
 v86.prototype.run = function()
 {
     this.stopping = false;
+    // arm64 with several CPUs: let the vCPU workers run again after stop()
+    if(this.arm_cpu && this.arm_resume)
+    {
+        this.arm_resume();
+        this.arm_resume = null;
+    }
 
     if(!this.running)
     {
@@ -92,12 +100,21 @@ v86.prototype.stop = function()
     if(this.running)
     {
         this.stopping = true;
+        // arm64 with several CPUs: the vCPUs run in workers, park them
+        if(this.arm_cpu && !this.arm_resume)
+        {
+            this.arm_resume = this.arm_cpu.smp_pause();
+        }
     }
 };
 
 v86.prototype.destroy = function()
 {
     this.unregister_yield();
+    if(this.arm_cpu)
+    {
+        this.arm_cpu.smp_destroy();
+    }
 };
 
 v86.prototype.restart = function()
