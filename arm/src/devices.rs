@@ -157,3 +157,34 @@ impl Host for NativeBus {
         set_line(board::SPI_UART, level);
     }
 }
+
+/// A `NativeBus` shared by several vCPU threads (`armless-run --smp N`).
+#[derive(Clone)]
+pub struct SharedBus(pub std::sync::Arc<std::sync::Mutex<NativeBus>>);
+
+impl SharedBus {
+    pub fn new(bus: NativeBus) -> SharedBus {
+        SharedBus(std::sync::Arc::new(std::sync::Mutex::new(bus)))
+    }
+}
+
+impl Host for SharedBus {
+    fn mmio_read(&mut self, addr: u64, size: u32) -> Option<u64> {
+        self.0.lock().unwrap().mmio_read(addr, size)
+    }
+    fn mmio_write(&mut self, addr: u64, size: u32, value: u64) -> bool {
+        self.0.lock().unwrap().mmio_write(addr, size, value)
+    }
+    fn now_ns(&mut self) -> u64 {
+        self.0.lock().unwrap().now_ns()
+    }
+    fn wall_clock_secs(&mut self) -> u64 {
+        self.0.lock().unwrap().wall_clock_secs()
+    }
+    fn sync_irqs(&mut self, set_line: &mut dyn FnMut(u32, bool)) {
+        self.0.lock().unwrap().sync_irqs(set_line)
+    }
+    fn yield_now(&mut self) {
+        std::thread::yield_now();
+    }
+}

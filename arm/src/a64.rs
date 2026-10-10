@@ -381,6 +381,12 @@ impl<H: Host> Cpu<H> {
                 match crn {
                     2 => {
                         // Hints: NOP, YIELD, WFE, WFI, SEV(L), BTI, PAC*, ...
+                        if crm == 0 && op2 == 2 && self.machine.ncpus > 1 {
+                            // WFE: the guest is spinning on a lock or flag that
+                            // another CPU will change; let that CPU's thread run.
+                            self.host.yield_now();
+                            return Ok(());
+                        }
                         if crm == 0 && op2 == 3 {
                             if self.el == 0 && self.sys.sctlr & (1 << 16) == 0 {
                                 return Err(Event::Sync {
@@ -396,8 +402,10 @@ impl<H: Host> Cpu<H> {
                     },
                     3 => {
                         // Barriers and CLREX
-                        if op2 == 2 {
-                            self.set_excl(None);
+                        match op2 {
+                            2 => self.set_excl(None),
+                            4 => self.tlb_sync(), // DSB completes broadcast TLBIs
+                            _ => {},
                         }
                         Ok(())
                     },
@@ -420,7 +428,7 @@ impl<H: Host> Cpu<H> {
                             },
                             (3, 7) => {
                                 self.daif &= !((crm << 6) & (0xf << 6));
-                                self.irq_dirty = true;
+                                self.set_irq_dirty();
                             },
                             _ => {}, // PAN/UAO/DIT/SSBS... not implemented: ignore
                         }
@@ -466,7 +474,14 @@ impl<H: Host> Cpu<H> {
             return Err(Event::undefined());
         }
         match crn {
-            8 => self.tlb_flush(), // TLBI *
+            8 => {
+                // TLBI: the inner-shareable forms (CRm = 3) reach every CPU.
+                if (key >> 3) & 0xf == 3 {
+                    self.tlbi_broadcast();
+                } else {
+                    self.tlb_flush();
+                }
+            },
             7 => match key {
                 sr::AT_S1E1R => self.address_translate(self.xr(rt), false, false),
                 sr::AT_S1E1W => self.address_translate(self.xr(rt), true, false),
@@ -483,7 +498,14 @@ impl<H: Host> Cpu<H> {
         let s = &self.sys;
         Ok(match key {
             sr::MIDR_EL1 => id::MIDR,
-            sr::MPIDR_EL1 => id::MPIDR,
+            sr::MPIDR_EL1 => {
+                if self.machine.ncpus == 1 {
+                    id::MPIDR
+                } else {
+                    // Multiprocessor: U = 0, Aff0 = CPU number
+                    0x8000_0000 | self.index as u64
+                }
+            },
             sr::REVIDR_EL1 => 0,
             sr::ID_AA64PFR0_EL1 => id::AA64PFR0,
             sr::ID_AA64MMFR0_EL1 => id::AA64MMFR0,
@@ -519,7 +541,7 @@ impl<H: Host> Cpu<H> {
             sr::PAR_EL1 => s.par,
             sr::MAIR_EL1 => s.mair,
             sr::VBAR_EL1 => s.vbar,
-            sr::ISR_EL1 => (self.gic.irq_asserted() as u64) << 7,
+            sr::ISR_EL1 => (self.irq_asserted() as u64) << 7,
             sr::CONTEXTIDR_EL1 => s.contextidr,
             sr::TPIDR_EL1 => s.tpidr_el1,
             sr::TPIDR_EL0 => s.tpidr_el0,
@@ -579,7 +601,7 @@ impl<H: Host> Cpu<H> {
             sr::DAIF => {
                 self.daif = (v as u32) & (0xf << 6);
                 if self.daif & (1 << 7) == 0 {
-                    self.irq_dirty = true;
+                    self.set_irq_dirty();
                 }
             },
             sr::FPCR => self.sys.fpcr = v,
@@ -825,6 +847,7 @@ impl<H: Host> Cpu<H> {
         if o1 && size_log < 2 {
             return Err(Event::undefined());
         }
+        let smp = self.machine.ncpus > 1;
         if load {
             let pa = self.translate(addr, crate::mmu::Access::Read, false)?;
             if o1 {
@@ -832,28 +855,85 @@ impl<H: Host> Cpu<H> {
                 let b = self.read(addr.wrapping_add(bytes as u64), bytes, false)?;
                 self.wr(rt, a);
                 self.wr(rt2, b);
+                self.excl_value = a;
+                self.excl_value2 = b;
             } else {
                 let v = self.read(addr, bytes, false)?;
                 self.wr(rt, v);
+                self.excl_value = v;
             }
             self.set_excl(Some(pa));
         } else {
             let pa = self.translate(addr, crate::mmu::Access::Write, false)?;
-            let ok = self.excl().is_some_and(|e| e & !0x3f == pa & !0x3f);
-            if ok {
-                if o1 {
-                    let (a, b) = (self.xr(rt), self.xr(rt2));
-                    self.write(addr, bytes, a, false)?;
-                    self.write(addr.wrapping_add(bytes as u64), bytes, b, false)?;
-                } else {
-                    let v = self.xr(rt);
-                    self.write(addr, bytes, v, false)?;
+            let ok = if smp {
+                // Several CPUs: the store succeeds if memory still holds what
+                // the load-exclusive saw (compare-and-swap, as QEMU does).
+                self.excl().is_some_and(|e| e == pa)
+                    && self.store_exclusive_smp(addr, pa, bytes, o1, rt, rt2)?
+            } else {
+                let ok = self.excl().is_some_and(|e| e & !0x3f == pa & !0x3f);
+                if ok {
+                    if o1 {
+                        let (a, b) = (self.xr(rt), self.xr(rt2));
+                        self.write(addr, bytes, a, false)?;
+                        self.write(addr.wrapping_add(bytes as u64), bytes, b, false)?;
+                    } else {
+                        let v = self.xr(rt);
+                        self.write(addr, bytes, v, false)?;
+                    }
                 }
-            }
+                ok
+            };
             self.set_excl(None);
             self.wr(rs, (!ok) as u64);
         }
         Ok(())
+    }
+
+    /// STXR/STXP with several CPUs; returns whether the store happened.
+    fn store_exclusive_smp(
+        &mut self,
+        addr: u64,
+        pa: u64,
+        bytes: u32,
+        pair: bool,
+        rt: u32,
+        rt2: u32,
+    ) -> Res<bool> {
+        if !pair {
+            let new = self.xr(rt);
+            return match self.ram_cmpxchg(pa, bytes, self.excl_value, new) {
+                Some(ok) => {
+                    if ok
+                        && self
+                            .jit
+                            .code_page
+                            .get((pa >> 12) as usize)
+                            .is_some_and(|&b| b != 0)
+                    {
+                        self.jit.invalidate_page((pa >> 12) as usize);
+                    }
+                    Ok(ok)
+                },
+                None => {
+                    // Not RAM or unaligned: no atomicity to offer, just store.
+                    self.write(addr, bytes, new, false)?;
+                    Ok(true)
+                },
+            };
+        }
+        // No 128-bit atomics: pairs are updated under a machine-wide lock.
+        let m = self.machine.clone();
+        let _guard = m.pair_lock.lock();
+        let second = addr.wrapping_add(bytes as u64);
+        let ok = self.read(addr, bytes, false)? == self.excl_value
+            && self.read(second, bytes, false)? == self.excl_value2;
+        if ok {
+            let (a, b) = (self.xr(rt), self.xr(rt2));
+            self.write(addr, bytes, a, false)?;
+            self.write(second, bytes, b, false)?;
+        }
+        Ok(ok)
     }
 
     // ===================================================== data processing (reg)

@@ -451,8 +451,8 @@ impl<H: Host> Cpu<H> {
             c: a(std::ptr::addr_of!(self.c) as *const u8),
             v: a(std::ptr::addr_of!(self.v) as *const u8),
             insn_count: a(std::ptr::addr_of!(self.insn_count) as *const u8),
-            pending: a(std::ptr::addr_of!(self.jit_pending_flag) as *const u8),
-            excl_armed: a(std::ptr::addr_of!(self.excl_armed) as *const u8),
+            pending: a(std::ptr::addr_of!(self.jit_pending_flag)),
+            excl_armed: a(std::ptr::addr_of!(self.excl_armed)),
             limit: a(std::ptr::addr_of!(self.jit_limit) as *const u8),
             excl_addr: a(std::ptr::addr_of!(self.excl_addr) as *const u8),
             tpidr_el0: a(std::ptr::addr_of!(self.sys.tpidr_el0) as *const u8),
@@ -462,7 +462,8 @@ impl<H: Host> Cpu<H> {
             daif: a(std::ptr::addr_of!(self.daif) as *const u8),
             el: el as u32,
             spsel: spsel as u32,
-            irq_dirty: a(std::ptr::addr_of!(self.irq_dirty) as *const u8),
+            irq_dirty: a(self.attn_ptr()),
+            smp: (self.machine.ncpus > 1) as u32,
             mem: a(self.mem.as_ptr()),
             read_tag: a(f.read_tag_ptr()),
             read_base: a(f.read_base_ptr()),
@@ -601,18 +602,33 @@ impl<H: Host> Cpu<H> {
             0 => match crn {
                 2 | 3 => true, // hints, barriers, CLREX
                 // MSR (immediate): DAIFSet/DAIFClr may continue while IRQs stay masked
-                4 => (insn >> 16) & 7 == 3 && matches!((insn >> 5) & 7, 6 | 7) && self.daif & (1 << 7) != 0,
+                4 => {
+                    (insn >> 16) & 7 == 3
+                        && matches!((insn >> 5) & 7, 6 | 7)
+                        && self.daif & (1 << 7) != 0
+                },
                 _ => false,
             },
             _ => {
                 let key = (insn >> 5) & 0xffff;
                 match key {
                     sr::DAIF => self.daif & (1 << 7) != 0,
-                    sr::NZCV | sr::FPCR | sr::FPSR | sr::TPIDR_EL0 | sr::TPIDR_EL1 | sr::TPIDRRO_EL0 | sr::SP_EL0 => true,
-                    sr::SPSR_EL1 | sr::ELR_EL1 | sr::ESR_EL1 | sr::FAR_EL1 | sr::PAR_EL1 | sr::CONTEXTIDR_EL1 => true,
+                    sr::NZCV
+                    | sr::FPCR
+                    | sr::FPSR
+                    | sr::TPIDR_EL0
+                    | sr::TPIDR_EL1
+                    | sr::TPIDRRO_EL0
+                    | sr::SP_EL0 => true,
+                    sr::SPSR_EL1
+                    | sr::ELR_EL1
+                    | sr::ESR_EL1
+                    | sr::FAR_EL1
+                    | sr::PAR_EL1
+                    | sr::CONTEXTIDR_EL1 => true,
                     _ => false,
                 }
-            }
+            },
         }
     }
 
@@ -635,7 +651,7 @@ impl<H: Host> Cpu<H> {
                 *executed += n.max(1);
                 self.update_timers();
                 self.sync_host_irqs_pub();
-                if !self.gic.irq_asserted() {
+                if !self.irq_asserted() {
                     return Some(Some(Exit::Idle {
                         wake_ns: self.next_timer_deadline_ns(),
                     }));

@@ -10,11 +10,30 @@ use std::ops::{Deref, DerefMut};
 pub struct Ram {
     ptr: *mut u8,
     len: usize,
-    /// Allocated as a `Box<[u8]>` (else taken from memory.grow).
+    /// Allocated with the global allocator (else taken from memory.grow, or an alias).
     boxed: bool,
 }
 
+// Guest RAM is shared by the vCPU threads like physical memory is shared by
+// cores: concurrent accesses are the guest's business (it orders them with
+// barriers, acquire/release and exclusives, which are atomic operations here).
+unsafe impl Send for Ram {}
+unsafe impl Sync for Ram {}
+
 impl Ram {
+    /// Another handle on the same memory; it does not free it when dropped.
+    pub fn alias(&self) -> Ram {
+        Ram {
+            ptr: self.ptr,
+            len: self.len,
+            boxed: false,
+        }
+    }
+
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
     pub fn zeroed(len: usize) -> Ram {
         #[cfg(target_arch = "wasm32")]
         {
@@ -28,9 +47,13 @@ impl Ram {
                 };
             }
         }
-        let b = vec![0u8; len].into_boxed_slice();
+        // Page-aligned, so naturally aligned guest addresses are aligned on
+        // the host too (atomic accesses need that).
+        let layout = std::alloc::Layout::from_size_align(len.max(1), 4096).expect("RAM size");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "out of memory allocating guest RAM");
         Ram {
-            ptr: Box::into_raw(b) as *mut u8,
+            ptr,
             len,
             boxed: true,
         }

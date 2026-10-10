@@ -22,6 +22,7 @@ pub mod ram;
 pub mod rtc;
 pub mod simd;
 pub mod simd_ls;
+pub mod smp;
 pub mod state;
 pub mod sysreg;
 
@@ -104,6 +105,7 @@ pub fn boot_linux<H: Host>(
         memory_size: mem_size,
         cmdline,
         initrd: initrd_range,
+        ncpus: cpu.machine.ncpus,
     });
     if dtb.len() > 2 << 20 {
         return Err("device tree too large".into());
@@ -138,6 +140,7 @@ pub fn boot_raw<H: Host>(cpu: &mut Cpu<H>, bin: &[u8], addr: u64) -> Result<Boot
         memory_size: mem_size,
         cmdline: "",
         initrd: None,
+        ncpus: cpu.machine.ncpus,
     });
     cpu.reset();
     cpu.mem[addr as usize..end as usize].copy_from_slice(bin);

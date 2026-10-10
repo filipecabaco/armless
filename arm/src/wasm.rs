@@ -311,10 +311,11 @@ pub unsafe extern "C" fn armless_load_state(ptr: u32, len: u32) -> i32 {
     match c.load_cpu_state(slice(ptr, len)) {
         Ok(()) => {
             // Re-base the JS-driven line bookkeeping on the restored GIC lines.
+            let gic = c.machine.gic.lock();
             for w in 1..IRQ_WORDS {
                 let mut bits = 0u32;
                 for b in 0..32 {
-                    if c.gic.line_level((w * 32 + b) as u32) {
+                    if gic.line_level((w * 32 + b) as u32) {
                         bits |= 1 << b;
                     }
                 }

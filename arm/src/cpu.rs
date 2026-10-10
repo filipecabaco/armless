@@ -2,10 +2,12 @@
 //!
 //! The instruction semantics live in `a64.rs`, address translation in `mmu.rs`.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
 use crate::board::{self, Host};
-use crate::gic::Gic;
 use crate::mmu::Tlb;
-use crate::rtc::Rtc;
+use crate::smp::{self, Machine};
 
 /// Exception classes used in ESR_EL1.EC.
 pub mod ec {
@@ -139,9 +141,14 @@ pub struct Cpu<H: Host> {
     pub vreg: [u128; 32],
 
     /// Guest physical RAM, starting at physical address 0 (= v86's mem8).
+    /// An alias of `machine.mem`.
     pub mem: crate::ram::Ram,
-    pub gic: Gic,
-    pub rtc: Rtc,
+    /// What the CPUs share (GIC, RTC, timer, power and TLB coordination).
+    pub machine: Arc<Machine>,
+    /// This CPU's number (MPIDR Aff0, GIC CPU interface).
+    pub index: usize,
+    /// `machine.cpus[index].attn`, the "look at shared state" flag.
+    attn: *const AtomicU8,
     pub host: H,
     pub(crate) tlb: Tlb,
     /// Host fast paths (RAM pages only), one set per exception level:
@@ -152,6 +159,11 @@ pub struct Cpu<H: Host> {
     /// address `excl_addr`. Plain fields so JIT-generated code can use them.
     pub(crate) excl_armed: u8,
     pub(crate) excl_addr: u64,
+    /// With several CPUs, exclusives compare values: what the load saw.
+    pub(crate) excl_value: u64,
+    pub(crate) excl_value2: u64,
+    /// TLB generation that a DSB must wait for every CPU to apply (0: none).
+    pub(crate) tlb_sync_gen: u64,
     /// The PC is a block entry (target of a taken branch, exception or
     /// return, or the instruction after a JIT block): only there does the
     /// JIT look for or count blocks.
@@ -161,11 +173,6 @@ pub struct Cpu<H: Host> {
     pub(crate) next_pc: u64,
     /// Instructions retired since reset.
     pub insn_count: u64,
-    /// Re-evaluate the IRQ line before the next instruction.
-    pub(crate) irq_dirty: bool,
-    /// Generic timer: counter value at `timer_ns_base` (host ns).
-    pub(crate) timer_cnt_base: u64,
-    pub(crate) timer_ns_base: u64,
     /// Basic-block JIT state (enabled only where the host can compile wasm).
     pub jit: crate::jit::Jit,
     /// Exception raised inside a JIT helper, and its flag (read by blocks).
@@ -176,6 +183,10 @@ pub struct Cpu<H: Host> {
     /// Last undefined instruction seen (for diagnostics), as (pc, insn).
     pub last_undefined: Option<(u64, u32)>,
 }
+
+// A CPU moves to its host thread once; the raw pointers it holds point into
+// its own `machine`, which it keeps alive.
+unsafe impl<H: Host + Send> Send for Cpu<H> {}
 
 const FAST_ENTRIES: usize = 256;
 /// Executable pages remembered besides the current one (`code_page`).
@@ -259,11 +270,21 @@ impl<H: Host> Cpu<H> {
         }
     }
 
+    /// A single-CPU machine.
     pub fn new(memory_size: usize, host: H) -> Cpu<H> {
         assert!(
             memory_size as u64 <= board::RAM_MAX,
             "RAM would overlap the MMIO window"
         );
+        Self::new_smp(Arc::new(Machine::new(memory_size, 1)), 0, host)
+    }
+
+    /// CPU `index` of `machine`. CPU 0 resets the machine and starts
+    /// running; the others stay off until PSCI CPU_ON.
+    pub fn new_smp(machine: Arc<Machine>, index: usize, host: H) -> Cpu<H> {
+        assert!(index < machine.ncpus);
+        let memory_size = machine.mem.len();
+        let attn = &machine.cpus[index].attn as *const AtomicU8;
         let mut cpu = Cpu {
             x: [0; 31],
             pc: 0,
@@ -278,21 +299,22 @@ impl<H: Host> Cpu<H> {
             spsel: true,
             sys: SysRegs::default(),
             vreg: [0; 32],
-            mem: crate::ram::Ram::zeroed(memory_size),
-            gic: Gic::new(),
-            rtc: Rtc::default(),
+            mem: machine.mem.alias(),
+            machine,
+            index,
+            attn,
             host,
             tlb: Tlb::new(),
             fast: [FastTlb::new(), FastTlb::new()],
             excl_armed: 0,
             excl_addr: 0,
+            excl_value: 0,
+            excl_value2: 0,
+            tlb_sync_gen: 0,
             jit_entry: true,
             jit_limit: 0,
             next_pc: 0,
             insn_count: 0,
-            irq_dirty: true,
-            timer_cnt_base: 0,
-            timer_ns_base: 0,
             trap_undefined: false,
             last_undefined: None,
             jit: crate::jit::Jit::new(memory_size),
@@ -303,8 +325,58 @@ impl<H: Host> Cpu<H> {
         cpu
     }
 
-    /// Architectural reset into EL1h with the MMU off.
+    #[inline(always)]
+    fn attn(&self) -> &AtomicU8 {
+        // Points into `self.machine`, which this CPU keeps alive.
+        unsafe { &*self.attn }
+    }
+
+    /// Re-evaluate interrupts (and shared state) before the next instruction.
+    #[inline(always)]
+    pub(crate) fn set_irq_dirty(&self) {
+        self.attn().store(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn attn_ptr(&self) -> *const u8 {
+        self.attn as *const u8
+    }
+
+    /// Tell the CPUs in `mask` that their interrupt state may have changed.
+    pub(crate) fn kick(&self, mask: u32) {
+        if mask & (1 << self.index) != 0 {
+            self.set_irq_dirty();
+        }
+        if mask & !(1 << self.index) != 0 {
+            self.machine.kick_mask(mask, self.index);
+        }
+    }
+
+    /// Whether this CPU's IRQ input is asserted.
+    pub(crate) fn irq_asserted(&self) -> bool {
+        self.machine.gic.lock().irq_asserted(self.index)
+    }
+
+    /// Architectural reset into EL1h with the MMU off. CPU 0 also resets
+    /// what the CPUs share (GIC, timer, power state of the others).
     pub fn reset(&mut self) {
+        if self.index == 0 {
+            let m = &self.machine;
+            *m.gic.lock() = crate::gic::Gic::new(m.ncpus);
+            m.timer_ns_base.store(self.host.now_ns(), Ordering::SeqCst);
+            m.timer_cnt_base.store(0, Ordering::SeqCst);
+            m.stop.store(smp::STOP_NONE, Ordering::SeqCst);
+            for (i, c) in m.cpus.iter().enumerate().take(m.ncpus) {
+                c.power.store(
+                    if i == 0 { smp::POWER_ON } else { smp::POWER_OFF },
+                    Ordering::SeqCst,
+                );
+            }
+        }
+        self.reset_local();
+    }
+
+    /// Reset this CPU's own state only.
+    fn reset_local(&mut self) {
         self.x = [0; 31];
         self.vreg = [0; 32];
         self.pc = board::RAM_BASE;
@@ -322,13 +394,15 @@ impl<H: Host> Cpu<H> {
             sctlr: 0x30d0_0800,
             ..SysRegs::default()
         };
-        self.gic = Gic::new();
         self.tlb_flush();
         self.jit.flush_all();
         self.set_excl(None);
-        self.irq_dirty = true;
-        self.timer_ns_base = self.host.now_ns();
-        self.timer_cnt_base = 0;
+        self.tlb_sync_gen = 0;
+        self.machine.cpus[self.index].tlb_seen.store(
+            self.machine.tlb_gen.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        self.set_irq_dirty();
     }
 
     // ---------------------------------------------------------------- registers
@@ -430,7 +504,7 @@ impl<H: Host> Cpu<H> {
                 self.spsel = true;
             },
         }
-        self.irq_dirty = true;
+        self.set_irq_dirty();
     }
 
     // -------------------------------------------------------------- exceptions
@@ -452,7 +526,7 @@ impl<H: Host> Cpu<H> {
         self.daif = DAIF_ALL;
         self.set_excl(None);
         self.pc = self.sys.vbar.wrapping_add(offset + kind * 0x80);
-        self.irq_dirty = true;
+        self.set_irq_dirty();
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -503,8 +577,10 @@ impl<H: Host> Cpu<H> {
     /// Generic timer counter value (CNTPCT/CNTVCT; CNTVOFF is zero).
     pub fn counter(&mut self) -> u64 {
         let now = self.host.now_ns();
-        let ns = now.wrapping_sub(self.timer_ns_base);
-        self.timer_cnt_base
+        let m = &self.machine;
+        let ns = now.wrapping_sub(m.timer_ns_base.load(Ordering::Relaxed));
+        m.timer_cnt_base
+            .load(Ordering::Relaxed)
             .wrapping_add(ns / (1_000_000_000 / board::TIMER_FREQ_HZ))
     }
 
@@ -522,9 +598,12 @@ impl<H: Host> Cpu<H> {
         };
         let v = fire(&mut self.sys.cntv_ctl, self.sys.cntv_cval);
         let p = fire(&mut self.sys.cntp_ctl, self.sys.cntp_cval);
-        self.gic.set_line(board::PPI_VIRT_TIMER, v);
-        self.gic.set_line(board::PPI_PHYS_TIMER, p);
-        self.irq_dirty = true;
+        {
+            let mut g = self.machine.gic.lock();
+            g.set_line(self.index, board::PPI_VIRT_TIMER, v);
+            g.set_line(self.index, board::PPI_PHYS_TIMER, p);
+        }
+        self.set_irq_dirty();
     }
 
     /// Host time at which the earliest armed timer will fire.
@@ -551,8 +630,9 @@ impl<H: Host> Cpu<H> {
 
     /// Raise or lower a GIC input line (SPI numbers are GIC INTIDs, >= 32).
     pub fn set_irq_line(&mut self, intid: u32, level: bool) {
-        self.gic.set_line(intid, level);
-        self.irq_dirty = true;
+        let mask = self.machine.gic.lock().set_line(self.index, intid, level);
+        self.kick(mask);
+        self.set_irq_dirty();
     }
 
     pub(crate) fn sync_host_irqs_pub(&mut self) {
@@ -560,9 +640,16 @@ impl<H: Host> Cpu<H> {
     }
 
     fn sync_host_irqs(&mut self) {
-        let gic = &mut self.gic;
-        self.host
-            .sync_irqs(&mut |intid, level| gic.set_line(intid, level));
+        let index = self.index;
+        let mut mask = 0;
+        {
+            let mut gic = self.machine.gic.lock();
+            self.host
+                .sync_irqs(&mut |intid, level| mask |= gic.set_line(index, intid, level));
+        }
+        if mask != 0 {
+            self.kick(mask);
+        }
     }
 
     fn irq_masked(&self) -> bool {
@@ -573,14 +660,23 @@ impl<H: Host> Cpu<H> {
 
     /// Execute up to `budget` instructions.
     pub fn run(&mut self, budget: u64) -> Exit {
+        self.machine.cpus[self.index]
+            .run_state
+            .store(smp::RUN_RUNNING, Ordering::SeqCst);
+        if let Some(exit) = self.check_shared() {
+            return self.leave(exit);
+        }
         self.update_timers();
         let mut executed = 0;
         let mut last_poll = 0;
         while executed < budget {
-            if self.irq_dirty {
-                self.irq_dirty = false;
+            if self.attn().load(Ordering::Relaxed) != 0 {
+                self.attn().store(0, Ordering::Relaxed);
+                if let Some(exit) = self.check_shared() {
+                    return self.leave(exit);
+                }
                 self.sync_host_irqs();
-                if !self.irq_masked() && self.gic.irq_asserted() {
+                if !self.irq_masked() && self.irq_asserted() {
                     let ret = self.pc;
                     self.take_exception(1, ret);
                     self.jit_entry = true;
@@ -588,7 +684,7 @@ impl<H: Host> Cpu<H> {
             }
             if self.jit.enabled && self.jit_entry {
                 match self.jit_dispatch(&mut executed, budget) {
-                    Some(Some(exit)) => return exit,
+                    Some(Some(exit)) => return self.leave(exit),
                     Some(None) => {
                         if executed - last_poll >= 0x400 {
                             last_poll = executed;
@@ -607,13 +703,15 @@ impl<H: Host> Cpu<H> {
                 Err(Event::Wfi) => {
                     self.update_timers();
                     self.sync_host_irqs();
-                    if !self.gic.irq_asserted() {
-                        return Exit::Idle {
-                            wake_ns: self.next_timer_deadline_ns(),
-                        };
+                    if let Some(exit) = self.check_shared() {
+                        return self.leave(exit);
+                    }
+                    if !self.irq_asserted() {
+                        let wake_ns = self.next_timer_deadline_ns();
+                        return self.leave(Exit::Idle { wake_ns });
                     }
                 },
-                Err(Event::Stop(r)) => return Exit::Stop(r),
+                Err(Event::Stop(r)) => return self.leave(Exit::Stop(r)),
                 Err(Event::Sync { .. }) => unreachable!("handled in step"),
             }
             executed += 1;
@@ -623,7 +721,110 @@ impl<H: Host> Cpu<H> {
                 self.update_timers();
             }
         }
-        Exit::Budget
+        self.leave(Exit::Budget)
+    }
+
+    /// Bookkeeping when `run` returns: an idle CPU holds no translations in
+    /// flight, so TLB shootdowns need not wait for it.
+    pub(crate) fn leave(&mut self, exit: Exit) -> Exit {
+        if matches!(exit, Exit::Idle { .. }) {
+            self.machine.cpus[self.index]
+                .run_state
+                .store(smp::RUN_IDLE, Ordering::SeqCst);
+        }
+        exit
+    }
+
+    /// Act on what other CPUs asked of this one: machine stops, power
+    /// changes, TLB shootdowns. Returns an exit if `run` must return.
+    pub(crate) fn check_shared(&mut self) -> Option<Exit> {
+        let m = self.machine.clone();
+        match m.stop.load(Ordering::SeqCst) {
+            smp::STOP_NONE => {},
+            smp::STOP_RESET => return Some(Exit::Stop(StopReason::Reset)),
+            _ => return Some(Exit::Stop(StopReason::PowerOff)),
+        }
+        let me = &m.cpus[self.index];
+        match me.power.load(Ordering::SeqCst) {
+            smp::POWER_ON => {},
+            smp::POWER_ON_PENDING => {
+                let entry = me.entry.load(Ordering::SeqCst);
+                let context = me.context.load(Ordering::SeqCst);
+                self.reset_local();
+                self.pc = entry;
+                self.x[0] = context;
+                self.jit_entry = true;
+                me.power.store(smp::POWER_ON, Ordering::SeqCst);
+            },
+            _ => {
+                // Off: wait to be kicked (by CPU_ON).
+                return Some(Exit::Idle { wake_ns: None });
+            },
+        }
+        self.apply_tlb_shootdowns();
+        None
+    }
+
+    /// Flush the TLB if another CPU broadcast an invalidation since we last did.
+    pub(crate) fn apply_tlb_shootdowns(&mut self) {
+        if self.machine.ncpus == 1 {
+            return;
+        }
+        let gen = self.machine.tlb_gen.load(Ordering::SeqCst);
+        let me = &self.machine.cpus[self.index];
+        if me.tlb_seen.load(Ordering::Relaxed) != gen {
+            self.tlb_flush();
+            self.machine.cpus[self.index]
+                .tlb_seen
+                .store(gen, Ordering::SeqCst);
+        }
+    }
+
+    /// A TLBI ... IS: invalidate here and on every other CPU. The other CPUs
+    /// flush at their next instruction boundary; a later DSB waits for that.
+    pub(crate) fn tlbi_broadcast(&mut self) {
+        self.tlb_flush();
+        if self.machine.ncpus == 1 {
+            return;
+        }
+        let gen = self.machine.tlb_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.machine.cpus[self.index]
+            .tlb_seen
+            .store(gen, Ordering::SeqCst);
+        self.tlb_sync_gen = gen;
+        let all = self.machine.all_cpus_mask();
+        self.machine.kick_mask(all, self.index);
+    }
+
+    /// DSB after a broadcast TLBI: wait until every other running CPU applied it.
+    pub(crate) fn tlb_sync(&mut self) {
+        let gen = std::mem::take(&mut self.tlb_sync_gen);
+        if gen == 0 {
+            return;
+        }
+        let m = self.machine.clone();
+        let mut spins = 0u32;
+        loop {
+            // Apply other CPUs' shootdowns too, so two waiting CPUs can't deadlock.
+            self.apply_tlb_shootdowns();
+            let done = (0..m.ncpus).all(|i| {
+                let c = &m.cpus[i];
+                i == self.index
+                    || c.run_state.load(Ordering::SeqCst) != smp::RUN_RUNNING
+                    || c.power.load(Ordering::SeqCst) != smp::POWER_ON
+                    || c.tlb_seen.load(Ordering::SeqCst) >= gen
+            });
+            if done || m.stop.load(Ordering::SeqCst) != smp::STOP_NONE {
+                return;
+            }
+            // The CPUs we wait for may not have a host core right now.
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                self.host.yield_now();
+            }
+        }
     }
 
     /// Execute exactly one instruction, taking any exception it raises.
@@ -752,40 +953,63 @@ impl<H: Host> Cpu<H> {
 
     fn mmio_read(&mut self, pa: u64, size: u32) -> Option<u64> {
         if (board::GICD_BASE..board::GICD_BASE + board::GICD_SIZE).contains(&pa) {
-            return Some(self.gic.dist_read(pa - board::GICD_BASE, size));
+            return Some(self.machine.gic.lock().dist_read(
+                self.index,
+                pa - board::GICD_BASE,
+                size,
+            ));
         }
         if (board::GICC_BASE..board::GICC_BASE + board::GICC_SIZE).contains(&pa) {
-            let v = self.gic.cpu_read(pa - board::GICC_BASE);
-            self.irq_dirty = true;
+            let (v, mask) = self
+                .machine
+                .gic
+                .lock()
+                .cpu_read(self.index, pa - board::GICC_BASE);
+            self.kick(mask);
+            self.set_irq_dirty();
             return Some(v);
         }
         if (board::RTC_BASE..board::RTC_BASE + board::RTC_SIZE).contains(&pa) {
             let now = self.host.wall_clock_secs();
-            return Some(self.rtc.read(pa - board::RTC_BASE, now));
+            return Some(self.machine.rtc.lock().read(pa - board::RTC_BASE, now));
         }
         self.host.mmio_read(pa, size)
     }
 
     fn mmio_write(&mut self, pa: u64, size: u32, value: u64) -> bool {
         if (board::GICD_BASE..board::GICD_BASE + board::GICD_SIZE).contains(&pa) {
-            self.gic.dist_write(pa - board::GICD_BASE, size, value);
-            self.irq_dirty = true;
+            let mask =
+                self.machine
+                    .gic
+                    .lock()
+                    .dist_write(self.index, pa - board::GICD_BASE, size, value);
+            self.kick(mask);
+            self.set_irq_dirty();
             return true;
         }
         if (board::GICC_BASE..board::GICC_BASE + board::GICC_SIZE).contains(&pa) {
-            self.gic.cpu_write(pa - board::GICC_BASE, value);
-            self.irq_dirty = true;
+            let mask = self
+                .machine
+                .gic
+                .lock()
+                .cpu_write(self.index, pa - board::GICC_BASE, value);
+            self.kick(mask);
+            self.set_irq_dirty();
             return true;
         }
         if (board::RTC_BASE..board::RTC_BASE + board::RTC_SIZE).contains(&pa) {
             let now = self.host.wall_clock_secs();
-            let line = self.rtc.write(pa - board::RTC_BASE, value, now);
+            let line = self
+                .machine
+                .rtc
+                .lock()
+                .write(pa - board::RTC_BASE, value, now);
             self.set_irq_line(board::SPI_RTC, line);
             return true;
         }
         let ok = self.host.mmio_write(pa, size, value);
         // Device writes may raise interrupts through the host.
-        self.irq_dirty = true;
+        self.set_irq_dirty();
         ok
     }
 
@@ -809,6 +1033,34 @@ impl<H: Host> Cpu<H> {
             4 => m[a..a + 4].copy_from_slice(&(value as u32).to_le_bytes()),
             _ => m[a..a + 8].copy_from_slice(&value.to_le_bytes()),
         }
+    }
+
+    /// Atomic compare-and-swap of guest RAM at an aligned physical address
+    /// (STXR with several CPUs). None if `pa` is not RAM or not aligned.
+    pub(crate) fn ram_cmpxchg(&self, pa: u64, size: u32, expected: u64, new: u64) -> Option<bool> {
+        use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+        if !pa.is_multiple_of(size as u64) || pa + size as u64 > self.mem.len() as u64 {
+            return None;
+        }
+        // In bounds and naturally aligned (RAM is page-aligned on the host).
+        let p = unsafe { self.mem.as_mut_ptr().add(pa as usize) };
+        let (o, f) = (Ordering::SeqCst, Ordering::SeqCst);
+        Some(unsafe {
+            match size {
+                1 => AtomicU8::from_ptr(p)
+                    .compare_exchange(expected as u8, new as u8, o, f)
+                    .is_ok(),
+                2 => AtomicU16::from_ptr(p as *mut u16)
+                    .compare_exchange(expected as u16, new as u16, o, f)
+                    .is_ok(),
+                4 => AtomicU32::from_ptr(p as *mut u32)
+                    .compare_exchange(expected as u32, new as u32, o, f)
+                    .is_ok(),
+                _ => AtomicU64::from_ptr(p as *mut u64)
+                    .compare_exchange(expected, new, o, f)
+                    .is_ok(),
+            }
+        })
     }
 
     /// Virtual read of `size` bytes with the current (or EL0, if `unpriv`) permissions.
@@ -913,17 +1165,72 @@ impl<H: Host> Cpu<H> {
     /// Handle an HVC/SMC as a PSCI firmware call, like QEMU's virt board does.
     pub(crate) fn psci_call(&mut self) -> Res<()> {
         const NOT_SUPPORTED: u64 = (-1i64) as u64;
+        const INVALID_PARAMETERS: u64 = (-2i64) as u64;
+        const ALREADY_ON: u64 = (-4i64) as u64;
+        const ON_PENDING: u64 = (-5i64) as u64;
+        let m = self.machine.clone();
         let fid = self.x[0] as u32;
+        // MPIDR -> CPU number (Aff0; higher affinity levels must be zero)
+        let target = |mpidr: u64| -> Option<usize> {
+            let aff = mpidr & 0xff_00ff_ffff;
+            (aff < m.ncpus as u64).then_some(aff as usize)
+        };
         let ret = match fid {
             0x8400_0000 => 0x0001_0000, // PSCI_VERSION: 1.0
-            0x8400_0002 => return Err(Event::Stop(StopReason::PowerOff)), // CPU_OFF
-            0x8400_0004 | 0xC400_0004 => 0, // AFFINITY_INFO: on
-            0x8400_0006 => 2,           // MIGRATE_INFO_TYPE: not required
-            0x8400_0008 => return Err(Event::Stop(StopReason::PowerOff)),
-            0x8400_0009 => return Err(Event::Stop(StopReason::Reset)),
+            0x8400_0002 => {
+                // CPU_OFF
+                if m.ncpus == 1 {
+                    return Err(Event::Stop(StopReason::PowerOff));
+                }
+                m.cpus[self.index]
+                    .power
+                    .store(smp::POWER_OFF, Ordering::SeqCst);
+                self.set_irq_dirty();
+                return Err(Event::Wfi);
+            },
+            0x8400_0003 | 0xC400_0003 => {
+                // CPU_ON(target, entry, context)
+                match target(self.x[1]) {
+                    None => INVALID_PARAMETERS,
+                    Some(t) => {
+                        let c = &m.cpus[t];
+                        c.entry.store(self.x[2], Ordering::SeqCst);
+                        c.context.store(self.x[3], Ordering::SeqCst);
+                        match c.power.compare_exchange(
+                            smp::POWER_OFF,
+                            smp::POWER_ON_PENDING,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => {
+                                m.kick(t);
+                                0
+                            },
+                            Err(smp::POWER_ON_PENDING) => ON_PENDING,
+                            Err(_) => ALREADY_ON,
+                        }
+                    },
+                }
+            },
+            0x8400_0004 | 0xC400_0004 => {
+                // AFFINITY_INFO(target, level)
+                match target(self.x[1]) {
+                    Some(t) if self.x[2] == 0 => m.cpus[t].power.load(Ordering::SeqCst) as u64,
+                    _ => INVALID_PARAMETERS,
+                }
+            },
+            0x8400_0006 => 2, // MIGRATE_INFO_TYPE: not required
+            0x8400_0008 => {
+                m.request_stop(smp::STOP_POWER_OFF);
+                return Err(Event::Stop(StopReason::PowerOff));
+            },
+            0x8400_0009 => {
+                m.request_stop(smp::STOP_RESET);
+                return Err(Event::Stop(StopReason::Reset));
+            },
             0x8400_000A => match self.x[1] as u32 {
-                0x8400_0000 | 0x8400_0002 | 0x8400_0004 | 0xC400_0004 | 0x8400_0006
-                | 0x8400_0008 | 0x8400_0009 | 0x8400_000A => 0,
+                0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xC400_0003 | 0x8400_0004
+                | 0xC400_0004 | 0x8400_0006 | 0x8400_0008 | 0x8400_0009 | 0x8400_000A => 0,
                 _ => NOT_SUPPORTED,
             },
             _ => NOT_SUPPORTED,

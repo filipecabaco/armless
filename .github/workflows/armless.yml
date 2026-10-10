@@ -77,6 +77,16 @@ jobs:
             echo "::error title=userspace::$(tail -c 1500 userspace.log | tr -d '\r%' | tr '\n' ';')"
             exit 1
           fi
+      - name: SMP (2 and 4 CPUs; atomics, futexes, TLB shootdowns) matches qemu-aarch64
+        run: |
+          for n in 2 4; do
+            if ! sh tests/linux/smp.sh build-linux $n > smp.log 2>&1; then
+              cat smp.log
+              echo "::error title=smp $n CPUs::$(tail -c 1500 smp.log | tr -d '\r%' | tr '\n' ';')"
+              exit 1
+            fi
+            cat smp.log
+          done
       - uses: actions/setup-node@v4
         with:
           node-version: 22

@@ -146,6 +146,8 @@ pub struct BoardConfig<'a> {
     pub memory_size: u64,
     pub cmdline: &'a str,
     pub initrd: Option<(u64, u64)>,
+    /// Number of CPUs (1..=8).
+    pub ncpus: usize,
 }
 
 const PHANDLE_GIC: u32 = 1;
@@ -199,12 +201,14 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.begin("cpus");
     f.prop_u32("#address-cells", 1);
     f.prop_u32("#size-cells", 0);
-    f.begin("cpu@0");
-    f.prop_str("device_type", "cpu");
-    f.prop_str("compatible", "arm,cortex-a53");
-    f.prop_u32("reg", 0);
-    f.prop_str("enable-method", "psci");
-    f.end();
+    for i in 0..cfg.ncpus {
+        f.begin(&format!("cpu@{i}"));
+        f.prop_str("device_type", "cpu");
+        f.prop_str("compatible", "arm,cortex-a53");
+        f.prop_u32("reg", i as u32);
+        f.prop_str("enable-method", "psci");
+        f.end();
+    }
     f.end();
 
     f.begin("psci");
@@ -212,6 +216,8 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.prop_str("method", "hvc");
     f.end();
 
+    // GIC binding: PPI flags carry the CPU mask in bits 15:8 (level-high = 4).
+    let ppi_flags = (((1u32 << cfg.ncpus) - 1) << 8) | 4;
     f.begin("timer");
     f.prop_str("compatible", "arm,armv8-timer");
     // secure phys, non-secure phys, virtual, hypervisor (PPI = INTID - 16)
@@ -220,16 +226,16 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
         &[
             1,
             13,
-            0xf04,
+            ppi_flags,
             1,
             board::PPI_PHYS_TIMER - 16,
-            0xf04,
+            ppi_flags,
             1,
             board::PPI_VIRT_TIMER - 16,
-            0xf04,
+            ppi_flags,
             1,
             board::PPI_HYP_TIMER - 16,
-            0xf04,
+            ppi_flags,
         ],
     );
     f.prop_empty("always-on");
@@ -369,6 +375,7 @@ mod tests {
             memory_size: 512 << 20,
             cmdline: "console=ttyS0",
             initrd: Some((0x1000_0000, 0x1100_0000)),
+            ncpus: 4,
         });
         assert_eq!(&dtb[0..4], &0xd00d_feedu32.to_be_bytes());
         let total = u32::from_be_bytes(dtb[4..8].try_into().unwrap()) as usize;

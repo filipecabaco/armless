@@ -50,6 +50,8 @@ pub struct Layout {
     /// Values (not addresses): the exception level and SPSel of this code.
     pub el: u32,
     pub spsel: u32,
+    /// Non-zero with several CPUs: exclusives and DSB stay interpreted.
+    pub smp: u32,
     /// Byte: non-zero when interrupt state must be re-examined.
     pub irq_dirty: u32,
     /// Guest RAM base.
@@ -1126,9 +1128,13 @@ impl Gen<'_> {
     /// Barriers (no-ops on one core) and MRS/MSR of registers kept in the
     /// CPU struct. Everything else in the system space is interpreted.
     fn system(&mut self, insn: u32) -> bool {
-        if insn & 0xffff_f01f == 0xd503_301f && matches!(field(insn, 5, 3), 4 | 5 | 6) && insn & 0xf00 != 0 {
-            // DSB/DMB (CRm != 0) and ISB
-            return true;
+        if insn & 0xffff_f01f == 0xd503_301f
+            && matches!(field(insn, 5, 3), 4 | 5 | 6)
+            && insn & 0xf00 != 0
+        {
+            // DSB/DMB (CRm != 0) and ISB. With several CPUs a DSB may have to
+            // wait for TLB shootdowns: interpreted.
+            return !(self.l.smp != 0 && field(insn, 5, 3) == 4);
         }
         if insn & 0xffff_f0ff == 0xd503_30df {
             return true; // ISB (any CRm)
@@ -1209,6 +1215,9 @@ impl Gen<'_> {
         let rt = insn & 31;
         if o1 || rt2 != 31 {
             return false; // pairs, CAS, UNDEFINED encodings
+        }
+        if !o2 && self.l.smp != 0 {
+            return false; // several CPUs: compare-and-swap in the interpreter
         }
         if o2 && (rs != 31 || !o0) {
             return false;

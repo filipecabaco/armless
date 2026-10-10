@@ -75,4 +75,7 @@ pub trait Host {
     fn jit_compile(&mut self, _table_index: u32, _wasm: &[u8]) -> bool {
         false
     }
+    /// Give the host CPU to other vCPU threads for a moment (guest WFE, or
+    /// a wait for other CPUs). Only called on machines with several CPUs.
+    fn yield_now(&mut self) {}
 }
