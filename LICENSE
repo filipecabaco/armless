@@ -1,3 +1,5 @@
+Copyright (c) 2026, Filipe Cabaço and the armless contributors
+Portions (the zstd glue, the 9p filesystem format and its tools) come from v86:
 Copyright (c) 2012, The v86 contributors
 All rights reserved.
 

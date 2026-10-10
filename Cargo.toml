@@ -1,30 +1,37 @@
 [package]
-name = "v86"
-version = "0.1.0"
-publish = false
+name = "armless"
+version = "0.2.0"
 edition = "2021"
-
-[features]
-default = []
-profiler = []
+publish = false
+description = "An AArch64 virtual machine (CPU, JIT, devices) for the browser and native hosts"
+license = "BSD-2-Clause"
+repository = "https://github.com/filipecabaco/armless"
+include = ["src/**", "lib/zstd/**", "js/**", "build-wasm.sh", "LICENSE", "Readme.md"]
 
 [lib]
-crate-type = ["cdylib"]
-path = "src/rust/lib.rs"
+crate-type = ["rlib"]
+path = "src/lib.rs"
 
-[profile.test]
-lto = false
-opt-level = 2
-overflow-checks = false
+[dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ruzstd = { version = "0.8", default-features = false, features = ["std"] }
+
+[features]
+# Compile the wasm export layer natively, to type-check it without a wasm target.
+wasm-api = []
+
+[[bin]]
+name = "armless-run"
+path = "src/bin/armless-run.rs"
 
 [profile.dev]
-lto = true
 opt-level = 2
-panic = "abort"
-overflow-checks = false
+overflow-checks = true
 
 [profile.release]
 lto = true
 opt-level = 3
-incremental = false
 panic = "abort"
+codegen-units = 1

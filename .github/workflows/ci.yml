@@ -1,195 +1,186 @@
-name: CI
+name: ci
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  eslint:
-    name: eslint
-    runs-on: ubuntu-latest
+  core:
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Run eslint
-        run: sudo npm install -g eslint; make eslint
-
-  test:
-    runs-on: ubuntu-latest
-    name: Build and test
-    timeout-minutes: 60
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          filter: tree:0
-
-      - name: Setup Node.js version
-        uses: actions/setup-node@v6
-        with:
-          node-version: '24.17.0'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Setup toolchain
+      - uses: actions/checkout@v4
+      - name: Toolchain
         run: |
-          rustup toolchain install stable --profile minimal
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
           rustup target add wasm32-unknown-unknown
-          rustup component add rustfmt
-
-      - name: Install APT packages
+          rustup component add rust-src
+      - name: Unit tests and bare-metal guest
+        run: cargo test --release
+      - name: Type-check the wasm layer natively
+        run: cargo check --features wasm-api
+      - name: Build armless.wasm and armless-smp.wasm
         run: |
-          sudo apt-get update -y
-          sudo apt-get install nasm gdb qemu-system-x86 libc6-dev-i386 -y
-
-      - name: Build all-debug
-        run: |
-          rustc --version
-          make all-debug
-
-      - name: Build all
-        run: make all
-
-      - name: Build fallback
-        run: make build/v86-fallback.wasm
-
-      - name: rustfmt check
-        run: make rustfmt
-
-      - name: Fetch kvm-unit-test cache
-        uses: actions/cache@v5
-        id: cache-kvm-unit-test
+          sh build-wasm.sh
+          SMP=1 sh build-wasm.sh
+      - uses: actions/setup-node@v4
         with:
-          path: tests/kvm-unit-tests/
-          key: ${{ runner.os }}-kvm-unit-test-${{ hashFiles('tests/kvm-unit-tests/**') }}
-
-      - name: Build kvm-unit-test
-        if: steps.cache-kvm-unit-test.outputs.cache-hit != 'true'
-        run: tests/kvm-unit-tests/build.sh
-
-      - name: Run kvm-unit-test
+          node-version: 22
+      - name: Bare-metal guest through armless.js (interpreter, and every block JIT-compiled)
         run: |
-          # armless fork: report the failing test's output as an annotation
-          run() {
-            if ! "$@" > kvm.log 2>&1; then
-              echo "::error title=kvm-unit-test $*::$(tail -c 1500 kvm.log | tr -d '\r%' | tr '\n' ';')"
+          OUT="$RUNNER_TEMP/guest" sh guest/build.sh
+          node tests/js/run-bare.mjs "$RUNNER_TEMP/guest/tests.bin" -m 512 --no-jit
+          node tests/js/run-bare.mjs "$RUNNER_TEMP/guest/tests.bin" -m 512 --jit-threshold 1 --jit-sync
+      - uses: actions/upload-artifact@v4
+        with:
+          name: armless-web
+          path: |
+            build/armless.wasm
+            build/armless-smp.wasm
+            js/armless.js
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu flex bison bc linux-source-6.8.0 qemu-user clang lld
+          sudo pip install --break-system-packages zstandard
+          rustup target add wasm32-unknown-unknown
+          rustup component add rust-src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cache kernel
+        id: kcache
+        uses: actions/cache@v4
+        with:
+          path: build-linux
+          key: linux-6.8-${{ hashFiles('tests/linux/armless_defconfig', 'tests/linux/init.c', 'tests/linux/mkcpio.py') }}
+      - name: Build kernel and initramfs
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/linux"
+          tar xjf /usr/src/linux-source-6.8.0/linux-source-6.8.0.tar.bz2 -C "$RUNNER_TEMP/linux"
+          sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-source-6.8.0" build-linux
+      - name: Boot Linux to userspace
+        run: sh tests/linux/boot.sh build-linux
+      - name: Build busybox + glibc rootfs
+        run: |
+          git clone --depth 1 https://github.com/mirror/busybox "$RUNNER_TEMP/busybox"
+          sh tests/linux/build-rootfs.sh "$RUNNER_TEMP/busybox" build-linux
+      - name: Userspace matches qemu-aarch64
+        run: |
+          if ! sh tests/linux/userspace.sh build-linux > userspace.log 2>&1; then
+            cat userspace.log
+            echo "::error title=userspace::$(tail -c 1500 userspace.log | tr -d '\r%' | tr '\n' ';')"
+            exit 1
+          fi
+      - name: SMP (2 and 4 CPUs; atomics, futexes, TLB shootdowns) matches qemu-aarch64
+        run: |
+          for n in 2 4; do
+            if ! sh tests/linux/smp.sh build-linux $n > smp.log 2>&1; then
+              cat smp.log
+              echo "::error title=smp $n CPUs::$(tail -c 1500 smp.log | tr -d '\r%' | tr '\n' ';')"
               exit 1
             fi
-          }
-          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/taskswitch.flat
-          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/taskswitch2.flat
-          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/realmode.flat
-          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/pat.flat
-          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/nx.flat
-          DISABLE_JIT=1 run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/nx.flat
+            cat smp.log
+          done
+      - name: The snowglobe flow, natively (9p root, console, snapshot, restore; 1 and 2 CPUs)
+        run: |
+          gzip -9 -k -f build-linux/Image
+          sh tests/fs/make-9pfs.sh build-linux/busybox build-linux/Image.gz build-linux/9pfs
+          ARMLESS_9PFS=build-linux/9pfs cargo test --release --test vm
+      - name: Build armless.wasm and armless-smp.wasm
+        run: |
+          sh build-wasm.sh
+          SMP=1 sh build-wasm.sh
+      - name: Userspace through armless.js with the JIT matches qemu-aarch64
+        run: |
+          node tests/js/boot.mjs --cmdline "console=ttyS0 rdinit=/init quiet" \
+              --expect ARMLESS-USERSPACE-OK build-linux/Image.gz build-linux/rootfs.cpio > js-userspace.log
+          sed -n '/^== userspace ==/,/^ARMLESS-USERSPACE-OK/p' js-userspace.log \
+              | grep -v -e '^== ' -e '^ARMLESS-USERSPACE-OK' -e '^dc' | tr -d '\r' > js-dut.txt
+          if ! diff -u build-linux/ref.txt js-dut.txt > js-diff.txt; then
+            cat js-diff.txt
+            echo "::error title=userspace (armless.js + JIT)::$(head -c 1500 js-diff.txt | tr -d '\r%' | tr '\n' ';')"
+            exit 1
+          fi
+      - name: The snowglobe flow through armless.js (1, 2 and 4 CPUs; HTTP over fetch, port forwarding)
+        run: |
+          for n in 1 2 4; do
+            if ! node tests/js/flow.mjs build-linux/9pfs $n > flow.log 2>&1; then
+              cat flow.log
+              echo "::error title=flow $n CPUs::$(tail -c 1500 flow.log | tr -d '\r%' | tr '\n' ';')"
+              exit 1
+            fi
+            cat flow.log
+          done
 
-      - name: Fetch namsmtests cache
-        uses: actions/cache@v5
-        id: cache-nasmtests
-        with:
-          path: tests/nasm/build/
-          key: ${{ runner.os }}-nasmtests-${{ hashFiles('gen/x86_table.js', 'tests/nasm/*.js', 'tests/nasm/*.asm', 'tests/nasm/*.inc', 'tests/nasm/gdb-extract-def') }}
-
-      - name: Run nasmtests
-        run: MAX_PARALLEL_TESTS=1 make nasmtests
-
-      - name: Run nasmtests-force-jit
-        run: MAX_PARALLEL_TESTS=1 make nasmtests-force-jit
-
-      - name: Run rust-test
-        run: make rust-test
-
-      - name: Fetch image cache
-        uses: actions/cache@v5
-        id: cache-images
-        with:
-          path: images/
-          key: ${{ runner.os }}-images-v2
-
-      - name: Download uncached images
-        if: steps.cache-images.outputs.cache-hit != 'true'
-        run: mkdir -p images && curl --compressed --output-dir images --remote-name-all https://i.copy.sh/{linux.iso,linux3.iso,linux4.iso,buildroot-bzimage68.bin,TinyCore-11.0.iso,oberon.img,msdos.img,openbsd-floppy.img,kolibri.img,windows101.img,os8.img,freedos722.img,mobius-fd-release5.img,msdos622.img}
-
-      - name: Run api-tests
-        run: make api-tests
-
-      - name: Run qemutests
-        run: make qemutests
-
-      - name: Run qemutests-release
-        run: make qemutests-release
-
-      - name: Run jitpagingtests
-        run: make jitpagingtests
-
-      - name: Run integration tests
-        run: MAX_PARALLEL_TESTS=1 make tests
-
-      - name: Run devices tests
-        run: make devices-test
-
-      - name: Run expect tests
-        run: make expect-tests
-
-      - name: Update package.json version
-        run: make update-package-json-version
-
-      - name: Upload the artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: v86
-          path: |
-            package.json
-            LICENSE
-            Readme.md
-            v86.d.ts
-            build/libv86*.js
-            build/libv86*.js.map
-            build/v86*.wasm
-            build/*.mjs
-
-  upload:
-    name: Upload release
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.ref == 'refs/heads/master'
-
-    permissions:
-      id-token: write
-      contents: write
-
+  difftest:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        classes: [int, fp, simd, simds, ldst]
     steps:
-      - name: Delete old release and tag
-        uses: dev-drprasad/delete-tag-and-release@v1.0.1
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu qemu-user
+          rustup target add wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
         with:
-          delete_release: true
-          tag_name: latest
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          node-version: 22
+      - name: Differential test against qemu-aarch64
+        run: |
+          for seed in 1 2 3; do
+            if ! sh tests/difftest/run.sh ${{ matrix.classes }} 10000 $seed; then
+              echo "::error title=difftest ${{ matrix.classes }} seed $seed::$(grep -E '^[-+][0-9]' build-difftest/diff.txt | head -12 | tr '\n' ';')"
+              exit 1
+            fi
+          done
+      - name: Differential test of the wasm JIT against qemu-aarch64
+        run: |
+          sh build-wasm.sh
+          for seed in 1 2; do
+            if ! DUT=jit sh tests/difftest/run.sh ${{ matrix.classes }} 5000 $seed; then
+              echo "::error title=difftest jit ${{ matrix.classes }} seed $seed::$(grep -E '^[-+][0-9]' build-difftest/diff.txt | head -12 | tr '\n' ';')"
+              exit 1
+            fi
+          done
 
-      - name: Get artifacts
-        uses: actions/download-artifact@v8
+  alpine:
+    # A real arm64 Alpine (linux-virt + OpenRC), prepared and booted the way
+    # snowglobe does it, through armless.js.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          name: v86
-
-      - name: Display structure of downloaded files
-        run: ls -R
-
-      - uses: actions/setup-node@v6
+          node-version: 22
+      - uses: docker/setup-qemu-action@v3
         with:
-          node-version: '24.17.0'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Release to GitHub
-        uses: ncipollo/release-action@v1
-        with:
-          name: Latest Release
-          tag: latest
-          commit: master
-          body: ${{ github.event.head_commit.message }}
-          artifacts: "build/libv86*.js,build/libv86*.js.map,build/*.mjs,build/v86*.wasm"
-          prerelease: true
-
-      - name: Release to NPM
-        run: npm publish --provenance --access public
-        if: github.repository == 'copy/v86'
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Toolchain
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang lld
+          sudo pip install --break-system-packages zstandard
+          rustup target add wasm32-unknown-unknown
+          rustup component add rust-src
+      - name: Build armless.wasm and armless-smp.wasm
+        run: |
+          sh build-wasm.sh
+          SMP=1 sh build-wasm.sh
+      - name: Build the Alpine arm64 guest as a 9p filesystem
+        run: sh tests/fs/alpine/build.sh "$RUNNER_TEMP/alpine"
+      - name: Boot Alpine, run commands, save and restore a snapshot (1 and 2 CPUs)
+        run: |
+          node tests/js/alpine.mjs "$RUNNER_TEMP/alpine" 1
+          node tests/js/alpine.mjs "$RUNNER_TEMP/alpine" 2

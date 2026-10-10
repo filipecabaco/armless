@@ -1,0 +1,55 @@
+name: release
+
+# Publishes what a page needs to run armless, as a GitHub release:
+#   armless.js         the loader (classic script; also require()-able in Node)
+#   armless.wasm       the machine
+#   armless-smp.wasm   its threaded build, for cpus > 1 (needs a cross-origin isolated page)
+# plus armless-web.tar.gz with all three, the license and the docs.
+# Native programs use the crate itself (a git dependency on the tag).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. armless-v0.2.0); empty for the rolling armless-snapshot"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang lld
+          rustup target add wasm32-unknown-unknown
+          rustup component add rust-src
+      - name: Build
+        run: |
+          sh build-wasm.sh
+          SMP=1 sh build-wasm.sh
+      - name: Package
+        run: |
+          mkdir -p dist/armless-web
+          cp js/armless.js build/armless.wasm build/armless-smp.wasm LICENSE docs/armless.md dist/armless-web/
+          tar -C dist -czf dist/armless-web.tar.gz armless-web
+          ls -la dist/armless-web dist/armless-web.tar.gz
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-armless-snapshot}"
+          if [ "$tag" = armless-snapshot ]; then
+            gh release delete "$tag" --yes --cleanup-tag || true
+          fi
+          gh release create "$tag" --title "$tag" --target "$GITHUB_SHA" \
+            --notes "armless $tag: an AArch64 machine for the browser (armless.js + armless.wasm) and a Rust crate for native hosts. See armless.md." \
+            $( [ "$tag" = armless-snapshot ] && echo --prerelease ) \
+            dist/armless-web.tar.gz dist/armless-web/armless.js \
+            dist/armless-web/armless.wasm dist/armless-web/armless-smp.wasm

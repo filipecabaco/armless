@@ -1,6 +1,6 @@
-root=true
+root = true
 
-[*.js]
+[*.{js,mjs}]
 charset = utf-8
 indent_style = space
-indent_size = 4
+indent_size = 2
