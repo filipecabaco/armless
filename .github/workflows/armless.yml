@@ -26,9 +26,8 @@ jobs:
         run: cargo check --features wasm-api
       - name: Build armless.wasm
         run: |
-          cargo build --release --lib --target wasm32-unknown-unknown
-          cp ../build/wasm32-unknown-unknown/release/armless.wasm .
-          ls -la armless.wasm
+          sh build-wasm.sh
+          cp ../build/armless.wasm .
       - uses: actions/upload-artifact@v4
         with:
           name: armless-wasm
@@ -67,7 +66,7 @@ jobs:
         run: |
           if ! sh tests/linux/userspace.sh build-linux > userspace.log 2>&1; then
             cat userspace.log
-            echo "::error title=userspace::$(tail -c 3000 userspace.log | tr '\n' ';')"
+            echo "::error title=userspace::$(tail -c 1500 userspace.log | tr -d '\r%' | tr '\n' ';')"
             exit 1
           fi
       - uses: actions/setup-node@v4

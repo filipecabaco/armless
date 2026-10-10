@@ -4,7 +4,7 @@
 #   tests/linux/boot.sh [OUT_DIR]
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-out=${1:-$here/../../build-linux}
+out=$(realpath "${1:-$here/../../build-linux}")
 cd "$here/../.."
 cargo build --release --bin armless-run
 log=$(mktemp)

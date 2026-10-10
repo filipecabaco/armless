@@ -10,6 +10,7 @@ bb=${1:?usage: build-rootfs.sh BUSYBOX_SRC [OUT_DIR]}
 out=${2:-$here/../../build-linux}
 cross=${CROSS_COMPILE:-aarch64-linux-gnu-}
 mkdir -p "$out"
+out=$(realpath "$out")
 
 make -C "$bb" ARCH=arm64 CROSS_COMPILE="$cross" defconfig >/dev/null
 sed -i \

@@ -287,6 +287,8 @@ impl<H: Host> Cpu<H> {
 
     pub fn tlb_flush(&mut self) {
         self.tlb.flush();
+        self.fast[0].flush();
+        self.fast[1].flush();
     }
 
     /// AT S1E{0,1}{R,W}: translate and report through PAR_EL1.

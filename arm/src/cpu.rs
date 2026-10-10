@@ -142,6 +142,9 @@ pub struct Cpu<H: Host> {
     pub rtc: Rtc,
     pub host: H,
     pub(crate) tlb: Tlb,
+    /// Host fast paths (RAM pages only), one set per exception level:
+    /// a direct-mapped read and write TLB, and the current code page.
+    pub(crate) fast: [FastTlb; 2],
 
     /// Exclusive monitor: physical address of the last load-exclusive.
     pub(crate) excl: Option<u64>,
@@ -157,6 +160,38 @@ pub struct Cpu<H: Host> {
     pub trap_undefined: bool,
     /// Last undefined instruction seen (for diagnostics), as (pc, insn).
     pub last_undefined: Option<(u64, u32)>,
+}
+
+const FAST_ENTRIES: usize = 256;
+
+/// Virtual page -> offset of the page in `mem`, for pages known to be RAM
+/// with the needed permission at one exception level.
+pub(crate) struct FastTlb {
+    read_tag: Vec<u64>,
+    read_base: Vec<usize>,
+    write_tag: Vec<u64>,
+    write_base: Vec<usize>,
+    pub(crate) code_page: u64,
+    pub(crate) code_base: usize,
+}
+
+impl FastTlb {
+    fn new() -> FastTlb {
+        FastTlb {
+            read_tag: vec![u64::MAX; FAST_ENTRIES],
+            read_base: vec![0; FAST_ENTRIES],
+            write_tag: vec![u64::MAX; FAST_ENTRIES],
+            write_base: vec![0; FAST_ENTRIES],
+            code_page: u64::MAX,
+            code_base: 0,
+        }
+    }
+
+    pub(crate) fn flush(&mut self) {
+        self.read_tag.fill(u64::MAX);
+        self.write_tag.fill(u64::MAX);
+        self.code_page = u64::MAX;
+    }
 }
 
 const DAIF_ALL: u32 = 0xf << 6;
@@ -184,6 +219,7 @@ impl<H: Host> Cpu<H> {
             rtc: Rtc::default(),
             host,
             tlb: Tlb::new(),
+            fast: [FastTlb::new(), FastTlb::new()],
             excl: None,
             next_pc: 0,
             insn_count: 0,
@@ -217,7 +253,7 @@ impl<H: Host> Cpu<H> {
             ..SysRegs::default()
         };
         self.gic = Gic::new();
-        self.tlb.flush();
+        self.tlb_flush();
         self.excl = None;
         self.irq_dirty = true;
         self.timer_ns_base = self.host.now_ns();
@@ -514,7 +550,18 @@ impl<H: Host> Cpu<H> {
         }
     }
 
+    #[inline(always)]
     fn fetch(&mut self, pc: u64) -> Res<u32> {
+        let f = &self.fast[self.el as usize];
+        if pc >> 12 == f.code_page {
+            let a = f.code_base + (pc & 0xffc) as usize;
+            return Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()));
+        }
+        self.fetch_slow(pc)
+    }
+
+    #[inline(never)]
+    fn fetch_slow(&mut self, pc: u64) -> Res<u32> {
         if pc & 3 != 0 {
             return Err(Event::Sync {
                 ec: ec::PC_ALIGN,
@@ -526,6 +573,12 @@ impl<H: Host> Cpu<H> {
         let pa = self.translate(pc, crate::mmu::Access::Exec, false)?;
         let a = pa as usize;
         if a + 4 <= self.mem.len() {
+            let page = (pa & !0xfff) as usize;
+            if page + 0x1000 <= self.mem.len() {
+                let f = &mut self.fast[self.el as usize];
+                f.code_page = pc >> 12;
+                f.code_base = page;
+            }
             Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()))
         } else {
             // Executing from MMIO is not supported: synchronous external abort.
@@ -607,10 +660,53 @@ impl<H: Host> Cpu<H> {
         ok
     }
 
+    #[inline(always)]
+    fn ram_load(&self, a: usize, size: u32) -> u64 {
+        let m = &self.mem;
+        match size {
+            1 => m[a] as u64,
+            2 => u16::from_le_bytes([m[a], m[a + 1]]) as u64,
+            4 => u32::from_le_bytes(m[a..a + 4].try_into().unwrap()) as u64,
+            _ => u64::from_le_bytes(m[a..a + 8].try_into().unwrap()),
+        }
+    }
+
+    #[inline(always)]
+    fn ram_store(&mut self, a: usize, size: u32, value: u64) {
+        let m = &mut self.mem;
+        match size {
+            1 => m[a] = value as u8,
+            2 => m[a..a + 2].copy_from_slice(&(value as u16).to_le_bytes()),
+            4 => m[a..a + 4].copy_from_slice(&(value as u32).to_le_bytes()),
+            _ => m[a..a + 8].copy_from_slice(&value.to_le_bytes()),
+        }
+    }
+
     /// Virtual read of `size` bytes with the current (or EL0, if `unpriv`) permissions.
+    #[inline(always)]
     pub fn read(&mut self, va: u64, size: u32, unpriv: bool) -> Res<u64> {
+        let off = va & 0xfff;
+        if !unpriv && off + size as u64 <= 0x1000 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.read_tag[i] == va >> 12 {
+                return Ok(self.ram_load(f.read_base[i] + off as usize, size));
+            }
+        }
+        self.read_slow(va, size, unpriv)
+    }
+
+    #[inline(never)]
+    fn read_slow(&mut self, va: u64, size: u32, unpriv: bool) -> Res<u64> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
             let pa = self.translate(va, crate::mmu::Access::Read, unpriv)?;
+            let page = (pa & !0xfff) as usize;
+            if !unpriv && page + 0x1000 <= self.mem.len() {
+                let f = &mut self.fast[self.el as usize];
+                let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+                f.read_tag[i] = va >> 12;
+                f.read_base[i] = page;
+            }
             return self.phys_read(pa, size).ok_or_else(|| self.external_abort(va, false));
         }
         // Crosses a page boundary: go byte by byte.
@@ -622,9 +718,32 @@ impl<H: Host> Cpu<H> {
         Ok(v)
     }
 
+    #[inline(always)]
     pub fn write(&mut self, va: u64, size: u32, value: u64, unpriv: bool) -> Res<()> {
+        let off = va & 0xfff;
+        if !unpriv && off + size as u64 <= 0x1000 && self.excl.is_none() {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.write_tag[i] == va >> 12 {
+                let a = f.write_base[i] + off as usize;
+                self.ram_store(a, size, value);
+                return Ok(());
+            }
+        }
+        self.write_slow(va, size, value, unpriv)
+    }
+
+    #[inline(never)]
+    fn write_slow(&mut self, va: u64, size: u32, value: u64, unpriv: bool) -> Res<()> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
             let pa = self.translate(va, crate::mmu::Access::Write, unpriv)?;
+            let page = (pa & !0xfff) as usize;
+            if !unpriv && page + 0x1000 <= self.mem.len() {
+                let f = &mut self.fast[self.el as usize];
+                let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+                f.write_tag[i] = va >> 12;
+                f.write_base[i] = page;
+            }
             if let Some(e) = self.excl {
                 if e & !0x3f == pa & !0x3f {
                     self.excl = None;
