@@ -5,8 +5,8 @@
 //
 //   node tests/js/flow.mjs DIR [CPUS]      (DIR from tests/fs/make-9pfs.sh)
 //
-// HTTP goes to a server in this process: the guest asks for http://testhost/...,
-// which the port-80 relay turns into a fetch() that is pointed here.
+// HTTP goes to a server in this process: the guest asks for http://testhost/..., which the
+// machine's web relay hands out as a request this test's fetch() points here.
 import crypto from "node:crypto";
 import http from "node:http";
 import path from "node:path";
@@ -39,7 +39,7 @@ const server = http.createServer((req, res) => {
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const PORT = server.address().port;
-const http_options = {
+const network = {
   upgrade_https: false,
   fetch: (url, init) => fetch(url.replace(/^http:\/\/testhost\b/, `http://127.0.0.1:${PORT}`), init),
 };
@@ -53,8 +53,7 @@ function machine(extra) {
     memory_mb: 256,
     cpus,
     filesystem: { json: path.join(dir, "fs.json"), baseurl: path.join(dir, "blobs") + "/" },
-    network: true,
-    http_options,
+    network,
     ...extra,
   });
   let text = "";

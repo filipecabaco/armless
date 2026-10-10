@@ -287,141 +287,28 @@
     }
   }
 
-  // ---------------------------------------------------------- HTTP over fetch
+  // -------------------------------------------------------------- web relay
 
-  const CRLFCRLF = [13, 10, 13, 10];
-  function find(hay, needle, from = 0) {
-    outer: for (let i = from; i + needle.length <= hay.length; i++) {
-      for (let k = 0; k < needle.length; k++) if (hay[i + k] !== needle[k]) continue outer;
-      return i;
-    }
-    return -1;
+  // The guest's connections to ports 80 and 443 end inside the machine (HTTPS terminated with
+  // the site's CA); what comes out is a request to make or a WebSocket to open, done here with
+  // the page's own fetch() and WebSocket.
+
+  const HTTP_SKIP = /^(content-encoding|content-length|transfer-encoding|keep-alive|connection)$/i;
+
+  function web_options(network) {
+    const o = typeof network === "object" && network ? network : {};
+    return {
+      fetch: o.fetch || ((...a) => fetch(...a)),
+      WebSocket: o.WebSocket || globalThis.WebSocket,
+      // Pages on https:// may not fetch http:// (nor open ws://): ask for the same over TLS
+      upgrade_https: o.upgrade_https ?? (typeof location !== "undefined" && location.protocol === "https:"),
+      tls: o.tls,
+    };
   }
-  function concat(a, b) {
-    const out = new Uint8Array(a.length + b.length);
-    out.set(a);
-    out.set(b, a.length);
-    return out;
-  }
 
-  /**
-   * Answer HTTP/1.x requests on `conn` with fetch(): the guest's plain HTTP becomes the
-   * page's own requests (upgraded to https:// on https pages, where http:// is blocked).
-   * One request per connection. `initial` = bytes already read from the connection.
-   */
-  function http_over_fetch(conn, initial, options = {}) {
-    const do_fetch = options.fetch || ((...a) => fetch(...a));
-    const upgrade = options.upgrade_https ?? (typeof location !== "undefined" && location.protocol === "https:");
-    let buf = initial ? new Uint8Array(initial) : new Uint8Array(0);
-    let head = null;
-    let done = false;
-
-    const fail = (status, text, message) => {
-      done = true;
-      const body = utf8.encode(message + "\n");
-      conn.write(`HTTP/1.1 ${status} ${text}\r\ncontent-type: text/plain\r\ncontent-length: ${body.length}\r\nconnection: close\r\n\r\n`);
-      conn.write(body);
-      conn.close();
-    };
-
-    const try_request = () => {
-      if (done) return;
-      if (!head) {
-        const end = find(buf, CRLFCRLF);
-        if (end < 0) {
-          if (buf.length > 1 << 16) fail(431, "Request Header Fields Too Large", "snowglobe: request headers too large");
-          return;
-        }
-        const lines = new TextDecoder().decode(buf.subarray(0, end)).split("\r\n");
-        const [method, target] = lines[0].split(" ");
-        const headers = [];
-        for (const line of lines.slice(1)) {
-          const colon = line.indexOf(":");
-          if (colon <= 0) return fail(400, "Bad Request", `armless: bad header: ${line}`);
-          headers.push([line.slice(0, colon).trim(), line.slice(colon + 1).trim()]);
-        }
-        head = { method, target, headers, body_at: end + 4 };
-      }
-      const get = (k) => head.headers.find(([h]) => h.toLowerCase() === k)?.[1];
-      let body = buf.subarray(head.body_at);
-      if (/chunked/i.test(get("transfer-encoding") || "")) {
-        // Wait for the whole chunked body, then decode it
-        const parts = [];
-        let at = 0;
-        for (;;) {
-          const eol = find(body, [13, 10], at);
-          if (eol < 0) return;
-          const size = parseInt(new TextDecoder().decode(body.subarray(at, eol)), 16);
-          if (isNaN(size)) return fail(400, "Bad Request", "armless: bad chunked body");
-          if (size === 0) break;
-          if (body.length < eol + 2 + size + 2) return;
-          parts.push(body.subarray(eol + 2, eol + 2 + size));
-          at = eol + 2 + size + 2;
-        }
-        body = parts.reduce(concat, new Uint8Array(0));
-      } else {
-        const length = Number(get("content-length") || 0);
-        if (body.length < length) return;
-        body = body.subarray(0, length);
-      }
-      done = true;
-      send(body);
-    };
-
-    const send = async (body) => {
-      let url;
-      try {
-        url = /^https?:\/\//i.test(head.target) ? new URL(head.target) : new URL(`http://${get_host()}${head.target}`);
-      } catch {
-        return fail(400, "Bad Request", `armless: can't make a URL of ${head.target}`);
-      }
-      if (upgrade && url.protocol === "http:") url.protocol = "https:";
-      const headers = new Headers();
-      for (const [k, v] of head.headers) {
-        if (!/^(host|connection|keep-alive|proxy-connection|transfer-encoding|content-length|upgrade|te|trailer)$/i.test(k)) {
-          try { headers.append(k, v); } catch { /* forbidden in a browser */ }
-        }
-      }
-      const init = { method: head.method, headers, redirect: "manual" };
-      if (!/^(GET|HEAD)$/i.test(head.method)) init.body = body;
-      let response;
-      try {
-        response = await do_fetch(url.href, init);
-      } catch (e) {
-        return fail(502, "Fetch Error",
-          `armless: the browser could not fetch ${url.href}\n` +
-          `Requests from the guest are the page's own fetch() calls, so the server must allow CORS.\n${e}`);
-      }
-      const out = [`HTTP/1.1 ${response.status || 200} ${response.statusText || "OK"}`];
-      response.headers.forEach((v, k) => {
-        if (!/^(content-encoding|content-length|transfer-encoding|keep-alive|connection)$/i.test(k)) out.push(`${k}: ${v}`);
-      });
-      out.push("connection: close", "", "");
-      conn.write(out.join("\r\n"));
-      if (response.body && !/^HEAD$/i.test(head.method)) {
-        const reader = response.body.getReader();
-        try {
-          for (;;) {
-            const { value, done: end } = await reader.read();
-            if (end) break;
-            conn.write(value);
-            await conn.drain();
-            if (conn.state === "closed") return reader.cancel();
-          }
-        } catch { /* the transfer broke: the guest sees a short body */ }
-      }
-      conn.close();
-    };
-    const get_host = () => head.headers.find(([h]) => h.toLowerCase() === "host")?.[1] || conn.host;
-
-    conn.on("data", (bytes) => {
-      if (done) return;
-      buf = concat(buf, bytes);
-      try_request();
-    });
-    conn.on("end", () => { if (!done) { done = true; conn.close(); } });
-    if (conn.state === "new") conn.accept();
-    try_request();
+  function read_str(dv, bytes, at) {
+    const n = dv.getUint32(at, true);
+    return [new TextDecoder().decode(bytes.subarray(at + 4, at + 4 + n)), at + 4 + n];
   }
 
   // ---------------------------------------------------------------- Armless
@@ -507,10 +394,21 @@
       } else if (o.boot) {
         await this._boot(o.boot);
       }
-      this._drain();
       if (o.network) {
+        this._web_options = web_options(o.network);
+        this._web = new Map();
+        this._seed();
+        if (this._web_options.tls) {
+          const tls = this._web_options.tls;
+          const json = typeof tls === "object" && !(tls instanceof ArrayBuffer) && !ArrayBuffer.isView(tls) ?
+            utf8.encode(JSON.stringify(tls)) : await load(tls);
+          this._with_bytes(json, (p, n) => {
+            if (e.armless_tls(p, n) !== 0) throw new Error("armless: tls: " + this._error());
+          });
+        }
         this._interval = setInterval(() => this._call("armless_tick", performance.now()), 250);
       }
+      this._drain();
       this.emit("ready");
       this.emit("emulator-loaded");
       if (o.autostart) this.run();
@@ -764,6 +662,7 @@
       const was_running = this.running;
       await this.stop();
       await this._restore(src);
+      if (this.options.network) this._seed();
       this._drain();
       if (was_running) this.run();
     }
@@ -868,10 +767,8 @@
           const conn = new Connection(this, id, text(), port);
           this._conns.set(id, conn);
           this.emit("tcp-connection", conn);
-          if (!conn.decided) {
-            if (port === 80 && this.options.http !== false) http_over_fetch(conn, null, this.options.http_options);
-            else conn.refuse();
-          }
+          // Ports other than 80 and 443: raw TCP, which a page can't make
+          if (!conn.decided) conn.refuse();
           break;
         }
         case 5: {
@@ -885,9 +782,160 @@
           const c = this._conns.get(id);
           this._conns.delete(id);
           if (c && c.state !== "closed") { c.state = "closed"; c.emit("close"); }
+          const w = this._web?.get(id);
+          if (w) {
+            this._web.delete(id);
+            w.abort?.abort();
+            if (w.socket && w.socket.readyState <= 1) w.socket.close();
+          }
+          break;
+        }
+        case 9: {
+          const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+          let at = 0, method, url, k, v;
+          [method, at] = read_str(dv, data, at);
+          [url, at] = read_str(dv, data, at);
+          const n = dv.getUint32(at, true);
+          at += 4;
+          const headers = [];
+          for (let i = 0; i < n; i++) {
+            [k, at] = read_str(dv, data, at);
+            [v, at] = read_str(dv, data, at);
+            headers.push([k, v]);
+          }
+          this._http(id, method, url, headers, data.slice(at));
+          break;
+        }
+        case 10: {
+          const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+          const [url, at] = read_str(dv, data, 0);
+          const protocols = new TextDecoder().decode(data.subarray(at)).split(",").filter(Boolean);
+          this._websocket(id, url, protocols);
+          break;
+        }
+        case 11: {
+          const socket = this._web?.get(id)?.socket;
+          if (socket?.readyState === 1) socket.send(port ? new TextDecoder().decode(data) : data.slice());
+          break;
+        }
+        case 12: {
+          const socket = this._web?.get(id)?.socket;
+          this._web?.delete(id);
+          if (socket && socket.readyState <= 1) socket.close(port === 1000 || (port >= 3000 && port < 5000) ? port : 1000);
           break;
         }
       }
+    }
+
+    _seed() {
+      const r = new Uint8Array(32);
+      globalThis.crypto.getRandomValues(r);
+      this._with_bytes(r, (p, n) => this._call("armless_seed", p, n));
+    }
+
+    _str_call(name, id, s, ...rest) {
+      this._with_bytes(utf8.encode(s), (p, n) => this._call(name, id, ...rest, p, n));
+    }
+
+    /** One of the guest's HTTP(S) requests, made with fetch(). */
+    async _http(id, method, url, headers, body) {
+      const o = this._web_options;
+      const w = { abort: typeof AbortController === "function" ? new AbortController() : null };
+      this._web.set(id, w);
+      const fail = (message) => {
+        if (this._web.get(id) !== w) return;
+        this._web.delete(id);
+        this._str_call("armless_http_fail", id, message);
+        this._drain();
+        this._poke();
+      };
+      let target = url;
+      if (o.upgrade_https && target.startsWith("http:")) target = "https:" + target.slice(5);
+      const h = new Headers();
+      for (const [k, v] of headers) {
+        try { h.append(k, v); } catch { /* a header the browser won't send */ }
+      }
+      let response;
+      try {
+        response = await o.fetch(target, {
+          method,
+          headers: h,
+          body: /^(GET|HEAD)$/i.test(method) ? undefined : body,
+          signal: w.abort?.signal,
+          redirect: "follow",
+        });
+      } catch (err) {
+        return fail(`the browser could not fetch ${target} (the server must allow CORS): ${err}`);
+      }
+      if (this._web.get(id) !== w) return;
+      const pairs = [];
+      response.headers.forEach((v, k) => { if (!HTTP_SKIP.test(k)) pairs.push(k, v); });
+      const reason = utf8.encode(response.statusText || "OK");
+      const hb = utf8.encode(pairs.join("\0"));
+      const rp = this._copy_in(reason);
+      this._with_bytes(hb, (p, n) => this._call("armless_http_respond", id, response.status || 200, rp, reason.length, p, n));
+      this.exports.armless_free(rp, reason.length);
+      this._drain();
+      this._poke();
+      if (response.body) {
+        const reader = response.body.getReader();
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (this._web.get(id) !== w) return reader.cancel();
+            this._with_bytes(value, (p, n) => this._call("armless_http_body", id, p, n));
+            this._poke();
+            while (this._web.get(id) === w && this._call("armless_tcp_buffered", id) > TCP_BACKLOG) await sleep(5);
+          }
+        } catch {
+          return fail("the transfer broke");
+        }
+      }
+      if (this._web.get(id) !== w) return;
+      this._web.delete(id);
+      this._call("armless_http_end", id);
+      this._drain();
+      this._poke();
+    }
+
+    /** One of the guest's WebSockets, opened with the page's WebSocket. */
+    _websocket(id, url, protocols) {
+      const o = this._web_options;
+      let target = url;
+      if (o.upgrade_https && target.startsWith("ws:")) target = "wss:" + target.slice(3);
+      let socket;
+      try {
+        socket = new o.WebSocket(target, protocols);
+      } catch (err) {
+        this._str_call("armless_http_fail", id, `the browser could not open ${target}: ${err}`);
+        return this._drain();
+      }
+      socket.binaryType = "arraybuffer";
+      const w = { socket };
+      this._web.set(id, w);
+      let opened = false;
+      socket.onopen = () => {
+        opened = true;
+        this._str_call("armless_ws_accept", id, socket.protocol || "");
+        this._drain();
+        this._poke();
+      };
+      socket.onmessage = ({ data }) => {
+        const text = typeof data === "string";
+        const bytes = text ? utf8.encode(data) : new Uint8Array(data);
+        this._with_bytes(bytes, (p, n) => this._call("armless_ws_send", id, text ? 1 : 0, p, n));
+        this._drain();
+        this._poke();
+      };
+      socket.onclose = ({ code }) => {
+        if (this._web.get(id) !== w) return;
+        this._web.delete(id);
+        if (opened) this._call("armless_ws_close", id, code || 1005);
+        else this._str_call("armless_http_fail", id, `the browser could not open ${target}`);
+        this._drain();
+        this._poke();
+      };
     }
 
     async _fetch_blob(name) {
@@ -914,9 +962,8 @@
   }
 
   Armless.Connection = Connection;
-  Armless.http_over_fetch = http_over_fetch;
   Armless.load = load;
 
   root.Armless = Armless;
-  if (typeof module === "object" && module.exports) module.exports = { Armless, http_over_fetch };
+  if (typeof module === "object" && module.exports) module.exports = { Armless };
 })(typeof globalThis !== "undefined" ? globalThis : this);

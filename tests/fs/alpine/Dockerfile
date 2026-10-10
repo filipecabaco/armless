@@ -2,7 +2,11 @@
 # (internal/boot/boot.Dockerfile), for tests/arm/alpine.mjs.
 FROM --platform=linux/arm64 alpine:3.24
 
-RUN apk add --no-cache openrc alpine-base agetty linux-virt linux-firmware-none
+RUN apk add --no-cache openrc alpine-base agetty linux-virt linux-firmware-none curl ca-certificates
+
+# The test CA (tests/fixtures; test-only keys): HTTPS in the guest is terminated with it
+COPY test-ca.crt /usr/local/share/ca-certificates/armless-test.crt
+RUN update-ca-certificates
 
 # ttyS0: root shell for the test; hvc0: the "app" console
 RUN sed -i '/^tty[0-9]/d' /etc/inittab && \

@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use super::web::{self, cert::TlsKeys, Rng, Web};
 use super::{Event, Outbox};
 use crate::ser::{R, W};
 
@@ -69,6 +70,8 @@ struct Conn {
     closing: bool,
     fin_sent: bool,
     guest_fin: bool,
+    /// Ports 80 and 443: relayed as HTTP inside the machine
+    web: Option<Box<Web>>,
     dup_acks: u32,
     last_progress: u64,
     rto: u64,
@@ -100,6 +103,9 @@ pub struct Stack {
     now: u64,
     /// Ethernet frames for the guest.
     pub frames: VecDeque<Vec<u8>>,
+    /// The site's CA: with it, port 443 is HTTPS terminated here
+    pub tls: Option<TlsKeys>,
+    pub rng: Rng,
 }
 
 fn checksum(parts: &[&[u8]]) -> u16 {
@@ -143,6 +149,8 @@ impl Stack {
             ip_id: 1,
             now: 0,
             frames: VecDeque::new(),
+            tls: None,
+            rng: Rng::default(),
         }
     }
 
@@ -292,6 +300,33 @@ impl Stack {
         }
     }
 
+    // ------------------------------------------------------------ web relay
+
+    /// Run `f` on a relayed connection and carry out what it asks.
+    pub fn with_web(
+        &mut self,
+        id: u32,
+        out: &Outbox,
+        f: impl FnOnce(&mut Web, Option<&mut TlsKeys>, &mut Rng) -> web::Out,
+    ) {
+        let Some(mut w) = self.conns.get_mut(&id).and_then(|c| c.web.take()) else {
+            return;
+        };
+        let o = f(&mut w, self.tls.as_mut(), &mut self.rng);
+        if let Some(c) = self.conns.get_mut(&id) {
+            c.web = Some(w);
+        }
+        for e in o.events {
+            out.push(e);
+        }
+        if !o.to_guest.is_empty() {
+            self.send(id, &o.to_guest);
+        }
+        if o.close {
+            self.close(id, out);
+        }
+    }
+
     // ------------------------------------------------------------ host API
 
     pub fn accept(&mut self, id: u32) {
@@ -309,12 +344,14 @@ impl Stack {
         self.segment(id, SYN, isn, &[], &[2, 4, (MSS >> 8) as u8, MSS as u8]);
     }
 
-    pub fn refuse(&mut self, id: u32) {
+    /// Refuse a connection the guest opened (TcpClosed follows, like for every TcpOpen).
+    pub fn refuse(&mut self, id: u32, out: &Outbox) {
         if let Some(c) = self.conns.get(&id) {
             let ack = c.rcv_nxt;
             let (ip, sport, dport) = (c.remote_ip, c.remote_port, c.guest_port);
             self.tcp_raw(ip, sport, dport, 0, ack, RST | ACK, &[], &[]);
             self.conns.remove(&id);
+            out.push(Event::TcpClosed { id });
         }
     }
 
@@ -335,6 +372,7 @@ impl Stack {
         self.finish_if_done(id, out);
     }
 
+    /// Reset a connection (no TcpClosed: the host knows).
     pub fn abort(&mut self, id: u32) {
         if let Some(c) = self.conns.get(&id) {
             let seq = c.snd_nxt;
@@ -399,6 +437,7 @@ impl Stack {
             last_progress: self.now,
             rto: RTO_MS,
             retries: 0,
+            web: None,
         }
     }
 
@@ -694,8 +733,15 @@ impl Stack {
                 c.rcv_nxt = seq.wrapping_add(1);
                 c.guest_window = window;
                 c.mss = parse_mss(&t[20..off]).unwrap_or(536).min(MSS);
-                self.conns.insert(id, c);
                 let host = self.host_of(dst);
+                if dport == 80 || (dport == 443 && self.tls.is_some()) {
+                    // The web relay answers this one itself
+                    c.web = Some(Box::new(Web::new(id, dport == 443, host)));
+                    self.conns.insert(id, c);
+                    self.accept(id);
+                    return;
+                }
+                self.conns.insert(id, c);
                 out.push(Event::TcpOpen {
                     id,
                     host,
@@ -715,14 +761,8 @@ impl Stack {
         };
 
         if flags & RST != 0 {
-            let notify = self
-                .conns
-                .get(&id)
-                .is_some_and(|c| c.state != State::SynReceived || c.accepted);
             self.conns.remove(&id);
-            if notify {
-                out.push(Event::TcpClosed { id });
-            }
+            out.push(Event::TcpClosed { id });
             return;
         }
 
@@ -798,18 +838,29 @@ impl Stack {
             let skip = c.rcv_nxt.wrapping_sub(seq) as usize;
             if skip <= payload.len() && !c.guest_fin {
                 let fresh = &payload[skip..];
+                let is_web = c.web.is_some();
                 if !fresh.is_empty() {
                     c.rcv_nxt = c.rcv_nxt.wrapping_add(fresh.len() as u32);
-                    out.push(Event::TcpData {
-                        id,
-                        data: fresh.to_vec(),
-                    });
+                    if is_web {
+                        let fresh = fresh.to_vec();
+                        self.with_web(id, out, |w, tls, rng| w.from_guest(&fresh, tls, rng));
+                    } else {
+                        out.push(Event::TcpData {
+                            id,
+                            data: fresh.to_vec(),
+                        });
+                    }
                 }
-                let c = self.conns.get_mut(&id).unwrap();
-                if flags & FIN != 0 && seq.wrapping_add(payload.len() as u32) == c.rcv_nxt {
-                    c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
-                    c.guest_fin = true;
-                    out.push(Event::TcpEof { id });
+                if let Some(c) = self.conns.get_mut(&id) {
+                    if flags & FIN != 0 && seq.wrapping_add(payload.len() as u32) == c.rcv_nxt {
+                        c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
+                        c.guest_fin = true;
+                        if is_web {
+                            self.with_web(id, out, |w, _, _| w.guest_eof());
+                        } else {
+                            out.push(Event::TcpEof { id });
+                        }
+                    }
                 }
             }
         }

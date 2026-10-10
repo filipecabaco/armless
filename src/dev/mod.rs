@@ -16,6 +16,7 @@ pub mod p9;
 pub mod pci;
 pub mod uart;
 pub mod virtio;
+pub mod web;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +46,27 @@ pub enum Event {
     TcpData { id: u32, data: Vec<u8> },
     /// The guest closed its sending side.
     TcpEof { id: u32 },
-    /// The connection is gone (closed both ways, reset or refused).
+    /// The guest made an HTTP(S) request (ports 80 and 443 end in the machine's web relay).
+    /// Answer with `http_respond`, `http_body`… and `http_end`, or `http_fail`.
+    HttpRequest {
+        id: u32,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    /// The guest opened a WebSocket (ws:// or wss:// URL): `ws_accept` or `ws_fail`.
+    WsOpen {
+        id: u32,
+        url: String,
+        protocols: Vec<String>,
+    },
+    /// A message from the guest's WebSocket.
+    WsMessage { id: u32, text: bool, data: Vec<u8> },
+    /// The guest closed its WebSocket.
+    WsClose { id: u32, code: u16 },
+    /// The connection is gone (closed both ways, reset, refused, or given up on;
+    /// not after the host's own `tcp_abort`). Every `TcpOpen` ends with one.
     TcpClosed { id: u32 },
 }
 

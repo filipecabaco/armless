@@ -79,7 +79,8 @@ fn machine(dir: &PathBuf, cpus: usize, boot: bool) -> Machine {
         board,
         HostOptions {
             blobs: Some(dir.join("blobs")),
-            nat: false,
+            network: false,
+            ..Default::default()
         },
         Box::new(move |e| {
             if let Event::Console(b) = e {

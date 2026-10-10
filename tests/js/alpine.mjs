@@ -4,6 +4,7 @@
 // a shell on ttyS0; then save a snapshot and restore it.
 //
 //   node tests/js/alpine.mjs DIR [CPUS]   (DIR: fs.json + blobs/ from tests/fs/alpine/build.sh)
+import http from "node:http";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -29,6 +30,20 @@ function fail(msg) {
   process.exit(1);
 }
 
+// HTTPS from the guest: terminated in the machine with the test CA, made here with fetch()
+// pointed at this server
+const server = http.createServer((req, res) => {
+  const parts = [];
+  req.on("data", (c) => parts.push(c));
+  req.on("end", () => res.end(`secure ${req.method} ${req.url} ${Buffer.concat(parts).length}\n`));
+});
+await new Promise((r) => server.listen(0, "127.0.0.1", r));
+const network = {
+  tls: path.join(root, "tests/fixtures/tls.json"),
+  upgrade_https: false,
+  fetch: (url, init) => fetch(url.replace(/^https:\/\/[^/]+/, `http://127.0.0.1:${server.address().port}`), init),
+};
+
 function make(extra) {
   const vm = new Armless({
     wasm: path.join(root, "build/armless.wasm"),
@@ -36,7 +51,7 @@ function make(extra) {
     memory_mb: 512,
     cpus,
     filesystem: { json: path.join(dir, "fs.json"), baseurl: path.join(dir, "blobs") + "/" },
-    network: true,
+    network,
     ...extra,
   });
   vm.on("serial", (bytes) => {
@@ -72,6 +87,12 @@ await wait_for("ok-42", 120_000);
 if (!serial.includes("aarch64")) fail("uname -m is not aarch64");
 log("commands run: " + serial.slice(serial.lastIndexOf("uname -m")).split("\n").slice(1, 5).join(" | "));
 
+vm.serial_input("ip link set eth0 up; ip addr add 192.168.86.100/24 dev eth0; ip route add default via 192.168.86.1; " +
+  "echo nameserver 192.168.86.1 > /etc/resolv.conf; curl -sS -d hello https://api.example.test/v1?q=2; echo net-$((40+2))\n");
+await wait_for("net-42", 120_000);
+if (!serial.includes("secure POST /v1?q=2 5")) fail("HTTPS through the web relay");
+log("HTTPS from the guest: " + serial.slice(serial.indexOf("secure POST")).split("\n")[0]);
+
 vm.serial_input("sync; echo 3 > /proc/sys/vm/drop_caches; echo cache-$((40+2))\n");
 await wait_for("cache-42", 120_000);
 const state = await vm.save_state();
@@ -85,5 +106,6 @@ vm.serial_input("echo restored-$((6*7)) $(uname -r)\n");
 await wait_for("restored-42", 120_000);
 log("restored snapshot answers: " + serial.slice(serial.indexOf("restored-42")).split("\n")[0]);
 vm.destroy();
+server.close();
 log("PASS");
 process.exit(0);

@@ -41,6 +41,9 @@ is queued as `Event`s, and the host answers through `Board`:
 |---|---|
 | `Serial(bytes)`, `Console(bytes)` | (display it) |
 | `Blob(name)` | `provide_blob(name, contents)` or `blob_failed(name)` |
+| `HttpRequest { id, method, url, headers, body }` | `http_respond` (status, headers), `http_body`…, `http_end`; or `http_fail` |
+| `WsOpen { id, url, protocols }` | `ws_accept(id, protocol)` or `http_fail`; then `ws_send`/`ws_close` |
+| `WsMessage`, `WsClose` | (deliver to the other end) |
 | `TcpOpen { id, host, port }` | `tcp_accept(id)` or `tcp_refuse(id)`, then `tcp_send`/`tcp_close` |
 | `TcpData`, `TcpEof`, `TcpClosed` | (deliver to the other end) |
 | `TcpConnected { id }` | after `tcp_connect(port)`, the host's connection into the guest is up |
@@ -56,13 +59,46 @@ held) and is answered when the blob arrives. Fetched blobs are cached up to
 
 The guest is 192.168.86.100/24, and the router 192.168.86.1 answers ARP, DHCP, DNS
 and ping. DNS gives every name an address of its own (10.x.y.z, kept in snapshots),
-so `TcpOpen` carries the name the guest resolved:
+so the machine always knows which *name* a connection is for.
 
-- **Browser:** port 80 goes to `fetch()` (`Armless.http_over_fetch`), upgraded to
-  https:// on https pages. A page can claim other ports, for example snowglobe's
-  TLS bridge on 443.
-- **Native:** `NativeHost` connects real sockets, or refuses everything when the
-  network is off.
+### The web relay (`dev/web`)
+
+Browsers and most sandboxes only let HTTP out: `fetch()` and WebSocket, or an HTTP(S)
+proxy. So the guest's connections to port 80, and to 443 once `Board::set_tls` gave
+the site's CA, end inside the machine:
+
+- **TLS 1.3** on 443 (`tls.rs`) uses TLS_AES_128_GCM_SHA256 with X25519 or P-256 and
+  an ECDSA P-256 certificate minted per SNI name, signed by the site's CA (`cert.rs`).
+  The guest trusts that CA. There is no resumption and no HelloRetryRequest. Every
+  current OpenSSL, Node, Python, Go, Rust and Java client offers what it needs.
+- **HTTP/1.1** inside (`mod.rs`) takes one request per connection: Content-Length or
+  chunked bodies, `Expect: 100-continue`. Responses are streamed and end with the
+  connection.
+- **WebSocket upgrades** become `WsOpen` and the frames become messages. Pings are
+  answered in the machine.
+
+The host only sees `HttpRequest`/`WsOpen`, with full https://, wss://… URLs:
+
+- **Browser:** `fetch()` and `WebSocket`, upgraded to https:// and wss:// on https
+  pages (CORS applies).
+- **Native:** `native::Egress`, a small HTTP/1.1 + WebSocket client on rustls. It
+  goes direct or through the environment's proxy (CONNECT for TLS, absolute-form for
+  plain HTTP, `NO_PROXY` honoured) and checks TLS against the system roots, so
+  TLS-intercepting sandbox proxies work. Private addresses are refused unless
+  allowed.
+
+Randomness for TLS comes from the host (`Board::seed`): the browser uses
+`crypto.getRandomValues`, natively it comes from `/dev/urandom`. It is seeded again
+after every restore.
+
+### Other TCP
+
+Other ports reach the host as `TcpOpen` streams:
+
+- **Native:** a real connection, direct or tunnelled with CONNECT through the proxy.
+- **Browser:** refused unless the page takes it.
+
+With the network off, everything is refused.
 
 TCP towards the guest respects its window. The link never drops frames: they wait
 for receive buffers. A retransmit timer (`Board::tick`) covers what the guest's own

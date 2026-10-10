@@ -159,7 +159,7 @@ impl Board {
         self.with_net(|s, _| s.accept(id));
     }
     pub fn tcp_refuse(&self, id: u32) {
-        self.with_net(|s, _| s.refuse(id));
+        self.with_net(|s, io| s.refuse(id, &io.out));
     }
     pub fn tcp_send(&self, id: u32, data: &[u8]) {
         self.with_net(|s, _| s.send(id, data));
@@ -182,6 +182,53 @@ impl Board {
     /// Timers of the network (retransmissions): call every ~100-500 ms.
     pub fn tick(&self, now_ms: u64) {
         self.with_net(|s, io| s.tick(now_ms, &io.out));
+    }
+
+    // -------------------------------------------------------- web relay
+
+    /// The site's CA (`tls.json`): from now on the guest's HTTPS (port 443) is terminated in
+    /// the machine and reaches the host as `HttpRequest`/`WsOpen` events.
+    pub fn set_tls(&self, json: &[u8]) -> Result<(), String> {
+        let keys = crate::dev::web::cert::TlsKeys::from_json(json)?;
+        self.with_net(|s, _| s.tls = Some(keys))
+            .ok_or("this machine has no network")?;
+        Ok(())
+    }
+
+    /// Randomness for TLS (call once at start-up, and after restoring a snapshot).
+    pub fn seed(&self, entropy: &[u8]) {
+        self.with_net(|s, _| s.rng.seed(entropy));
+    }
+
+    fn with_web(&self, id: u32, f: impl FnOnce(&mut crate::dev::web::Web) -> crate::dev::web::Out) {
+        self.with_net(|s, io| s.with_web(id, &io.out, |w, _, _| f(w)));
+    }
+
+    /// The response to an `HttpRequest`: status and headers (the body follows with
+    /// `http_body`, then `http_end`).
+    pub fn http_respond(&self, id: u32, status: u16, reason: &str, headers: &[(String, String)]) {
+        self.with_web(id, |w| w.respond(status, reason, headers));
+    }
+    pub fn http_body(&self, id: u32, data: &[u8]) {
+        self.with_web(id, |w| w.body(data));
+    }
+    pub fn http_end(&self, id: u32) {
+        self.with_web(id, |w| w.end());
+    }
+    /// The request (or WebSocket) could not be made: the guest gets a 502, or the connection
+    /// closes if the response had started.
+    pub fn http_fail(&self, id: u32, message: &str) {
+        self.with_web(id, |w| w.fail(message));
+    }
+    /// The WebSocket for a `WsOpen` is open (with this subprotocol, or "").
+    pub fn ws_accept(&self, id: u32, protocol: &str) {
+        self.with_web(id, |w| w.ws_accept(protocol));
+    }
+    pub fn ws_send(&self, id: u32, text: bool, data: &[u8]) {
+        self.with_web(id, |w| w.ws_send(text, data));
+    }
+    pub fn ws_close(&self, id: u32, code: u16) {
+        self.with_web(id, |w| w.ws_close(code));
     }
 
     /// A file's contents by absolute path (or the blobs it waits on).

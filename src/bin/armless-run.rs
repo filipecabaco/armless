@@ -166,7 +166,11 @@ fn main() {
     let wait_for = console_after.clone();
     let _host = NativeHost::spawn(
         board.clone(),
-        HostOptions { blobs, nat: net },
+        HostOptions {
+            blobs,
+            network: net,
+            egress: armless::native::Egress::from_env(),
+        },
         Box::new(move |e| {
             let mut out = std::io::stdout();
             match e {

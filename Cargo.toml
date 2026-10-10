@@ -14,9 +14,20 @@ path = "src/lib.rs"
 
 [dependencies]
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+# TLS 1.3 for the web relay (pure Rust, no randomness of their own: the host seeds ours)
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hmac = { version = "0.12", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "pkcs8", "alloc"] }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }
+# Native egress: HTTPS out of the machine (system roots, so TLS-intercepting proxies work)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
 
 [features]
 # Compile the wasm export layer natively, to type-check it without a wasm target.

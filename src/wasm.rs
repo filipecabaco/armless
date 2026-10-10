@@ -11,6 +11,10 @@
 //! 1 serial output   2 console output   3 blob wanted (name)
 //! 4 tcp open (host) 5 tcp connected    6 tcp data
 //! 7 tcp eof         8 tcp closed
+//! 9 http request: method, url, headers (each a u32-length-prefixed string, headers after a
+//!   u32 count as name/value pairs), then the body
+//! 10 websocket open: url (u32-length-prefixed), then the protocols joined with ","
+//! 11 websocket message (port: 1 text, 0 binary)   12 websocket close (port: code)
 //! ```
 //!
 //! With several CPUs (`armless-smp.wasm`) every vCPU worker instantiates the
@@ -440,6 +444,36 @@ pub extern "C" fn armless_events() -> u32 {
             Event::TcpData { id, data } => put(6, id, 0, &data),
             Event::TcpEof { id } => put(7, id, 0, &[]),
             Event::TcpClosed { id } => put(8, id, 0, &[]),
+            Event::HttpRequest {
+                id,
+                method,
+                url,
+                headers,
+                body,
+            } => {
+                let mut d = Vec::new();
+                let s = |d: &mut Vec<u8>, v: &str| {
+                    d.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    d.extend_from_slice(v.as_bytes());
+                };
+                s(&mut d, &method);
+                s(&mut d, &url);
+                d.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+                for (k, v) in &headers {
+                    s(&mut d, k);
+                    s(&mut d, v);
+                }
+                d.extend_from_slice(&body);
+                put(9, id, 0, &d)
+            },
+            Event::WsOpen { id, url, protocols } => {
+                let mut d = (url.len() as u32).to_le_bytes().to_vec();
+                d.extend_from_slice(url.as_bytes());
+                d.extend_from_slice(protocols.join(",").as_bytes());
+                put(10, id, 0, &d)
+            },
+            Event::WsMessage { id, text, data } => put(11, id, text as u32, &data),
+            Event::WsClose { id, code } => put(12, id, code as u32, &[]),
         }
     }
     out(b)
@@ -553,6 +587,91 @@ pub extern "C" fn armless_tcp_abort(id: u32) {
 #[no_mangle]
 pub extern "C" fn armless_tcp_connect(port: u32) -> u32 {
     vm().board.tcp_connect(port as u16).unwrap_or(0)
+}
+
+/// The site's CA (`tls.json`): HTTPS on port 443 is terminated in the machine. 0 or -1.
+///
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_tls(ptr: u32, len: u32) -> i32 {
+    match vm().board.set_tls(slice(ptr, len)) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        },
+    }
+}
+
+/// Randomness (from crypto.getRandomValues) for TLS.
+///
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_seed(ptr: u32, len: u32) {
+    vm().board.seed(slice(ptr, len));
+}
+
+/// Answer an HTTP request event: status, reason, headers as "name\0value\0..." pairs.
+///
+/// # Safety
+/// Pointers must reference readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_http_respond(
+    id: u32,
+    status: u32,
+    reason: u32,
+    reason_len: u32,
+    hdrs: u32,
+    hdrs_len: u32,
+) {
+    let text = string(hdrs, hdrs_len);
+    let parts: Vec<&str> = text.split('\0').collect();
+    let headers: Vec<(String, String)> = parts
+        .chunks_exact(2)
+        .map(|kv| (kv[0].to_string(), kv[1].to_string()))
+        .collect();
+    vm().board
+        .http_respond(id, status as u16, &string(reason, reason_len), &headers);
+}
+
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_http_body(id: u32, ptr: u32, len: u32) {
+    vm().board.http_body(id, slice(ptr, len));
+}
+
+#[no_mangle]
+pub extern "C" fn armless_http_end(id: u32) {
+    vm().board.http_end(id);
+}
+
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_http_fail(id: u32, ptr: u32, len: u32) {
+    vm().board.http_fail(id, &string(ptr, len));
+}
+
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_ws_accept(id: u32, ptr: u32, len: u32) {
+    vm().board.ws_accept(id, &string(ptr, len));
+}
+
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_ws_send(id: u32, text: u32, ptr: u32, len: u32) {
+    vm().board.ws_send(id, text != 0, slice(ptr, len));
+}
+
+#[no_mangle]
+pub extern "C" fn armless_ws_close(id: u32, code: u32) {
+    vm().board.ws_close(id, code as u16);
 }
 
 #[no_mangle]
