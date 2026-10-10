@@ -458,6 +458,8 @@ impl<H: Host> Cpu<H> {
             tpidrro_el0: a(std::ptr::addr_of!(self.sys.tpidrro_el0) as *const u8),
             sp_el0: a(std::ptr::addr_of!(self.sp_el0) as *const u8),
             daif: a(std::ptr::addr_of!(self.daif) as *const u8),
+            vreg: a(self.vreg.as_ptr() as *const u8),
+            cpacr: a(std::ptr::addr_of!(self.sys.cpacr) as *const u8),
             el: el as u32,
             spsel: spsel as u32,
             irq_dirty: a(self.attn_ptr()),

@@ -47,6 +47,9 @@ pub struct Layout {
     pub tpidrro_el0: u32,
     pub sp_el0: u32,
     pub daif: u32,
+    /// The SIMD&FP registers (32 x u128) and CPACR_EL1 (u64, FPEN gates them).
+    pub vreg: u32,
+    pub cpacr: u32,
     /// Values (not addresses): the exception level and SPSel of this code.
     pub el: u32,
     pub spsel: u32,
@@ -571,6 +574,7 @@ impl Gen<'_> {
             },
             0b1010 | 0b1011 => self.branch(insn) || self.system(insn),
             0b0100 | 0b0110 | 0b1100 | 0b1110 => self.ldst(insn),
+            0b0111 | 0b1111 => self.simd(insn),
             _ => false,
         }
     }
@@ -683,9 +687,9 @@ impl Gen<'_> {
                 true
             },
             0b110 => {
-                // SBFM / UBFM (BFM is left to the interpreter)
+                // SBFM / UBFM / BFM
                 let opc = field(insn, 29, 2);
-                if bit(insn, 22) != sf || opc == 1 || opc == 3 {
+                if bit(insn, 22) != sf || opc == 3 {
                     return false;
                 }
                 let immr = field(insn, 16, 6);
@@ -694,6 +698,34 @@ impl Gen<'_> {
                     return false;
                 }
                 let size = if sf { 64 } else { 32 };
+                if opc == 1 {
+                    // BFM: Rn's field replaces the same bits of Rd (BFXIL / BFI)
+                    let (width, pos, shr) = if imms >= immr {
+                        (imms - immr + 1, 0, immr)
+                    } else {
+                        (imms + 1, size - immr, 0)
+                    };
+                    let field_mask = (u64::MAX >> (64 - width)) << pos;
+                    self.wr(rd, |g| {
+                        g.xr(rd);
+                        g.c.i64c(!field_mask as i64);
+                        g.c.i64_and();
+                        g.xr(rn);
+                        if shr > 0 {
+                            g.c.i64c(shr as i64);
+                            g.c.i64_shr_u();
+                        }
+                        if pos > 0 {
+                            g.c.i64c(pos as i64);
+                            g.c.i64_shl();
+                        }
+                        g.c.i64c(field_mask as i64);
+                        g.c.i64_and();
+                        g.c.i64_or();
+                        g.trunc32(sf);
+                    });
+                    return true;
+                }
                 let signed = opc == 0;
                 self.wr(rd, |g| {
                     // Move the field to the top of an i64, then shift it down
@@ -1491,6 +1523,352 @@ impl Gen<'_> {
         }
     }
 
+    // ------------------------------------------------------------ SIMD&FP
+
+    /// Push half `h` (0 = low 64 bits) of Vr.
+    fn vld(&mut self, r: u32, h: u32) {
+        self.c.i32c(0);
+        self.c.i64_load(self.l.vreg + 16 * r + 8 * h);
+    }
+
+    /// Store the value produced by `f` to half `h` of Vr.
+    fn vst(&mut self, r: u32, h: u32, f: impl FnOnce(&mut Self)) {
+        self.c.i32c(0);
+        f(self);
+        self.c.i64_store(self.l.vreg + 16 * r + 8 * h);
+    }
+
+    /// Lane-wise result per 64-bit half: `f` pushes half `h`'s value. A
+    /// 64-bit (Q=0) result clears the top half.
+    fn vlanes(&mut self, q: bool, rd: u32, mut f: impl FnMut(&mut Self, u32)) {
+        self.vst(rd, 0, |g| f(g, 0));
+        if q {
+            self.vst(rd, 1, |g| f(g, 1));
+        } else {
+            self.vst(rd, 1, |g| g.c.i64c(0));
+        }
+    }
+
+    /// The common integer SIMD&FP instructions, inline. The rest, and any
+    /// access CPACR_EL1 traps, go to the interpreter.
+    fn simd(&mut self, insn: u32) -> bool {
+        let start = self.c.b.len();
+        // FPEN allows EL0 and EL1 (3), or only EL1 (1)
+        let fpen = if self.l.el == 0 { 3 } else { 1 };
+        self.c.i32c(0);
+        self.c.i64_load(self.l.cpacr);
+        self.c.i64c(20);
+        self.c.i64_shr_u();
+        self.c.i64c(fpen);
+        self.c.i64_and();
+        self.c.i64c(fpen);
+        self.c.i64_eq();
+        self.c.if_(EMPTY);
+        if !self.simd_ops(insn) {
+            self.c.b.truncate(start);
+            return false;
+        }
+        self.c.else_();
+        self.interp(insn);
+        self.c.end();
+        true
+    }
+
+    fn simd_ops(&mut self, insn: u32) -> bool {
+        let q = bit(insn, 30);
+        let u = bit(insn, 29);
+        let size = field(insn, 22, 2);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        let rm = field(insn, 16, 5);
+        if insn & 0x9f20_0400 == 0x0e20_0400 {
+            // Three registers of the same type
+            let opcode = field(insn, 11, 5);
+            return match opcode {
+                0b00011 => {
+                    // AND / BIC / ORR / ORN / EOR / BSL / BIT / BIF
+                    self.vlanes(q, rd, |g, h| {
+                        match (u, size) {
+                            (false, 0) => {
+                                g.vld(rn, h);
+                                g.vld(rm, h);
+                                g.c.i64_and();
+                            },
+                            (false, 1) => {
+                                g.vld(rn, h);
+                                g.vld(rm, h);
+                                g.c.i64c(-1);
+                                g.c.i64_xor();
+                                g.c.i64_and();
+                            },
+                            (false, 2) => {
+                                g.vld(rn, h);
+                                if rm != rn {
+                                    g.vld(rm, h);
+                                    g.c.i64_or();
+                                }
+                            },
+                            (false, _) => {
+                                g.vld(rn, h);
+                                g.vld(rm, h);
+                                g.c.i64c(-1);
+                                g.c.i64_xor();
+                                g.c.i64_or();
+                            },
+                            (true, 0) => {
+                                g.vld(rn, h);
+                                g.vld(rm, h);
+                                g.c.i64_xor();
+                            },
+                            (true, 1) => {
+                                // BSL: m ^ ((n ^ m) & d)
+                                g.vld(rm, h);
+                                g.vld(rn, h);
+                                g.vld(rm, h);
+                                g.c.i64_xor();
+                                g.vld(rd, h);
+                                g.c.i64_and();
+                                g.c.i64_xor();
+                            },
+                            (true, s) => {
+                                // BIT: d ^ ((d ^ n) & m); BIF: d ^ ((d ^ n) & ~m)
+                                g.vld(rd, h);
+                                g.vld(rd, h);
+                                g.vld(rn, h);
+                                g.c.i64_xor();
+                                g.vld(rm, h);
+                                if s == 3 {
+                                    g.c.i64c(-1);
+                                    g.c.i64_xor();
+                                }
+                                g.c.i64_and();
+                                g.c.i64_xor();
+                            },
+                        }
+                    });
+                    true
+                },
+                0b10000 => {
+                    // ADD / SUB, in SWAR for lanes narrower than 64 bits
+                    if size == 3 && !q {
+                        return false;
+                    }
+                    let hi = lane_tops(size);
+                    self.vlanes(q, rd, |g, h| {
+                        if size == 3 {
+                            g.vld(rn, h);
+                            g.vld(rm, h);
+                            if u {
+                                g.c.i64_sub();
+                            } else {
+                                g.c.i64_add();
+                            }
+                            return;
+                        }
+                        g.vld(rn, h);
+                        g.c.set(T0);
+                        g.vld(rm, h);
+                        g.c.set(T1);
+                        if u {
+                            // ((a | H) - (b & ~H)) ^ ((a ^ ~b) & H)
+                            g.c.get(T0);
+                            g.c.i64c(hi);
+                            g.c.i64_or();
+                            g.c.get(T1);
+                            g.c.i64c(!hi);
+                            g.c.i64_and();
+                            g.c.i64_sub();
+                            g.c.get(T0);
+                            g.c.get(T1);
+                            g.c.i64c(-1);
+                            g.c.i64_xor();
+                            g.c.i64_xor();
+                        } else {
+                            // ((a & ~H) + (b & ~H)) ^ ((a ^ b) & H)
+                            g.c.get(T0);
+                            g.c.i64c(!hi);
+                            g.c.i64_and();
+                            g.c.get(T1);
+                            g.c.i64c(!hi);
+                            g.c.i64_and();
+                            g.c.i64_add();
+                            g.c.get(T0);
+                            g.c.get(T1);
+                            g.c.i64_xor();
+                        }
+                        g.c.i64c(hi);
+                        g.c.i64_and();
+                        g.c.i64_xor();
+                    });
+                    true
+                },
+                0b00110 | 0b00111 | 0b10001 if size == 3 && q => {
+                    // CMGT / CMHI / CMGE / CMHS / CMTST / CMEQ (2D)
+                    self.vlanes(true, rd, |g, h| {
+                        g.c.i64c(0);
+                        g.vld(rn, h);
+                        g.vld(rm, h);
+                        match (opcode, u) {
+                            (0b00110, false) => g.c.i64_gt_s(),
+                            (0b00110, true) => g.c.i64_gt_u(),
+                            (0b00111, false) => g.c.i64_ge_s(),
+                            (0b00111, true) => g.c.i64_ge_u(),
+                            (_, false) => {
+                                g.c.i64_and();
+                                g.c.i64c(0);
+                                g.c.i64_ne();
+                            },
+                            (_, true) => g.c.i64_eq(),
+                        }
+                        g.c.i64_extend_i32_u();
+                        g.c.i64_sub();
+                    });
+                    true
+                },
+                0b01000 if size == 3 && q => {
+                    // SSHL / USHL (2D): by the signed low byte of each Vm lane
+                    self.vlanes(true, rd, |g, h| {
+                        g.vld(rn, h);
+                        g.c.set(T0);
+                        g.vld(rm, h);
+                        g.c.i64c(56);
+                        g.c.i64_shl();
+                        g.c.i64c(56);
+                        g.c.i64_shr_s();
+                        g.c.set(T1);
+                        // left: 0 from 64 up
+                        g.c.get(T0);
+                        g.c.get(T1);
+                        g.c.i64_shl();
+                        g.c.i64c(0);
+                        g.c.get(T1);
+                        g.c.i64c(64);
+                        g.c.i64_lt_s();
+                        g.c.select();
+                        // right: everything shifted out from -64 down
+                        g.c.get(T0);
+                        g.c.i64c(0);
+                        g.c.get(T1);
+                        g.c.i64_sub();
+                        if u {
+                            g.c.i64_shr_u();
+                            g.c.i64c(0);
+                        } else {
+                            g.c.i64_shr_s();
+                            g.c.get(T0);
+                            g.c.i64c(63);
+                            g.c.i64_shr_s();
+                        }
+                        g.c.get(T1);
+                        g.c.i64c(-64);
+                        g.c.i64_gt_s();
+                        g.c.select();
+                        g.c.get(T1);
+                        g.c.i64c(0);
+                        g.c.i64_ge_s();
+                        g.c.select();
+                    });
+                    true
+                },
+                _ => false,
+            };
+        }
+        if insn & 0xbfe0_fc00 == 0x0e00_0c00 {
+            // DUP (general)
+            let imm5 = field(insn, 16, 5);
+            let (mask, rep): (u64, u64) = match imm5.trailing_zeros() {
+                0 => (0xff, 0x0101_0101_0101_0101),
+                1 => (0xffff, 0x0001_0001_0001_0001),
+                2 => (0xffff_ffff, 0x0000_0001_0000_0001),
+                3 if q => (u64::MAX, 1),
+                _ => return false,
+            };
+            self.xr(rn);
+            if rep != 1 {
+                self.c.i64c(mask as i64);
+                self.c.i64_and();
+                self.c.i64c(rep as i64);
+                self.c.i64_mul();
+            }
+            self.c.set(T0);
+            self.vlanes(q, rd, |g, _| g.c.get(T0));
+            return true;
+        }
+        if insn & 0xbf3f_fc00 == 0x0e21_2800 && size != 3 {
+            // XTN / XTN2: the low half of each lane, packed into 64 bits
+            for h in 0..2 {
+                self.vld(rn, h);
+                self.c.set(T0);
+                if size == 0 {
+                    self.pack(T0, 8, 0x00ff_00ff_00ff_00ff);
+                }
+                if size <= 1 {
+                    self.pack(T0, 16, 0x0000_ffff_0000_ffff);
+                }
+                self.pack(T0, 32, 0xffff_ffff);
+                self.c.get(T0);
+                if h == 0 {
+                    self.c.set(T2);
+                } else {
+                    self.c.i64c(32);
+                    self.c.i64_shl();
+                    self.c.get(T2);
+                    self.c.i64_or();
+                    self.c.set(T2);
+                }
+            }
+            if q {
+                self.vst(rd, 1, |g| g.c.get(T2));
+            } else {
+                self.vlanes(false, rd, |g, _| g.c.get(T2));
+            }
+            return true;
+        }
+        match insn & 0xffff_fc00 {
+            0x1e26_0000 | 0x9e66_0000 | 0x9eae_0000 => {
+                // FMOV Wd, Sn / Xd, Dn / Xd, Vn.D[1]
+                let sf = bit(insn, 31);
+                let h = (insn >> 23) & 1;
+                self.wr(rd, |g| {
+                    g.vld(rn, h);
+                    g.trunc32(sf);
+                });
+                true
+            },
+            0x1e27_0000 | 0x9e67_0000 => {
+                // FMOV Sd, Wn / Dd, Xn
+                let sf = bit(insn, 31);
+                self.vlanes(false, rd, |g, _| {
+                    g.xr(rn);
+                    g.trunc32(sf);
+                });
+                true
+            },
+            0x9eaf_0000 => {
+                // FMOV Vd.D[1], Xn
+                self.vst(rd, 1, |g| g.xr(rn));
+                true
+            },
+            _ => false,
+        }
+    }
+
+    /// local t: each lane of 2n bits keeps its low n bits, packed down
+    /// (`mask` selects those low halves).
+    fn pack(&mut self, t: u32, n: i64, mask: i64) {
+        self.c.get(t);
+        self.c.i64c(mask);
+        self.c.i64_and();
+        self.c.tee(t);
+        if n < 32 {
+            self.c.get(t);
+            self.c.i64c(n);
+            self.c.i64_shr_u();
+            self.c.i64_or();
+        }
+        self.c.set(t);
+    }
+
     /// local t = ((t >> n) & mask) | ((t & mask) << n)
     fn swap_units(&mut self, t: u32, n: i64, mask: i64) {
         self.c.get(t);
@@ -1844,4 +2222,13 @@ fn translate_block(g: &mut Gen, insns: &[u32]) {
 
 fn is_hint(insn: u32) -> bool {
     insn & 0xffff_f01f == 0xd503_201f && !matches!(field(insn, 5, 7), 2 | 3)
+}
+
+/// The top bit of every lane of 8 << size bits in a 64-bit half.
+fn lane_tops(size: u32) -> i64 {
+    match size {
+        0 => 0x8080_8080_8080_8080u64 as i64,
+        1 => 0x8000_8000_8000_8000u64 as i64,
+        _ => 0x8000_0000_8000_0000u64 as i64,
+    }
 }
