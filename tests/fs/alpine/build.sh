@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the arm64 Alpine test image and convert it to a v86 9p filesystem.
-#   tests/fs/alpine/build.sh OUT_DIR      (needs docker buildx with arm64 emulation)
+#   tests/fs/alpine/build.sh OUT_DIR      (needs docker buildx; on an x86 host, arm64 emulation)
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)

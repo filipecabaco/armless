@@ -9,7 +9,7 @@ jobs:
   core:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: |
           sudo apt-get update
@@ -24,7 +24,7 @@ jobs:
         run: |
           sh build-wasm.sh
           SMP=1 sh build-wasm.sh
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Bare-metal guest through armless.js (interpreter, and every block JIT-compiled)
@@ -32,7 +32,7 @@ jobs:
           OUT="$RUNNER_TEMP/guest" sh guest/build.sh
           node tests/js/run-bare.mjs "$RUNNER_TEMP/guest/tests.bin" -m 512 --no-jit
           node tests/js/run-bare.mjs "$RUNNER_TEMP/guest/tests.bin" -m 512 --jit-threshold 1 --jit-sync
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: armless-web
           path: |
@@ -43,7 +43,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: |
           sudo apt-get update
@@ -51,12 +51,12 @@ jobs:
           sudo pip install --break-system-packages zstandard
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Cache kernel
         id: kcache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build-linux
           key: linux-6.8-${{ hashFiles('tests/linux/armless_defconfig', 'tests/linux/init.c', 'tests/linux/mkcpio.py') }}
@@ -126,13 +126,13 @@ jobs:
       matrix:
         classes: [int, fp, simd, simds, ldst]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu qemu-user
           rustup target add wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Differential test against qemu-aarch64
@@ -155,18 +155,15 @@ jobs:
 
   alpine:
     # A real arm64 Alpine (linux-virt + OpenRC), prepared and booted the way
-    # snowglobe does it, through armless.js.
-    runs-on: ubuntu-24.04
+    # snowglobe does it, through armless.js. On an arm64 runner, so the image builds natively
+    # instead of under QEMU's binfmt emulation.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-      - uses: docker/setup-buildx-action@v3
       - name: Toolchain
         run: |
           sudo apt-get update -y
