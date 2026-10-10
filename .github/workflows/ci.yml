@@ -70,12 +70,19 @@ jobs:
 
       - name: Run kvm-unit-test
         run: |
-          tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/taskswitch.flat
-          tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/taskswitch2.flat
-          tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/realmode.flat
-          tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/pat.flat
-          tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/nx.flat
-          DISABLE_JIT=1 tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/nx.flat
+          # armless fork: report the failing test's output as an annotation
+          run() {
+            if ! "$@" > kvm.log 2>&1; then
+              echo "::error title=kvm-unit-test $*::$(tail -c 1500 kvm.log | tr -d '\r%' | tr '\n' ';')"
+              exit 1
+            fi
+          }
+          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/taskswitch.flat
+          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/taskswitch2.flat
+          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/realmode.flat
+          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/pat.flat
+          run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/nx.flat
+          DISABLE_JIT=1 run tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/nx.flat
 
       - name: Fetch namsmtests cache
         uses: actions/cache@v5
