@@ -9,6 +9,7 @@
 //   node tests/arm/snowglobe.mjs DIR     (DIR has vmlinuz, fs.json, blobs/)
 import fs from "node:fs";
 import path from "node:path";
+import http from "node:http";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -118,6 +119,21 @@ con.send("echo restored-$((6*7)) $(uname -m); cat /etc/motd");
 await con.wait("restored-42 aarch64");
 await con.wait("hello from 9p");
 log("restored guest answers on hvc0");
+
+// ---- 3. networking after restore: virtio-net + the fetch relay. The guest
+// reaches a local HTTP server as http://PORT.external/ (fetch_network.js).
+const server = http.createServer((req, res) => {
+    res.end("pong " + req.url + " from the host\n");
+});
+await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+const port = server.address().port;
+con.send("ip addr add 192.168.86.100/24 dev eth0; ip link set eth0 up; " +
+         "ip route add default via 192.168.86.1; echo nameserver 192.168.86.1 > /etc/resolv.conf; echo net-up");
+await con.wait("net-up");
+con.send(`wget -q -O - http://${port}.external/ping-arm64`);
+await con.wait("pong /ping-arm64 from the host");
+server.close();
+log("guest fetched from the host over virtio-net (fetch relay)");
 
 const halted = new Promise(resolve => emulator.add_listener("cpu-event-halt", resolve));
 con.send("poweroff");
