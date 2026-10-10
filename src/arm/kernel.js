@@ -15,7 +15,8 @@ function u32(bytes, offset)
 /* global DecompressionStream */
 async function gunzip(bytes)
 {
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    const blob = /** @type {?} */ (new Blob([bytes]));
+    const stream = blob.stream().pipeThrough(new DecompressionStream("gzip"));
     return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 

@@ -23,10 +23,21 @@ export function v86(bus, wasm)
 
     const stop_idling = () => { this.idle && this.next_tick(0); };
 
+    /** @type {ArmCPU} the AArch64 CPU, when created with arch "arm64" */
+    this.arm_cpu = null;
+
     /** @type {CPU} */
-    this.cpu = wasm.arch === "arm64" ?
-        new ArmCPU(bus, wasm, stop_idling, () => v86.microtick()).as_cpu() :
-        new CPU(bus, wasm, stop_idling);
+    this.cpu = null;
+
+    if(wasm.arch === "arm64")
+    {
+        this.arm_cpu = new ArmCPU(bus, wasm, stop_idling, () => v86.microtick());
+        this.cpu = this.arm_cpu.as_cpu();
+    }
+    else
+    {
+        this.cpu = new CPU(bus, wasm, stop_idling);
+    }
 
     this.bus = bus;
 

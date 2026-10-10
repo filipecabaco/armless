@@ -25,6 +25,9 @@ import { SyncBuffer, buffer_from_object } from "../buffer.js";
 import { FS } from "../../lib/filesystem.js";
 import { prepare_arm64_kernel } from "../arm/kernel.js";
 
+// For types only
+import { ArmCPU } from "../arm/cpu.js";
+
 /**
  * Constructor for emulator instances.
  *
@@ -62,6 +65,8 @@ export function V86(options)
     this.emulator_bus = bus[1];
 
     var cpu;
+    /** @type {ArmCPU} */
+    var arm_cpu = null;
     var wasm_memory;
 
     const wasm_table = new WebAssembly.Table({ element: "anyfunc", initial: WASM_TABLE_SIZE + WASM_TABLE_OFFSET });
@@ -115,8 +120,8 @@ export function V86(options)
 
     // armless.wasm imports: MMIO forwarded to v86's devices, and clocks
     const arm_shared_funcs = {
-        "mmio_read": (addr, size) => cpu.mmio_read(addr, size),
-        "mmio_write": (addr, size, value) => cpu.mmio_write(addr, size, value),
+        "mmio_read": (addr, size) => arm_cpu.mmio_read(addr, size),
+        "mmio_write": (addr, size, value) => arm_cpu.mmio_write(addr, size, value),
         "microtick": v86.microtick,
         "wall_clock_ms": () => Date.now(),
     };
@@ -196,6 +201,7 @@ export function V86(options)
 
             const emulator = this.v86 = new v86(this.emulator_bus, { exports, wasm_table, arch });
             cpu = emulator.cpu;
+            arm_cpu = emulator.arm_cpu;
 
             this.continue_init(emulator, options);
         });

@@ -64,7 +64,12 @@ jobs:
           git clone --depth 1 https://github.com/mirror/busybox "$RUNNER_TEMP/busybox"
           sh tests/linux/build-rootfs.sh "$RUNNER_TEMP/busybox" build-linux
       - name: Userspace matches qemu-aarch64
-        run: sh tests/linux/userspace.sh build-linux
+        run: |
+          if ! sh tests/linux/userspace.sh build-linux > userspace.log 2>&1; then
+            cat userspace.log
+            echo "::error title=userspace::$(tail -c 3000 userspace.log | tr '\n' ';')"
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -100,5 +105,9 @@ jobs:
       - name: Differential test against qemu-aarch64
         run: |
           for seed in 1 2 3; do
-            sh tests/difftest/run.sh ${{ matrix.classes }} 10000 $seed
+            if ! sh tests/difftest/run.sh ${{ matrix.classes }} 10000 $seed; then
+              # surface the mismatches as an annotation (visible without logs)
+              echo "::error title=difftest ${{ matrix.classes }} seed $seed::$(grep -E '^[-+][0-9]' ../build-difftest/diff.txt | head -12 | tr '\n' ';')"
+              exit 1
+            fi
           done

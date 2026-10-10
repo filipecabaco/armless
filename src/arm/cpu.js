@@ -52,7 +52,8 @@ export function ArmCPU(bus, wm, stop_idling, microtick)
 
     this.wasm_memory = this.exports["memory"];
     this.memory_size = new Uint32Array(1);
-    this._mem8 = new Uint8Array(0);
+    /** @type {!Uint8Array} guest RAM, physical address 0 */
+    this.mem8 = new Uint8Array(0);
 
     /** @type {!Object} */
     this.devices = {};
@@ -78,41 +79,55 @@ export function ArmCPU(bus, wm, stop_idling, microtick)
     }
 }
 
-Object.defineProperty(ArmCPU.prototype, "mem8", {
-    /** @this {ArmCPU} */
-    get: function()
+/**
+ * Re-create the RAM view if wasm memory grew (growing detaches old views).
+ * Called after every call into armless.wasm that may allocate, and on entry
+ * to the MMIO callbacks, so device code always sees a live mem8.
+ */
+ArmCPU.prototype.refresh_memory = function()
+{
+    if(this.mem8.byteLength === 0 && this.memory_size[0])
     {
-        // wasm memory can grow (and detach old views) when Rust allocates
-        if(this._mem8.byteLength === 0 && this.memory_size[0])
-        {
-            this._mem8 = new Uint8Array(this.wasm_memory.buffer, this.exports["armless_mem_ptr"](), this.memory_size[0]);
-        }
-        return this._mem8;
-    },
-});
+        this.mem8 = new Uint8Array(this.wasm_memory.buffer, this.exports["armless_mem_ptr"](), this.memory_size[0]);
+    }
+};
 
 // ------------------------------------------------------------------ memory
+// Each helper first makes sure mem8 is live: device code can run from async
+// callbacks after something else (zstd, state restore) grew wasm memory.
 
-ArmCPU.prototype.read8 = function(addr) { return this.mem8[addr]; };
+ArmCPU.prototype.read8 = function(addr)
+{
+    this.refresh_memory();
+    return this.mem8[addr];
+};
 ArmCPU.prototype.read16 = function(addr)
 {
+    this.refresh_memory();
     const m = this.mem8;
     return m[addr] | m[addr + 1] << 8;
 };
 ArmCPU.prototype.read32s = function(addr)
 {
+    this.refresh_memory();
     const m = this.mem8;
     return m[addr] | m[addr + 1] << 8 | m[addr + 2] << 16 | m[addr + 3] << 24;
 };
-ArmCPU.prototype.write8 = function(addr, value) { this.mem8[addr] = value; };
+ArmCPU.prototype.write8 = function(addr, value)
+{
+    this.refresh_memory();
+    this.mem8[addr] = value;
+};
 ArmCPU.prototype.write16 = function(addr, value)
 {
+    this.refresh_memory();
     const m = this.mem8;
     m[addr] = value;
     m[addr + 1] = value >> 8;
 };
 ArmCPU.prototype.write32 = function(addr, value)
 {
+    this.refresh_memory();
     const m = this.mem8;
     m[addr] = value;
     m[addr + 1] = value >> 8;
@@ -121,19 +136,23 @@ ArmCPU.prototype.write32 = function(addr, value)
 };
 ArmCPU.prototype.write_blob = function(blob, offset)
 {
+    this.refresh_memory();
     dbg_assert(offset + blob.length <= this.memory_size[0]);
     this.mem8.set(blob, offset);
 };
 ArmCPU.prototype.read_blob = function(offset, length)
 {
+    this.refresh_memory();
     return this.mem8.subarray(offset, offset + length);
 };
 ArmCPU.prototype.zero_memory = function(offset, length)
 {
+    this.refresh_memory();
     this.mem8.fill(0, offset, offset + length);
 };
 ArmCPU.prototype.reset_memory = function()
 {
+    this.refresh_memory();
     this.mem8.fill(0);
 };
 
@@ -141,6 +160,7 @@ ArmCPU.prototype.reset_memory = function()
 
 ArmCPU.prototype.mmio_read = function(addr, size)
 {
+    this.refresh_memory();
     addr >>>= 0;
     const io = this.io;
     if(addr >= board.UART_BASE && addr < board.UART_BASE + board.UART_SIZE)
@@ -169,6 +189,7 @@ ArmCPU.prototype.mmio_read = function(addr, size)
 
 ArmCPU.prototype.mmio_write = function(addr, size, value)
 {
+    this.refresh_memory();
     addr >>>= 0;
     const io = this.io;
     if(addr >= board.UART_BASE && addr < board.UART_BASE + board.UART_SIZE)
@@ -325,7 +346,8 @@ ArmCPU.prototype.init = function(settings, device_bus)
         throw new Error("armless: cannot create a machine with " + size + " bytes of RAM");
     }
     this.memory_size[0] = size;
-    this._mem8 = new Uint8Array(0);
+    this.mem8 = new Uint8Array(0);
+    this.refresh_memory();
 
     this.io = new IO(cpu);
 
@@ -381,6 +403,7 @@ ArmCPU.prototype.to_wasm = function(bytes)
 {
     const ptr = this.exports["armless_alloc"](bytes.length);
     new Uint8Array(this.wasm_memory.buffer, ptr, bytes.length).set(bytes);
+    this.refresh_memory();
     return ptr;
 };
 
@@ -435,6 +458,7 @@ ArmCPU.prototype.main_loop = function()
     for(;;)
     {
         const result = this.exports["armless_run"](RUN_BUDGET);
+        this.refresh_memory();
         if(result === RUN_BUDGET_USED)
         {
             if(this.microtick() - start > TIME_PER_FRAME)
@@ -471,6 +495,7 @@ ArmCPU.prototype.main_loop = function()
 
 ArmCPU.prototype.pack_memory = function()
 {
+    this.refresh_memory();
     const mem = this.mem8;
     const page_count = mem.length >> 12;
     const bitmap = new Bitmap(page_count);
@@ -496,6 +521,7 @@ ArmCPU.prototype.pack_memory = function()
 
 ArmCPU.prototype.unpack_memory = function(bitmap, packed_memory)
 {
+    this.refresh_memory();
     const mem = this.mem8;
     mem.fill(0);
     const page_count = this.memory_size[0] >> 12;
@@ -519,6 +545,7 @@ ArmCPU.prototype.get_state = function()
     const len = this.exports["armless_save_state"]();
     const ptr = this.exports["armless_state_ptr"]();
     state[2] = new Uint8Array(this.wasm_memory.buffer, ptr, len).slice();
+    this.refresh_memory();
 
     const { packed_memory, bitmap } = this.pack_memory();
     state[3] = packed_memory;

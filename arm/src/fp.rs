@@ -1238,11 +1238,27 @@ pub fn rsqrt_step<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
     if (a.is_inf() && b.is_zero()) || (a.is_zero() && b.is_inf()) {
         return one_half;
     }
+    // (3 - a*b) / 2 is one fused operation: compute 1.5 - (a/2)*b, halving
+    // whichever operand halves exactly (a normal number above the minimum
+    // exponent), so overflow and rounding happen once, on the final value.
+    let ebits = F::BITS - 1 - F::MANT;
+    let exp = |x: F| (x.bits() >> F::MANT) & crate::bits::ones(ebits);
+    let half = F::from_bits64(if F::BITS == 32 { 0x3f00_0000 } else { 0x3fe0_0000_0000_0000 });
+    let mut tmp = 0u64;
+    let mut exact = Fpst { fpcr: 0, fpsr: &mut tmp };
+    if exp(a) > 1 && !a.is_inf() {
+        let ah = mul(&mut exact, a, half);
+        return muladd(st, one_half, ah, b);
+    }
+    if exp(b) > 1 && !b.is_inf() {
+        let bh = mul(&mut exact, b, half);
+        return muladd(st, one_half, a, bh);
+    }
+    // Both operands tiny: the product cannot affect overflow.
     let r = muladd(st, three, a, b);
     if r.is_nan() || r.is_inf() || r.is_zero() {
         return r;
     }
-    let half = F::from_bits64(if F::BITS == 32 { 0x3f00_0000 } else { 0x3fe0_0000_0000_0000 });
     mul(st, r, half)
 }
 
