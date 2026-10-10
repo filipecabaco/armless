@@ -12,6 +12,12 @@ on:
   push:
     tags: ["armless-v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. armless-v0.1.0); empty for the rolling armless-snapshot"
+        required: false
+        default: ""
+
 
 permissions:
   contents: write
@@ -46,9 +52,12 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+          if [ -n "${INPUT_TAG}" ]; then
+            tag="${INPUT_TAG}"
+          elif [ "${GITHUB_REF_TYPE}" != "tag" ]; then
             tag="armless-snapshot"
             gh release delete "$tag" --yes --cleanup-tag || true
           fi
