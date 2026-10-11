@@ -374,6 +374,12 @@ impl<P: Platform> Vm<P> {
         save_state(&self.board, &mut refs)
     }
 
+    /// Snapshot for a machine of the first `n` CPUs; see [`save_state_cpus`].
+    pub fn save_state_cpus(&mut self, n: usize) -> Result<Vec<u8>, String> {
+        let mut refs: Vec<&mut Cpu<BoardHost<P>>> = self.cpus.iter_mut().collect();
+        save_state_cpus(&self.board, &mut refs, n)
+    }
+
     /// Restore a snapshot (raw or zstd-compressed).
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
         let mut refs: Vec<&mut Cpu<BoardHost<P>>> = self.cpus.iter_mut().collect();
@@ -383,15 +389,27 @@ impl<P: Platform> Vm<P> {
 
 /// Snapshot of the machine; every CPU must be stopped and in `cpus`, in order.
 pub fn save_state<H: Host>(board: &Board, cpus: &mut [&mut Cpu<H>]) -> Vec<u8> {
+    let n = cpus.len();
+    save_state_cpus(board, cpus, n).expect("every CPU is kept")
+}
+
+/// Snapshot for a machine of the first `n` CPUs: the rest must be powered off, taken offline
+/// by the guest (`echo 0 > /sys/devices/system/cpu/cpuN/online`). A machine can boot and warm
+/// up on more CPUs than it ships with.
+pub fn save_state_cpus<H: Host>(
+    board: &Board,
+    cpus: &mut [&mut Cpu<H>],
+    n: usize,
+) -> Result<Vec<u8>, String> {
     let mut meta = W::new();
-    meta.bytes(&Cpu::save_machine_state(cpus));
+    meta.bytes(&Cpu::save_machine_state_cpus(cpus, n)?);
     board.devices.lock().save(&mut meta);
 
     let mem = &board.io.mem;
     let mut out = Vec::with_capacity(meta.0.len() + mem.len() / 4);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(mem.len() as u64).to_le_bytes());
-    out.extend_from_slice(&(board.config.cpus as u32).to_le_bytes());
+    out.extend_from_slice(&(n as u32).to_le_bytes());
     out.extend_from_slice(&(meta.0.len() as u64).to_le_bytes());
     out.extend_from_slice(&meta.0);
     for (i, page) in mem.chunks(PAGE).enumerate() {
@@ -404,7 +422,7 @@ pub fn save_state<H: Host>(board: &Board, cpus: &mut [&mut Cpu<H>]) -> Vec<u8> {
         }
     }
     out.extend_from_slice(&END.to_le_bytes());
-    out
+    Ok(out)
 }
 
 /// Restore a snapshot (raw or zstd); every CPU stopped and in `cpus`.

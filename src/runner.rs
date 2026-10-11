@@ -160,6 +160,13 @@ impl Runner {
         crate::vm::save_state(&self.board, &mut cpus)
     }
 
+    /// Snapshot for a machine of the first `n` CPUs; the others must be offline in the guest.
+    pub fn save_state_cpus(&self, n: usize) -> Result<Vec<u8>, String> {
+        let mut p = self.pause();
+        let mut cpus = p.cpus();
+        crate::vm::save_state_cpus(&self.board, &mut cpus, n)
+    }
+
     /// Restore a snapshot (raw or zstd); the CPUs must not be running yet,
     /// or are paused for it.
     pub fn load_state(&self, data: &[u8]) -> Result<(), String> {

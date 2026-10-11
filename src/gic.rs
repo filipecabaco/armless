@@ -438,9 +438,17 @@ impl Gic {
 
     /// Serialise for save_state.
     pub fn save(&self, out: &mut Vec<u8>) {
+        self.save_cpus(out, self.ncpus);
+    }
+
+    /// Serialise as a machine of the first `n` CPUs (the others are powered off): their CPU
+    /// interfaces only, and shared interrupts targeted at them (CPU 0 if none is left).
+    pub fn save_cpus(&self, out: &mut Vec<u8>, n: usize) {
+        assert!((1..=self.ncpus).contains(&n));
+        let keep = ((1u32 << n) - 1) as u8;
         out.push(self.dist_enabled as u8);
-        out.push(self.ncpus as u8);
-        for c in &self.cpu {
+        out.push(n as u8);
+        for c in &self.cpu[..n] {
             out.push(c.enabled as u8);
             out.extend_from_slice(&c.pmr.to_le_bytes());
             out.extend_from_slice(&c.bpr.to_le_bytes());
@@ -456,7 +464,7 @@ impl Gic {
         for (irq, &t) in self.shared.iter().zip(&self.targets) {
             out.push(irq.flags());
             out.push(irq.priority);
-            out.push(t);
+            out.push(if t & keep != 0 || t == 0 { t & keep } else { 1 });
         }
     }
 
@@ -504,6 +512,26 @@ impl Gic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_fewer_cpus() {
+        // Booted on 4 CPUs, saved as 2: SPI 40 aimed at CPUs 1 and 3 keeps CPU 1; SPI 41 aimed
+        // only at CPU 3, which is gone, falls back to CPU 0
+        let mut g = Gic::new(4);
+        g.dist_write(0, 0x000, 4, 1);
+        g.dist_write(0, 0x800 + 40, 1, 0b1010);
+        g.dist_write(0, 0x800 + 41, 1, 0b1000);
+        let mut out = Vec::new();
+        g.save_cpus(&mut out, 2);
+        let mut two = Gic::new(2);
+        two.load(&mut out.as_slice()).expect("a 2-CPU GIC loads it");
+        assert_eq!(two.targets[40 - 32], 0b0010);
+        assert_eq!(two.targets[41 - 32], 0b0001);
+        let mut out = Vec::new();
+        g.save_cpus(&mut out, 1);
+        assert!(Gic::new(1).load(&mut out.as_slice()).is_some());
+        assert!(Gic::new(4).load(&mut out.as_slice()).is_none(), "the CPU count is checked");
+    }
 
     #[test]
     fn level_irq_flow() {

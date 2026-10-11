@@ -32,25 +32,41 @@ impl<H: Host> Cpu<H> {
 
     /// Snapshot of the machine whose CPUs (all of them, in order, stopped) are `cpus`.
     pub fn save_machine_state(cpus: &mut [&mut Cpu<H>]) -> Vec<u8> {
+        let n = cpus.len();
+        Self::save_machine_state_cpus(cpus, n).expect("every CPU is kept")
+    }
+
+    /// Snapshot of the machine as one of its first `n` CPUs, for a machine with `n` CPUs to
+    /// restore. The others must be powered off (the guest took them offline): they are left out,
+    /// and the restored guest sees them as offline CPUs that can't come back.
+    pub fn save_machine_state_cpus(cpus: &mut [&mut Cpu<H>], n: usize) -> Result<Vec<u8>, String> {
         let counter = cpus[0].counter();
         let m = cpus[0].machine.clone();
+        if n == 0 || n > cpus.len() {
+            return Err(format!("can't keep {n} of {} CPUs", cpus.len()));
+        }
+        for (i, slot) in m.cpus.iter().enumerate().skip(n) {
+            if slot.power.load(Ordering::SeqCst) != crate::smp::POWER_OFF {
+                return Err(format!("CPU {i} is still on: take it offline in the guest first"));
+            }
+        }
         let mut w = W::new();
         w.0.extend_from_slice(MAGIC);
         w.u32(VERSION);
         w.u64(m.mem.len() as u64);
-        w.u32(m.ncpus as u32);
+        w.u32(n as u32);
         w.u64(counter);
-        m.gic.lock().save(&mut w.0);
+        m.gic.lock().save_cpus(&mut w.0, n);
         {
             let rtc = m.rtc.lock();
             w.u64(rtc.offset as u64);
             w.u32(rtc.match_value);
             w.u8(rtc.enabled as u8 | (rtc.irq_mask as u8) << 1 | (rtc.raw_irq as u8) << 2);
         }
-        for cpu in cpus.iter() {
+        for cpu in cpus[..n].iter() {
             cpu.save_one(&mut w);
         }
-        w.0
+        Ok(w.0)
     }
 
     fn save_one(&self, w: &mut W) {

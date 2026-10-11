@@ -138,6 +138,12 @@ Blobs are not saved; the guest's unmodified files are fetched again after a rest
 Extensions go after the devices, so snapshots without them still load (9p fids then
 belong to root, as they used to).
 
+A machine can be saved as one of its first n CPUs (`save_state_cpus`) once the guest has taken
+the others offline (`echo 0 > /sys/devices/system/cpu/cpuN/online`, which ends in PSCI CPU_OFF):
+their state is left out and shared interrupts aimed only at them go to CPU 0. A machine with n
+CPUs restores it; the guest sees the rest as offline CPUs, and CPU_ON for them fails. snowglobe
+boots and warms a site on more CPUs than it ships with this way.
+
 ## SMP in the browser
 
 `armless-smp.wasm` is built with atomics and imports a shared memory. The page's
