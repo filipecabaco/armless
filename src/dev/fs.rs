@@ -33,9 +33,10 @@ pub const EPERM: u32 = 1;
 
 /// Largest file the guest may grow (they live in host memory).
 const MAX_FILE: u64 = 1 << 31;
-/// Fetched file contents kept at most; older ones are fetched again when
-/// needed (the guest's page cache keeps what it uses often anyway).
-const MAX_CACHED: usize = 256 << 20;
+/// Fetched file contents kept at most by default; older ones are fetched again
+/// when needed (the guest's page cache keeps what it uses often anyway). Hosts
+/// set their own budget (`DeviceConfig::fs_cache`, `Board::set_fs_cache`).
+pub const DEFAULT_CACHE: usize = 256 << 20;
 
 #[derive(Clone, Debug)]
 pub enum Content {
@@ -101,10 +102,11 @@ pub struct Fs {
     inodes: Vec<Option<Inode>>,
     free: Vec<Ino>,
     /// Decompressed blobs fetched so far (not saved: fetched again), oldest
-    /// first in `order`, at most `MAX_CACHED` bytes.
+    /// first in `order`, at most `max_cached` bytes.
     blobs: HashMap<String, Arc<Vec<u8>>>,
     order: VecDeque<String>,
     cached: usize,
+    max_cached: usize,
     /// Blobs the host could not provide: reads fail with EIO.
     failed: HashSet<String>,
 }
@@ -118,6 +120,7 @@ impl Fs {
             blobs: HashMap::new(),
             order: VecDeque::new(),
             cached: 0,
+            max_cached: DEFAULT_CACHE,
             failed: HashSet::new(),
         };
         let root = fs.alloc(Inode {
@@ -626,13 +629,24 @@ impl Fs {
         self.cached += raw.len();
         self.blobs.insert(name.to_string(), Arc::new(raw));
         self.order.push_back(name.to_string());
-        while self.cached > MAX_CACHED && self.order.len() > 1 {
+        self.evict();
+        Ok(())
+    }
+
+    /// The most decompressed file content to keep; older content goes first, and the newest
+    /// always stays (a read is waiting for it).
+    pub fn set_cache_limit(&mut self, bytes: usize) {
+        self.max_cached = bytes;
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.cached > self.max_cached && self.order.len() > 1 {
             let old = self.order.pop_front().unwrap();
             if let Some(b) = self.blobs.remove(&old) {
                 self.cached -= b.len();
             }
         }
-        Ok(())
     }
 
     pub fn blob_failed(&mut self, name: &str) {
@@ -780,5 +794,28 @@ impl Fs {
         }
         fs.get(ROOT)?;
         Some(fs)
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::Fs;
+
+    #[test]
+    fn the_cache_stays_within_its_budget() {
+        let mut fs = Fs::empty();
+        fs.set_cache_limit(20);
+        for name in ["a", "b", "c"] {
+            fs.provide_blob(name, vec![1; 8]).unwrap();
+        }
+        // 24 bytes is over 20: the oldest went first
+        assert!(!fs.blobs.contains_key("a"));
+        assert!(fs.blobs.contains_key("b") && fs.blobs.contains_key("c"));
+        assert_eq!(fs.cached, 16);
+
+        // Lowering the budget drops what is over it now; the newest always stays
+        fs.set_cache_limit(0);
+        assert_eq!(fs.blobs.keys().collect::<Vec<_>>(), ["c"]);
+        assert_eq!(fs.cached, 8);
     }
 }

@@ -141,6 +141,14 @@ impl Board {
     }
 
     /// Drop every loaded blob: what the guest reads next is fetched again.
+    /// Change the 9p filesystem's budget for decompressed file contents (see
+    /// `DeviceConfig::fs_cache`); what is over it is dropped now.
+    pub fn set_fs_cache(&self, bytes: usize) {
+        if let Some((_, p)) = self.devices.lock().p9() {
+            p.fs.set_cache_limit(bytes);
+        }
+    }
+
     pub fn forget_blobs(&self) {
         if let Some((_, p)) = self.devices.lock().p9() {
             p.fs.forget_blobs();
@@ -425,6 +433,21 @@ pub fn save_state_cpus<H: Host>(
     Ok(out)
 }
 
+/// Zero the RAM pages the snapshot didn't write. Reading an untouched page doesn't commit it (the
+/// host maps its zero page), so only pages the guest had dirtied get written.
+fn zero_unwritten(mem: &crate::ram::Ram, written: &[u64]) {
+    for (page, chunk) in mem.chunks(PAGE).enumerate() {
+        if written[page / 64] & (1 << (page % 64)) != 0 {
+            continue;
+        }
+        // Word at a time: RAM is page-aligned, so the middle is all of it
+        let (head, words, tail) = unsafe { chunk.align_to::<u64>() };
+        if head.iter().any(|&b| b != 0) || words.iter().any(|&w| w != 0) || tail.iter().any(|&b| b != 0) {
+            unsafe { std::ptr::write_bytes(mem.as_mut_ptr().add(page * PAGE), 0, chunk.len()) };
+        }
+    }
+}
+
 /// Restore a snapshot (raw or zstd); every CPU stopped and in `cpus`.
 pub fn load_state<H: Host>(
     board: &Board,
@@ -455,6 +478,8 @@ pub struct StateLoader {
     stage: Stage,
     buf: Vec<u8>,
     meta: Vec<u8>,
+    /// One bit per RAM page the snapshot wrote; the others are made zero in `finish`
+    written: Vec<u64>,
 }
 
 impl StateLoader {
@@ -463,6 +488,7 @@ impl StateLoader {
             stage: Stage::Header,
             buf: Vec::new(),
             meta: Vec::new(),
+            written: Vec::new(),
         }
     }
 
@@ -507,8 +533,10 @@ impl StateLoader {
                                     board.config.cpus
                                 ));
                             }
-                            // Pages not in the snapshot are zero.
-                            unsafe { std::ptr::write_bytes(mem.as_mut_ptr(), 0, mem.len()) };
+                            // Pages not in the snapshot are zero, which `finish` sees to without
+                            // touching the ones that already are: a fresh machine's RAM is never
+                            // committed beyond what the snapshot holds
+                            self.written = vec![0; mem.len().div_ceil(PAGE).div_ceil(64)];
                             Stage::Meta(meta)
                         },
                         Stage::Meta(_) => {
@@ -522,6 +550,7 @@ impl StateLoader {
                             } else if (p as usize) * PAGE >= mem.len() {
                                 return Err("snapshot page outside RAM".into());
                             } else {
+                                self.written[p as usize / 64] |= 1 << (p % 64);
                                 Stage::PageData {
                                     page: p as usize,
                                     at: 0,
@@ -563,6 +592,7 @@ impl StateLoader {
         if !matches!(self.stage, Stage::Done) {
             return Err("truncated snapshot".into());
         }
+        zero_unwritten(&board.io.mem, &self.written);
         let mut r = R(&self.meta);
         let cpu_state = r.bytes().ok_or("corrupt snapshot")?;
         Cpu::load_machine_state(cpus, cpu_state)?;
@@ -579,5 +609,34 @@ impl StateLoader {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod restore_tests {
+    use super::{Config, PAGE};
+
+    #[test]
+    fn restore_clears_what_the_snapshot_lacks_and_keeps_what_it_has() {
+        let (mut vm, _clock) = crate::runner::new_vm(Config {
+            memory_size: 16 << 20,
+            cpus: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let ptr = vm.board.io.mem.as_mut_ptr();
+        unsafe { *ptr.add(5 * PAGE + 7) = 0xab };
+        let state = vm.save_state();
+
+        // After the snapshot: a page it doesn't have gets dirty, one it has changes
+        unsafe {
+            *ptr.add(9 * PAGE + 1) = 0xcd;
+            *ptr.add(5 * PAGE + 7) = 0x11;
+        }
+        vm.load_state(&state).unwrap();
+        let mem = &vm.board.io.mem;
+        assert_eq!(mem[5 * PAGE + 7], 0xab, "a page from the snapshot is restored");
+        assert_eq!(mem[9 * PAGE + 1], 0, "a page the snapshot doesn't have is zero again");
+        assert!(mem[12 * PAGE..13 * PAGE].iter().all(|&b| b == 0), "untouched pages stay zero");
     }
 }

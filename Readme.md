@@ -52,6 +52,9 @@ Events and calls:
 - **Events:** `console` and `serial` (bytes), `progress` (`{file, loaded, total}`),
   `blob` (a file being fetched), `tcp-connection` (a `Connection`), `stop`
   (`{reason}`) and `error`.
+- **Memory:** `memory_mb` is the guest's RAM; a restored snapshot only commits the pages it
+  holds. `fs_cache_mb` caps the decompressed file contents kept on the host (256 by default;
+  the guest's page cache keeps what it uses often), `Board::set_fs_cache` natively.
 - **Calls:** `console_input`, `console_resize`, `serial_input`, `provide_blob`
   (preload), `connect(port)` (a connection into the guest), `save_state()`,
   `restore_state()`, `stop()`, `run()` and `destroy()`.

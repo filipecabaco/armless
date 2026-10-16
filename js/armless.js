@@ -391,6 +391,8 @@
       if (o.mac) mac = this._copy_in(Uint8Array.from(o.mac.split(":").map((x) => parseInt(x, 16))));
       if (e.armless_create(o.memory_mb, this.cpus, flags, mac) !== 0) throw new Error("armless: " + this._error());
       e.armless_jit_config(o.jit ? 1 : 0, o.jit_threshold | 0);
+      // Decompressed file contents kept in this page (the guest caches what it uses itself)
+      if (o.fs_cache_mb != null) e.armless_set_fs_cache(o.fs_cache_mb >>> 0);
       // Testing aid: every block is compiled before it first runs
       if (o.jit_sync) e.armless_jit_sync(1);
       this._jit_pending = new Set();

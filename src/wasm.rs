@@ -203,6 +203,12 @@ pub unsafe extern "C" fn armless_create(
     }
 }
 
+/// The 9p filesystem's budget for decompressed file contents, in MiB.
+#[no_mangle]
+pub extern "C" fn armless_set_fs_cache(mb: u32) {
+    vm().board.set_fs_cache((mb as usize) << 20);
+}
+
 /// Last error message: pointer (length from `armless_error_len`).
 #[no_mangle]
 #[allow(static_mut_refs)]
