@@ -247,16 +247,25 @@
       this.sport = port; // v86 name
       this.state = "new"; // new | open | closed
       this.decided = false;
+      this.held = false;
     }
-    accept() {
+    /** Decide later: the guest's SYN waits until accept() or refuse(). */
+    hold() {
       if (this.decided) return;
       this.decided = true;
+      this.held = true;
+    }
+    accept() {
+      if (this.decided && !this.held) return;
+      this.decided = true;
+      this.held = false;
       this.state = "open";
       this.vm._call("armless_tcp_accept", this.id);
     }
     refuse() {
-      if (this.decided) return;
+      if (this.decided && !this.held) return;
       this.decided = true;
+      this.held = false;
       this.state = "closed";
       this.vm._call("armless_tcp_refuse", this.id);
       this.vm._conns.delete(this.id);
@@ -303,7 +312,14 @@
       // Pages on https:// may not fetch http:// (nor open ws://): ask for the same over TLS
       upgrade_https: o.upgrade_https ?? (typeof location !== "undefined" && location.protocol === "https:"),
       tls: o.tls,
+      // Guest TCP destinations carried over a WebSocket: [{ host?, port, url }]
+      tunnels: (o.tunnels || []).map((t) => ({ ...t, host: t.host?.toLowerCase() })),
     };
+  }
+
+  function tunnel_for(tunnels, host, port) {
+    host = host.toLowerCase();
+    return tunnels.find((t) => t.port === port && (t.host == null || t.host === host));
   }
 
   function read_str(dv, bytes, at) {
@@ -788,7 +804,9 @@
         case 4: {
           const conn = new Connection(this, id, text(), port);
           this._conns.set(id, conn);
-          this.emit("tcp-connection", conn);
+          const t = this._web_options && tunnel_for(this._web_options.tunnels, conn.host, port);
+          if (t) this._tunnel(conn, t.url);
+          else this.emit("tcp-connection", conn);
           // Ports other than 80 and 443: raw TCP, which a page can't make
           if (!conn.decided) conn.refuse();
           break;
@@ -919,6 +937,52 @@
       this._call("armless_http_end", id);
       this._drain();
       this._poke();
+    }
+
+    /**
+     * A guest TCP connection carried over a WebSocket to `url`, as binary messages. The guest's
+     * SYN waits until the WebSocket opens, so an unreachable tunnel is refused like a port.
+     */
+    _tunnel(conn, url) {
+      conn.hold();
+      // A function gives each connection its own URL (a fresh access token, say)
+      Promise.resolve(typeof url === "function" ? url({ host: conn.host, port: conn.port }) : url).then(
+        (u) => this._tunnel_open(conn, u),
+        () => { conn.refuse(); this._poke(); },
+      );
+    }
+
+    _tunnel_open(conn, url) {
+      const o = this._web_options;
+      let target = String(url);
+      if (o.upgrade_https && target.startsWith("ws:")) target = "wss:" + target.slice(3);
+      let socket;
+      try {
+        socket = new o.WebSocket(target);
+      } catch {
+        conn.refuse();
+        return this._poke();
+      }
+      socket.binaryType = "arraybuffer";
+      let opened = false;
+      socket.onopen = () => {
+        opened = true;
+        conn.accept();
+        this._poke();
+      };
+      socket.onmessage = ({ data }) => {
+        conn.write(typeof data === "string" ? utf8.encode(data) : data);
+        this._poke();
+      };
+      socket.onclose = () => {
+        if (opened) conn.close();
+        else conn.refuse();
+        this._poke();
+      };
+      // A WebSocket can't half-close: the guest finishing its side closes it
+      conn.on("data", (bytes) => socket.readyState === 1 && socket.send(bytes));
+      conn.on("end", () => socket.readyState <= 1 && socket.close(1000));
+      conn.on("close", () => socket.readyState <= 1 && socket.close(1000));
     }
 
     /** One of the guest's WebSockets, opened with the page's WebSocket. */

@@ -21,6 +21,10 @@ fn usage() -> ! {
                        its blobs in DIR/blobs (or DIR/filesystem), tag host9p
   --boot-fs            boot the kernel and initrd found under /boot in --fs
   --net                virtio-net, with the guest's TCP connections made from here
+  --tunnel [H:]P=URL   carry the guest's TCP to H:P (any host if H is left out) over a
+                       WebSocket to URL instead (repeatable; needs --net)
+  --allow-private      let the guest reach loopback and private addresses (a local
+                       tunnel endpoint, say)
   -m MB                RAM size in MiB (default 512)
   --smp N              number of CPUs (default 1; one thread each)
   --timeout SECS       stop after SECS seconds of wall time
@@ -62,6 +66,8 @@ fn main() {
     let mut fs_dir: Option<PathBuf> = None;
     let mut boot_fs = false;
     let mut net = false;
+    let mut tunnels = Vec::new();
+    let mut allow_private = false;
     let mut mem_mb = 512u64;
     let mut timeout = None;
     let mut input = String::new();
@@ -89,6 +95,10 @@ fn main() {
             "--fs" => fs_dir = Some(PathBuf::from(val())),
             "--boot-fs" => boot_fs = true,
             "--net" => net = true,
+            "--tunnel" => {
+                tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
+            },
+            "--allow-private" => allow_private = true,
             "-m" => mem_mb = parse_num(&val()),
             "--timeout" => timeout = Some(Duration::from_secs(parse_num(&val()))),
             "--input" => input = val().replace("\\n", "\n"),
@@ -169,7 +179,11 @@ fn main() {
         HostOptions {
             blobs,
             network: net,
-            egress: armless::native::Egress::from_env(),
+            egress: armless::native::Egress {
+                allow_private,
+                ..armless::native::Egress::from_env()
+            },
+            tunnels,
         },
         Box::new(move |e| {
             let mut out = std::io::stdout();
