@@ -104,6 +104,16 @@ Other ports reach the host as `TcpOpen` streams:
 - **Native:** a real connection, direct or tunnelled with CONNECT through the proxy.
 - **Browser:** refused unless the page takes it.
 
+Either host can carry chosen destinations over a WebSocket instead: a **tunnel** maps a
+name and port (or any name, on a port) to a ws:// or wss:// URL, and each connection to
+it becomes one WebSocket whose binary messages are the stream's bytes (what websockify,
+websocat and Neon's wsproxy speak). It is `HostOptions::tunnels` natively (`Tunnel::parse`
+reads `[HOST:]PORT=URL`) and `network.tunnels` in the browser, where it is the only way
+out for raw TCP, and where the URL can be made per connection by a function (a fresh
+access token for a gateway that holds the real credentials, so none is in the page). The guest's SYN waits until the WebSocket is open, so a tunnel that
+can't be reached is refused like a closed port. A WebSocket can't half-close: the guest
+finishing its side closes it.
+
 With the network off, everything is refused.
 
 TCP towards the guest respects its window. The link never drops frames: they wait

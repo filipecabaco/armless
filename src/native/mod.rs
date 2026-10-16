@@ -2,7 +2,8 @@
 //!
 //! * blobs from a directory (`<dir>/<name>`)
 //! * the web relay's requests (`HttpRequest`, `WsOpen`) made with a built-in HTTP client
-//! * other TCP connections the guest opens, as real connections
+//! * other TCP connections the guest opens, as real connections, or through a WebSocket
+//!   tunnel for the destinations [`HostOptions::tunnels`] names
 //! * connections into the guest (port forwarding) from host sockets
 //! * the network's retransmit timer
 //!
@@ -35,6 +36,44 @@ pub struct HostOptions {
     pub network: bool,
     /// How (see [`Egress::from_env`]).
     pub egress: Egress,
+    /// Guest TCP destinations carried over a WebSocket instead of a direct connection.
+    pub tunnels: Vec<Tunnel>,
+}
+
+/// A guest TCP destination reached through a WebSocket: each connection the guest opens to it
+/// becomes one WebSocket to `url`, its bytes sent and received as binary messages (what
+/// websockify, websocat and Neon's wsproxy speak). The browser host does the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tunnel {
+    /// The name the guest connected to; `None` for any
+    pub host: Option<String>,
+    pub port: u16,
+    /// A ws:// or wss:// URL
+    pub url: String,
+}
+
+impl Tunnel {
+    /// `[HOST:]PORT=URL`, e.g. `db.internal:5432=wss://proxy.example.com/db`.
+    pub fn parse(spec: &str) -> Option<Tunnel> {
+        let (dest, url) = spec.split_once('=')?;
+        if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+            return None;
+        }
+        let (host, port) = match dest.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() => (Some(h.to_ascii_lowercase()), p),
+            Some(_) => return None,
+            None => (None, dest),
+        };
+        Some(Tunnel {
+            host,
+            port: port.parse().ok().filter(|p| *p != 0)?,
+            url: url.to_string(),
+        })
+    }
+
+    pub fn matches(&self, host: &str, port: u16) -> bool {
+        self.port == port && self.host.as_ref().is_none_or(|h| h.eq_ignore_ascii_case(host))
+    }
 }
 
 pub type Observer = Box<dyn FnMut(&Event) + Send>;
@@ -78,6 +117,8 @@ struct Conns {
     sockets: HashMap<u32, (Sender<Option<Vec<u8>>>, TcpStream)>,
     /// WebSockets: frames to send
     websockets: HashMap<u32, Sender<WsOut>>,
+    /// Tunnelled TCP: the guest's bytes (`None`: it has finished sending)
+    tunnels: HashMap<u32, Sender<Option<Vec<u8>>>>,
     /// Connections the guest has closed (requests in flight stop)
     closed: HashSet<u32>,
 }
@@ -229,6 +270,18 @@ fn event_loop(
                         board.tcp_refuse(id);
                         continue;
                     }
+                    if let Some(t) = options.tunnels.iter().find(|t| t.matches(&host, port)) {
+                        let (ttx, trx) = channel();
+                        conns.lock().unwrap().tunnels.insert(id, ttx);
+                        let url = t.url.clone();
+                        let (board, conns, egress, tx) =
+                            (board.clone(), conns.clone(), egress.clone(), tx.clone());
+                        std::thread::spawn(move || {
+                            tunnel(&board, &conns, &egress, id, &url, trx);
+                            let _ = tx.send(Msg::Wake);
+                        });
+                        continue;
+                    }
                     let (board, conns, egress, tx) =
                         (board.clone(), conns.clone(), egress.clone(), tx.clone());
                     std::thread::spawn(move || {
@@ -248,12 +301,14 @@ fn event_loop(
                     }
                 },
                 Event::TcpData { id, data } => {
-                    if let Some((w, _)) = conns.lock().unwrap().sockets.get(&id) {
+                    let c = conns.lock().unwrap();
+                    if let Some(w) = c.sockets.get(&id).map(|(w, _)| w).or(c.tunnels.get(&id)) {
                         let _ = w.send(Some(data));
                     }
                 },
                 Event::TcpEof { id } => {
-                    if let Some((w, _)) = conns.lock().unwrap().sockets.get(&id) {
+                    let c = conns.lock().unwrap();
+                    if let Some(w) = c.sockets.get(&id).map(|(w, _)| w).or(c.tunnels.get(&id)) {
                         let _ = w.send(None);
                     }
                 },
@@ -266,6 +321,7 @@ fn event_loop(
                         let _ = s.shutdown(Shutdown::Both);
                     }
                     c.websockets.remove(&id);
+                    c.tunnels.remove(&id);
                     c.closed.insert(id);
                 },
                 Event::Serial(_) | Event::Console(_) => {},
@@ -428,6 +484,91 @@ fn websocket(
     }
 }
 
+/// A guest TCP connection carried over a WebSocket to `url`. The guest's SYN waits until the
+/// WebSocket is open, so a tunnel that can't be reached is refused like a direct connection.
+fn tunnel(
+    board: &Board,
+    conns: &Shared,
+    egress: &Egress,
+    id: u32,
+    url: &str,
+    out: Receiver<Option<Vec<u8>>>,
+) {
+    let key = crate::dev::web::base64_encode(&random_bytes(16));
+    let reader = match egress.websocket(url, &[], &key) {
+        Ok((_, r)) => r,
+        Err(_) => {
+            conns.lock().unwrap().tunnels.remove(&id);
+            board.tcp_refuse(id);
+            return;
+        },
+    };
+    board.tcp_accept(id);
+    // As in websocket(): one thread owns the stream, polling it and sending what is queued
+    let mut buf = reader.buffer().to_vec();
+    let mut conn = reader.into_inner();
+    let _ = conn.tcp().set_read_timeout(Some(Duration::from_millis(20)));
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        if is_closed(conns, id) {
+            let _ = conn.write_all(&egress::client_frame(8, &1000u16.to_be_bytes(), mask()));
+            return;
+        }
+        loop {
+            match out.try_recv() {
+                Ok(Some(data)) => {
+                    if conn.write_all(&egress::client_frame(2, &data, mask())).is_err() {
+                        board.tcp_abort(id);
+                        return;
+                    }
+                },
+                // A WebSocket can't half-close: close it, and keep reading until the far side
+                // answers with its own close
+                Ok(None) => {
+                    let _ = conn.write_all(&egress::client_frame(8, &1000u16.to_be_bytes(), mask()));
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        let _ = conn.flush();
+        match conn.read(&mut chunk) {
+            Ok(0) => {
+                board.tcp_close(id);
+                return;
+            },
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {},
+            Err(_) => {
+                board.tcp_abort(id);
+                return;
+            },
+        }
+        while let Some((_, opcode, payload, used)) = parse_frame(&buf) {
+            buf.drain(..used);
+            match opcode {
+                8 => {
+                    board.tcp_close(id);
+                    return;
+                },
+                9 => {
+                    let _ = conn.write_all(&egress::client_frame(10, &payload, mask()));
+                },
+                10 => {},
+                // A byte stream: fragments and text frames are just more bytes
+                _ => {
+                    board.tcp_send(id, &payload);
+                    backpressure(board, conns, id);
+                },
+            }
+        }
+    }
+}
+
 fn mask() -> [u8; 4] {
     random_bytes(4).try_into().unwrap()
 }
@@ -508,4 +649,27 @@ fn attach(board: &Arc<Board>, conns: &Shared, id: u32, stream: TcpStream) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tunnel;
+
+    #[test]
+    fn tunnel_specs() {
+        let t = Tunnel::parse("DB.internal:5432=wss://proxy.example.com/db?x=1").unwrap();
+        assert_eq!(t.host.as_deref(), Some("db.internal"));
+        assert_eq!((t.port, t.url.as_str()), (5432, "wss://proxy.example.com/db?x=1"));
+        assert!(t.matches("db.INTERNAL", 5432));
+        assert!(!t.matches("db.internal", 5433));
+        assert!(!t.matches("other", 5432));
+
+        let any = Tunnel::parse("6379=ws://127.0.0.1:7000").unwrap();
+        assert_eq!(any.host, None);
+        assert!(any.matches("anything", 6379));
+
+        for bad in ["5432", "db:5432=tcp://x", ":5432=ws://x", "db:0=ws://x", "db:nope=ws://x", "=ws://x"] {
+            assert_eq!(Tunnel::parse(bad), None, "{bad}");
+        }
+    }
 }

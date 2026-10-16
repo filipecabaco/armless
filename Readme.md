@@ -62,12 +62,17 @@ Events and calls:
 - `fetch` and `WebSocket`: replace the page's own.
 - `upgrade_https`: ask for https:// and wss:// when the guest uses http:// and ws://.
   This is the default on https pages.
+- `tunnels`: `[{ host, port, url }]`, guest TCP destinations carried over a WebSocket
+  to `url` as binary messages (websockify, websocat, Neon's wsproxy). Leave out `host`
+  to match any name on that port. `url` can be a function of `{ host, port }`, returning a
+  URL or a promise of one, called for each connection (to add a fresh access token, say);
+  if it throws or rejects, the guest's connection is refused.
 
 TCP connections to other ports are `tcp-connection` events with a `Connection`. It
 has `host` (the name the guest resolved) and `port`, and supports `accept()`,
-`refuse()`, `write()`, `close()` and `drain()`, plus the `data`, `end`, `connect`
-and `close` events. A page can't make raw TCP connections, so connections nobody
-accepts are refused.
+`refuse()`, `hold()` (decide later), `write()`, `close()` and `drain()`, plus the
+`data`, `end`, `connect` and `close` events. A page can't make raw TCP connections,
+so connections nobody accepts (and no tunnel takes) are refused.
 
 ## Natively
 
@@ -78,7 +83,7 @@ let (mut vm, clock) = runner::new_vm(Config { memory_size: 512 << 20, cpus: 2, .
 vm.board.load_filesystem(&std::fs::read("filesystem.json")?)?;
 vm.board.set_tls(&std::fs::read("tls.json")?)?;  // the guest's HTTPS ends in the machine
 let host = NativeHost::spawn(vm.board.clone(),
-    HostOptions { blobs: Some("filesystem".into()), network: true, egress: Egress::from_env() },
+    HostOptions { blobs: Some("filesystem".into()), network: true, egress: Egress::from_env(), tunnels: vec![] },
     Box::new(|event| { /* console output, files read, ... */ }));
 let mut runner = Runner::new(vm, clock, false);
 runner.load_state(&std::fs::read("state.bin.zst")?)?;

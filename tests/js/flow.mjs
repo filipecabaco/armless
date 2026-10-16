@@ -39,9 +39,36 @@ const server = http.createServer((req, res) => {
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const PORT = server.address().port;
+// A WebSocket for the TCP tunnel: it answers each message upper-cased, and ws://down never opens
+const tunnelled = [];
+class EchoSocket {
+  constructor(url) {
+    if (url === "ws://down/") throw new Error("unreachable");
+    tunnelled.push(url);
+    this.readyState = 0;
+    setTimeout(() => { this.readyState = 1; this.onopen?.(); }, 10);
+  }
+  send(bytes) {
+    const reply = new TextEncoder().encode(new TextDecoder().decode(bytes).toUpperCase());
+    setTimeout(() => this.onmessage?.({ data: reply.buffer }), 5);
+  }
+  close() {
+    if (this.readyState > 1) return;
+    this.readyState = 2;
+    setTimeout(() => { this.readyState = 3; this.onclose?.({ code: 1000 }); }, 50);
+  }
+}
 const network = {
   upgrade_https: false,
   fetch: (url, init) => fetch(url.replace(/^http:\/\/testhost\b/, `http://127.0.0.1:${PORT}`), init),
+  WebSocket: EchoSocket,
+  tunnels: [
+    { host: "tunnelhost", port: 5432, url: "ws://echo/" },
+    { port: 5433, url: "ws://down/" },
+    // A URL made per connection, as a page adding a fresh token would
+    { host: "tunnelhost", port: 5435, url: async ({ host, port }) => `ws://echo/${host}/${port}?token=t${tunnelled.length}` },
+    { host: "tunnelhost", port: 5436, url: () => Promise.reject(new Error("no token")) },
+  ],
 };
 
 const CMDLINE = "rw root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose init=/init console=ttyS0 quiet";
@@ -123,6 +150,15 @@ const got = await new Promise((resolve, reject) => {
   setTimeout(() => reject(new Error("port forward timed out: " + text)), 30000);
 });
 check(got.includes("hello-from-guest"), "connection into the guest", got);
+
+// Guest TCP through a WebSocket tunnel; one that can't open, and an unmapped port, are refused
+out = await a.sh("echo ping-through-tunnel | timeout 5 nc tunnelhost 5432");
+check(out.includes("PING-THROUGH-TUNNEL") && tunnelled.length === 1, "TCP through a WebSocket tunnel", out);
+out = await a.sh("echo x | timeout 5 nc tunnelhost 5433; echo status=$?; echo x | timeout 5 nc tunnelhost 5434; echo status=$?");
+check((out.match(/status=1/g) || []).length === 2, "unreachable tunnel and unmapped port refused", out);
+out = await a.sh("echo per-connection | timeout 5 nc tunnelhost 5435; echo x | timeout 5 nc tunnelhost 5436; echo status=$?");
+check(out.includes("PER-CONNECTION") && tunnelled.at(-1) === "ws://echo/tunnelhost/5435?token=t1" && out.includes("status=1"),
+  "tunnel URL made per connection; one that fails is refused", out);
 out = await a.sh("echo kept > /root/note; sync; echo 3 > /proc/sys/vm/drop_caches");
 
 const state = await a.save_state();
