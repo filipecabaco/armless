@@ -6,8 +6,14 @@ name: release
 #   armless-smp.wasm   its threaded build, for cpus > 1 (needs a cross-origin isolated page)
 # plus armless-web.tar.gz with all three, the license and the docs.
 # Native programs use the crate itself (a git dependency on the tag).
+#
+# A push to main that changes the crate's version releases armless-v<version>, once: a version
+# that already has a tag is left alone. Run by hand for the rolling armless-snapshot or a re-release.
 
 on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
   workflow_dispatch:
     inputs:
       tag:
@@ -18,33 +24,57 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - name: Version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            echo "tag=${INPUT_TAG:-armless-snapshot}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          tag="armless-v$version"
+          if gh release view "$tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag is already released; nothing to do"
+          else
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
       - name: Toolchain
+        if: steps.version.outputs.tag
         run: |
           sudo apt-get update -y
           sudo apt-get install -y clang lld
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
       - name: Build
+        if: steps.version.outputs.tag
         run: |
           sh build-wasm.sh
           SMP=1 sh build-wasm.sh
       - name: Package
+        if: steps.version.outputs.tag
         run: |
           mkdir -p dist/armless-web
           cp js/armless.js build/armless.wasm build/armless-smp.wasm LICENSE docs/armless.md dist/armless-web/
           tar -C dist -czf dist/armless-web.tar.gz armless-web
           ls -la dist/armless-web dist/armless-web.tar.gz
       - name: Publish
+        if: steps.version.outputs.tag
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_TAG: ${{ inputs.tag }}
+          tag: ${{ steps.version.outputs.tag }}
         run: |
-          tag="${INPUT_TAG:-armless-snapshot}"
           if [ "$tag" = armless-snapshot ]; then
             gh release delete "$tag" --yes --cleanup-tag || true
           fi
