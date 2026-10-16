@@ -250,6 +250,9 @@ pub struct DeviceConfig {
     pub console: bool,
     /// 9p filesystem with this mount tag
     pub fs_tag: Option<String>,
+    /// Bytes of decompressed file contents the 9p filesystem keeps on the host (the guest's
+    /// page cache keeps what it uses often): a cap on what reading files costs the host
+    pub fs_cache: usize,
     /// virtio-net with the user-mode network
     pub net: bool,
     pub mac: [u8; 6],
@@ -260,6 +263,7 @@ impl Default for DeviceConfig {
         DeviceConfig {
             console: true,
             fs_tag: None,
+            fs_cache: fs::DEFAULT_CACHE,
             net: false,
             mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
         }
@@ -294,7 +298,11 @@ impl Devices {
         if let Some(tag) = &cfg.fs_tag {
             pci.add(
                 SLOT_FS,
-                virtio::Device::P9(p9::P9::new(tag, fs::Fs::empty())),
+                virtio::Device::P9(p9::P9::new(tag, {
+                    let mut f = fs::Fs::empty();
+                    f.set_cache_limit(cfg.fs_cache);
+                    f
+                })),
             );
         }
         if cfg.net {

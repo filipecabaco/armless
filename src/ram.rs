@@ -10,9 +10,11 @@ use std::ops::{Deref, DerefMut};
 pub struct Ram {
     ptr: *mut u8,
     len: usize,
-    /// Allocated with the global allocator (else taken from memory.grow, or an alias).
-    boxed: bool,
+    /// What the global allocator returned, to free it with (none for memory.grow and aliases).
+    alloc: Option<(*mut u8, std::alloc::Layout)>,
 }
+
+const PAGE: usize = 4096;
 
 // Guest RAM is shared by the vCPU threads like physical memory is shared by
 // cores: concurrent accesses are the guest's business (it orders them with
@@ -26,7 +28,7 @@ impl Ram {
         Ram {
             ptr: self.ptr,
             len: self.len,
-            boxed: false,
+            alloc: None,
         }
     }
 
@@ -43,19 +45,23 @@ impl Ram {
                 return Ram {
                     ptr: (old * 65536) as *mut u8,
                     len,
-                    boxed: false,
+                    alloc: None,
                 };
             }
         }
-        // Page-aligned, so naturally aligned guest addresses are aligned on
-        // the host too (atomic accesses need that).
-        let layout = std::alloc::Layout::from_size_align(len.max(1), 4096).expect("RAM size");
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!ptr.is_null(), "out of memory allocating guest RAM");
+        // Page-aligned, so naturally aligned guest addresses are aligned on the
+        // host too (atomic accesses need that). Not by asking the allocator for
+        // that alignment, though: it then zeroes every byte itself, committing
+        // all of RAM up front. With its own alignment a zeroed allocation this
+        // size is calloc's fresh zero pages, which cost nothing until the guest
+        // touches them; one page more leaves room to align by hand.
+        let layout = std::alloc::Layout::from_size_align(len.max(1) + PAGE, 8).expect("RAM size");
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!raw.is_null(), "out of memory allocating guest RAM");
         Ram {
-            ptr,
+            ptr: unsafe { raw.add(raw.align_offset(PAGE)) },
             len,
-            boxed: true,
+            alloc: Some((raw, layout)),
         }
     }
 }
@@ -77,12 +83,25 @@ impl DerefMut for Ram {
 
 impl Drop for Ram {
     fn drop(&mut self) {
-        if self.boxed {
-            unsafe {
-                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                    self.ptr, self.len,
-                )))
-            }
+        if let Some((raw, layout)) = self.alloc {
+            unsafe { std::alloc::dealloc(raw, layout) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ram;
+
+    #[test]
+    fn ram_is_page_aligned_zero_and_writable() {
+        let mut ram = Ram::zeroed(64 << 20);
+        assert_eq!(ram.as_mut_ptr() as usize % 4096, 0);
+        assert_eq!(ram.len(), 64 << 20);
+        assert!(ram.iter().step_by(4096).all(|&b| b == 0));
+        ram[0] = 1;
+        let last = ram.len() - 1;
+        ram[last] = 2;
+        assert_eq!((ram[0], ram[last]), (1, 2));
     }
 }
