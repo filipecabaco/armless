@@ -30,6 +30,7 @@ pub mod mmu;
 pub mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod platform;
+pub mod predecode;
 pub mod ram;
 pub mod rtc;
 #[cfg(not(target_arch = "wasm32"))]
