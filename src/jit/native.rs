@@ -278,6 +278,9 @@ impl Compiler {
     fn new() -> Option<Compiler> {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").ok()?;
+        // Checking the IR of every function takes about a third of the compile time; the block
+        // tests and fuzzers keep the translation honest.
+        flags.set("enable_verifier", "false").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
         let isa = cranelift_native::builder()
