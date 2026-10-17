@@ -14,6 +14,8 @@
 //! slow path, which does the invalidation.
 
 pub mod gen;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+pub mod native;
 pub mod wasm;
 
 use std::collections::HashMap;
@@ -91,6 +93,12 @@ pub struct Jit {
     /// Instructions retired inside modules, and those of them interpreted.
     pub block_insns: u64,
     pub helper_interps: u64,
+    /// The native JIT's compiled code (None: pages go to the host, i.e. the browser) and the
+    /// address of each slot's function in it.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    pub(crate) native: Option<native::Native>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    native_fns: Vec<usize>,
 }
 
 #[inline(always)]
@@ -129,6 +137,10 @@ impl Jit {
             page_invalidations: 0,
             block_insns: 0,
             helper_interps: 0,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+            native: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+            native_fns: vec![0; SLOTS as usize],
         }
     }
 
@@ -320,6 +332,10 @@ impl<H: Host> Cpu<H> {
     /// Run translated code at the current PC if there is any.
     #[inline(always)]
     pub(crate) fn jit_step(&mut self, budget: u64) -> JitStep {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+        if self.jit.native.as_ref().is_some_and(|n| n.has_done()) {
+            self.jit_take_compiled();
+        }
         let Some(pa) = self.jit_pc_pa() else {
             return JitStep::NotCompiled;
         };
@@ -352,6 +368,14 @@ impl<H: Host> Cpu<H> {
     /// it is in flight. Returns true if a compile was started.
     #[cold]
     fn jit_compile(&mut self, key: u64) -> bool {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+        if self.jit.native.as_ref().is_some_and(|n| n.full()) {
+            // Start a new module: no slot may point into the old one.
+            self.jit.flush_all();
+            if let Some(n) = self.jit.native.as_mut() {
+                n.reset();
+            }
+        }
         let page_key = page_of(key);
         let off = ((key >> 2) & 0xfff) as u16;
         let info = self.jit.pages.entry(page_key).or_default();
@@ -404,7 +428,7 @@ impl<H: Host> Cpu<H> {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         let layout = self.jit_layout_for(page_key);
-        let wasm = gen::translate_page(&layout, &words, &entries, MAX_BLOCK);
+        let code = gen::translate_page_code(&layout, &words, &entries, MAX_BLOCK);
 
         let page = page_pa >> 12;
         self.jit.code_page[page] |= 1;
@@ -423,13 +447,73 @@ impl<H: Host> Cpu<H> {
         for f in self.fast.iter_mut() {
             f.forget_write_page(page_pa);
         }
-        if !self.host.jit_compile(SLOT_BASE + slot, &wasm) {
-            // The host cannot compile: give up on the JIT.
+        if !self.jit_compile_code(slot, &code, layout.smp != 0) {
+            // Nothing can compile it: give up on the JIT.
             self.jit.enabled = false;
             self.jit.flush_all();
             return false;
         }
         true
+    }
+
+    /// Have the function of slot `slot` compiled, by the native JIT or the host; either reports it
+    /// ready when it is.
+    fn jit_compile_code(&mut self, slot: u32, code: &wasm::Code, smp: bool) -> bool {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+        if let Some(n) = self.jit.native.as_mut() {
+            // On a thread of its own: `jit_take_compiled` marks the slot ready when it is. Until
+            // then the slot must not keep a function from its previous page.
+            self.jit.native_fns[slot as usize] = 0;
+            return n.submit(slot, code.b.clone());
+        }
+        let wasm = wasm::module(&gen::imports(), gen::LOCALS, code, smp);
+        self.host.jit_compile(SLOT_BASE + slot, &wasm)
+    }
+
+    /// The native compiler's statistics: (functions compiled, nanoseconds spent compiling).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    pub fn native_jit_stats(&self) -> (u64, u64) {
+        self.jit.native.as_ref().map_or((0, 0), |n| n.stats())
+    }
+
+    /// Testing aid: wait for the native JIT to finish what it was given; the next block entry takes
+    /// the results.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    pub fn wait_native_jit(&self) {
+        if let Some(n) = &self.jit.native {
+            n.wait_idle();
+        }
+    }
+
+    /// Take the slots the native JIT finished compiling and mark them ready.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    #[cold]
+    fn jit_take_compiled(&mut self) {
+        let Some(n) = self.jit.native.as_mut() else {
+            return;
+        };
+        let generation = n.generation;
+        for done in n.take_done() {
+            // A slot of an older generation was flushed before its module was freed: `ready`
+            // only frees it.
+            self.jit.native_fns[done.slot as usize] =
+                if done.generation == generation { done.function } else { 0 };
+            self.jit.ready(SLOT_BASE + done.slot);
+        }
+    }
+
+    /// Turn the JIT on with the native compiler (false where the host has no Cranelift backend).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    pub fn enable_native_jit(&mut self) -> bool {
+        let helpers = native::Helpers {
+            read: native_read::<H> as *const () as usize,
+            write: native_write::<H> as *const () as usize,
+            interp: native_interp::<H> as *const () as usize,
+        };
+        self.jit.native = native::Native::new(gen::LOCALS, helpers);
+        self.jit.enabled = self.jit.native.is_some();
+        self.jit_entry = true;
+        self.jit.enabled
     }
 
     /// Layout for code of the page key (its EL and SPSel select the TLB and SP).
@@ -440,7 +524,7 @@ impl<H: Host> Cpu<H> {
     }
 
     pub(crate) fn jit_layout_el(&self, el: u8, spsel: bool) -> gen::Layout {
-        let a = |p: *const u8| p as usize as u32;
+        let a = |p: *const u8| p as usize as u64;
         let f = &self.fast[el as usize];
         gen::Layout {
             x: a(self.x.as_ptr() as *const u8),
@@ -466,10 +550,10 @@ impl<H: Host> Cpu<H> {
             daif: a(std::ptr::addr_of!(self.daif) as *const u8),
             vreg: a(self.vreg.as_ptr() as *const u8),
             cpacr: a(std::ptr::addr_of!(self.sys.cpacr) as *const u8),
-            el: el as u32,
-            spsel: spsel as u32,
+            el: el as u64,
+            spsel: spsel as u64,
             irq_dirty: a(self.attn_ptr()),
-            smp: (self.machine.ncpus > 1) as u32,
+            smp: (self.machine.ncpus > 1) as u64,
             mem: a(self.mem.as_ptr()),
             read_tag: a(f.read_tag_ptr()),
             read_base: a(f.read_base_ptr()),
@@ -478,19 +562,37 @@ impl<H: Host> Cpu<H> {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", feature = "native-jit")))]
     fn jit_run(&mut self, _slot: u32, _budget: u64) -> JitStep {
         JitStep::NotCompiled
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", feature = "native-jit"))]
     fn jit_run(&mut self, slot: u32, budget: u64) -> JitStep {
         let before = self.insn_count;
         self.jit_limit = before.wrapping_add(budget.clamp(1, CHAIN_BUDGET));
         let pc = self.pc;
+        #[cfg(target_arch = "wasm32")]
         let status = unsafe {
             let f: extern "C" fn(i64) -> i32 = std::mem::transmute((SLOT_BASE + slot) as usize);
             f(pc as i64)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let status = {
+            let f = self.jit.native_fns[slot as usize];
+            if f == 0 {
+                return JitStep::NotCompiled;
+            }
+            // SAFETY: `f` is the function compiled for this slot, in the module the JIT holds; the
+            // block reaches this CPU through the addresses in its layout, and its helpers through
+            // CURRENT, while nothing else uses the CPU.
+            let previous = CURRENT.replace(self as *mut Self as *mut ());
+            let status = unsafe {
+                let f: extern "C" fn(i64) -> i32 = std::mem::transmute(f);
+                f(pc as i64)
+            };
+            CURRENT.set(previous);
+            status
         };
         self.jit.block_runs += 1;
         let ran = self.insn_count.wrapping_sub(before);
@@ -506,7 +608,10 @@ impl<H: Host> Cpu<H> {
     }
 
     /// Handle the exception a block left pending (cpu.pc = faulting instruction).
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_arch = "wasm32", feature = "native-jit")),
+        allow(dead_code)
+    )]
     fn jit_take_pending(&mut self) -> Result<(), StopReason> {
         self.jit_pending_flag = 0;
         match self.jit_pending.take() {
@@ -533,7 +638,10 @@ impl<H: Host> Cpu<H> {
         }
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_arch = "wasm32", feature = "native-jit")),
+        allow(dead_code)
+    )]
     fn read_code_word(&mut self, pc: u64) -> Res<u32> {
         self.read(pc, 4, false).map(|v| v as u32)
     }
@@ -665,4 +773,40 @@ impl<H: Host> Cpu<H> {
             JitStep::Stop(r) => Some(Some(Exit::Stop(r))),
         }
     }
+}
+
+// The native JIT's helpers: compiled blocks call them like the browser's imports, and they find the
+// CPU running the block through CURRENT (set by `jit_run`).
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+thread_local! {
+    static CURRENT: std::cell::Cell<*mut ()> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+fn current<H: Host>() -> *mut Cpu<H> {
+    CURRENT.get() as *mut Cpu<H>
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+extern "C" fn native_read<H: Host>(va: i64, size: i32) -> i64 {
+    // SAFETY: only blocks call the helpers, and only from `jit_run`, which set CURRENT to its CPU
+    // (of this H) for the duration of the call.
+    let cpu = unsafe { &mut *current::<H>() };
+    cpu.jit_helper_read(va as u64, size as u32) as i64
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+extern "C" fn native_write<H: Host>(va: i64, size: i32, value: i64) {
+    // SAFETY: only blocks call the helpers, and only from `jit_run`, which set CURRENT to its CPU
+    // (of this H) for the duration of the call.
+    let cpu = unsafe { &mut *current::<H>() };
+    cpu.jit_helper_write(va as u64, size as u32, value as u64)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+extern "C" fn native_interp<H: Host>(insn: i32, pc: i64) -> i32 {
+    // SAFETY: only blocks call the helpers, and only from `jit_run`, which set CURRENT to its CPU
+    // (of this H) for the duration of the call.
+    let cpu = unsafe { &mut *current::<H>() };
+    cpu.jit_helper_interp(insn as u32, pc as u64)
 }

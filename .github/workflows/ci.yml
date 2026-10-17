@@ -94,6 +94,23 @@ jobs:
           gzip -9 -k -f build-linux/Image
           sh tests/fs/make-9pfs.sh build-linux/busybox build-linux/Image.gz build-linux/9pfs
           ARMLESS_9PFS=build-linux/9pfs cargo test --release --test vm
+      - name: With the native JIT (x86_64 host code), userspace and SMP match qemu-aarch64, and the snowglobe flow
+        env:
+          ARMLESS_JIT: native
+        run: |
+          if ! sh tests/linux/userspace.sh build-linux > userspace.log 2>&1; then
+            cat userspace.log
+            echo "::error title=userspace, native JIT::$(tail -c 1500 userspace.log | tr -d '\r%' | tr '\n' ';')"
+            exit 1
+          fi
+          for n in 2 4; do
+            if ! sh tests/linux/smp.sh build-linux $n > smp.log 2>&1; then
+              cat smp.log
+              echo "::error title=smp $n CPUs, native JIT::$(tail -c 1500 smp.log | tr -d '\r%' | tr '\n' ';')"
+              exit 1
+            fi
+          done
+          ARMLESS_9PFS=build-linux/9pfs cargo test --release --test vm
       - name: Build armless.wasm and armless-smp.wasm
         run: |
           sh build-wasm.sh

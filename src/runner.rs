@@ -59,6 +59,15 @@ pub fn new_vm(config: crate::vm::Config) -> Result<(Vm<NativePlatform>, Arc<Cloc
         std::thread::available_parallelism().map_or(1, |n| n.get()) as u32,
         Ordering::Relaxed,
     );
+    // ARMLESS_JIT=native compiles hot guest code to host code (where the host supports it).
+    #[cfg(feature = "native-jit")]
+    if std::env::var("ARMLESS_JIT").is_ok_and(|v| v == "native") {
+        let mut vm = vm;
+        for cpu in vm.cpus.iter_mut() {
+            cpu.enable_native_jit();
+        }
+        return Ok((vm, clock));
+    }
     Ok((vm, clock))
 }
 
