@@ -28,8 +28,22 @@ ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1"
+# The native JIT: the blocks the JIT translates to wasm, compiled to host code instead (src/jit/native.rs)
+cranelift-codegen = { version = "=0.136.2", optional = true }
+cranelift-frontend = { version = "=0.136.2", optional = true }
+cranelift-jit = { version = "=0.136.2", optional = true }
+cranelift-module = { version = "=0.136.2", optional = true }
+cranelift-native = { version = "=0.136.2", optional = true }
+
+# The native JIT checks the kernel lets it make new code visible to other cores (membarrier)
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [features]
+default = ["native-jit"]
+# Compile hot guest code to host code on native hosts (opt-in at run time: ARMLESS_JIT=native, or
+# Cpu::enable_native_jit).
+native-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:libc"]
 # Compile the wasm export layer natively, to type-check it without a wasm target.
 wasm-api = []
 

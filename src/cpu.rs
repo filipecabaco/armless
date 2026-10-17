@@ -202,9 +202,10 @@ const CODE_ENTRIES: usize = 64;
 /// with the needed permission at one exception level.
 pub(crate) struct FastTlb {
     read_tag: Vec<u64>,
-    read_base: Vec<usize>,
+    /// Page offsets in RAM (u32 in every build: the JIT's code reads them as 4-byte entries).
+    read_base: Vec<u32>,
     write_tag: Vec<u64>,
-    write_base: Vec<usize>,
+    write_base: Vec<u32>,
     pub(crate) code_page: u64,
     pub(crate) code_base: usize,
     code_tag: Vec<u64>,
@@ -254,7 +255,7 @@ impl FastTlb {
     /// Remove write entries mapping to the physical page at `base`.
     pub(crate) fn forget_write_page(&mut self, base: usize) {
         for i in 0..FAST_ENTRIES {
-            if self.write_tag[i] != u64::MAX && self.write_base[i] == base {
+            if self.write_tag[i] != u64::MAX && self.write_base[i] as usize == base {
                 self.write_tag[i] = u64::MAX;
             }
         }
@@ -1286,7 +1287,7 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.read_tag[i] == va >> 12 {
-                return Ok(self.ram_load(f.read_base[i] + off as usize, size));
+                return Ok(self.ram_load(f.read_base[i] as usize + off as usize, size));
             }
         }
         self.read_slow(va, size, unpriv)
@@ -1305,7 +1306,7 @@ impl<H: Host> Cpu<H> {
                 let f = &mut self.fast[self.el as usize];
                 let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
                 f.read_tag[i] = va >> 12;
-                f.read_base[i] = page;
+                f.read_base[i] = page as u32;
             }
             return self
                 .phys_read(pa, size)
@@ -1327,7 +1328,7 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] + off as usize;
+                let a = f.write_base[i] as usize + off as usize;
                 self.ram_store(a, size, value);
                 return Ok(());
             }
@@ -1351,7 +1352,7 @@ impl<H: Host> Cpu<H> {
                 let f = &mut self.fast[self.el as usize];
                 let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
                 f.write_tag[i] = va >> 12;
-                f.write_base[i] = page;
+                f.write_base[i] = page as u32;
             }
             if let Some(e) = self.excl() {
                 if e & !0x3f == pa & !0x3f {

@@ -138,58 +138,59 @@ impl Code {
         leb_u(&mut self.b, l as u64);
     }
 
-    // memory: `addr` is the static offset; the dynamic address is on the stack
-    fn mem(&mut self, op: u8, align: u32, offset: u32) {
+    // memory: `addr` is the static offset; the dynamic address is on the stack. Offsets are
+    // linear-memory addresses in the browser and host addresses natively (see `native`).
+    fn mem(&mut self, op: u8, align: u32, offset: u64) {
         self.b.push(op);
         leb_u(&mut self.b, align as u64);
-        leb_u(&mut self.b, offset as u64);
+        leb_u(&mut self.b, offset);
     }
-    pub fn i32_load(&mut self, off: u32) {
+    pub fn i32_load(&mut self, off: u64) {
         self.mem(0x28, 2, off)
     }
-    pub fn i64_load(&mut self, off: u32) {
+    pub fn i64_load(&mut self, off: u64) {
         self.mem(0x29, 3, off)
     }
-    pub fn i32_load8_u(&mut self, off: u32) {
+    pub fn i32_load8_u(&mut self, off: u64) {
         self.mem(0x2d, 0, off)
     }
-    pub fn i64_load8_u(&mut self, off: u32) {
+    pub fn i64_load8_u(&mut self, off: u64) {
         self.mem(0x31, 0, off)
     }
-    pub fn i64_load8_s(&mut self, off: u32) {
+    pub fn i64_load8_s(&mut self, off: u64) {
         self.mem(0x30, 0, off)
     }
-    pub fn i64_load16_u(&mut self, off: u32) {
+    pub fn i64_load16_u(&mut self, off: u64) {
         self.mem(0x33, 1, off)
     }
-    pub fn i64_load16_s(&mut self, off: u32) {
+    pub fn i64_load16_s(&mut self, off: u64) {
         self.mem(0x32, 1, off)
     }
-    pub fn i64_load32_u(&mut self, off: u32) {
+    pub fn i64_load32_u(&mut self, off: u64) {
         self.mem(0x35, 2, off)
     }
-    pub fn i64_load32_s(&mut self, off: u32) {
+    pub fn i64_load32_s(&mut self, off: u64) {
         self.mem(0x34, 2, off)
     }
-    pub fn i32_store(&mut self, off: u32) {
+    pub fn i32_store(&mut self, off: u64) {
         self.mem(0x36, 2, off)
     }
-    pub fn i64_store(&mut self, off: u32) {
+    pub fn i64_store(&mut self, off: u64) {
         self.mem(0x37, 3, off)
     }
     pub fn i32_clz(&mut self) {
         self.op(0x67)
     }
-    pub fn i32_store8(&mut self, off: u32) {
+    pub fn i32_store8(&mut self, off: u64) {
         self.mem(0x3a, 0, off)
     }
-    pub fn i64_store8(&mut self, off: u32) {
+    pub fn i64_store8(&mut self, off: u64) {
         self.mem(0x3c, 0, off)
     }
-    pub fn i64_store16(&mut self, off: u32) {
+    pub fn i64_store16(&mut self, off: u64) {
         self.mem(0x3d, 1, off)
     }
-    pub fn i64_store32(&mut self, off: u32) {
+    pub fn i64_store32(&mut self, off: u64) {
         self.mem(0x3e, 2, off)
     }
 
