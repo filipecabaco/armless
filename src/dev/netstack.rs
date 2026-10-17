@@ -954,6 +954,9 @@ mod restore_tests {
         after.load(&mut R(&w.0)).unwrap();
         let id = after.connect(5000);
         let port = after.remote_port(id).unwrap();
-        assert!(!ports.contains(&port), "{port} was in use before the save: {ports:?}");
+        assert!(
+            !ports.contains(&port),
+            "{port} was in use before the save: {ports:?}"
+        );
     }
 }
