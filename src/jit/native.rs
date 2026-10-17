@@ -23,6 +23,31 @@ use std::sync::Arc;
 
 use super::wasm;
 
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+mod code;
+
+/// Code memory for a module (`code::CodeMemory`) and how far from where it is written its code
+/// runs; None where the host has none, and Cranelift's own memory is used.
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+fn code_memory() -> Option<(Box<dyn cranelift_jit::JITMemoryProvider + Send>, isize)> {
+    // Room for CODE_LIMIT of code and what is still compiled once it is reached.
+    let memory = code::CodeMemory::new(2 * CODE_LIMIT)?;
+    let offset = memory.exec_address(std::ptr::null()) as isize;
+    Some((Box::new(memory), offset))
+}
+
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
+fn code_memory() -> Option<(Box<dyn cranelift_jit::JITMemoryProvider + Send>, isize)> {
+    None
+}
+
+/// Let the compiler thread write code memory, or stop it (see `code::CodeMemory::writable`).
+fn code_writable(on: bool) {
+    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    code::CodeMemory::writable(on);
+    let _ = on;
+}
+
 /// Code compiled into one module before it is dropped and the JIT starts over (`full`).
 const CODE_LIMIT: usize = 64 << 20;
 
@@ -90,9 +115,10 @@ pub struct Native {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Whether generated code can be made visible to every core. On Linux arm64 Cranelift does that
-/// with membarrier(2) and panics if the kernel refuses it, which a sandbox may (seccomp, gVisor):
-/// there, ask first and stay with the interpreter if neither command it uses is available.
+/// Whether code in Cranelift's own memory can be made visible to every core. On Linux arm64
+/// Cranelift does that with membarrier(2) and panics if the kernel refuses it, which a sandbox may
+/// (seccomp, gVisor): there, ask first and stay with the interpreter if neither command it uses is
+/// available. (`CodeMemory` needs no system call for it.)
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 fn can_publish_code() -> bool {
     const QUERY: libc::c_long = 0;
@@ -112,9 +138,6 @@ impl Native {
     /// None where Cranelift does not support the host. `locals` and the helpers are those of the
     /// functions `gen` writes for this CPU.
     pub fn new(locals: &'static [(u32, u8)], helpers: Helpers) -> Option<Native> {
-        if !can_publish_code() {
-            return None;
-        }
         let (jobs, job_rx) = channel::<Job>();
         let (done_tx, done) = channel::<Done>();
         let (ready_tx, ready_rx) = channel::<bool>();
@@ -272,6 +295,8 @@ struct Compiler {
     fctx: FunctionBuilderContext,
     code_bytes: usize,
     functions: u32,
+    /// How far from where it was written each function runs (with `CodeMemory` on Linux).
+    exec_offset: isize,
 }
 
 impl Compiler {
@@ -287,7 +312,15 @@ impl Compiler {
             .ok()?
             .finish(settings::Flags::new(flags))
             .ok()?;
-        let module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+        let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+        let mut exec_offset = 0;
+        if let Some((memory, offset)) = code_memory() {
+            exec_offset = offset;
+            builder.memory_provider(memory);
+        } else if !can_publish_code() {
+            return None;
+        }
+        let module = JITModule::new(builder);
         let ctx = module.make_context();
         Some(Compiler {
             module: std::mem::ManuallyDrop::new(module),
@@ -295,6 +328,7 @@ impl Compiler {
             fctx: FunctionBuilderContext::new(),
             code_bytes: 0,
             functions: 0,
+            exec_offset,
         })
     }
 
@@ -333,14 +367,27 @@ impl Compiler {
             self.module.clear_context(&mut self.ctx);
             return None;
         }
+        code_writable(true);
         let defined = self.module.define_function(id, &mut self.ctx);
+        // Code that runs where it was written may refer to other addresses; elsewhere it must
+        // refer to none (`gen` calls the helpers through addresses in registers, and jump tables
+        // are relative to the function).
+        let movable = self.exec_offset == 0
+            || self
+                .ctx
+                .compiled_code()
+                .is_some_and(|c| c.buffer.relocs().is_empty());
         if let Some(code) = self.ctx.compiled_code() {
             self.code_bytes += code.code_buffer().len();
         }
         self.module.clear_context(&mut self.ctx);
-        defined.ok()?;
-        self.module.finalize_definitions().ok()?;
-        Some(self.module.get_finalized_function(id))
+        let finalized = defined.is_ok() && movable && self.module.finalize_definitions().is_ok();
+        code_writable(false);
+        finalized.then(|| {
+            self.module
+                .get_finalized_function(id)
+                .wrapping_offset(self.exec_offset)
+        })
     }
 }
 

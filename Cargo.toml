@@ -35,8 +35,9 @@ cranelift-jit = { version = "=0.136.2", optional = true }
 cranelift-module = { version = "=0.136.2", optional = true }
 cranelift-native = { version = "=0.136.2", optional = true }
 
-# The native JIT checks the kernel lets it make new code visible to other cores (membarrier)
-[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+# The native JIT checks the kernel lets it make new code visible to other cores (membarrier), and
+# maps its code memory itself (src/jit/native/code.rs)
+[target.'cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 libc = { version = "0.2", optional = true }
 
 [features]
