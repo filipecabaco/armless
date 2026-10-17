@@ -48,13 +48,30 @@ pub struct Runner {
     threads: Vec<JoinHandle<()>>,
 }
 
-/// Creates a machine for the native runner.
+/// Fresh randomness from the host's own generator, to seed a machine with (`Board::seed`).
+pub fn os_entropy() -> [u8; 32] {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    let read = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes));
+    if read.is_err() {
+        // No /dev/urandom: the clock and this process, which at least differ between runs
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mix = t ^ (u128::from(std::process::id()) << 64);
+        bytes[..16].copy_from_slice(&mix.to_le_bytes());
+    }
+    bytes
+}
+
+/// Creates a machine for the native runner, seeded with the host's randomness.
 pub fn new_vm(config: crate::vm::Config) -> Result<(Vm<NativePlatform>, Arc<Clock>), String> {
     let clock = Clock::new();
     let c = clock.clone();
     let vm = Vm::new(config, crate::platform::unix_secs, move |_| {
         NativePlatform::new(c.clone())
     })?;
+    vm.board.seed(&os_entropy());
     vm.machine().host_cores.store(
         std::thread::available_parallelism().map_or(1, |n| n.get()) as u32,
         Ordering::Relaxed,
@@ -177,11 +194,14 @@ impl Runner {
     }
 
     /// Restore a snapshot (raw or zstd); the CPUs must not be running yet,
-    /// or are paused for it.
+    /// or are paused for it. The machine is seeded afresh, as after every restore (`Board::seed`):
+    /// otherwise each restore of a snapshot would draw the same "random" numbers.
     pub fn load_state(&self, data: &[u8]) -> Result<(), String> {
         let mut p = self.pause();
         let mut cpus = p.cpus();
-        crate::vm::load_state(&self.board, &mut cpus, data)
+        crate::vm::load_state(&self.board, &mut cpus, data)?;
+        self.board.seed(&os_entropy());
+        Ok(())
     }
 
     /// Restore a snapshot streamed from `reader` (decompressed bytes).
@@ -197,7 +217,9 @@ impl Runner {
             }
             loader.feed(&self.board, &buf[..n])?;
         }
-        loader.finish(&self.board, &mut cpus)
+        loader.finish(&self.board, &mut cpus)?;
+        self.board.seed(&os_entropy());
+        Ok(())
     }
 
     /// Wait until the machine stops (or `timeout` passes).
@@ -351,5 +373,33 @@ fn vcpu_thread(
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_restore_gets_fresh_randomness() {
+        let config = crate::vm::Config {
+            memory_size: 16 << 20,
+            ..Default::default()
+        };
+        let (vm, clock) = new_vm(config).unwrap();
+        let runner = Runner::new(vm, clock, false);
+        let booted = runner.board.devices.lock().vmgenid;
+        assert_ne!(booted, [0; 16], "a new machine is seeded");
+        let state = runner.save_state();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            runner.load_state(&state).unwrap();
+            ids.push(runner.board.devices.lock().vmgenid);
+        }
+        assert_ne!(ids[0], booted);
+        assert_ne!(
+            ids[0], ids[1],
+            "each restore of the same snapshot has its own generation"
+        );
     }
 }
