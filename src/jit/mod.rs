@@ -75,8 +75,11 @@ pub struct Jit {
     free: Vec<u32>,
     /// Physical page number -> page keys (one per EL/SPSel) with modules.
     page_keys: HashMap<u32, Vec<u64>>,
-    /// One byte per physical page of RAM: non-zero if it holds compiled code.
+    /// One byte per physical page of RAM: non-zero if it holds compiled code (bit 0) or
+    /// pre-decoded instructions (bit 1).
     pub code_page: Vec<u8>,
+    /// The interpreter's pre-decoded pages, dropped with the page's compiled code.
+    pub pre: crate::predecode::Cache,
     /// Statistics
     pub compiled: u64,
     pub invalidated: u64,
@@ -118,6 +121,7 @@ impl Jit {
             free: (0..SLOTS).rev().collect(),
             page_keys: HashMap::new(),
             code_page: vec![0; memory_size.div_ceil(4096)],
+            pre: crate::predecode::Cache::new(memory_size),
             compiled: 0,
             invalidated: 0,
             block_runs: 0,
@@ -208,6 +212,7 @@ impl Jit {
         }
         self.code_page[page] = 0;
         self.page_invalidations += 1;
+        self.pre.drop_page(page);
         if let Some(keys) = self.page_keys.remove(&(page as u32)) {
             for k in keys {
                 self.remove_page(k);
@@ -234,6 +239,7 @@ impl Jit {
         }
         self.page_keys.clear();
         self.code_page.fill(0);
+        self.pre.clear();
         self.hot_key.fill(u64::MAX);
         self.lookup_key.fill(u64::MAX);
     }
@@ -401,7 +407,7 @@ impl<H: Host> Cpu<H> {
         let wasm = gen::translate_page(&layout, &words, &entries, MAX_BLOCK);
 
         let page = page_pa >> 12;
-        self.jit.code_page[page] = 1;
+        self.jit.code_page[page] |= 1;
         self.machine.code_pages[page].store(1, std::sync::atomic::Ordering::Relaxed);
         let keys = self.jit.page_keys.entry(page as u32).or_default();
         if !keys.contains(&page_key) {

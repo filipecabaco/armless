@@ -181,6 +181,11 @@ pub struct Cpu<H: Host> {
     pub insn_count: u64,
     /// Basic-block JIT state (enabled only where the host can compile wasm).
     pub jit: crate::jit::Jit,
+    /// The pre-decoded page `step` is executing from: its physical base, its slot in
+    /// `jit.pre`, and the cache generation the slot was found in.
+    dec_base: usize,
+    dec_slot: u32,
+    dec_gen: u64,
     /// Exception raised inside a JIT helper, and its flag (read by blocks).
     pub(crate) jit_pending: Option<Event>,
     pub(crate) jit_pending_flag: u8,
@@ -346,6 +351,9 @@ impl<H: Host> Cpu<H> {
             trap_undefined: false,
             last_undefined: None,
             jit: crate::jit::Jit::new(memory_size),
+            dec_base: usize::MAX,
+            dec_slot: crate::predecode::NONE,
+            dec_gen: 0,
             jit_pending: None,
             jit_pending_flag: 0,
         };
@@ -917,11 +925,12 @@ impl<H: Host> Cpu<H> {
     }
 
     /// Execute exactly one instruction, taking any exception it raises.
+    #[inline(always)]
     pub fn step(&mut self) -> Res<()> {
         let pc = self.pc;
         self.next_pc = pc.wrapping_add(4);
-        let result = match self.fetch(pc) {
-            Ok(insn) => self.execute(insn),
+        let result = match self.fetch_decoded(pc) {
+            Ok(e) => self.exec_decoded(e),
             Err(e) => Err(e),
         };
         self.insn_count = self.insn_count.wrapping_add(1);
@@ -963,6 +972,62 @@ impl<H: Host> Cpu<H> {
             return Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()));
         }
         self.fetch_slow(pc)
+    }
+
+    /// The pre-decoded entry of the instruction at `pc` (see `predecode`).
+    #[inline(always)]
+    fn fetch_decoded(&mut self, pc: u64) -> Res<u64> {
+        let f = &self.fast[self.el as usize];
+        if pc >> 12 == f.code_page
+            && f.code_base == self.dec_base
+            && self.dec_gen == self.jit.pre.gen
+        {
+            let i = ((pc & 0xfff) >> 2) as usize;
+            let e = self.jit.pre.get(self.dec_slot, i);
+            if e != 0 {
+                return Ok(e);
+            }
+            return Ok(self.decode_at(i));
+        }
+        self.fetch_decoded_slow(pc)
+    }
+
+    #[inline(never)]
+    fn fetch_decoded_slow(&mut self, pc: u64) -> Res<u64> {
+        let insn = self.fetch(pc)?;
+        let f = &self.fast[self.el as usize];
+        if pc >> 12 != f.code_page {
+            // Not a page the fetch path keeps (it ends past RAM): run it undecoded.
+            return Ok(crate::predecode::entry(insn));
+        }
+        let base = f.code_base;
+        let page = base >> 12;
+        let mut slot = self.jit.pre.slot(page);
+        if slot == crate::predecode::NONE {
+            slot = self.jit.pre.alloc(page);
+            self.jit.code_page[page] |= 2;
+            // Stores to the page, here or by a device, must drop what was decoded from it.
+            self.machine.code_pages[page].store(1, Ordering::Relaxed);
+            for f in self.fast.iter_mut() {
+                f.forget_write_page(base);
+            }
+        }
+        self.dec_base = base;
+        self.dec_slot = slot;
+        self.dec_gen = self.jit.pre.gen;
+        let i = ((pc & 0xfff) >> 2) as usize;
+        let e = self.jit.pre.get(slot, i);
+        Ok(if e != 0 { e } else { self.decode_at(i) })
+    }
+
+    /// Decode instruction `i` of the current pre-decoded page.
+    #[inline(never)]
+    fn decode_at(&mut self, i: usize) -> u64 {
+        let a = self.dec_base + i * 4;
+        let insn = u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap());
+        let e = crate::predecode::entry(insn);
+        self.jit.pre.set(self.dec_slot, i, e);
+        e
     }
 
     pub(crate) fn fetch_slow_pub(&mut self, pc: u64) -> Res<u32> {

@@ -113,127 +113,159 @@ impl<H: Host> Cpu<H> {
     // ===================================================== data processing (imm)
 
     fn dp_imm(&mut self, insn: u32) -> Res<()> {
+        match field(insn, 23, 3) {
+            0b000 | 0b001 => self.adr(insn),
+            0b010 => self.add_sub_imm(insn),
+            0b100 => self.logical_imm(insn),
+            0b101 => self.move_wide(insn),
+            0b110 => self.bitfield_imm(insn),
+            _ => self.extr(insn),
+        }
+    }
+
+    /// ADR / ADRP
+    #[inline(always)]
+    pub(crate) fn adr(&mut self, insn: u32) -> Res<()> {
+        let rd = insn & 31;
+        let immlo = field(insn, 29, 2) as u64;
+        let immhi = field(insn, 5, 19) as u64;
+        let imm = sext((immhi << 2) | immlo, 21);
+        let v = if bit(insn, 31) {
+            (self.pc & !0xfff).wrapping_add((imm << 12) as u64)
+        } else {
+            self.pc.wrapping_add(imm as u64)
+        };
+        self.wr(rd, v);
+        Ok(())
+    }
+
+    /// ADD/ADDS/SUB/SUBS (immediate)
+    #[inline(always)]
+    pub(crate) fn add_sub_imm(&mut self, insn: u32) -> Res<()> {
         let sf = bit(insn, 31);
         let rd = insn & 31;
         let rn = field(insn, 5, 5);
-        match field(insn, 23, 3) {
-            0b000 | 0b001 => {
-                // ADR / ADRP
-                let immlo = field(insn, 29, 2) as u64;
-                let immhi = field(insn, 5, 19) as u64;
-                let imm = sext((immhi << 2) | immlo, 21);
-                let v = if bit(insn, 31) {
-                    (self.pc & !0xfff).wrapping_add((imm << 12) as u64)
-                } else {
-                    self.pc.wrapping_add(imm as u64)
-                };
-                self.wr(rd, v);
-            },
-            0b010 => {
-                // ADD/ADDS/SUB/SUBS (immediate)
-                let sub = bit(insn, 30);
-                let set = bit(insn, 29);
-                let mut imm = field(insn, 10, 12) as u64;
-                if bit(insn, 22) {
-                    imm <<= 12;
-                }
-                let x = self.xs(rn);
-                let (r, n, z, c, v) = if sub {
-                    add_with_carry(x, !imm, true, sf)
-                } else {
-                    add_with_carry(x, imm, false, sf)
-                };
-                let r = trunc(r, sf);
-                if set {
-                    self.set_flags(n, z, c, v);
-                    self.wr(rd, r);
-                } else {
-                    self.ws(rd, r);
-                }
-            },
-            0b100 => {
-                // Logical (immediate)
-                let opc = field(insn, 29, 2);
-                let nbit = field(insn, 22, 1);
-                if !sf && nbit == 1 {
-                    return Err(Event::undefined());
-                }
-                let imm = decode_bit_masks(nbit, field(insn, 10, 6), field(insn, 16, 6), sf)
-                    .ok_or_else(Event::undefined)?;
-                let x = self.xr(rn);
-                let r = trunc(
-                    match opc {
-                        0 | 3 => x & imm,
-                        1 => x | imm,
-                        _ => x ^ imm,
-                    },
-                    sf,
-                );
-                if opc == 3 {
-                    self.set_nz_logical(r, sf);
-                    self.wr(rd, r);
-                } else {
-                    self.ws(rd, r);
-                }
-            },
-            0b101 => {
-                // MOVN / MOVZ / MOVK
-                let opc = field(insn, 29, 2);
-                let hw = field(insn, 21, 2);
-                if !sf && hw > 1 {
-                    return Err(Event::undefined());
-                }
-                let shift = hw * 16;
-                let imm = (field(insn, 5, 16) as u64) << shift;
-                let r = match opc {
-                    0 => !imm,
-                    2 => imm,
-                    3 => (self.xr(rd) & !(0xffffu64 << shift)) | imm,
-                    _ => return Err(Event::undefined()),
-                };
-                self.wr(rd, trunc(r, sf));
-            },
-            0b110 => {
-                // SBFM / BFM / UBFM
-                let opc = field(insn, 29, 2);
-                let nbit = bit(insn, 22);
-                if nbit != sf || opc == 3 {
-                    return Err(Event::undefined());
-                }
-                let immr = field(insn, 16, 6);
-                let imms = field(insn, 10, 6);
-                let size = if sf { 64 } else { 32 };
-                if !sf && (immr >= 32 || imms >= 32) {
-                    return Err(Event::undefined());
-                }
-                let src = trunc(self.xr(rn), sf);
-                let r = self.bitfield(opc, src, self.xr(rd), immr, imms, size);
-                self.wr(rd, trunc(r, sf));
-            },
-            _ => {
-                // EXTR
-                if field(insn, 29, 2) != 0 || bit(insn, 22) != sf || bit(insn, 21) {
-                    return Err(Event::undefined());
-                }
-                let rm = field(insn, 16, 5);
-                let lsb = field(insn, 10, 6);
-                let (hi, lo) = (self.xr(rn), self.xr(rm));
-                let r = if sf {
-                    if lsb == 0 {
-                        lo
-                    } else {
-                        (lo >> lsb) | (hi << (64 - lsb))
-                    }
-                } else {
-                    if lsb >= 32 {
-                        return Err(Event::undefined());
-                    }
-                    let (hi, lo) = (hi as u32, lo as u32);
-                    (if lsb == 0 { lo } else { (lo >> lsb) | (hi << (32 - lsb)) }) as u64
-                };
-                self.wr(rd, r);
-            },
+        let sub = bit(insn, 30);
+        let set = bit(insn, 29);
+        let mut imm = field(insn, 10, 12) as u64;
+        if bit(insn, 22) {
+            imm <<= 12;
         }
+        let x = self.xs(rn);
+        let (r, n, z, c, v) =
+            if sub { add_with_carry(x, !imm, true, sf) } else { add_with_carry(x, imm, false, sf) };
+        let r = trunc(r, sf);
+        if set {
+            self.set_flags(n, z, c, v);
+            self.wr(rd, r);
+        } else {
+            self.ws(rd, r);
+        }
+        Ok(())
+    }
+
+    /// Logical (immediate)
+    #[inline(always)]
+    pub(crate) fn logical_imm(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        let opc = field(insn, 29, 2);
+        let nbit = field(insn, 22, 1);
+        if !sf && nbit == 1 {
+            return Err(Event::undefined());
+        }
+        let imm = decode_bit_masks(nbit, field(insn, 10, 6), field(insn, 16, 6), sf)
+            .ok_or_else(Event::undefined)?;
+        let x = self.xr(rn);
+        let r = trunc(
+            match opc {
+                0 | 3 => x & imm,
+                1 => x | imm,
+                _ => x ^ imm,
+            },
+            sf,
+        );
+        if opc == 3 {
+            self.set_nz_logical(r, sf);
+            self.wr(rd, r);
+        } else {
+            self.ws(rd, r);
+        }
+        Ok(())
+    }
+
+    /// MOVN / MOVZ / MOVK
+    #[inline(always)]
+    pub(crate) fn move_wide(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let opc = field(insn, 29, 2);
+        let hw = field(insn, 21, 2);
+        if !sf && hw > 1 {
+            return Err(Event::undefined());
+        }
+        let shift = hw * 16;
+        let imm = (field(insn, 5, 16) as u64) << shift;
+        let r = match opc {
+            0 => !imm,
+            2 => imm,
+            3 => (self.xr(rd) & !(0xffffu64 << shift)) | imm,
+            _ => return Err(Event::undefined()),
+        };
+        self.wr(rd, trunc(r, sf));
+        Ok(())
+    }
+
+    /// SBFM / BFM / UBFM
+    #[inline(always)]
+    pub(crate) fn bitfield_imm(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        let opc = field(insn, 29, 2);
+        let nbit = bit(insn, 22);
+        if nbit != sf || opc == 3 {
+            return Err(Event::undefined());
+        }
+        let immr = field(insn, 16, 6);
+        let imms = field(insn, 10, 6);
+        let size = if sf { 64 } else { 32 };
+        if !sf && (immr >= 32 || imms >= 32) {
+            return Err(Event::undefined());
+        }
+        let src = trunc(self.xr(rn), sf);
+        let r = self.bitfield(opc, src, self.xr(rd), immr, imms, size);
+        self.wr(rd, trunc(r, sf));
+        Ok(())
+    }
+
+    /// EXTR
+    #[inline(always)]
+    pub(crate) fn extr(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        if field(insn, 29, 2) != 0 || bit(insn, 22) != sf || bit(insn, 21) {
+            return Err(Event::undefined());
+        }
+        let rm = field(insn, 16, 5);
+        let lsb = field(insn, 10, 6);
+        let (hi, lo) = (self.xr(rn), self.xr(rm));
+        let r = if sf {
+            if lsb == 0 {
+                lo
+            } else {
+                (lo >> lsb) | (hi << (64 - lsb))
+            }
+        } else {
+            if lsb >= 32 {
+                return Err(Event::undefined());
+            }
+            let (hi, lo) = (hi as u32, lo as u32);
+            (if lsb == 0 { lo } else { (lo >> lsb) | (hi << (32 - lsb)) }) as u64
+        };
+        self.wr(rd, r);
         Ok(())
     }
 
@@ -267,42 +299,65 @@ impl<H: Host> Cpu<H> {
 
     fn branch_sys(&mut self, insn: u32) -> Res<()> {
         if insn & 0x7c00_0000 == 0x1400_0000 {
-            // B / BL
-            let off = sext((insn & 0x3ff_ffff) as u64, 26) << 2;
-            if bit(insn, 31) {
-                self.x[30] = self.pc.wrapping_add(4);
-            }
-            self.next_pc = self.pc.wrapping_add(off as u64);
+            self.b_bl(insn)
         } else if insn & 0x7e00_0000 == 0x3400_0000 {
-            // CBZ / CBNZ
-            let sf = bit(insn, 31);
-            let t = trunc(self.xr(insn & 31), sf);
-            if (t == 0) != bit(insn, 24) {
-                let off = sext(field(insn, 5, 19) as u64, 19) << 2;
-                self.next_pc = self.pc.wrapping_add(off as u64);
-            }
+            self.cbz_cbnz(insn)
         } else if insn & 0x7e00_0000 == 0x3600_0000 {
-            // TBZ / TBNZ
-            let b = (field(insn, 31, 1) << 5) | field(insn, 19, 5);
-            let set = (self.xr(insn & 31) >> b) & 1 != 0;
-            if set == bit(insn, 24) {
-                let off = sext(field(insn, 5, 14) as u64, 14) << 2;
-                self.next_pc = self.pc.wrapping_add(off as u64);
-            }
+            self.tbz_tbnz(insn)
         } else if insn & 0xff00_0010 == 0x5400_0000 {
-            // B.cond
-            if self.cond_holds(insn & 0xf) {
-                let off = sext(field(insn, 5, 19) as u64, 19) << 2;
-                self.next_pc = self.pc.wrapping_add(off as u64);
-            }
+            self.b_cond(insn)
         } else if insn & 0xff00_0000 == 0xd400_0000 {
-            return self.exception_gen(insn);
+            self.exception_gen(insn)
         } else if insn & 0xffc0_0000 == 0xd500_0000 {
-            return self.system(insn);
+            self.system(insn)
         } else if insn & 0xfe00_0000 == 0xd600_0000 {
-            return self.branch_reg(insn);
+            self.branch_reg(insn)
         } else {
-            return Err(Event::undefined());
+            Err(Event::undefined())
+        }
+    }
+
+    /// B / BL
+    #[inline(always)]
+    pub(crate) fn b_bl(&mut self, insn: u32) -> Res<()> {
+        let off = sext((insn & 0x3ff_ffff) as u64, 26) << 2;
+        if bit(insn, 31) {
+            self.x[30] = self.pc.wrapping_add(4);
+        }
+        self.next_pc = self.pc.wrapping_add(off as u64);
+        Ok(())
+    }
+
+    /// CBZ / CBNZ
+    #[inline(always)]
+    pub(crate) fn cbz_cbnz(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let t = trunc(self.xr(insn & 31), sf);
+        if (t == 0) != bit(insn, 24) {
+            let off = sext(field(insn, 5, 19) as u64, 19) << 2;
+            self.next_pc = self.pc.wrapping_add(off as u64);
+        }
+        Ok(())
+    }
+
+    /// TBZ / TBNZ
+    #[inline(always)]
+    pub(crate) fn tbz_tbnz(&mut self, insn: u32) -> Res<()> {
+        let b = (field(insn, 31, 1) << 5) | field(insn, 19, 5);
+        let set = (self.xr(insn & 31) >> b) & 1 != 0;
+        if set == bit(insn, 24) {
+            let off = sext(field(insn, 5, 14) as u64, 14) << 2;
+            self.next_pc = self.pc.wrapping_add(off as u64);
+        }
+        Ok(())
+    }
+
+    /// B.cond
+    #[inline(always)]
+    pub(crate) fn b_cond(&mut self, insn: u32) -> Res<()> {
+        if self.cond_holds(insn & 0xf) {
+            let off = sext(field(insn, 5, 19) as u64, 19) << 2;
+            self.next_pc = self.pc.wrapping_add(off as u64);
         }
         Ok(())
     }
@@ -336,7 +391,8 @@ impl<H: Host> Cpu<H> {
         }
     }
 
-    fn branch_reg(&mut self, insn: u32) -> Res<()> {
+    #[inline(always)]
+    pub(crate) fn branch_reg(&mut self, insn: u32) -> Res<()> {
         let opc = field(insn, 21, 4);
         let op2 = field(insn, 16, 5);
         let op3 = field(insn, 10, 6);
@@ -722,26 +778,7 @@ impl<H: Host> Cpu<H> {
         if insn & 0x3f00_0000 == 0x0800_0000 {
             self.ldst_exclusive(insn)
         } else if insn & 0x3b00_0000 == 0x1800_0000 {
-            // LDR (literal)
-            let off = sext(field(insn, 5, 19) as u64, 19) << 2;
-            let addr = self.pc.wrapping_add(off as u64);
-            let rt = insn & 31;
-            match field(insn, 30, 2) {
-                0 => {
-                    let v = self.read(addr, 4, false)?;
-                    self.wr(rt, v);
-                },
-                1 => {
-                    let v = self.read(addr, 8, false)?;
-                    self.wr(rt, v);
-                },
-                2 => {
-                    let v = self.read(addr, 4, false)?;
-                    self.wr(rt, v as u32 as i32 as i64 as u64);
-                },
-                _ => {}, // PRFM
-            }
-            Ok(())
+            self.ldr_literal(insn)
         } else if insn & 0x3800_0000 == 0x2800_0000 {
             self.ldst_pair(insn)
         } else if insn & 0x3800_0000 == 0x3800_0000 {
@@ -751,7 +788,32 @@ impl<H: Host> Cpu<H> {
         }
     }
 
-    fn ldst_pair(&mut self, insn: u32) -> Res<()> {
+    /// LDR (literal)
+    #[inline(always)]
+    pub(crate) fn ldr_literal(&mut self, insn: u32) -> Res<()> {
+        let off = sext(field(insn, 5, 19) as u64, 19) << 2;
+        let addr = self.pc.wrapping_add(off as u64);
+        let rt = insn & 31;
+        match field(insn, 30, 2) {
+            0 => {
+                let v = self.read(addr, 4, false)?;
+                self.wr(rt, v);
+            },
+            1 => {
+                let v = self.read(addr, 8, false)?;
+                self.wr(rt, v);
+            },
+            2 => {
+                let v = self.read(addr, 4, false)?;
+                self.wr(rt, v as u32 as i32 as i64 as u64);
+            },
+            _ => {}, // PRFM
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn ldst_pair(&mut self, insn: u32) -> Res<()> {
         let opc = field(insn, 30, 2);
         let mode = field(insn, 23, 2);
         let load = bit(insn, 22);
@@ -785,47 +847,72 @@ impl<H: Host> Cpu<H> {
     }
 
     fn ldst_reg(&mut self, insn: u32) -> Res<()> {
+        if bit(insn, 24) {
+            self.ldst_uimm(insn)
+        } else if !bit(insn, 21) {
+            self.ldst_imm9(insn)
+        } else if field(insn, 10, 2) == 2 {
+            self.ldst_regoff(insn)
+        } else {
+            // Atomic memory operations (LSE): not advertised.
+            Err(Event::undefined())
+        }
+    }
+
+    /// LDR/STR (unsigned scaled 12-bit offset)
+    #[inline(always)]
+    pub(crate) fn ldst_uimm(&mut self, insn: u32) -> Res<()> {
+        let size_log = field(insn, 30, 2);
+        let base = self.xs(field(insn, 5, 5));
+        let addr = base.wrapping_add((field(insn, 10, 12) as u64) << size_log);
+        self.ldst_access(insn, addr, None, false)
+    }
+
+    /// LDUR/STUR, post- and pre-indexed, LDTR/STTR (signed 9-bit offset)
+    #[inline(always)]
+    pub(crate) fn ldst_imm9(&mut self, insn: u32) -> Res<()> {
+        let base = self.xs(field(insn, 5, 5));
+        let imm = sext(field(insn, 12, 9) as u64, 9) as u64;
+        let (addr, writeback, unpriv) = match field(insn, 10, 2) {
+            0 => (base.wrapping_add(imm), None, false), // LDUR/STUR
+            1 => (base, Some(base.wrapping_add(imm)), false),
+            2 => (base.wrapping_add(imm), None, true), // LDTR/STTR
+            _ => {
+                let a = base.wrapping_add(imm);
+                (a, Some(a), false)
+            },
+        };
+        self.ldst_access(insn, addr, writeback, unpriv)
+    }
+
+    /// LDR/STR (register offset)
+    #[inline(always)]
+    pub(crate) fn ldst_regoff(&mut self, insn: u32) -> Res<()> {
+        let size_log = field(insn, 30, 2);
+        let base = self.xs(field(insn, 5, 5));
+        let rm = field(insn, 16, 5);
+        let option = field(insn, 13, 3);
+        if option & 2 == 0 {
+            return Err(Event::undefined());
+        }
+        let shift = if bit(insn, 12) { size_log } else { 0 };
+        let addr = base.wrapping_add(extend_reg(self.xr(rm), option, shift));
+        self.ldst_access(insn, addr, None, false)
+    }
+
+    /// The access of a load or store of a general register at `addr`, then the writeback.
+    #[inline(always)]
+    fn ldst_access(
+        &mut self,
+        insn: u32,
+        addr: u64,
+        writeback: Option<u64>,
+        unpriv: bool,
+    ) -> Res<()> {
         let size_log = field(insn, 30, 2);
         let opc = field(insn, 22, 2);
         let rn = field(insn, 5, 5);
         let rt = insn & 31;
-        let base = self.xs(rn);
-        let mut unpriv = false;
-        let mut writeback: Option<u64> = None;
-        let addr = if bit(insn, 24) {
-            // Unsigned scaled 12-bit offset
-            base.wrapping_add((field(insn, 10, 12) as u64) << size_log)
-        } else if !bit(insn, 21) {
-            let imm = sext(field(insn, 12, 9) as u64, 9) as u64;
-            match field(insn, 10, 2) {
-                0 => base.wrapping_add(imm), // LDUR/STUR
-                1 => {
-                    writeback = Some(base.wrapping_add(imm));
-                    base
-                },
-                2 => {
-                    unpriv = true; // LDTR/STTR
-                    base.wrapping_add(imm)
-                },
-                _ => {
-                    let a = base.wrapping_add(imm);
-                    writeback = Some(a);
-                    a
-                },
-            }
-        } else if field(insn, 10, 2) == 2 {
-            // Register offset
-            let rm = field(insn, 16, 5);
-            let option = field(insn, 13, 3);
-            if option & 2 == 0 {
-                return Err(Event::undefined());
-            }
-            let shift = if bit(insn, 12) { size_log } else { 0 };
-            base.wrapping_add(extend_reg(self.xr(rm), option, shift))
-        } else {
-            // Atomic memory operations (LSE): not advertised.
-            return Err(Event::undefined());
-        };
         let bytes = 1u32 << size_log;
         match opc {
             0 => {
@@ -997,118 +1084,199 @@ impl<H: Host> Cpu<H> {
     // ===================================================== data processing (reg)
 
     fn dp_reg(&mut self, insn: u32) -> Res<()> {
+        if insn & 0x1f00_0000 == 0x0a00_0000 {
+            self.logical_shifted(insn)
+        } else if insn & 0x1f20_0000 == 0x0b00_0000 {
+            self.add_sub_shifted(insn)
+        } else if insn & 0x1f20_0000 == 0x0b20_0000 {
+            self.add_sub_extended(insn)
+        } else if insn & 0x1fe0_0000 == 0x1a00_0000 {
+            self.adc_sbc(insn)
+        } else if insn & 0x1fe0_0000 == 0x1a40_0000 {
+            self.cond_compare(insn)
+        } else if insn & 0x1fe0_0000 == 0x1a80_0000 {
+            self.cond_select(insn)
+        } else if insn & 0x5fe0_0000 == 0x1ac0_0000 {
+            self.dp_2src_leaf(insn)
+        } else if insn & 0x5fe0_0000 == 0x5ac0_0000 {
+            self.dp_1src_leaf(insn)
+        } else if insn & 0x1f00_0000 == 0x1b00_0000 {
+            self.dp_3src_leaf(insn)
+        } else {
+            Err(Event::undefined())
+        }
+    }
+
+    /// Logical (shifted register)
+    #[inline(always)]
+    pub(crate) fn logical_shifted(&mut self, insn: u32) -> Res<()> {
         let sf = bit(insn, 31);
         let rd = insn & 31;
         let rn = field(insn, 5, 5);
         let rm = field(insn, 16, 5);
-        if insn & 0x1f00_0000 == 0x0a00_0000 {
-            // Logical (shifted register)
-            let opc = field(insn, 29, 2);
-            let imm6 = field(insn, 10, 6);
-            if !sf && imm6 >= 32 {
-                return Err(Event::undefined());
-            }
-            let mut op2 = shift_reg(self.xr(rm), field(insn, 22, 2), imm6, sf);
-            if bit(insn, 21) {
-                op2 = !op2;
-            }
-            let x = self.xr(rn);
-            let r = trunc(
-                match opc {
-                    0 | 3 => x & op2,
-                    1 => x | op2,
-                    _ => x ^ op2,
-                },
-                sf,
-            );
-            if opc == 3 {
-                self.set_nz_logical(r, sf);
-            }
-            self.wr(rd, r);
-        } else if insn & 0x1f20_0000 == 0x0b00_0000 {
-            // ADD/SUB (shifted register)
-            let kind = field(insn, 22, 2);
-            let imm6 = field(insn, 10, 6);
-            if kind == 3 || (!sf && imm6 >= 32) {
-                return Err(Event::undefined());
-            }
-            let op2 = shift_reg(self.xr(rm), kind, imm6, sf);
-            let r = self.addsub(insn, self.xr(rn), op2, sf);
-            self.wr(rd, r);
-        } else if insn & 0x1f20_0000 == 0x0b20_0000 {
-            // ADD/SUB (extended register)
-            let imm3 = field(insn, 10, 3);
-            if imm3 > 4 || field(insn, 22, 2) != 0 {
-                return Err(Event::undefined());
-            }
-            let op2 = trunc(extend_reg(self.xr(rm), field(insn, 13, 3), imm3), sf);
-            let r = self.addsub(insn, self.xs(rn), op2, sf);
-            if bit(insn, 29) {
-                self.wr(rd, r);
-            } else {
-                self.ws(rd, r);
-            }
-        } else if insn & 0x1fe0_0000 == 0x1a00_0000 {
-            // ADC/SBC
-            if field(insn, 10, 6) != 0 {
-                return Err(Event::undefined());
-            }
-            let mut y = self.xr(rm);
-            if bit(insn, 30) {
-                y = !y;
-            }
-            let (r, n, z, c, v) = add_with_carry(self.xr(rn), y, self.c, sf);
-            if bit(insn, 29) {
-                self.set_flags(n, z, c, v);
-            }
-            self.wr(rd, trunc(r, sf));
-        } else if insn & 0x1fe0_0000 == 0x1a40_0000 {
-            // CCMN/CCMP (register or immediate)
-            if !bit(insn, 29) || bit(insn, 10) || bit(insn, 4) {
-                return Err(Event::undefined());
-            }
-            let cond = field(insn, 12, 4);
-            if self.cond_holds(cond) {
-                let y = if bit(insn, 11) { rm as u64 } else { self.xr(rm) };
-                let x = self.xr(rn);
-                let (_, n, z, c, v) = if bit(insn, 30) {
-                    add_with_carry(x, !y, true, sf)
-                } else {
-                    add_with_carry(x, y, false, sf)
-                };
-                self.set_flags(n, z, c, v);
-            } else {
-                self.set_nzcv(((insn & 0xf) as u64) << 28);
-            }
-        } else if insn & 0x1fe0_0000 == 0x1a80_0000 {
-            // CSEL/CSINC/CSINV/CSNEG
-            if bit(insn, 29) || bit(insn, 11) {
-                return Err(Event::undefined());
-            }
-            let op = bit(insn, 30);
-            let o2 = bit(insn, 10);
-            let r = if self.cond_holds(field(insn, 12, 4)) {
-                self.xr(rn)
-            } else {
-                let m = self.xr(rm);
-                match (op, o2) {
-                    (false, false) => m,
-                    (false, true) => m.wrapping_add(1),
-                    (true, false) => !m,
-                    (true, true) => m.wrapping_neg(),
-                }
-            };
-            self.wr(rd, trunc(r, sf));
-        } else if insn & 0x5fe0_0000 == 0x1ac0_0000 {
-            self.dp_2src(insn, sf, rd, rn, rm)?;
-        } else if insn & 0x5fe0_0000 == 0x5ac0_0000 {
-            self.dp_1src(insn, sf, rd, rn)?;
-        } else if insn & 0x1f00_0000 == 0x1b00_0000 {
-            self.dp_3src(insn, sf, rd, rn, rm)?;
-        } else {
+        let opc = field(insn, 29, 2);
+        let imm6 = field(insn, 10, 6);
+        if !sf && imm6 >= 32 {
             return Err(Event::undefined());
         }
+        let mut op2 = shift_reg(self.xr(rm), field(insn, 22, 2), imm6, sf);
+        if bit(insn, 21) {
+            op2 = !op2;
+        }
+        let x = self.xr(rn);
+        let r = trunc(
+            match opc {
+                0 | 3 => x & op2,
+                1 => x | op2,
+                _ => x ^ op2,
+            },
+            sf,
+        );
+        if opc == 3 {
+            self.set_nz_logical(r, sf);
+        }
+        self.wr(rd, r);
         Ok(())
+    }
+
+    /// ADD/SUB (shifted register)
+    #[inline(always)]
+    pub(crate) fn add_sub_shifted(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        let rm = field(insn, 16, 5);
+        let kind = field(insn, 22, 2);
+        let imm6 = field(insn, 10, 6);
+        if kind == 3 || (!sf && imm6 >= 32) {
+            return Err(Event::undefined());
+        }
+        let op2 = shift_reg(self.xr(rm), kind, imm6, sf);
+        let r = self.addsub(insn, self.xr(rn), op2, sf);
+        self.wr(rd, r);
+        Ok(())
+    }
+
+    /// ADD/SUB (extended register)
+    #[inline(always)]
+    pub(crate) fn add_sub_extended(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        let rm = field(insn, 16, 5);
+        let imm3 = field(insn, 10, 3);
+        if imm3 > 4 || field(insn, 22, 2) != 0 {
+            return Err(Event::undefined());
+        }
+        let op2 = trunc(extend_reg(self.xr(rm), field(insn, 13, 3), imm3), sf);
+        let r = self.addsub(insn, self.xs(rn), op2, sf);
+        if bit(insn, 29) {
+            self.wr(rd, r);
+        } else {
+            self.ws(rd, r);
+        }
+        Ok(())
+    }
+
+    /// ADC/SBC
+    #[inline(always)]
+    pub(crate) fn adc_sbc(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        let rm = field(insn, 16, 5);
+        if field(insn, 10, 6) != 0 {
+            return Err(Event::undefined());
+        }
+        let mut y = self.xr(rm);
+        if bit(insn, 30) {
+            y = !y;
+        }
+        let (r, n, z, c, v) = add_with_carry(self.xr(rn), y, self.c, sf);
+        if bit(insn, 29) {
+            self.set_flags(n, z, c, v);
+        }
+        self.wr(rd, trunc(r, sf));
+        Ok(())
+    }
+
+    /// CCMN/CCMP (register or immediate)
+    #[inline(always)]
+    pub(crate) fn cond_compare(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rn = field(insn, 5, 5);
+        let rm = field(insn, 16, 5);
+        if !bit(insn, 29) || bit(insn, 10) || bit(insn, 4) {
+            return Err(Event::undefined());
+        }
+        let cond = field(insn, 12, 4);
+        if self.cond_holds(cond) {
+            let y = if bit(insn, 11) { rm as u64 } else { self.xr(rm) };
+            let x = self.xr(rn);
+            let (_, n, z, c, v) = if bit(insn, 30) {
+                add_with_carry(x, !y, true, sf)
+            } else {
+                add_with_carry(x, y, false, sf)
+            };
+            self.set_flags(n, z, c, v);
+        } else {
+            self.set_nzcv(((insn & 0xf) as u64) << 28);
+        }
+        Ok(())
+    }
+
+    /// CSEL/CSINC/CSINV/CSNEG
+    #[inline(always)]
+    pub(crate) fn cond_select(&mut self, insn: u32) -> Res<()> {
+        let sf = bit(insn, 31);
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        let rm = field(insn, 16, 5);
+        if bit(insn, 29) || bit(insn, 11) {
+            return Err(Event::undefined());
+        }
+        let op = bit(insn, 30);
+        let o2 = bit(insn, 10);
+        let r = if self.cond_holds(field(insn, 12, 4)) {
+            self.xr(rn)
+        } else {
+            let m = self.xr(rm);
+            match (op, o2) {
+                (false, false) => m,
+                (false, true) => m.wrapping_add(1),
+                (true, false) => !m,
+                (true, true) => m.wrapping_neg(),
+            }
+        };
+        self.wr(rd, trunc(r, sf));
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn dp_2src_leaf(&mut self, insn: u32) -> Res<()> {
+        self.dp_2src(
+            insn,
+            bit(insn, 31),
+            insn & 31,
+            field(insn, 5, 5),
+            field(insn, 16, 5),
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn dp_1src_leaf(&mut self, insn: u32) -> Res<()> {
+        self.dp_1src(insn, bit(insn, 31), insn & 31, field(insn, 5, 5))
+    }
+
+    #[inline(always)]
+    pub(crate) fn dp_3src_leaf(&mut self, insn: u32) -> Res<()> {
+        self.dp_3src(
+            insn,
+            bit(insn, 31),
+            insn & 31,
+            field(insn, 5, 5),
+            field(insn, 16, 5),
+        )
     }
 
     #[inline(always)]
