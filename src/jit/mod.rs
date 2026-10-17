@@ -33,6 +33,9 @@ const MAX_ENTRIES: usize = 192;
 /// Instructions a module may run before it returns to the run loop.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const CHAIN_BUDGET: u64 = 0x400;
+/// Extra modules a page gets (see `PageInfo::extra`) before its own module is compiled again with
+/// all their entries, so that they chain to one another again.
+const CONSOLIDATE: usize = 3;
 const LOOKUP_BITS: u32 = 14;
 const LOOKUP: usize = 1 << LOOKUP_BITS;
 
@@ -56,6 +59,44 @@ struct PageInfo {
     compiling_entries: Vec<u16>,
     /// Entries that got warm: included in the next compile of the page.
     warm: Vec<u16>,
+    /// Natively: modules compiled besides the page's own (`slot`) for entries it lacks, so that an
+    /// entry that gets hot is compiled at once rather than waiting for the page to be compiled
+    /// again with it. Ready ones and ones being compiled, each with its entries.
+    extra: Vec<(u32, Vec<u16>)>,
+    extra_compiling: Vec<(u32, Vec<u16>)>,
+}
+
+impl PageInfo {
+    /// The ready module that has entry `off`.
+    fn slot_of(&self, off: u16) -> Option<u32> {
+        if let Some(s) = self
+            .slot
+            .filter(|_| self.entries.binary_search(&off).is_ok())
+        {
+            return Some(s);
+        }
+        self.extra
+            .iter()
+            .find(|(_, e)| e.contains(&off))
+            .map(|&(s, _)| s)
+    }
+
+    /// Whether a module of this page has, or will have, entry `off`.
+    fn covers(&self, off: u16) -> bool {
+        self.slot_of(off).is_some()
+            || self.compiling_entries.contains(&off)
+            || self.extra_compiling.iter().any(|(_, e)| e.contains(&off))
+    }
+
+    fn covered(&self) -> usize {
+        self.entries.len()
+            + self
+                .extra
+                .iter()
+                .chain(&self.extra_compiling)
+                .map(|(_, e)| e.len())
+                .sum::<usize>()
+    }
 }
 
 pub struct Jit {
@@ -214,6 +255,11 @@ impl Jit {
                 self.free_slot(s);
                 self.invalidated += 1;
             }
+            for (s, entries) in info.extra.iter().chain(&info.extra_compiling) {
+                self.unmap_entries(page_key, entries);
+                self.free_slot(*s);
+                self.invalidated += 1;
+            }
         }
     }
 
@@ -272,6 +318,17 @@ impl Jit {
                 let Some(info) = self.pages.get_mut(&page_key) else {
                     return;
                 };
+                if let Some(i) = info.extra_compiling.iter().position(|&(s, _)| s == slot) {
+                    let (slot, entries) = info.extra_compiling.swap_remove(i);
+                    for &e in &entries {
+                        let key = page_key | ((e as u64) << 2);
+                        let i = hash(key);
+                        self.lookup_key[i] = key;
+                        self.lookup_slot[i] = slot;
+                    }
+                    info.extra.push((slot, entries));
+                    return;
+                }
                 if info.compiling != Some(slot) {
                     return;
                 }
@@ -279,9 +336,18 @@ impl Jit {
                 let entries = std::mem::take(&mut info.compiling_entries);
                 let old = info.slot.replace(slot);
                 let old_entries = std::mem::replace(&mut info.entries, entries.clone());
+                // Extra modules whose entries all moved into this one: no lookup reaches them now
+                // (the loop below maps their keys here).
+                let (merged, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut info.extra)
+                    .into_iter()
+                    .partition(|(_, e)| e.iter().all(|x| entries.binary_search(x).is_ok()));
+                info.extra = kept;
                 self.unmap_entries(page_key, &old_entries);
                 if let Some(old) = old {
                     self.free_slot(old);
+                }
+                for (s, _) in merged {
+                    self.free_slot(s);
                 }
                 for e in entries {
                     let key = page_key | ((e as u64) << 2);
@@ -378,34 +444,49 @@ impl<H: Host> Cpu<H> {
         }
         let page_key = page_of(key);
         let off = ((key >> 2) & 0xfff) as u16;
+        let additive = self.jit_additive();
         let info = self.jit.pages.entry(page_key).or_default();
-        if let Some(slot) = info.slot {
-            if info.entries.binary_search(&off).is_ok() {
-                // Compiled, but its lookup entry was evicted by a collision.
-                let i = hash(key);
-                self.jit.lookup_key[i] = key;
-                self.jit.lookup_slot[i] = slot;
-                return false;
-            }
+        if let Some(slot) = info.slot_of(off) {
+            // Compiled, but its lookup entry was evicted by a collision.
+            let i = hash(key);
+            self.jit.lookup_key[i] = key;
+            self.jit.lookup_slot[i] = slot;
+            return false;
         }
-        if info.compiling.is_some() {
-            if !info.compiling_entries.contains(&off) && !info.warm.contains(&off) {
+        if info.covers(off) {
+            return false;
+        }
+        let busy = info.compiling.is_some();
+        if busy && !additive {
+            if !info.warm.contains(&off) {
                 info.warm.push(off);
             }
             return false;
         }
-        if info.entries.len() >= MAX_ENTRIES {
-            // The page module is full: further entries stay interpreted.
+        if info.covered() >= MAX_ENTRIES {
+            // The page has as many compiled entries as it may: further ones stay interpreted.
             return false;
         }
-        // The compiled entries, this one, then warm ones while there is room.
-        let mut entries: Vec<u16> = info.entries.clone();
+        // A page with a module (or one on the way) gets another for this entry and the warm ones
+        // no module has; else the page's module is (re)compiled with them all, and with the
+        // entries of its extra modules once there are a few of those.
+        let consolidate = additive && !busy && info.extra.len() >= CONSOLIDATE;
+        let extra = additive && (info.slot.is_some() || busy) && !consolidate;
+        let mut entries: Vec<u16> = if extra { Vec::new() } else { info.entries.clone() };
+        if consolidate {
+            for (_, e) in &info.extra {
+                entries.extend_from_slice(e);
+            }
+            entries.truncate(MAX_ENTRIES - 1);
+        }
         entries.push(off);
         for &w in &info.warm {
             if entries.len() >= MAX_ENTRIES {
                 break;
             }
-            entries.push(w);
+            if !(extra && info.covers(w)) {
+                entries.push(w);
+            }
         }
         entries.sort_unstable();
         entries.dedup();
@@ -438,8 +519,12 @@ impl<H: Host> Cpu<H> {
             keys.push(page_key);
         }
         let info = self.jit.pages.entry(page_key).or_default();
-        info.compiling = Some(slot);
-        info.compiling_entries = entries;
+        if extra {
+            info.extra_compiling.push((slot, entries));
+        } else {
+            info.compiling = Some(slot);
+            info.compiling_entries = entries;
+        }
         self.jit.slot_page[slot as usize] = page_key;
         self.jit.slot_state[slot as usize] = SlotState::Compiling;
         self.jit.compiled += 1;
@@ -454,6 +539,16 @@ impl<H: Host> Cpu<H> {
             return false;
         }
         true
+    }
+
+    /// Whether a page gets a module of its own for entries that get hot after it was compiled
+    /// (natively, where small modules compile quickly) instead of being compiled again.
+    fn jit_additive(&self) -> bool {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+        if self.jit.native.is_some() {
+            return true;
+        }
+        false
     }
 
     /// Have the function of slot `slot` compiled, by the native JIT or the host; either reports it
