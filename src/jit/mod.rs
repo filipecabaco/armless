@@ -532,7 +532,7 @@ impl<H: Host> Cpu<H> {
         for f in self.fast.iter_mut() {
             f.forget_write_page(page_pa);
         }
-        if !self.jit_compile_code(slot, &code, layout.smp != 0) {
+        if !self.jit_compile_code(slot, &code, &layout) {
             // Nothing can compile it: give up on the JIT.
             self.jit.enabled = false;
             self.jit.flush_all();
@@ -553,15 +553,24 @@ impl<H: Host> Cpu<H> {
 
     /// Have the function of slot `slot` compiled, by the native JIT or the host; either reports it
     /// ready when it is.
-    fn jit_compile_code(&mut self, slot: u32, code: &wasm::Code, smp: bool) -> bool {
+    fn jit_compile_code(&mut self, slot: u32, code: &wasm::Code, layout: &gen::Layout) -> bool {
         #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
         if let Some(n) = self.jit.native.as_mut() {
             // On a thread of its own: `jit_take_compiled` marks the slot ready when it is. Until
             // then the slot must not keep a function from its previous page.
             self.jit.native_fns[slot as usize] = 0;
-            return n.submit(slot, code.b.clone());
+            // Loads of the general registers, SP, the instruction count and the flags reuse the
+            // value the block last stored or loaded there, until the interpreter may change it.
+            let wide = (0..31)
+                .map(|r| layout.x + 8 * r)
+                .chain([layout.sp, layout.sp_el0, layout.insn_count])
+                .map(|addr| native::Cached { addr, byte: false });
+            let flags = [layout.n, layout.z, layout.c, layout.v]
+                .into_iter()
+                .map(|addr| native::Cached { addr, byte: true });
+            return n.submit(slot, code.b.clone(), wide.chain(flags).collect());
         }
-        let wasm = wasm::module(&gen::imports(), gen::LOCALS, code, smp);
+        let wasm = wasm::module(&gen::imports(), gen::LOCALS, code, layout.smp != 0);
         self.host.jit_compile(SLOT_BASE + slot, &wasm)
     }
 
