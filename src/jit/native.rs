@@ -26,6 +26,17 @@ use super::wasm;
 /// Code compiled into one module before it is dropped and the JIT starts over (`full`).
 const CODE_LIMIT: usize = 64 << 20;
 
+/// A field of the CPU whose value the compiled code remembers after storing or loading it, so
+/// that a later load of it within the same function reuses the value instead of reading memory
+/// again: its host address, and whether it is a u64 (a general register, SP, the instruction
+/// count) or a byte (a flag, read with `i32.load8_u` and written with `i32.store8`). Stores still
+/// go to memory, so the CPU's state there is always current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cached {
+    pub addr: u64,
+    pub byte: bool,
+}
+
 /// The helpers blocks call, as host function addresses (see `gen::imports`).
 #[derive(Clone, Copy)]
 pub struct Helpers {
@@ -43,6 +54,7 @@ enum Job {
         generation: u64,
         slot: u32,
         body: Vec<u8>,
+        cached: Vec<Cached>,
     },
     /// Free the module and compile into a new one: nothing compiled before is reachable any more.
     Reset,
@@ -122,10 +134,11 @@ impl Native {
                             generation,
                             slot,
                             body,
+                            cached,
                         } => {
                             let started = std::time::Instant::now();
                             let function = compiler
-                                .compile(&body, locals, &helpers)
+                                .compile(&body, locals, &helpers, &cached)
                                 .map_or(0, |f| f as usize);
                             thread_shared.compiles.fetch_add(1, Ordering::Relaxed);
                             thread_shared
@@ -171,8 +184,9 @@ impl Native {
         })
     }
 
-    /// Compile `body` (a `gen` function) for `slot`; the result comes back through `take_done`.
-    pub fn submit(&mut self, slot: u32, body: Vec<u8>) -> bool {
+    /// Compile `body` (a `gen` function) for `slot`, remembering the `cached` fields' values; the
+    /// result comes back through `take_done`.
+    pub fn submit(&mut self, slot: u32, body: Vec<u8>, cached: Vec<Cached>) -> bool {
         let generation = self.generation;
         self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
         let sent = self.jobs.as_ref().is_some_and(|j| {
@@ -180,6 +194,7 @@ impl Native {
                 generation,
                 slot,
                 body,
+                cached,
             })
             .is_ok()
         });
@@ -282,7 +297,13 @@ impl Compiler {
 
     /// Compile the body of a `gen` function, `(pc: i64) -> i32` with `locals` after the
     /// parameter. None if it uses something this does not translate.
-    fn compile(&mut self, body: &[u8], locals: &[(u32, u8)], h: &Helpers) -> Option<*const u8> {
+    fn compile(
+        &mut self,
+        body: &[u8],
+        locals: &[(u32, u8)],
+        h: &Helpers,
+        cached: &[Cached],
+    ) -> Option<*const u8> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(I64));
         sig.returns.push(AbiParam::new(I32));
@@ -296,7 +317,9 @@ impl Compiler {
         let target = self.module.target_config();
         let translated = {
             let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-            let ok = Translator::new(&mut b, locals, h).run(body).is_some();
+            let ok = Translator::new(&mut b, locals, h, cached)
+                .run(body)
+                .is_some();
             if ok {
                 b.seal_all_blocks();
                 b.finalize(target);
@@ -341,6 +364,25 @@ struct Frame {
     result: Option<Type>,
     /// Value-stack height at entry.
     height: usize,
+    /// What is known of the cached fields where control reaches `end` (one per incoming path),
+    /// and for an `if`, what was known before it.
+    incoming: Vec<Known>,
+    before: Option<Known>,
+}
+
+/// The values the cached fields are known to have at a point, by (address, byte).
+type Known = std::collections::HashMap<(u64, bool), Value>;
+
+/// What all of `paths` agree on: values defined before they split, which dominate where they meet.
+fn agreed(paths: &[Known]) -> Known {
+    let Some((first, rest)) = paths.split_first() else {
+        return Known::new();
+    };
+    first
+        .iter()
+        .filter(|(k, v)| rest.iter().all(|p| p.get(k) == Some(v)))
+        .map(|(&k, &v)| (k, v))
+        .collect()
 }
 
 struct Translator<'a, 'b> {
@@ -354,6 +396,11 @@ struct Translator<'a, 'b> {
     /// Blocks opened inside unreachable code.
     skipped: u32,
     sigs: [Option<SigRef>; 3],
+    /// The fields whose values are remembered, and what is known of them here.
+    cached: &'a [Cached],
+    known: Known,
+    /// i32 constants by value, to tell accesses with a constant (zero) base from others.
+    consts: std::collections::HashMap<Value, i64>,
 }
 
 fn val_type(t: u8) -> Option<Type> {
@@ -420,7 +467,12 @@ impl Reader<'_> {
 }
 
 impl<'a, 'b> Translator<'a, 'b> {
-    fn new(b: &'a mut FunctionBuilder<'b>, locals: &[(u32, u8)], h: &'a Helpers) -> Self {
+    fn new(
+        b: &'a mut FunctionBuilder<'b>,
+        locals: &[(u32, u8)],
+        h: &'a Helpers,
+        cached: &'a [Cached],
+    ) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -451,11 +503,36 @@ impl<'a, 'b> Translator<'a, 'b> {
                 end,
                 result: Some(I32),
                 height: 0,
+                incoming: Vec::new(),
+                before: None,
             }],
             unreachable: false,
             skipped: 0,
             sigs: [None; 3],
+            cached,
+            known: Known::new(),
+            consts: std::collections::HashMap::new(),
         }
+    }
+
+    /// The cached field an access at `offset` with dynamic address `dynamic` reaches: the dynamic
+    /// part is the constant 0 and `offset` is the field's address, accessed in its own width.
+    fn cached_key(&self, dynamic: Value, offset: u64, byte: bool) -> Option<(u64, bool)> {
+        let cached = self
+            .cached
+            .iter()
+            .any(|c| c.addr == offset && c.byte == byte);
+        (cached && self.consts.get(&dynamic) == Some(&0)).then_some((offset, byte))
+    }
+
+    /// Record that control reaches the end of frame `depth` from here.
+    fn reaches(&mut self, depth: usize) -> Option<()> {
+        let i = self.frames.len().checked_sub(depth + 1)?;
+        if !matches!(self.frames[i].kind, Kind::Loop) {
+            let k = self.known.clone();
+            self.frames[i].incoming.push(k);
+        }
+        Some(())
     }
 
     fn pop(&mut self) -> Option<Value> {
@@ -524,27 +601,31 @@ impl<'a, 'b> Translator<'a, 'b> {
         };
         let (else_block, end, result, height) = (*else_block, f.end, f.result, f.height);
         *saw_else = true;
+        let before = f.before.clone().unwrap_or_default();
         if !self.unreachable {
             let args: Vec<BlockArg> = match result {
                 Some(_) => vec![BlockArg::Value(self.pop()?)],
                 None => Vec::new(),
             };
             self.b.ins().jump(end, &args);
+            self.reaches(0)?;
         }
         self.stack.truncate(height);
         self.b.switch_to_block(else_block);
+        self.known = before;
         self.unreachable = false;
         Some(())
     }
 
     fn end(&mut self) -> Option<()> {
-        let f = self.frames.pop()?;
+        let mut f = self.frames.pop()?;
         if !self.unreachable {
             let args: Vec<BlockArg> = match f.result {
                 Some(_) => vec![BlockArg::Value(self.pop()?)],
                 None => Vec::new(),
             };
             self.b.ins().jump(f.end, &args);
+            f.incoming.push(std::mem::take(&mut self.known));
         }
         if let Kind::If {
             else_block,
@@ -557,7 +638,9 @@ impl<'a, 'b> Translator<'a, 'b> {
             }
             self.b.switch_to_block(else_block);
             self.b.ins().jump(f.end, &[]);
+            f.incoming.push(f.before.take().unwrap_or_default());
         }
+        self.known = agreed(&f.incoming);
         self.stack.truncate(f.height);
         self.b.switch_to_block(f.end);
         self.unreachable = false;
@@ -587,6 +670,8 @@ impl<'a, 'b> Translator<'a, 'b> {
                 end,
                 result,
                 height,
+                incoming: Vec::new(),
+                before: None,
             }),
             0x03 => {
                 if result.is_some() {
@@ -595,12 +680,16 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let header = self.b.create_block();
                 self.b.ins().jump(header, &[]);
                 self.b.switch_to_block(header);
+                // Branches back to the header bring what is not known here.
+                self.known.clear();
                 self.frames.push(Frame {
                     kind: Kind::Loop,
                     target: header,
                     end,
                     result,
                     height,
+                    incoming: Vec::new(),
+                    before: None,
                 });
             },
             _ => {
@@ -618,6 +707,8 @@ impl<'a, 'b> Translator<'a, 'b> {
                     end,
                     result,
                     height: self.stack.len(),
+                    incoming: Vec::new(),
+                    before: Some(self.known.clone()),
                 });
             },
         }
@@ -657,6 +748,11 @@ impl<'a, 'b> Translator<'a, 'b> {
         if let Some(&v) = self.b.inst_results(call).first() {
             self.push(v);
         }
+        // An interpreted instruction may change any field; reads and writes of guest memory
+        // change none (a fault is only recorded, and taken after the block).
+        if f == 2 {
+            self.known.clear();
+        }
         Some(())
     }
 
@@ -670,6 +766,16 @@ impl<'a, 'b> Translator<'a, 'b> {
     fn load(&mut self, op: u8, r: &mut Reader) -> Option<()> {
         r.leb_u()?;
         let offset = r.leb_u()?;
+        let key = match op {
+            0x29 => self.cached_key(*self.stack.last()?, offset, false),
+            0x2d => self.cached_key(*self.stack.last()?, offset, true),
+            _ => None,
+        };
+        if let Some(&v) = key.and_then(|k| self.known.get(&k)) {
+            self.pop()?;
+            self.push(v);
+            return Some(());
+        }
         let p = self.address(offset)?;
         let flags = MemFlagsData::new().with_notrap();
         let ins = self.b.ins();
@@ -685,6 +791,9 @@ impl<'a, 'b> Translator<'a, 'b> {
             0x34 => ins.sload32(flags, p, 0),
             _ => return None,
         };
+        if let Some(k) = key {
+            self.known.insert(k, v);
+        }
         self.push(v);
         Some(())
     }
@@ -693,16 +802,39 @@ impl<'a, 'b> Translator<'a, 'b> {
         r.leb_u()?;
         let offset = r.leb_u()?;
         let v = self.pop()?;
+        let dynamic = *self.stack.last()?;
+        let width = match op {
+            0x37 => 8,
+            0x36 | 0x3e => 4,
+            0x3b | 0x3d => 2,
+            _ => 1,
+        };
+        let key = match op {
+            0x37 => self.cached_key(dynamic, offset, false),
+            0x3a => self.cached_key(dynamic, offset, true),
+            _ => None,
+        };
+        if self.consts.get(&dynamic) == Some(&0) {
+            // Forget the fields this store overwrites, in part or in whole.
+            self.known.retain(|&(addr, byte), _| {
+                let len = if byte { 1 } else { 8 };
+                addr + len <= offset || offset + width <= addr
+            });
+        }
         let p = self.address(offset)?;
         let flags = MemFlagsData::new().with_notrap();
         let ins = self.b.ins();
         match op {
             0x36 | 0x37 => ins.store(flags, v, p, 0),
             0x3a | 0x3c => ins.istore8(flags, v, p, 0),
-            0x3d => ins.istore16(flags, v, p, 0),
+            0x3b | 0x3d => ins.istore16(flags, v, p, 0),
             0x3e => ins.istore32(flags, v, p, 0),
             _ => return None,
         };
+        if let Some(k) = key {
+            let v = if k.1 { self.b.ins().band_imm_u(v, 0xff) } else { v };
+            self.known.insert(k, v);
+        }
         Some(())
     }
 
@@ -754,6 +886,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let args = self.branch_args(depth)?;
                 let target = self.target(depth)?;
                 self.b.ins().jump(target, &args);
+                self.reaches(depth)?;
                 self.unreachable = true;
             },
             0x0d => {
@@ -763,6 +896,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let target = self.target(depth)?;
                 let next = self.b.create_block();
                 self.b.ins().brif(c, target, &args, next, &[]);
+                self.reaches(depth)?;
                 self.b.switch_to_block(next);
             },
             0x0e => {
@@ -782,9 +916,11 @@ impl<'a, 'b> Translator<'a, 'b> {
                     Some(t.b.func.dfg.block_call(block, &[]))
                 };
                 let def = call(self, default)?;
+                self.reaches(default)?;
                 let mut table = Vec::with_capacity(n);
                 for d in depths {
                     table.push(call(self, d)?);
+                    self.reaches(d)?;
                 }
                 let jt = self.b.create_jump_table(JumpTableData::new(def, &table));
                 self.b.ins().br_table(index, jt);
@@ -824,6 +960,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             0x41 => {
                 let v = r.leb_s()?;
                 let c = self.b.ins().iconst(I32, v as i32 as i64);
+                self.consts.insert(c, v as i32 as i64);
                 self.push(c);
             },
             0x42 => {
