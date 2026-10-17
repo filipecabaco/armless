@@ -989,9 +989,12 @@ impl<H: Host> Cpu<H> {
         }
         let pa = self.translate(pc, crate::mmu::Access::Exec, false)?;
         let a = pa as usize;
-        if a + 4 <= self.mem.len() {
+        if a.checked_add(4).is_some_and(|end| end <= self.mem.len()) {
             let page = (pa & !0xfff) as usize;
-            if page + 0x1000 <= self.mem.len() {
+            if page
+                .checked_add(0x1000)
+                .is_some_and(|end| end <= self.mem.len())
+            {
                 let f = &mut self.fast[self.el as usize];
                 f.code_page = pc >> 12;
                 f.code_base = page;
@@ -1208,7 +1211,11 @@ impl<H: Host> Cpu<H> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
             let pa = self.translate(va, crate::mmu::Access::Read, unpriv)?;
             let page = (pa & !0xfff) as usize;
-            if !unpriv && page + 0x1000 <= self.mem.len() {
+            if !unpriv
+                && page
+                    .checked_add(0x1000)
+                    .is_some_and(|end| end <= self.mem.len())
+            {
                 let f = &mut self.fast[self.el as usize];
                 let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
                 f.read_tag[i] = va >> 12;
@@ -1250,7 +1257,11 @@ impl<H: Host> Cpu<H> {
             let has_code = self.jit.code_page.get(page >> 12).is_some_and(|&b| b != 0);
             if has_code {
                 self.jit.invalidate_page(page >> 12);
-            } else if !unpriv && page + 0x1000 <= self.mem.len() {
+            } else if !unpriv
+                && page
+                    .checked_add(0x1000)
+                    .is_some_and(|end| end <= self.mem.len())
+            {
                 let f = &mut self.fast[self.el as usize];
                 let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
                 f.write_tag[i] = va >> 12;
