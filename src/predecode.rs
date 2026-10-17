@@ -17,18 +17,19 @@ const MAX_PAGES: usize = 1024;
 pub(crate) const NONE: u32 = u32::MAX;
 
 // Leaves dispatched to directly. 0 means the entry is not decoded yet; GENERIC runs `execute`.
+// GENERIC and the branches come first: only they may set `next_pc` (see `may_branch`).
 const GENERIC: u8 = 1;
-const ADR: u8 = 2;
-const ADD_SUB_IMM: u8 = 3;
-const LOGICAL_IMM: u8 = 4;
-const MOVE_WIDE: u8 = 5;
-const BITFIELD_IMM: u8 = 6;
-const EXTR: u8 = 7;
-const B_BL: u8 = 8;
-const CBZ_CBNZ: u8 = 9;
-const TBZ_TBNZ: u8 = 10;
-const B_COND: u8 = 11;
-const BRANCH_REG: u8 = 12;
+const B_BL: u8 = 2;
+const CBZ_CBNZ: u8 = 3;
+const TBZ_TBNZ: u8 = 4;
+const B_COND: u8 = 5;
+const BRANCH_REG: u8 = 6;
+const ADR: u8 = 7;
+const ADD_SUB_IMM: u8 = 8;
+const LOGICAL_IMM: u8 = 9;
+const MOVE_WIDE: u8 = 10;
+const BITFIELD_IMM: u8 = 11;
+const EXTR: u8 = 12;
 const LDR_LITERAL: u8 = 13;
 const LDST_PAIR: u8 = 14;
 const LDST_UIMM: u8 = 15;
@@ -120,6 +121,13 @@ pub(crate) fn leaf_of(insn: u32) -> u8 {
     }
 }
 
+/// Whether the instruction of entry `e` may set `next_pc`: a branch, or anything `execute` runs.
+/// The others always go on to the next instruction (or raise an exception).
+#[inline(always)]
+pub(crate) fn may_branch(e: u64) -> bool {
+    (e >> 32) as u8 <= BRANCH_REG
+}
+
 /// A decoded entry: the leaf above the instruction word. Never 0.
 #[inline(always)]
 pub(crate) fn entry(insn: u32) -> u64 {
@@ -134,8 +142,10 @@ pub struct Cache {
     slots: Vec<Box<[u64]>>,
     slot_page: Vec<u32>,
     free: Vec<u32>,
-    /// Bumped whenever a slot is dropped, so `step` never uses one it remembered from before.
-    pub(crate) gen: u64,
+    /// The page `step` executes from: its physical base and its entries. Reset when any slot
+    /// is dropped, so `step` never runs entries of a dropped page.
+    pub(crate) cur_base: usize,
+    pub(crate) cur_ptr: *mut u64,
     /// Statistics: pages decoded, pages dropped, full flushes.
     pub decoded: u64,
     pub dropped: u64,
@@ -149,7 +159,8 @@ impl Cache {
             slots: Vec::new(),
             slot_page: Vec::new(),
             free: Vec::new(),
-            gen: 0,
+            cur_base: usize::MAX,
+            cur_ptr: std::ptr::null_mut(),
             decoded: 0,
             dropped: 0,
             flushes: 0,
@@ -161,14 +172,36 @@ impl Cache {
         self.page_slot[page]
     }
 
-    #[inline(always)]
-    pub(crate) fn get(&self, slot: u32, i: usize) -> u64 {
-        self.slots[slot as usize][i]
+    /// Make `slot`, the slot of the page at physical address `base`, the current page.
+    pub(crate) fn set_current(&mut self, base: usize, slot: u32) {
+        self.cur_base = base;
+        // A slot's entries are a boxed slice: they stay put when `slots` grows.
+        self.cur_ptr = self.slots[slot as usize].as_mut_ptr();
     }
 
+    /// Entry `i` of the current page, if `base` is that page (0: not decoded yet).
     #[inline(always)]
-    pub(crate) fn set(&mut self, slot: u32, i: usize, e: u64) {
-        self.slots[slot as usize][i] = e;
+    pub(crate) fn current(&self, base: usize, i: usize) -> u64 {
+        debug_assert!(i < PAGE_INSNS);
+        if base != self.cur_base {
+            return 0;
+        }
+        // SAFETY: `cur_ptr` points at the entries of the page at `cur_base`, a live slot (dropping
+        // any slot resets `cur_base`), and `i` is an instruction index within a page.
+        unsafe { *self.cur_ptr.add(i) }
+    }
+
+    /// Record entry `i` of the current page.
+    #[inline(always)]
+    pub(crate) fn set_current_entry(&mut self, i: usize, e: u64) {
+        debug_assert!(i < PAGE_INSNS && self.cur_base != usize::MAX);
+        // SAFETY: as in `current`.
+        unsafe { *self.cur_ptr.add(i) = e }
+    }
+
+    /// Entry `i` of `slot`.
+    pub(crate) fn get(&self, slot: u32, i: usize) -> u64 {
+        self.slots[slot as usize][i]
     }
 
     /// A slot for physical page `page`, with nothing decoded yet.
@@ -203,7 +236,7 @@ impl Cache {
         self.slots[slot as usize].fill(0);
         self.free.push(slot);
         self.dropped += 1;
-        self.gen += 1;
+        self.cur_base = usize::MAX;
     }
 
     pub(crate) fn clear(&mut self) {
@@ -216,7 +249,7 @@ impl Cache {
             }
         }
         self.flushes += 1;
-        self.gen += 1;
+        self.cur_base = usize::MAX;
     }
 }
 
@@ -303,7 +336,11 @@ mod tests {
         assert_eq!(leaf_of(0xd65f_03c0), BRANCH_REG); // ret
         assert_eq!(leaf_of(0xd503_201f), GENERIC); // nop: a system instruction
         assert_eq!(leaf_of(0x4ea1_1c20), GENERIC); // mov v0.16b, v1.16b: SIMD
-        assert_ne!(entry(0), 0, "an entry is never mistaken for an undecoded one");
+        assert_ne!(
+            entry(0),
+            0,
+            "an entry is never mistaken for an undecoded one"
+        );
     }
 
     #[test]
