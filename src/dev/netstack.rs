@@ -97,7 +97,6 @@ pub struct Stack {
     by_name: HashMap<String, u32>,
     conns: BTreeMap<u32, Conn>,
     next_id: u32,
-    next_port: u16,
     isn: u32,
     ip_id: u16,
     now: u64,
@@ -144,7 +143,6 @@ impl Stack {
             by_name: HashMap::new(),
             conns: BTreeMap::new(),
             next_id: 1,
-            next_port: 40000,
             isn: 0x1000_0000,
             ip_id: 1,
             now: 0,
@@ -385,8 +383,7 @@ impl Stack {
     pub fn connect(&mut self, port: u16) -> u32 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        let rport = self.next_port;
-        self.next_port = if self.next_port >= 60999 { 40000 } else { self.next_port + 1 };
+        let rport = router_port(id);
         let isn = self.next_isn();
         self.conns.insert(
             id,
@@ -401,6 +398,12 @@ impl Stack {
     /// Bytes the host gave a connection that the guest has not acknowledged.
     pub fn buffered(&self, id: u32) -> usize {
         self.conns.get(&id).map_or(0, |c| c.buf.len())
+    }
+
+    /// Whether `id`'s connection is open (tests).
+    #[cfg(test)]
+    fn remote_port(&self, id: u32) -> Option<u16> {
+        self.conns.get(&id).map(|c| c.remote_port)
     }
 
     fn next_isn(&mut self) -> u32 {
@@ -904,6 +907,13 @@ impl Stack {
     }
 }
 
+/// The router's port for the connection `id` it opens into the guest. Derived from the id, which a
+/// snapshot keeps: a restored guest still has the connections the saved machine had open, and a
+/// new one from the same port would collide with one of them.
+fn router_port(id: u32) -> u16 {
+    40000 + (id % 21000) as u16
+}
+
 fn parse_mss(opts: &[u8]) -> Option<u16> {
     let mut i = 0;
     while i < opts.len() {
@@ -923,4 +933,30 @@ fn parse_mss(opts: &[u8]) -> Option<u16> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+
+    #[test]
+    fn connections_after_a_restore_use_ports_the_saved_machine_did_not() {
+        let mut before = Stack::new([2, 0, 0, 0, 0, 1]);
+        let ports: Vec<u16> = (0..3)
+            .map(|_| {
+                let id = before.connect(5000);
+                before.remote_port(id).unwrap()
+            })
+            .collect();
+        let mut w = W::new();
+        before.save(&mut w);
+        let mut after = Stack::new([2, 0, 0, 0, 0, 1]);
+        after.load(&mut R(&w.0)).unwrap();
+        let id = after.connect(5000);
+        let port = after.remote_port(id).unwrap();
+        assert!(
+            !ports.contains(&port),
+            "{port} was in use before the save: {ports:?}"
+        );
+    }
 }
