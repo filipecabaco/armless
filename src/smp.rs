@@ -227,10 +227,10 @@ impl Machine {
         self.stats[2].fetch_add(1, Ordering::Relaxed);
         {
             let mut c = self.code_inval.lock();
-            // IC IVAU comes once per cache line: record each page once.
-            if c.gen > 0 && c.ring[(c.gen as usize - 1) % CODE_RING] == page {
-                return;
-            }
+            // Every invalidation is recorded, even of the page recorded last: CPUs that applied
+            // that one may have compiled or decoded the page again since. (IC IVAU comes once
+            // per page, the IminLine CTR_EL0 reports with several CPUs, and a DMA write only for
+            // a page flagged as holding code since the last one.)
             let n = c.gen as usize % CODE_RING;
             c.ring[n] = page;
             c.gen += 1;

@@ -697,6 +697,9 @@ impl<H: Host> Cpu<H> {
         self.update_timers();
         let mut executed = 0;
         let mut last_poll = 0;
+        // The guest pc lives here between instructions rather than being read back from `self.pc`
+        // (which `step_at` keeps up to date); whatever else may move it reloads it.
+        let mut pc = self.pc;
         while executed < budget {
             if self.attn().load(Ordering::Relaxed) != 0 {
                 self.attn().store(0, Ordering::Relaxed);
@@ -709,9 +712,12 @@ impl<H: Host> Cpu<H> {
                     self.take_exception(1, ret);
                     self.jit_entry = true;
                 }
+                pc = self.pc;
             }
             if self.jit.enabled && self.jit_entry {
-                match self.jit_dispatch(&mut executed, budget) {
+                let dispatched = self.jit_dispatch(&mut executed, budget);
+                pc = self.pc;
+                match dispatched {
                     Some(Some(exit)) => return self.leave(exit),
                     Some(None) => {
                         if executed - last_poll >= 0x400 {
@@ -723,11 +729,12 @@ impl<H: Host> Cpu<H> {
                     None => {},
                 }
             }
-            let pc = self.pc;
-            let r = self.step();
-            self.jit_entry = self.pc != pc.wrapping_add(4);
+            let r = self.step_at(pc);
+            if self.jit.enabled {
+                self.jit_entry = self.pc != pc.wrapping_add(4);
+            }
             match r {
-                Ok(()) => {},
+                Ok(next) => pc = next,
                 Err(Event::Wfi) => {
                     self.update_timers();
                     self.sync_host_irqs();
@@ -738,6 +745,7 @@ impl<H: Host> Cpu<H> {
                         let wake_ns = self.next_timer_deadline_ns();
                         return self.leave(Exit::Idle { wake_ns });
                     }
+                    pc = self.pc;
                 },
                 Err(Event::Stop(r)) => return self.leave(Exit::Stop(r)),
                 Err(Event::Sync { .. }) => unreachable!("handled in step"),
@@ -917,18 +925,38 @@ impl<H: Host> Cpu<H> {
     }
 
     /// Execute exactly one instruction, taking any exception it raises.
+    #[inline(always)]
     pub fn step(&mut self) -> Res<()> {
-        let pc = self.pc;
+        self.step_at(self.pc).map(|_| ())
+    }
+
+    /// `step` for the instruction at `pc` (which is `self.pc`). Returns the new pc, also stored
+    /// in `self.pc`, unless the CPU stops or waits, so that `run` keeps the pc in a register: an
+    /// instruction that cannot branch goes on to `pc + 4` without `next_pc` making a round trip
+    /// through memory.
+    #[inline(always)]
+    fn step_at(&mut self, pc: u64) -> Res<u64> {
+        debug_assert_eq!(pc, self.pc);
         self.next_pc = pc.wrapping_add(4);
-        let result = match self.fetch(pc) {
-            Ok(insn) => self.execute(insn),
-            Err(e) => Err(e),
+        let result = 'exec: {
+            let mut e = self.fetch_decoded(pc);
+            if e == 0 {
+                e = match self.fetch_decoded_slow(pc) {
+                    Ok(e) => e,
+                    Err(x) => break 'exec Err(x),
+                };
+            }
+            match self.exec_decoded(e) {
+                Ok(()) if crate::predecode::may_branch(e) => Ok(self.next_pc),
+                Ok(()) => Ok(pc.wrapping_add(4)),
+                Err(x) => Err(x),
+            }
         };
         self.insn_count = self.insn_count.wrapping_add(1);
         match result {
-            Ok(()) => {
-                self.pc = self.next_pc;
-                Ok(())
+            Ok(next) => {
+                self.pc = next;
+                Ok(next)
             },
             Err(Event::Sync {
                 ec,
@@ -945,7 +973,9 @@ impl<H: Host> Cpu<H> {
                         }
                     }
                 }
-                self.sync_exception(ec, iss, far, ret).map_err(Event::Stop)
+                self.sync_exception(ec, iss, far, ret)
+                    .map_err(Event::Stop)?;
+                Ok(self.pc)
             },
             Err(Event::Wfi) => {
                 self.pc = self.next_pc;
@@ -959,10 +989,55 @@ impl<H: Host> Cpu<H> {
     fn fetch(&mut self, pc: u64) -> Res<u32> {
         let f = &self.fast[self.el as usize];
         if pc >> 12 == f.code_page {
-            let a = f.code_base + (pc & 0xffc) as usize;
-            return Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()));
+            // The current code page lies in RAM (see `fetch_slow`).
+            return Ok(self.ram_load(f.code_base + (pc & 0xffc) as usize, 4) as u32);
         }
         self.fetch_slow(pc)
+    }
+
+    /// The pre-decoded entry of the instruction at `pc` if it is in the current decoded page
+    /// and decoded already, else 0 (see `predecode`).
+    #[inline(always)]
+    fn fetch_decoded(&self, pc: u64) -> u64 {
+        let f = &self.fast[self.el as usize];
+        if pc >> 12 != f.code_page {
+            return 0;
+        }
+        self.jit
+            .pre
+            .current(f.code_base, ((pc & 0xfff) >> 2) as usize)
+    }
+
+    /// The pre-decoded entry of the instruction at `pc`, fetching and decoding it.
+    #[inline(never)]
+    fn fetch_decoded_slow(&mut self, pc: u64) -> Res<u64> {
+        let insn = self.fetch(pc)?;
+        let f = &self.fast[self.el as usize];
+        if pc >> 12 != f.code_page {
+            // Not a page the fetch path keeps (it ends past RAM): run it undecoded.
+            return Ok(crate::predecode::entry(insn));
+        }
+        let base = f.code_base;
+        let page = base >> 12;
+        let mut slot = self.jit.pre.slot(page);
+        if slot == crate::predecode::NONE {
+            slot = self.jit.pre.alloc(page);
+            self.jit.code_page[page] |= 2;
+            // Stores to the page, here or by a device, must drop what was decoded from it.
+            self.machine.code_pages[page].store(1, Ordering::Relaxed);
+            for f in self.fast.iter_mut() {
+                f.forget_write_page(base);
+            }
+        }
+        self.jit.pre.set_current(base, slot);
+        let i = ((pc & 0xfff) >> 2) as usize;
+        let e = self.jit.pre.get(slot, i);
+        if e != 0 {
+            return Ok(e);
+        }
+        let e = crate::predecode::entry(insn);
+        self.jit.pre.set_current_entry(i, e);
+        Ok(e)
     }
 
     pub(crate) fn fetch_slow_pub(&mut self, pc: u64) -> Res<u32> {
@@ -989,9 +1064,12 @@ impl<H: Host> Cpu<H> {
         }
         let pa = self.translate(pc, crate::mmu::Access::Exec, false)?;
         let a = pa as usize;
-        if a + 4 <= self.mem.len() {
+        if a.checked_add(4).is_some_and(|end| end <= self.mem.len()) {
             let page = (pa & !0xfff) as usize;
-            if page + 0x1000 <= self.mem.len() {
+            if page
+                .checked_add(0x1000)
+                .is_some_and(|end| end <= self.mem.len())
+            {
                 let f = &mut self.fast[self.el as usize];
                 f.code_page = pc >> 12;
                 f.code_base = page;
@@ -1102,25 +1180,36 @@ impl<H: Host> Cpu<H> {
         ok
     }
 
+    /// Load `size` bytes of RAM at `a`, which every caller has checked lies in RAM (a page the
+    /// fast tables hold, with the access inside it, or a range compared with the RAM size).
     #[inline(always)]
     fn ram_load(&self, a: usize, size: u32) -> u64 {
-        let m = &self.mem;
-        match size {
-            1 => m[a] as u64,
-            2 => u16::from_le_bytes([m[a], m[a + 1]]) as u64,
-            4 => u32::from_le_bytes(m[a..a + 4].try_into().unwrap()) as u64,
-            _ => u64::from_le_bytes(m[a..a + 8].try_into().unwrap()),
+        debug_assert!(a + size as usize <= self.mem.len());
+        // SAFETY: in RAM, see above; guest accesses need not be aligned.
+        unsafe {
+            let p = self.mem.as_ptr().add(a);
+            match size {
+                1 => *p as u64,
+                2 => u16::from_le((p as *const u16).read_unaligned()) as u64,
+                4 => u32::from_le((p as *const u32).read_unaligned()) as u64,
+                _ => u64::from_le((p as *const u64).read_unaligned()),
+            }
         }
     }
 
+    /// Store `size` bytes of RAM at `a`, which the caller has checked lies in RAM.
     #[inline(always)]
     fn ram_store(&mut self, a: usize, size: u32, value: u64) {
-        let m = &mut self.mem;
-        match size {
-            1 => m[a] = value as u8,
-            2 => m[a..a + 2].copy_from_slice(&(value as u16).to_le_bytes()),
-            4 => m[a..a + 4].copy_from_slice(&(value as u32).to_le_bytes()),
-            _ => m[a..a + 8].copy_from_slice(&value.to_le_bytes()),
+        debug_assert!(a + size as usize <= self.mem.len());
+        // SAFETY: in RAM, see `ram_load`.
+        unsafe {
+            let p = self.mem.as_mut_ptr().add(a);
+            match size {
+                1 => *p = value as u8,
+                2 => (p as *mut u16).write_unaligned((value as u16).to_le()),
+                4 => (p as *mut u32).write_unaligned((value as u32).to_le()),
+                _ => (p as *mut u64).write_unaligned(value.to_le()),
+            }
         }
     }
 
@@ -1208,7 +1297,11 @@ impl<H: Host> Cpu<H> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
             let pa = self.translate(va, crate::mmu::Access::Read, unpriv)?;
             let page = (pa & !0xfff) as usize;
-            if !unpriv && page + 0x1000 <= self.mem.len() {
+            if !unpriv
+                && page
+                    .checked_add(0x1000)
+                    .is_some_and(|end| end <= self.mem.len())
+            {
                 let f = &mut self.fast[self.el as usize];
                 let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
                 f.read_tag[i] = va >> 12;
@@ -1250,7 +1343,11 @@ impl<H: Host> Cpu<H> {
             let has_code = self.jit.code_page.get(page >> 12).is_some_and(|&b| b != 0);
             if has_code {
                 self.jit.invalidate_page(page >> 12);
-            } else if !unpriv && page + 0x1000 <= self.mem.len() {
+            } else if !unpriv
+                && page
+                    .checked_add(0x1000)
+                    .is_some_and(|end| end <= self.mem.len())
+            {
                 let f = &mut self.fast[self.el as usize];
                 let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
                 f.write_tag[i] = va >> 12;
