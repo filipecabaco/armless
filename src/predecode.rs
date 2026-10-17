@@ -370,6 +370,20 @@ mod tests {
     }
 
     #[test]
+    fn a_device_writing_the_same_decoded_page_again_is_seen_again() {
+        let mut c = cpu();
+        let io = crate::dev::Io::new(c.machine.clone(), || 0);
+        put(&mut c, 0x1000, MOVZ_X0 | 1 << 5);
+        run_at(&mut c, 0x1000);
+        for n in 2..5u32 {
+            // The page was decoded again since the last write: this write must drop it too.
+            assert!(io.write(0x1000, &(MOVZ_X0 | n << 5).to_le_bytes()));
+            run_at(&mut c, 0x1000);
+            assert_eq!(c.x[0], n as u64);
+        }
+    }
+
+    #[test]
     fn more_code_pages_than_are_kept_still_run_correctly() {
         let mut c = cpu();
         let pages = MAX_PAGES + 10;
