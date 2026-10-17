@@ -21,49 +21,50 @@ use super::wasm::{self, Code, FuncType, Import, EMPTY, I32, I64};
 use crate::bits::{bit, decode_bit_masks, field, sext};
 use crate::sysreg::sr;
 
-/// Linear-memory addresses the generated code uses (all wasm32 pointers).
+/// Addresses the generated code uses: linear-memory addresses (wasm32 pointers) in the browser,
+/// host addresses natively.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Layout {
-    pub x: u32,
+    pub x: u64,
     /// The stack pointer selected by this block's EL and SPSel.
-    pub sp: u32,
-    pub pc: u32,
-    pub n: u32,
-    pub z: u32,
-    pub c: u32,
-    pub v: u32,
-    pub insn_count: u32,
-    pub pending: u32,
+    pub sp: u64,
+    pub pc: u64,
+    pub n: u64,
+    pub z: u64,
+    pub c: u64,
+    pub v: u64,
+    pub insn_count: u64,
+    pub pending: u64,
     /// Non-zero while the exclusive monitor is armed: stores must go
     /// through the helper so they clear it.
-    pub excl_armed: u32,
+    pub excl_armed: u64,
     /// u64: blocks stop chaining once insn_count reaches this.
-    pub limit: u32,
+    pub limit: u64,
     /// u64: physical address watched by the exclusive monitor.
-    pub excl_addr: u32,
+    pub excl_addr: u64,
     /// System registers translated inline (u64 each; DAIF is u32).
-    pub tpidr_el0: u32,
-    pub tpidr_el1: u32,
-    pub tpidrro_el0: u32,
-    pub sp_el0: u32,
-    pub daif: u32,
+    pub tpidr_el0: u64,
+    pub tpidr_el1: u64,
+    pub tpidrro_el0: u64,
+    pub sp_el0: u64,
+    pub daif: u64,
     /// The SIMD&FP registers (32 x u128) and CPACR_EL1 (u64, FPEN gates them).
-    pub vreg: u32,
-    pub cpacr: u32,
+    pub vreg: u64,
+    pub cpacr: u64,
     /// Values (not addresses): the exception level and SPSel of this code.
-    pub el: u32,
-    pub spsel: u32,
+    pub el: u64,
+    pub spsel: u64,
     /// Non-zero with several CPUs: exclusives and DSB stay interpreted.
-    pub smp: u32,
+    pub smp: u64,
     /// Byte: non-zero when interrupt state must be re-examined.
-    pub irq_dirty: u32,
+    pub irq_dirty: u64,
     /// Guest RAM base.
-    pub mem: u32,
+    pub mem: u64,
     /// Fast TLB arrays for this block's EL (u64 tags, u32 page offsets).
-    pub read_tag: u32,
-    pub read_base: u32,
-    pub write_tag: u32,
-    pub write_base: u32,
+    pub read_tag: u64,
+    pub read_base: u64,
+    pub write_tag: u64,
+    pub write_base: u64,
 }
 
 pub const STATUS_DONE: i32 = 0;
@@ -114,7 +115,7 @@ const DATA: u32 = 8;
 const IDX: u32 = 9;
 const ST: u32 = 10;
 
-const LOCALS: &[(u32, u8)] = &[(8, I64), (4, I32)];
+pub(crate) const LOCALS: &[(u32, u8)] = &[(8, I64), (4, I32)];
 
 /// Whether an instruction ends a block: branches, exception generation and
 /// WFI/WFE. Other system instructions don't: the interpreter helper ends the
@@ -219,7 +220,7 @@ impl Gen<'_> {
             self.c.i64c(0);
         } else {
             self.c.i32c(0);
-            self.c.i64_load(self.l.x + 8 * r);
+            self.c.i64_load(self.l.x + 8 * r as u64);
         }
     }
 
@@ -240,7 +241,7 @@ impl Gen<'_> {
         } else {
             self.c.i32c(0);
             f(self);
-            self.c.i64_store(self.l.x + 8 * r);
+            self.c.i64_store(self.l.x + 8 * r as u64);
         }
     }
 
@@ -249,7 +250,7 @@ impl Gen<'_> {
         self.c.i32c(0);
         f(self);
         self.c
-            .i64_store(if r == 31 { self.l.sp } else { self.l.x + 8 * r });
+            .i64_store(if r == 31 { self.l.sp } else { self.l.x + 8 * r as u64 });
     }
 
     fn trunc32(&mut self, sf: bool) {
@@ -259,7 +260,7 @@ impl Gen<'_> {
         }
     }
 
-    fn set_flag(&mut self, addr: u32, f: impl FnOnce(&mut Self)) {
+    fn set_flag(&mut self, addr: u64, f: impl FnOnce(&mut Self)) {
         self.c.i32c(0);
         f(self);
         self.c.i32_store8(addr);
@@ -348,7 +349,7 @@ impl Gen<'_> {
     /// Push the i32 truth value of condition `cond`.
     fn cond(&mut self, cond: u32) {
         let l = *self.l;
-        let ld = |g: &mut Self, a: u32| {
+        let ld = |g: &mut Self, a: u64| {
             g.c.i32c(0);
             g.c.i32_load8_u(a);
         };
@@ -489,7 +490,7 @@ impl Gen<'_> {
     }
 
     /// Push (tag[idx] == VA >> 12) && ((VA & 0xfff) + size <= 0x1000); sets IDX and PAGE.
-    fn tlb_probe(&mut self, tags: u32, size: u32) {
+    fn tlb_probe(&mut self, tags: u64, size: u32) {
         self.c.get(VA);
         self.c.i64c(12);
         self.c.i64_shr_u();
@@ -513,7 +514,7 @@ impl Gen<'_> {
     }
 
     /// Push the i32 host offset (page base + VA & 0xfff), relative to `mem`.
-    fn host_addr(&mut self, bases: u32) {
+    fn host_addr(&mut self, bases: u64) {
         self.c.get(IDX);
         self.c.i32c(2);
         self.c.i32_shl();
@@ -1528,14 +1529,14 @@ impl Gen<'_> {
     /// Push half `h` (0 = low 64 bits) of Vr.
     fn vld(&mut self, r: u32, h: u32) {
         self.c.i32c(0);
-        self.c.i64_load(self.l.vreg + 16 * r + 8 * h);
+        self.c.i64_load(self.l.vreg + 16 * r as u64 + 8 * h as u64);
     }
 
     /// Store the value produced by `f` to half `h` of Vr.
     fn vst(&mut self, r: u32, h: u32, f: impl FnOnce(&mut Self)) {
         self.c.i32c(0);
         f(self);
-        self.c.i64_store(self.l.vreg + 16 * r + 8 * h);
+        self.c.i64_store(self.l.vreg + 16 * r as u64 + 8 * h as u64);
     }
 
     /// Lane-wise result per 64-bit half: `f` pushes half `h`'s value. A
@@ -2141,6 +2142,18 @@ pub fn translate_page(
     entries: &[u16],
     max_block: usize,
 ) -> Vec<u8> {
+    let code = translate_page_code(layout, words, entries, max_block);
+    wasm::module(&imports(), LOCALS, &code, layout.smp != 0)
+}
+
+/// The body of the function `translate_page` puts in its module, `(pc: i64) -> i32` with
+/// `LOCALS` (the native JIT compiles it directly).
+pub fn translate_page_code(
+    layout: &Layout,
+    words: &[u32],
+    entries: &[u16],
+    max_block: usize,
+) -> Code {
     let n_entries = entries.len() as u32;
     let mut g = Gen {
         l: layout,
@@ -2189,7 +2202,7 @@ pub fn translate_page(
     g.c.ret();
     g.c.end(); // $top
     g.c.i32c(STATUS_DONE);
-    wasm::module(&imports(), LOCALS, &g.c, layout.smp != 0)
+    g.c
 }
 
 fn translate_block(g: &mut Gen, insns: &[u32]) {
