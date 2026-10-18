@@ -580,6 +580,13 @@ impl<H: Host> Cpu<H> {
         self.jit.native.as_ref().map_or((0, 0), |n| n.stats())
     }
 
+    /// Bytes of code the native JIT holds for this CPU, stale functions included until its next
+    /// reset.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    pub fn native_jit_code_bytes(&self) -> usize {
+        self.jit.native.as_ref().map_or(0, |n| n.code_bytes())
+    }
+
     /// Testing aid: wait for the native JIT to finish what it was given; the next block entry takes
     /// the results.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
