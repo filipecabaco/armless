@@ -18,7 +18,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 
 use super::wasm;
@@ -30,8 +30,8 @@ mod code;
 /// runs; None where the host has none, and Cranelift's own memory is used.
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 fn code_memory() -> Option<(Box<dyn cranelift_jit::JITMemoryProvider + Send>, isize)> {
-    // Room for CODE_LIMIT of code and what is still compiled once it is reached.
-    let memory = code::CodeMemory::new(2 * CODE_LIMIT)?;
+    // Room for the code limit and what is still compiled once it is reached.
+    let memory = code::CodeMemory::new(2 * code_limit())?;
     let offset = memory.exec_address(std::ptr::null()) as isize;
     Some((Box::new(memory), offset))
 }
@@ -48,8 +48,22 @@ fn code_writable(on: bool) {
     let _ = on;
 }
 
-/// Code compiled into one module before it is dropped and the JIT starts over (`full`).
-const CODE_LIMIT: usize = 64 << 20;
+/// Code compiled into one module before it is dropped and the JIT starts over (`full`). Code of
+/// replaced modules stays until then, so this bounds the code a CPU holds: Node starting Storage
+/// compiles 3 to 17 MB per CPU, and a lower limit (`ARMLESS_JIT_CODE_MB`) costs recompiles.
+const CODE_LIMIT: usize = 16 << 20;
+
+/// The code limit: `ARMLESS_JIT_CODE_MB` megabytes of compiled code per CPU, or `CODE_LIMIT`.
+fn code_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("ARMLESS_JIT_CODE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .map_or(CODE_LIMIT, |mb| mb << 20)
+    })
+}
 
 /// A field of the CPU whose value the compiled code remembers after storing or loading it, so
 /// that a later load of it within the same function reuses the value instead of reading memory
@@ -151,7 +165,19 @@ impl Native {
                     return;
                 };
                 let _ = ready_tx.send(true);
-                for job in job_rx {
+                loop {
+                    let job = match job_rx.try_recv() {
+                        Ok(job) => job,
+                        Err(TryRecvError::Disconnected) => return,
+                        Err(TryRecvError::Empty) => {
+                            // Nothing queued: give back what compiling took, until the next job
+                            compiler.release_scratch();
+                            match job_rx.recv() {
+                                Ok(job) => job,
+                                Err(_) => return,
+                            }
+                        },
+                    };
                     match job {
                         Job::Compile {
                             generation,
@@ -255,7 +281,7 @@ impl Native {
 
     /// Whether the module holds enough code that the JIT should flush and `reset`.
     pub fn full(&self) -> bool {
-        self.shared.code_bytes.load(Ordering::Relaxed) >= CODE_LIMIT
+        self.shared.code_bytes.load(Ordering::Relaxed) >= code_limit()
     }
 
     /// Start a new module. The caller has flushed every slot: no code of the old one is reachable,
@@ -266,6 +292,11 @@ impl Native {
         if let Some(j) = &self.jobs {
             let _ = j.send(Job::Reset);
         }
+    }
+
+    /// Bytes of compiled code in the current module (stale functions included, until a reset).
+    pub fn code_bytes(&self) -> usize {
+        self.shared.code_bytes.load(Ordering::Relaxed)
     }
 
     /// Statistics: (functions compiled, nanoseconds spent compiling them).
@@ -297,6 +328,8 @@ struct Compiler {
     functions: u32,
     /// How far from where it was written each function runs (with `CodeMemory` on Linux).
     exec_offset: isize,
+    /// Whether `ctx` and `fctx` hold the buffers of a compile since `release_scratch`.
+    scratch: bool,
 }
 
 impl Compiler {
@@ -329,6 +362,7 @@ impl Compiler {
             code_bytes: 0,
             functions: 0,
             exec_offset,
+            scratch: false,
         })
     }
 
@@ -341,6 +375,7 @@ impl Compiler {
         h: &Helpers,
         cached: &[Cached],
     ) -> Option<*const u8> {
+        self.scratch = true;
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(I64));
         sig.returns.push(AbiParam::new(I32));
@@ -388,6 +423,36 @@ impl Compiler {
                 .get_finalized_function(id)
                 .wrapping_offset(self.exec_offset)
         })
+    }
+}
+
+impl Compiler {
+    /// Frees the buffers compiling grew: Cranelift keeps them between functions, as large as the
+    /// largest function compiled (a page module can be), for as long as the compiler lives.
+    fn release_scratch(&mut self) {
+        if std::mem::take(&mut self.scratch) {
+            self.ctx = self.module.make_context();
+            self.fctx = FunctionBuilderContext::new();
+            return_freed_memory();
+        }
+    }
+}
+
+/// Hands memory the allocator holds free back to the system: malloc keeps the pages of what is
+/// freed, and counts them as the process's, until asked.
+fn return_freed_memory() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone means every zone; a zero goal, as much as it can.
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: only returns free memory to the system.
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 

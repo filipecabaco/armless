@@ -4,7 +4,7 @@ An AArch64 virtual machine that runs unmodified arm64 Linux in a browser tab, an
 natively. It is written in Rust:
 
 - CPU: ARMv8-A EL0/EL1 with FP/AdvSIMD. Interpreted, with a JIT that translates
-  hot pages to WebAssembly.
+  hot pages to WebAssembly in a page, and to host code natively (Cranelift).
 - SMP: up to 8 CPUs, one Web Worker (or native thread) each.
 - Interrupts and time: GICv2 and the generic timer.
 - Devices, all in Rust:
@@ -98,6 +98,17 @@ runner.start();
 system's roots (`SSL_CERT_FILE` included). That covers sandboxes whose only way out is
 a TLS-intercepting proxy. Private and loopback addresses are off limits unless
 `allow_private` is set.
+
+`runner::new_vm` and every `Runner` restore seed the machine from the host
+(`Board::seed`): a restored guest gets a new VM generation id, so Linux reseeds its
+random generator at once instead of replaying the saved machine's.
+
+The native JIT compiles hot guest code to host code with Cranelift, on a compiler
+thread per CPU; `Cpu::enable_native_jit` turns it on, and `ARMLESS_JIT=native` does
+for `runner::new_vm`. It needs no hypervisor, so it runs in sandboxes too. Each CPU
+keeps up to `ARMLESS_JIT_CODE_MB` (default 16) MB of compiled code, stale code of
+replaced pages included, and starts over when that is full; its compiler gives back
+its working memory whenever it has nothing queued.
 
 `armless-run` is a command-line runner for kernels and bare-metal binaries
 (`cargo run --release --bin armless-run -- --help`).
