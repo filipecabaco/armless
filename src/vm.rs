@@ -267,7 +267,7 @@ impl Board {
                 .ok_or_else(|| BootError::Fail(format!("{path}: not found")))?;
         match p.fs.read_all(ino) {
             Ok(v) => Ok(v),
-            Err(crate::dev::fs::Fail::Need(b)) => Err(BootError::Need(vec![b])),
+            Err(crate::dev::fs::Fail::Need(b)) => Err(BootError::Need(b)),
             Err(crate::dev::fs::Fail::Errno(e)) => {
                 Err(BootError::Fail(format!("{path}: error {e}")))
             },

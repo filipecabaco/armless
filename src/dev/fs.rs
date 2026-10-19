@@ -2,6 +2,9 @@
 //! `filesystem.json` (format 3). File contents are content-addressed blobs
 //! the host fetches on first use (`Event::Blob`); files the guest writes keep
 //! their contents here, and are part of snapshots.
+//!
+//! A large file can be a list of chunks instead of one blob: reads fetch only
+//! the chunks they cover, and writes copy only the chunks they touch.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -48,8 +51,25 @@ pub enum Content {
     /// Contents in blob `name` (fetched lazily), `size` bytes.
     Blob(String),
     Mem(Vec<u8>),
+    /// Contents in pieces, back to back; their lengths add up to `size`.
+    Chunks(Vec<Chunk>),
     /// Devices, FIFOs, sockets.
     Special,
+}
+
+/// `len` bytes of a chunked file.
+#[derive(Clone, Debug)]
+pub struct Chunk {
+    pub len: u64,
+    pub data: Piece,
+}
+
+#[derive(Clone, Debug)]
+pub enum Piece {
+    /// The first `len` bytes of a blob (fetched lazily).
+    Blob(String),
+    /// Written by the guest: exactly `len` bytes.
+    Mem(Vec<u8>),
 }
 
 #[derive(Clone, Debug)]
@@ -86,8 +106,8 @@ impl Inode {
 pub enum Fail {
     /// errno for the guest
     Errno(u32),
-    /// Waits for this blob from the host.
-    Need(String),
+    /// Waits for these blobs from the host.
+    Need(Vec<String>),
 }
 
 impl From<u32> for Fail {
@@ -109,6 +129,9 @@ pub struct Fs {
     max_cached: usize,
     /// Blobs the host could not provide: reads fail with EIO.
     failed: HashSet<String>,
+    /// Chunks a waiting read covers: kept until it completes, so a read over
+    /// several chunks doesn't lose the first while it waits for the next.
+    pinned: HashSet<String>,
 }
 
 impl Fs {
@@ -122,6 +145,7 @@ impl Fs {
             cached: 0,
             max_cached: DEFAULT_CACHE,
             failed: HashSet::new(),
+            pinned: HashSet::new(),
         };
         let root = fs.alloc(Inode {
             mode: S_IFDIR | 0o755,
@@ -200,9 +224,12 @@ impl Fs {
                     inode.content = Content::Symlink(t.as_bytes().to_vec());
                 },
                 S_IFREG => {
-                    inode.content = match target.and_then(Json::as_str) {
-                        Some(blob) if inode.size > 0 && !blob.is_empty() => {
+                    inode.content = match target {
+                        Some(Json::Str(blob)) if inode.size > 0 && !blob.is_empty() => {
                             Content::Blob(blob.to_string())
+                        },
+                        Some(Json::Arr(list)) if inode.size > 0 => {
+                            Content::Chunks(Self::chunks_from_json(name, inode.size, list)?)
                         },
                         _ => {
                             inode.size = 0;
@@ -223,6 +250,38 @@ impl Fs {
             }
         }
         Ok(())
+    }
+
+    /// A chunked file's `[[blob, length], ...]`.
+    fn chunks_from_json(name: &str, size: u64, list: &[Json]) -> Result<Vec<Chunk>, String> {
+        let mut chunks = Vec::with_capacity(list.len());
+        let mut total = 0u64;
+        for c in list {
+            let pair = c.as_arr().unwrap_or(&[]);
+            let (Some(blob), Some(len)) = (
+                pair.first().and_then(Json::as_str),
+                pair.get(1).and_then(Json::as_f64),
+            ) else {
+                return Err(format!(
+                    "filesystem.json: {name}: a chunk is not [blob, length]"
+                ));
+            };
+            let len = len as u64;
+            if len == 0 {
+                continue;
+            }
+            total += len;
+            chunks.push(Chunk {
+                len,
+                data: Piece::Blob(blob.to_string()),
+            });
+        }
+        if total != size {
+            return Err(format!(
+                "filesystem.json: {name}: chunks hold {total} bytes, the file {size}"
+            ));
+        }
+        Ok(chunks)
     }
 
     fn alloc(&mut self, inode: Inode) -> Ino {
@@ -537,8 +596,169 @@ impl Fs {
         }
         match self.blobs.get(&name) {
             Some(b) => Ok(b.as_slice()),
-            None => Err(Fail::Need(name)),
+            None => Err(Fail::Need(vec![name])),
         }
+    }
+
+    /// A chunk's contents, if fetched (EIO if the host failed it, or it is short).
+    fn piece<'a>(&'a self, c: &'a Chunk) -> Res<Option<&'a [u8]>> {
+        match &c.data {
+            Piece::Mem(d) => Ok(Some(d)),
+            Piece::Blob(n) if self.failed.contains(n) => Err(EIO.into()),
+            Piece::Blob(n) => match self.blobs.get(n) {
+                Some(b) if b.len() as u64 >= c.len => Ok(Some(&b[..c.len as usize])),
+                Some(_) => Err(EIO.into()),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// The chunks overlapping `start..end`, as (index, offset of the chunk).
+    fn chunks_in(chunks: &[Chunk], start: u64, end: u64) -> Vec<(usize, u64)> {
+        let mut out = Vec::new();
+        if start >= end {
+            return out;
+        }
+        let mut pos = 0u64;
+        for (k, c) in chunks.iter().enumerate() {
+            if pos >= end {
+                break;
+            }
+            if pos + c.len > start {
+                out.push((k, pos));
+            }
+            pos += c.len;
+        }
+        out
+    }
+
+    /// Every chunk of `start..end` is fetched, or the ones still missing are asked
+    /// for (and those already here pinned until then).
+    fn need_chunks(&mut self, ino: Ino, start: u64, end: u64) -> Res<()> {
+        let Content::Chunks(chunks) = &self.inode(ino)?.content else {
+            return Ok(());
+        };
+        let mut missing = Vec::new();
+        let mut covered = Vec::new();
+        for (k, _) in Self::chunks_in(chunks, start, end) {
+            let c = &chunks[k];
+            if let Piece::Blob(n) = &c.data {
+                if self.piece(c)?.is_none() && !missing.contains(n) {
+                    missing.push(n.clone());
+                }
+                covered.push(n.clone());
+            }
+        }
+        if missing.is_empty() {
+            for n in &covered {
+                self.pinned.remove(n);
+            }
+            Ok(())
+        } else {
+            self.pinned.extend(covered);
+            Err(Fail::Need(missing))
+        }
+    }
+
+    fn read_chunks(&mut self, ino: Ino, offset: u64, end: u64) -> Res<Vec<u8>> {
+        self.need_chunks(ino, offset, end)?;
+        let Content::Chunks(chunks) = &self.inode(ino)?.content else {
+            unreachable!()
+        };
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        for (k, pos) in Self::chunks_in(chunks, offset, end) {
+            let c = &chunks[k];
+            let d = self.piece(c)?.ok_or(Fail::Errno(EIO))?;
+            let a = offset.max(pos) - pos;
+            let b = end.min(pos + c.len) - pos;
+            out.extend_from_slice(&d[a as usize..b as usize]);
+        }
+        Ok(out)
+    }
+
+    /// Make the chunks of `start..end` writable (private copies of those only).
+    fn materialize_chunks(&mut self, ino: Ino, start: u64, end: u64) -> Res<()> {
+        self.need_chunks(ino, start, end)?;
+        let Content::Chunks(chunks) = &self.inode(ino)?.content else {
+            unreachable!()
+        };
+        let mut copies = Vec::new();
+        for (k, _) in Self::chunks_in(chunks, start, end) {
+            if let Piece::Blob(_) = chunks[k].data {
+                let d = self.piece(&chunks[k])?.ok_or(Fail::Errno(EIO))?;
+                copies.push((k, d.to_vec()));
+            }
+        }
+        let Content::Chunks(chunks) = &mut self.inode_mut(ino)?.content else {
+            unreachable!()
+        };
+        for (k, d) in copies {
+            chunks[k].data = Piece::Mem(d);
+        }
+        Ok(())
+    }
+
+    /// Grow or shrink a chunked file to `size` bytes (zeros when growing).
+    fn resize_chunks(chunks: &mut Vec<Chunk>, size: u64) {
+        let mut pos = 0u64;
+        let mut keep = 0;
+        for c in chunks.iter_mut() {
+            if pos >= size {
+                break;
+            }
+            if pos + c.len > size {
+                // The new end is inside this chunk: a blob keeps a prefix.
+                c.len = size - pos;
+                if let Piece::Mem(d) = &mut c.data {
+                    d.truncate(c.len as usize);
+                }
+            }
+            pos += c.len;
+            keep += 1;
+        }
+        chunks.truncate(keep);
+        if pos < size {
+            let grow = size - pos;
+            match chunks.last_mut() {
+                Some(Chunk {
+                    len,
+                    data: Piece::Mem(d),
+                }) => {
+                    *len += grow;
+                    d.resize(*len as usize, 0);
+                },
+                _ => chunks.push(Chunk {
+                    len: grow,
+                    data: Piece::Mem(vec![0; grow as usize]),
+                }),
+            }
+        }
+    }
+
+    fn write_chunks(&mut self, ino: Ino, offset: u64, bytes: &[u8]) -> Res<()> {
+        let end = offset + bytes.len() as u64;
+        let size = self.inode(ino)?.size;
+        // Fetch what is overwritten before changing anything (the write is tried again).
+        self.materialize_chunks(ino, offset, end.min(size))?;
+        let i = self.inode_mut(ino)?;
+        let Content::Chunks(chunks) = &mut i.content else {
+            unreachable!()
+        };
+        if end > size {
+            Self::resize_chunks(chunks, end);
+            i.size = end;
+        }
+        for (k, pos) in Self::chunks_in(chunks, offset, end) {
+            let c = &mut chunks[k];
+            let Piece::Mem(d) = &mut c.data else {
+                unreachable!("written chunks are in memory")
+            };
+            let a = offset.max(pos);
+            let b = end.min(pos + c.len);
+            d[(a - pos) as usize..(b - pos) as usize]
+                .copy_from_slice(&bytes[(a - offset) as usize..(b - offset) as usize]);
+        }
+        Ok(())
     }
 
     pub fn read(&mut self, ino: Ino, offset: u64, count: usize) -> Res<Vec<u8>> {
@@ -547,6 +767,10 @@ impl Fs {
             // Reading at or past the end needs no contents.
             self.inode(ino)?;
             return Ok(Vec::new());
+        }
+        if let Content::Chunks(_) = self.inode(ino)?.content {
+            let end = offset.saturating_add(count as u64).min(size);
+            return self.read_chunks(ino, offset, end);
         }
         let data = self.data(ino)?;
         let end = (offset as usize).saturating_add(count).min(data.len());
@@ -574,6 +798,13 @@ impl Fs {
         if end > MAX_FILE {
             return Err(EFBIG.into());
         }
+        if let Content::Chunks(_) = self.inode(ino)?.content {
+            self.write_chunks(ino, offset, bytes)?;
+            let i = self.inode_mut(ino)?;
+            i.mtime = (now, 0);
+            i.ctime = (now, 0);
+            return Ok(bytes.len());
+        }
         let d = self.materialize(ino)?;
         if d.len() < end as usize {
             d.resize(end as usize, 0);
@@ -592,9 +823,14 @@ impl Fs {
             return Err(EFBIG.into());
         }
         if size == 0 {
-            if let Content::Blob(_) = self.inode(ino)?.content {
+            if let Content::Blob(_) | Content::Chunks(_) = self.inode(ino)?.content {
                 self.inode_mut(ino)?.content = Content::Mem(Vec::new());
             }
+        }
+        if let Content::Chunks(chunks) = &mut self.inode_mut(ino)?.content {
+            Self::resize_chunks(chunks, size);
+            self.inode_mut(ino)?.size = size;
+            return Ok(());
         }
         let d = self.materialize(ino)?;
         d.resize(size as usize, 0);
@@ -641,11 +877,18 @@ impl Fs {
     }
 
     fn evict(&mut self) {
+        // Pinned chunks stay, at the front, until the read waiting on them completes.
+        let mut kept = Vec::new();
         while self.cached > self.max_cached && self.order.len() > 1 {
             let old = self.order.pop_front().unwrap();
-            if let Some(b) = self.blobs.remove(&old) {
+            if self.pinned.contains(&old) {
+                kept.push(old);
+            } else if let Some(b) = self.blobs.remove(&old) {
                 self.cached -= b.len();
             }
+        }
+        while let Some(n) = kept.pop() {
+            self.order.push_front(n);
         }
     }
 
@@ -658,6 +901,7 @@ impl Fs {
         self.blobs.clear();
         self.order.clear();
         self.cached = 0;
+        self.pinned.clear();
     }
 
     /// The blob a file's contents are in, if they are still unmodified.
@@ -668,8 +912,12 @@ impl Fs {
         }
     }
 
-    /// Whole contents of a file, or the blob it waits on.
+    /// Whole contents of a file, or the blobs it waits on.
     pub fn read_all(&mut self, ino: Ino) -> Res<Vec<u8>> {
+        if let Content::Chunks(_) = self.inode(ino)?.content {
+            let size = self.inode(ino)?.size;
+            return self.read_chunks(ino, 0, size);
+        }
         Ok(self.data(ino)?.to_vec())
     }
 
@@ -736,6 +984,24 @@ impl Fs {
                     w.bytes(d);
                 },
                 Content::Special => w.u8(4),
+                Content::Chunks(chunks) => {
+                    // Only written chunks carry their bytes.
+                    w.u8(5);
+                    w.u64(chunks.len() as u64);
+                    for c in chunks {
+                        w.u64(c.len);
+                        match &c.data {
+                            Piece::Blob(n) => {
+                                w.u8(0);
+                                w.str(n);
+                            },
+                            Piece::Mem(d) => {
+                                w.u8(1);
+                                w.bytes(d);
+                            },
+                        }
+                    }
+                },
             }
         }
     }
@@ -776,6 +1042,22 @@ impl Fs {
                 1 => Content::Symlink(r.bytes()?.to_vec()),
                 2 => Content::Blob(r.str()?),
                 3 => Content::Mem(r.bytes()?.to_vec()),
+                5 => {
+                    let mut chunks = Vec::new();
+                    for _ in 0..r.u64()? {
+                        let len = r.u64()?;
+                        let data = match r.u8()? {
+                            0 => Piece::Blob(r.str()?),
+                            1 => Piece::Mem(r.bytes()?.to_vec()),
+                            _ => return None,
+                        };
+                        if matches!(&data, Piece::Mem(d) if d.len() as u64 != len) {
+                            return None;
+                        }
+                        chunks.push(Chunk { len, data });
+                    }
+                    Content::Chunks(chunks)
+                },
                 _ => Content::Special,
             };
             fs.inodes.push(Some(Inode {
@@ -817,5 +1099,231 @@ mod cache_tests {
         fs.set_cache_limit(0);
         assert_eq!(fs.blobs.keys().collect::<Vec<_>>(), ["c"]);
         assert_eq!(fs.cached, 8);
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    /// /big: 10 bytes in chunks "a" (4), "b" (4), "c" (2); /old: one blob "o".
+    fn image() -> Fs {
+        let json = br#"{"version":3,"fsroot":[
+            ["big",10,0,33188,0,0,[["a",4],["b",4],["c",2]]],
+            ["old",3,0,33188,0,0,"o"]]}"#;
+        Fs::from_json(json).unwrap()
+    }
+
+    fn provide_all(fs: &mut Fs) {
+        for (n, d) in [
+            ("a", &b"0123"[..]),
+            ("b", b"4567"),
+            ("c", b"89"),
+            ("o", b"xyz"),
+        ] {
+            fs.provide_blob(n, d.to_vec()).unwrap();
+        }
+    }
+
+    fn need(names: &[&str]) -> Fail {
+        Fail::Need(names.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn reads_fetch_only_the_chunks_they_cover() {
+        let mut fs = image();
+        let big = fs.lookup_path("/big").unwrap();
+        assert_eq!(fs.inode(big).unwrap().size, 10);
+        assert_eq!(fs.read(big, 0, 2), Err(need(&["a"])));
+        assert_eq!(fs.read(big, 5, 2), Err(need(&["b"])));
+        // Across a boundary: everything missing is asked for at once
+        assert_eq!(fs.read(big, 2, 7), Err(need(&["a", "b", "c"])));
+        fs.provide_blob("b", b"4567".to_vec()).unwrap();
+        assert_eq!(fs.read(big, 2, 7), Err(need(&["a", "c"])));
+        fs.provide_blob("a", b"0123".to_vec()).unwrap();
+        assert_eq!(fs.read(big, 2, 4).unwrap(), b"2345");
+        assert_eq!(fs.read(big, 2, 7), Err(need(&["c"])));
+        fs.provide_blob("c", b"89".to_vec()).unwrap();
+        assert_eq!(fs.read(big, 2, 100).unwrap(), b"23456789");
+        assert_eq!(fs.read(big, 10, 5).unwrap(), b"");
+        assert_eq!(fs.read_all(big).unwrap(), b"0123456789");
+    }
+
+    #[test]
+    fn old_single_blob_files_still_work() {
+        let mut fs = image();
+        let old = fs.lookup_path("/old").unwrap();
+        assert_eq!(fs.blob_of(old), Some("o"));
+        assert_eq!(fs.read(old, 0, 10), Err(need(&["o"])));
+        provide_all(&mut fs);
+        assert_eq!(fs.read(old, 1, 10).unwrap(), b"yz");
+        fs.write(old, 3, b"!", 1).unwrap();
+        assert_eq!(fs.read_all(old).unwrap(), b"xyz!");
+    }
+
+    #[test]
+    fn a_failed_or_short_chunk_is_an_io_error() {
+        let mut fs = image();
+        let big = fs.lookup_path("/big").unwrap();
+        fs.blob_failed("a");
+        assert_eq!(fs.read(big, 0, 1), Err(Fail::Errno(EIO)));
+        fs.provide_blob("b", b"45".to_vec()).unwrap();
+        assert_eq!(fs.read(big, 4, 1), Err(Fail::Errno(EIO)));
+    }
+
+    #[test]
+    fn writes_copy_only_the_chunks_they_touch() {
+        let mut fs = image();
+        let big = fs.lookup_path("/big").unwrap();
+        // Overwriting part of "b" needs only "b"
+        assert_eq!(fs.write(big, 5, b"XY", 1), Err(need(&["b"])));
+        fs.provide_blob("b", b"4567".to_vec()).unwrap();
+        assert_eq!(fs.write(big, 5, b"XY", 1).unwrap(), 2);
+        let Content::Chunks(c) = &fs.inode(big).unwrap().content else {
+            panic!()
+        };
+        assert!(matches!(&c[0].data, Piece::Blob(n) if n == "a"));
+        assert!(matches!(&c[1].data, Piece::Mem(d) if d == b"4XY7"));
+        assert!(matches!(&c[2].data, Piece::Blob(n) if n == "c"));
+        assert_eq!(fs.inode(big).unwrap().mtime, (1, 0));
+        // The shared blob is untouched
+        provide_all(&mut fs);
+        assert_eq!(fs.read_all(big).unwrap(), b"01234XY789");
+        assert_eq!(&**fs.blobs.get("b").unwrap(), b"4567");
+        // Across a boundary, and past the end with a hole
+        fs.write(big, 3, b"ab", 2).unwrap();
+        fs.write(big, 12, b"Z", 2).unwrap();
+        assert_eq!(fs.inode(big).unwrap().size, 13);
+        assert_eq!(fs.read_all(big).unwrap(), b"012abXY789\0\0Z");
+        // Appending right at the end extends the last in-memory chunk
+        fs.write(big, 13, b"!", 3).unwrap();
+        let Content::Chunks(c) = &fs.inode(big).unwrap().content else {
+            panic!()
+        };
+        assert_eq!(c.len(), 4);
+        assert_eq!(fs.read(big, 10, 10).unwrap(), b"\0\0Z!");
+    }
+
+    #[test]
+    fn truncate_keeps_a_prefix_without_fetching() {
+        let mut fs = image();
+        let big = fs.lookup_path("/big").unwrap();
+        fs.truncate(big, 6).unwrap();
+        let Content::Chunks(c) = &fs.inode(big).unwrap().content else {
+            panic!()
+        };
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[1].len, 2);
+        assert!(fs.blobs.is_empty());
+        // Growing again shows zeros, not the rest of the blob
+        fs.truncate(big, 9).unwrap();
+        provide_all(&mut fs);
+        assert_eq!(fs.read_all(big).unwrap(), b"012345\0\0\0");
+        // A cut inside an in-memory chunk
+        fs.write(big, 0, b"Q", 1).unwrap();
+        fs.truncate(big, 3).unwrap();
+        assert_eq!(fs.read_all(big).unwrap(), b"Q12");
+        assert_eq!(fs.inode(big).unwrap().size, 3);
+        fs.truncate(big, 0).unwrap();
+        assert_eq!(fs.read_all(big).unwrap(), b"");
+        assert!(matches!(fs.inode(big).unwrap().content, Content::Mem(_)));
+    }
+
+    #[test]
+    fn hard_links_and_renames_share_the_chunks() {
+        let mut fs = image();
+        let big = fs.lookup_path("/big").unwrap();
+        fs.link(ROOT, b"also", big, 1).unwrap();
+        fs.rename(ROOT, b"big", ROOT, b"moved", 1).unwrap();
+        provide_all(&mut fs);
+        fs.write(big, 0, b"!", 1).unwrap();
+        let also = fs.lookup_path("/also").unwrap();
+        assert_eq!(fs.read_all(also).unwrap(), b"!123456789");
+        assert_eq!(fs.lookup_path("/moved"), Some(big));
+    }
+
+    #[test]
+    fn snapshots_keep_only_written_chunks() {
+        let mut fs = image();
+        let big = fs.lookup_path("/big").unwrap();
+        provide_all(&mut fs);
+        fs.write(big, 4, b"W", 1).unwrap();
+        fs.truncate(big, 9).unwrap();
+        let mut w = W::new();
+        fs.save(&mut w);
+        // "a" stays a name; only the written chunk "b" carries bytes
+        assert!(w.0.windows(4).any(|s| s == b"W567"));
+        assert!(!w.0.windows(4).any(|s| s == b"0123"));
+        let mut back = Fs::load(&mut R(&w.0)).unwrap();
+        let big2 = back.lookup_path("/big").unwrap();
+        assert_eq!(back.read(big2, 0, 100), Err(need(&["a", "c"])));
+        provide_all(&mut back);
+        assert_eq!(back.read_all(big2).unwrap(), b"0123W5678");
+    }
+
+    #[test]
+    fn snapshots_from_before_chunks_still_load() {
+        // A root directory with a file in blob "o" and a written one, encoded by hand
+        // the way format 3 always has.
+        let mut w = W::new();
+        let inode = |w: &mut W, mode: u32, nlink: u32, size: u64| {
+            w.u8(1);
+            for v in [mode, 0, 0, nlink] {
+                w.u32(v);
+            }
+            w.u64(size);
+            w.u64(0);
+            for _ in 0..3 {
+                w.u64(5);
+                w.u32(0);
+            }
+        };
+        w.u64(4);
+        w.u8(0);
+        inode(&mut w, S_IFDIR | 0o755, 2, 4096);
+        w.u8(0);
+        w.u64(ROOT);
+        w.u64(2);
+        w.bytes(b"new");
+        w.u64(3);
+        w.bytes(b"old");
+        w.u64(2);
+        inode(&mut w, S_IFREG | 0o644, 1, 3);
+        w.u8(2);
+        w.str("o");
+        inode(&mut w, S_IFREG | 0o644, 1, 2);
+        w.u8(3);
+        w.bytes(b"hi");
+        let mut fs = Fs::load(&mut R(&w.0)).unwrap();
+        let old = fs.lookup_path("/old").unwrap();
+        assert_eq!(fs.read(old, 0, 9), Err(need(&["o"])));
+        fs.provide_blob("o", b"xyz".to_vec()).unwrap();
+        assert_eq!(fs.read(old, 0, 9).unwrap(), b"xyz");
+        let new = fs.lookup_path("/new").unwrap();
+        assert_eq!(fs.read_all(new).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn chunk_lengths_must_add_up() {
+        let json = br#"{"version":3,"fsroot":[["f",9,0,33188,0,0,[["a",4],["b",4]]]]}"#;
+        assert!(Fs::from_json(json).err().unwrap().contains("8 bytes"));
+        let json = br#"{"version":3,"fsroot":[["f",4,0,33188,0,0,[["a"]]]]}"#;
+        assert!(Fs::from_json(json).is_err());
+    }
+
+    #[test]
+    fn a_waiting_read_keeps_its_chunks_cached() {
+        let mut fs = image();
+        let big = fs.lookup_path("/big").unwrap();
+        fs.set_cache_limit(0);
+        assert!(fs.read(big, 0, 10).is_err());
+        fs.provide_blob("a", b"0123".to_vec()).unwrap();
+        fs.provide_blob("b", b"4567".to_vec()).unwrap();
+        fs.provide_blob("c", b"89".to_vec()).unwrap();
+        // Over budget, but the read still has everything it waited for
+        assert_eq!(fs.read_all(big).unwrap(), b"0123456789");
+        // Done: no longer pinned, so the next blob pushes them out
+        fs.provide_blob("o", b"xyz".to_vec()).unwrap();
+        assert_eq!(fs.blobs.len(), 1);
     }
 }

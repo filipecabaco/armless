@@ -1,8 +1,8 @@
 //! virtio-9p: a 9P2000.L server over [`Fs`], for Linux's `trans=virtio`.
 //!
 //! A request that needs a file's contents the host has not delivered yet is
-//! parked (its descriptor chain held) and the blob requested; it is answered
-//! when the blob arrives.
+//! parked (its descriptor chain held) and the blobs requested; it is answered
+//! once they have all arrived.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -62,7 +62,8 @@ const NONUNAME: u32 = !0;
 struct Parked {
     chain: Chain,
     request: Vec<u8>,
-    blob: String,
+    /// What it waits for (served again as each arrives, until none is missing).
+    blobs: Vec<String>,
 }
 
 pub struct P9 {
@@ -169,14 +170,16 @@ impl P9 {
                 let n = chain.write_all(io, &response);
                 t.complete(io, 0, chain.head, n as u32);
             },
-            Err(blob) => {
-                if self.requested.insert(blob.clone()) {
-                    io.out.push(Event::Blob(blob.clone()));
+            Err(blobs) => {
+                for blob in &blobs {
+                    if self.requested.insert(blob.clone()) {
+                        io.out.push(Event::Blob(blob.clone()));
+                    }
                 }
                 self.parked.push(Parked {
                     chain,
                     request,
-                    blob,
+                    blobs,
                 });
             },
         }
@@ -187,7 +190,7 @@ impl P9 {
         self.requested.remove(name);
         let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked)
             .into_iter()
-            .partition(|p| p.blob == name);
+            .partition(|p| p.blobs.iter().any(|b| b == name));
         self.parked = waiting;
         for p in ready {
             self.serve(io, t, p.chain, p.request);
@@ -196,15 +199,15 @@ impl P9 {
 
     /// Blobs that parked requests wait for (to ask again after a restore).
     pub fn wanted_blobs(&mut self) -> Vec<String> {
-        let mut v: Vec<String> = self.parked.iter().map(|p| p.blob.clone()).collect();
+        let mut v: Vec<String> = self.parked.iter().flat_map(|p| p.blobs.clone()).collect();
         v.sort();
         v.dedup();
         self.requested = v.iter().cloned().collect();
         v
     }
 
-    /// A full response message, or the blob the request waits on.
-    fn handle(&mut self, io: &Io, msg: &[u8]) -> Result<Vec<u8>, String> {
+    /// A full response message, or the blobs the request waits on.
+    fn handle(&mut self, io: &Io, msg: &[u8]) -> Result<Vec<u8>, Vec<String>> {
         if msg.len() < 7 {
             return Ok(Vec::new());
         }
@@ -214,7 +217,7 @@ impl P9 {
         let result = self.dispatch(io, ty, tag, Req(R(&msg[7..])), &mut body);
         let (rty, body) = match result {
             Ok(()) => (ty + 1, body.0),
-            Err(Fail::Need(blob)) => return Err(blob),
+            Err(Fail::Need(blobs)) => return Err(blobs),
             Err(Fail::Errno(e)) => {
                 let mut w = W::new();
                 w.u32(e);
@@ -573,7 +576,8 @@ impl P9 {
                 }
             }
             w.bytes(&p.request);
-            w.str(&p.blob);
+            // One is enough: served again when it arrives, the request asks for the rest.
+            w.str(p.blobs.first().map_or("", String::as_str));
         }
     }
 
@@ -632,10 +636,46 @@ impl P9 {
             self.parked.push(Parked {
                 chain,
                 request,
-                blob,
+                blobs: vec![blob],
             });
         }
         self.requested.clear();
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn tread(fid: u32, offset: u64, count: u32) -> Vec<u8> {
+        let mut w = W::new();
+        w.u32(4 + 1 + 2 + 4 + 8 + 4);
+        w.u8(TREAD);
+        w.u16(1);
+        w.u32(fid);
+        w.u64(offset);
+        w.u32(count);
+        w.0
+    }
+
+    #[test]
+    fn a_read_across_chunks_waits_for_all_of_them() {
+        let json = br#"{"version":3,"fsroot":[["f",6,0,33188,0,0,[["a",3],["b",3]]]]}"#;
+        let mut p = P9::new("t", Fs::from_json(json).unwrap());
+        let io = Io::new(Arc::new(crate::smp::Machine::new(1 << 20, 1)), || 0);
+        let f = p.fs.lookup_path("/f").unwrap();
+        p.set_fid(7, f, 0);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(p.handle(&io, &tread(7, 1, 4)), Err(names(&["a", "b"])));
+        p.fs.provide_blob("b", b"def".to_vec()).unwrap();
+        assert_eq!(p.handle(&io, &tread(7, 1, 4)), Err(names(&["a"])));
+        p.fs.provide_blob("a", b"abc".to_vec()).unwrap();
+        let r = p.handle(&io, &tread(7, 1, 4)).unwrap();
+        assert_eq!(r[4], TREAD + 1);
+        assert_eq!(&r[7..11], &4u32.to_le_bytes());
+        assert_eq!(&r[11..], b"bcde");
     }
 }
