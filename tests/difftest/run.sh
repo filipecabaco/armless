@@ -16,12 +16,16 @@ mkdir -p "$out"
 cd "$here"
 
 simd=""
-case "$classes" in *simd*|*fp*|*ldst*) simd="-DWITH_SIMD" ;; esac
-case "$classes" in *ldst*) simd="$simd -DLDST" ;; esac
+case "$classes" in *simd*|*fp*|*ldst*|*crypto*|*lse*) simd="-DWITH_SIMD" ;; esac
+case "$classes" in *ldst*|*lse*) simd="$simd -DLDST" ;; esac
+# The LSE atomics need an ARMv8.1 reference; everything else is checked against
+# plain ARMv8.0 (with crypto and CRC32), which is what armless implements.
+cpu=cortex-a53
+case "$classes" in *lse*) cpu=cortex-a76 ;; esac
 
 python3 gen.py --classes "$classes" --count "$count" --seed "$seed" > "$out/cases.S"
 
-# Reference: Linux user mode under QEMU (Cortex-A53 = plain ARMv8.0).
+# Reference: Linux user mode under QEMU.
 # C code avoids FP/SIMD registers; the assembly needs them for the harness.
 GCC=aarch64-linux-gnu-gcc
 GCFLAGS="-ffreestanding -fno-stack-protector -O1 $simd"
@@ -30,7 +34,7 @@ $GCC $GCFLAGS -mgeneral-regs-only -c report.c -o "$out/report_ref.o"
 $GCC $GCFLAGS -c harness.S -o "$out/harness_ref.o"
 $GCC $GCFLAGS -c "$out/cases.S" -o "$out/cases_ref.o"
 $GCC -static -nostdlib -o "$out/ref.elf" "$out/main_linux.o" "$out/report_ref.o" "$out/harness_ref.o" "$out/cases_ref.o"
-qemu-aarch64 -cpu cortex-a53 "$out/ref.elf" > "$out/ref.txt"
+qemu-aarch64 -cpu $cpu "$out/ref.elf" > "$out/ref.txt"
 
 # armless: bare metal
 CFLAGS="--target=aarch64-none-elf -march=armv8-a -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -O1 $simd"

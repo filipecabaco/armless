@@ -21,7 +21,8 @@ done
 cp "$here/rootfs/init" "$tree/init"
 chmod +x "$tree/init"
 echo "hello from 9p" > "$tree/etc/motd"
-# Data for the network and 9p tests: an 8 MiB incompressible file and many small ones.
+# Data for the network and 9p tests: an 8 MiB incompressible file (in chunks) and many
+# small ones.
 mkdir -p "$tree/data/small"
 python3 - "$tree/data" <<'PY'
 import hashlib, os, sys

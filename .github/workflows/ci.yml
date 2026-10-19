@@ -141,7 +141,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        classes: [int, fp, simd, simds, ldst]
+        classes: [int, fp, simd, simds, ldst, crypto, lse]
     steps:
       - uses: actions/checkout@v7
       - name: Toolchain

@@ -165,6 +165,14 @@ void exc_handler(struct frame *f, uint64_t kind) {
 
 // ------------------------------------------------------------------ tests
 
+static uint32_t crc32_sw(uint32_t crc, const uint8_t *p, int n, uint32_t poly) {
+    while (n--) {
+        crc ^= *p++;
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (poly & -(crc & 1));
+    }
+    return crc;
+}
+
 __attribute__((noinline)) static uint64_t fib(uint64_t n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
 
 static uint64_t sum_primes(int limit) {
@@ -273,6 +281,52 @@ static void test_exceptions(void) {
     __asm__ volatile("brk #0x42" ::: "memory");
     check("brk esr", last_esr, (0x3cULL << 26) | (1 << 25) | 0x42);
     check("CurrentEL", SYSREG_READ(CurrentEL), 4);
+}
+
+// ARMv8.1 atomics and CRC32 (the crypto instructions need SIMD registers: see the difftest).
+static void test_extensions(void) {
+    puts_("extensions:\n");
+    check("ID_AA64ISAR0_EL1", SYSREG_READ(id_aa64isar0_el1), 0x211120);
+    static volatile uint64_t m[2] __attribute__((aligned(16)));
+    m[0] = 40;
+    uint64_t old;
+    __asm__ volatile(".arch_extension lse\n ldaddal %1, %0, [%2]"
+                     : "=&r"(old) : "r"((uint64_t)2), "r"(m) : "memory");
+    check("ldaddal", old * 1000 + m[0], 40042);
+    uint32_t w;
+    m[0] = 0xfffffff0;
+    __asm__ volatile(".arch_extension lse\n ldsmax %w1, %w0, [%2]"
+                     : "=&r"(w) : "r"(5), "r"(m) : "memory");
+    check("ldsmax (signed 32)", (uint64_t)w << 32 | m[0], 0xfffffff000000005ULL);
+    __asm__ volatile(".arch_extension lse\n swpl %1, %0, [%2]"
+                     : "=&r"(old) : "r"((uint64_t)77), "r"(m) : "memory");
+    check("swpl", old * 1000 + m[0], 5077);
+    register uint64_t cmp __asm__("x4") = 77, cmp2 __asm__("x5") = 0;
+    register uint64_t nv __asm__("x6") = 9, nv2 __asm__("x7") = 10;
+    __asm__ volatile(".arch_extension lse\n casal %0, %1, [%2]"
+                     : "+r"(cmp) : "r"(nv), "r"(m) : "memory");
+    check("casal hit", cmp * 1000 + m[0], 77009);
+    cmp = 77;
+    __asm__ volatile(".arch_extension lse\n cas %0, %1, [%2]"
+                     : "+r"(cmp) : "r"(nv), "r"(m) : "memory");
+    check("cas miss loads the old value", cmp, 9);
+    m[1] = 0;
+    cmp = 9;
+    __asm__ volatile(".arch_extension lse\n caspal %0, %1, %2, %3, [%4]"
+                     : "+r"(cmp), "+r"(cmp2) : "r"(nv), "r"(nv2), "r"(m) : "memory");
+    check("caspal", m[0] * 100 + m[1], 910);
+    __asm__ volatile(".arch_extension lse\n ldadd %1, %0, [%2]"
+                     : "=&r"(old) : "r"((uint64_t)1), "r"((uintptr_t)m + 4) : "memory");
+    check("unaligned ldadd: alignment fault", last_esr & 0xfc00007f, (0x25u << 26) | 0x61);
+    check("alignment fault far", last_far, (uintptr_t)m + 4);
+    static const uint8_t bytes[8] = {'1', '2', '3', '4', '5', '6', '7', '8'};
+    uint64_t data;
+    memcpy(&data, bytes, 8);
+    uint32_t crc = 0xffffffff, crcc = 0xffffffff;
+    __asm__ volatile(".arch_extension crc\n crc32x %w0, %w0, %1" : "+r"(crc) : "r"(data));
+    __asm__ volatile(".arch_extension crc\n crc32cb %w0, %w0, %w1" : "+r"(crcc) : "r"((uint32_t)'1'));
+    check("crc32x", crc, crc32_sw(0xffffffff, bytes, 8, 0xedb88320));
+    check("crc32cb", crcc, crc32_sw(0xffffffff, bytes, 1, 0x82f63b78));
 }
 
 static long user_fn(long arg) {
@@ -465,6 +519,7 @@ int kmain(const uint8_t *dtb) {
     test_integer();
     test_atomics();
     test_exceptions();
+    test_extensions();
     test_el0();
     test_psci();
     test_rtc();

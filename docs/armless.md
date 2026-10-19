@@ -25,7 +25,7 @@ config, notifications) and a legacy INTx line. The device tree marks the bus
 
 | | |
 |---|---|
-| `cpu.rs`, `a64.rs`, `advsimd.rs`, `fp.rs`, `simd*.rs`, `mmu.rs`, `sysreg.rs` | the CPU |
+| `cpu.rs`, `a64.rs`, `advsimd.rs`, `crypto.rs`, `fp.rs`, `simd*.rs`, `mmu.rs`, `sysreg.rs` | the CPU |
 | `jit/` | page-at-a-time translation to WebAssembly modules (wasm builds only) |
 | `gic.rs`, `rtc.rs`, `smp.rs` | shared machine state, multi-CPU GIC, PSCI, TLB shootdowns |
 | `dev/` | UART, PCI, virtio transport, console, 9p + filesystem, net + network stack |
@@ -53,8 +53,25 @@ Input goes through `console_input`, `console_resize` and `serial_input`. Console
 input is queued until the guest posts receive buffers, so nothing is dropped.
 
 A 9p request that needs a blob that hasn't arrived waits (its descriptor chain is
-held) and is answered when the blob arrives. Fetched blobs are cached up to
-256 MiB, oldest evicted first.
+held) and is answered when the blobs it needs have all arrived. Fetched blobs are
+cached up to 256 MiB, oldest evicted first, except the chunks a waiting read covers.
+
+## The filesystem
+
+`filesystem.json` is v86's format 3: `fsroot` lists `[name, size, mtime, mode, uid,
+gid, target]`, where `target` is a directory's children, a symlink's target, or a
+regular file's blob. A file can instead be in chunks, `[[blob, length], ...]`, whose
+lengths add up to `size`:
+
+```json
+["big.bin", 8388608, 0, 33188, 0, 0, [["0e2c9a7d41.bin.zst", 878612], ["...", 7509996]]]
+```
+
+A read fetches only the chunks it covers, and a write copies only the chunks it
+touches into memory (truncating keeps a prefix of a chunk without fetching it).
+Chunks are plain blobs to the host, so identical chunks are shared across files and
+images. `tests/fs/cdc.py` cuts them where the contents say (a gear hash, 256 KiB to
+4 MiB, about 1 MiB), so an insertion only changes the chunks around it.
 
 ## The network
 
@@ -70,11 +87,22 @@ the site's CA, end inside the machine:
 
 - **TLS 1.3** on 443 (`tls.rs`) uses TLS_AES_128_GCM_SHA256 with X25519 or P-256 and
   an ECDSA P-256 certificate minted per SNI name, signed by the site's CA (`cert.rs`).
-  The guest trusts that CA. There is no resumption and no HelloRetryRequest. Every
-  current OpenSSL, Node, Python, Go, Rust and Java client offers what it needs.
-- **HTTP/1.1** inside (`mod.rs`) takes one request per connection: Content-Length or
-  chunked bodies, `Expect: 100-continue`. Responses are streamed and end with the
-  connection.
+  The guest trusts that CA. There is no HelloRetryRequest. Every current OpenSSL,
+  Node, Python, Go, Rust and Java client offers what it needs.
+- **Resumption:** every handshake ends with a session ticket (valid a day, for that SNI
+  name). A client that comes back with it skips the certificate and its signature, but
+  still makes a fresh X25519 or P-256 exchange (psk_dhe_ke only; no 0-RTT). Tickets are
+  sealed with a key made from the host's seed and forgotten at every `Board::seed`, so
+  copies of one snapshot can't use each other's tickets; a ticket the machine can't
+  open, or one that is too old or for another name, just means a full handshake. A
+  wrong binder fails it.
+- **HTTP/1.1** inside (`mod.rs`) keeps connections open: Content-Length or chunked
+  bodies, `Expect: 100-continue`, and requests answered one at a time (a pipelined one
+  waits in the buffer, and is a new `HttpRequest` once the response before it ends).
+  Responses are streamed with the host's Content-Length, or chunked when it gave none
+  (fetch() never does); a host that sends less, or more, than it said closes the
+  connection. HTTP/1.0 and `connection: close` requests get a response that ends with
+  the connection, as does a guest that has finished sending, after its last request.
 - **WebSocket upgrades** become `WsOpen` and the frames become messages. Pings are
   answered in the machine.
 
@@ -129,6 +157,12 @@ CPUs sleep on a wake counter (`Atomics.wait` in workers) until their timer expir
 or something kicks them. Device DMA into a page holding translated code invalidates
 that code on every CPU (`Machine::code_pages`).
 
+With several CPUs, a store-exclusive succeeds if memory still holds what its load-exclusive
+read (a host compare-and-swap, as QEMU does), and the LSE atomics (CAS, SWP, LDADD...) are host
+compare-and-swap loops on guest RAM, so both are atomic against every other CPU. 128-bit pairs
+(STXP, CASP of X registers) are updated under one machine-wide lock. Unaligned atomics take an
+alignment fault; the JIT leaves atomics and the crypto instructions to the interpreter.
+
 For a snapshot every CPU is paused between instruction slices. A paused CPU counts
 as idle, so a running CPU waiting for TLB acknowledgements does not wait for it.
 
@@ -137,7 +171,8 @@ as idle, so a running CPU waiting for TLB acknowledgements does not wait for it.
 ```text
 "ARMLESS\x03"  u64 RAM size  u32 CPUs  u64 meta length
 meta: CPUs, GIC, timers, RTC (state.rs), then the devices (UART, PCI functions,
-      virtio queues, console, the filesystem tree with files the guest wrote,
+      virtio queues, console, the filesystem tree with files the guest wrote
+      (of a chunked file, only the chunks it wrote),
       open 9p fids, waiting requests, network names), then tagged extensions
       (u32 tag + data; "P9OW": who each 9p fid belongs to, "VGID": the VM generation ID)
 RAM:  (u32 page, 4096 bytes) for every non-zero page, then u32 0xffffffff
@@ -145,6 +180,8 @@ RAM:  (u32 page, 4096 bytes) for every non-zero page, then u32 0xffffffff
 
 `StateLoader` streams this, zstd-compressed or not, straight into guest memory.
 Blobs are not saved; the guest's unmodified files are fetched again after a restore.
+Chunked files are a new content kind in the tree, so older armless can't load a snapshot
+that has one; snapshots without them are unchanged.
 Extensions go after the devices, so snapshots without them still load (9p fids then
 belong to root, as they used to).
 

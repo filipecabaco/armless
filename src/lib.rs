@@ -19,6 +19,7 @@ pub mod advsimd;
 pub mod bits;
 pub mod board;
 pub mod cpu;
+pub mod crypto;
 pub mod dev;
 pub mod dtb;
 pub mod fp;

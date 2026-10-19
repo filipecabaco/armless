@@ -18,6 +18,12 @@ pub struct TlsKeys {
     ca_key: SigningKey,
     pub leaf_key: SigningKey,
     minted: HashMap<String, Vec<u8>>,
+    /// The key session tickets are sealed with: made from the host's randomness when the
+    /// first ticket is issued, and forgotten at every seed (so a restored snapshot never
+    /// shares one with its other copies)
+    ticket_key: Option<[u8; 32]>,
+    /// The machine's clock (ms), for ticket lifetimes
+    pub now_ms: u64,
 }
 
 impl TlsKeys {
@@ -42,7 +48,28 @@ impl TlsKeys {
             ca_key: key("caKey")?,
             leaf_key: key("leafKey")?,
             minted: HashMap::new(),
+            ticket_key: None,
+            now_ms: 0,
         })
+    }
+
+    /// Tickets issued so far stop working (their clients fall back to a full handshake).
+    pub fn forget_tickets(&mut self) {
+        self.ticket_key = None;
+    }
+
+    /// The ticket key, made now if there is none.
+    pub(super) fn ticket_key(&mut self, rng: &mut Rng) -> [u8; 32] {
+        *self.ticket_key.get_or_insert_with(|| {
+            let mut k = [0u8; 32];
+            rng.fill(&mut k);
+            k
+        })
+    }
+
+    /// The ticket key, if any ticket was issued since the last seed.
+    pub(super) fn current_ticket_key(&self) -> Option<[u8; 32]> {
+        self.ticket_key
     }
 
     /// A certificate for `host`, signed by the CA (DER).

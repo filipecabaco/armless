@@ -310,6 +310,9 @@ impl Stack {
         let Some(mut w) = self.conns.get_mut(&id).and_then(|c| c.web.take()) else {
             return;
         };
+        if let Some(t) = self.tls.as_mut() {
+            t.now_ms = self.now;
+        }
         let o = f(&mut w, self.tls.as_mut(), &mut self.rng);
         if let Some(c) = self.conns.get_mut(&id) {
             c.web = Some(w);

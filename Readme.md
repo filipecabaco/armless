@@ -3,7 +3,8 @@
 An AArch64 virtual machine that runs unmodified arm64 Linux in a browser tab, and
 natively. It is written in Rust:
 
-- CPU: ARMv8-A EL0/EL1 with FP/AdvSIMD. Interpreted, with a JIT that translates
+- CPU: ARMv8-A EL0/EL1 with FP/AdvSIMD, AES/PMULL, SHA1, SHA256, CRC32 and the
+  ARMv8.1 atomics (LSE). Interpreted, with a JIT that translates
   hot pages to WebAssembly in a page, and to host code natively (Cranelift).
 - SMP: up to 8 CPUs, one Web Worker (or native thread) each.
 - Interrupts and time: GICv2 and the generic timer.
@@ -11,7 +12,7 @@ natively. It is written in Rust:
   - a PL031 RTC and a 16550 UART (`ttyS0`);
   - virtio-console (`hvc0`, with the terminal size);
   - a 9p root filesystem built from content-addressed blobs that are fetched on
-    first read;
+    first read (large files in chunks: a read fetches only what it covers);
   - virtio-net with a user-mode network. DHCP, DNS and ping are answered
     locally.
   - a web relay inside the machine. HTTP and HTTPS (ports 80 and 443; HTTPS is
@@ -127,15 +128,17 @@ The wasm builds need clang and lld (for the C zstd decoder in `lib/zstd`).
 
 | | |
 |---|---|
-| `cargo test --release` | unit tests; bare-metal CPU suite (`guest/`); TLS and HTTP of the web relay against rustls |
-| `tests/difftest/run.sh CLASS N SEED` | random instructions vs qemu-aarch64 (`DUT=jit`: the wasm JIT) |
+| `cargo test --release` | unit tests; bare-metal CPU suite (`guest/`); four CPUs racing on shared counters with LSE atomics and exclusives; TLS and HTTP of the web relay against rustls |
+| `tests/difftest/run.sh CLASS N SEED` | random instructions vs qemu-aarch64; CLASS is `int`, `fp`, `simd`, `simds`, `ldst`, `crypto` or `lse` (`DUT=jit`: the wasm JIT) |
 | `tests/linux/{boot,userspace,smp}.sh` | Linux on `armless-run`; userspace and SMP stress output vs qemu-aarch64 |
 | `ARMLESS_9PFS=DIR cargo test --release --test vm` | the snowglobe flow natively: 9p root, console, snapshot, restore |
 | `node tests/js/flow.mjs DIR [CPUS]` | the same through `armless.js`, plus HTTP over fetch and port forwarding |
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
 
 `tests/fs/make-9pfs.sh` builds the test filesystem, and `tests/fs/alpine/` builds
-a real Alpine image. See `docs/armless.md` for the design.
+a real Alpine image. `tests/fs/fs2json.py` and `copy-to-sha256.py` split files of 2 MiB
+and more into chunks (`--chunk-threshold`); `--no-chunks` makes images for armless 0.2.10
+and older. See `docs/armless.md` for the design.
 
 armless started as a fork of [v86](https://github.com/copy/v86). The v86-based
 version is kept on the `v86-fork` branch.

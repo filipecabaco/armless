@@ -95,19 +95,31 @@ LDST = {
 LDST_BASE = 5      # Rn field offset: forced to x28
 LDST_INDEX = 16    # Rm field offset for register-offset and post-index forms
 
-CLASSES = {"int": INT, "fp": FP, "simd": SIMD, "simds": SIMDS, "ldst": LDST}
+# The Cryptographic Extension and CRC32 (the integer and SIMD classes reach some of
+# these too, but rarely).
+CRYPTO = {
+    "aes": (0xFFFE0C00, 0x4E280800, [], False, [(0x1C000, 0x4000, 0.9)]),
+    "sha2": (0xFFFE0C00, 0x5E280800, [], False, [(0x1C000, 0, 0.9)]),
+    "sha3": (0xFFE08C00, 0x5E000000, [], False, []),
+    "pmull": (0xBFE0FC00, 0x0EE0E000, [], False, []),
+    "crc": (0x7FE0E000, 0x1AC04000, [0, 5, 16], True, []),
+}
 
-# Encodings QEMU's cortex-a53 implements but armless does not advertise.
+# LSE atomics on the scratch buffer (base x28, as LDST). Needs a reference CPU
+# with ARMv8.1 (run.sh picks one).
+LSE = {
+    "atomic": (0x3F200C00, 0x38200000, [0, 16], True, []),
+    "cas": (0x3FA07C00, 0x08A07C00, [0, 16], True, []),
+    "casp": (0xBFA07C00, 0x08207C00, [0, 16], False, []),
+}
+
+CLASSES = {"int": INT, "fp": FP, "simd": SIMD, "simds": SIMDS, "ldst": LDST,
+           "crypto": CRYPTO, "lse": LSE}
+
+# What the reference CPU implements but armless does not advertise.
 def excluded(enc):
-    # CRC32/CRC32C: data-processing (2 source), opcode 010xxx
-    if enc & 0x5FE00000 == 0x1AC00000 and (enc >> 13) & 7 == 0b010:
-        return True
-    # Crypto: AES, SHA1/SHA256 (2- and 3-register), PMULL with 64-bit elements
-    if enc & 0xFF3E0C00 == 0x4E280800:
-        return True
-    if enc & 0xFF208C00 == 0x5E000000 or enc & 0xFF3E0C00 == 0x5E280800:
-        return True
-    if enc & 0xBF20FC00 == 0x0E20E000 and (enc >> 22) & 3 == 3:
+    # LDAPR (RCpc), next to the LSE atomics
+    if enc & 0x3F20FC00 == 0x3820C000:
         return True
     return False
 
@@ -120,11 +132,14 @@ def gen_insn(rng, templates):
         for m, v, p in rules:
             if rng.random() < p:
                 enc = (enc & ~m) | v
-        limit = 27 if name.startswith("ldst:") else 29
+        mem = name.startswith(("ldst:", "lse:"))
+        limit = 27 if mem else 29
         for off in regs:
             r = 31 if (zr_ok and rng.random() < 0.08) else rng.randrange(limit)
             enc = (enc & ~(31 << off)) | (r << off)
-        if name.startswith("ldst:"):
+        if name == "lse:casp" and rng.random() < 0.9:
+            enc &= ~((1 << 16) | 1)  # even register pairs, mostly
+        if mem:
             enc = (enc & ~(31 << LDST_BASE)) | (28 << LDST_BASE)
             if name.endswith(("_reg", "_post")):
                 rm = 31 if (name.endswith("_post") and rng.random() < 0.5) else 27
@@ -172,8 +187,16 @@ def rand_q(rng):
     return rng.getrandbits(128)
 
 
-def state_block(rng, ldst=False):
+# The first 16 bytes at scratch+8192 (report.c's pattern), for compare-and-swaps that succeed.
+SCRATCH_WORDS = [0x342D261F18110A03, 0x6C655E575049423B]
+
+
+def state_block(rng, ldst=False, lse=False):
     words = [rand_x(rng) for _ in range(29)]
+    if lse:
+        for i in range(27):
+            if rng.random() < 0.3:
+                words[i] = SCRATCH_WORDS[(i & 1) if rng.random() < 0.7 else rng.randrange(2)]
     if ldst:
         words[27] = rng.randrange(0, 512) & ~7   # register offset
         words[28] = 0                            # base: added to scratch+8192 at run time
@@ -197,7 +220,8 @@ def main():
     args = ap.parse_args()
     rng = random.Random(args.seed)
     templates = {}
-    ldst = "ldst" in args.classes.split(",")
+    lse = "lse" in args.classes.split(",")
+    ldst = "ldst" in args.classes.split(",") or lse
     for c in args.classes.split(","):
         for k, v in CLASSES[c].items():
             templates[c + ":" + k] = v
@@ -224,7 +248,7 @@ def main():
     w("    .data\n    .balign 16\n")
     for b in range(args.blocks):
         w("init_%d:\n" % b)
-        for word in state_block(rng, ldst):
+        for word in state_block(rng, ldst, lse):
             w("    .quad 0x%016x\n" % word)
 
 

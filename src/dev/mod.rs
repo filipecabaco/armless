@@ -47,7 +47,8 @@ pub enum Event {
     /// The guest closed its sending side.
     TcpEof { id: u32 },
     /// The guest made an HTTP(S) request (ports 80 and 443 end in the machine's web relay).
-    /// Answer with `http_respond`, `http_body`… and `http_end`, or `http_fail`.
+    /// Answer with `http_respond`, `http_body`… and `http_end`, or `http_fail`. `id` is the
+    /// connection's: the next request on it comes only after `http_end`.
     HttpRequest {
         id: u32,
         method: String,

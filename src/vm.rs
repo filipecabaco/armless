@@ -208,7 +208,13 @@ impl Board {
     /// random generator at once: without it, every restore of a snapshot would draw the same
     /// "random" numbers (UUIDs, keys, nonces) as the machine that was saved.
     pub fn seed(&self, entropy: &[u8]) {
-        self.with_net(|s, _| s.rng.seed(entropy));
+        self.with_net(|s, _| {
+            s.rng.seed(entropy);
+            // Session tickets from before (another copy of this snapshot) stop working
+            if let Some(t) = s.tls.as_mut() {
+                t.forget_tickets();
+            }
+        });
         let mut id = [0u8; 16];
         for (i, b) in entropy.iter().enumerate() {
             id[i % 16] ^= b.rotate_left((i / 16) as u32);
@@ -261,7 +267,7 @@ impl Board {
                 .ok_or_else(|| BootError::Fail(format!("{path}: not found")))?;
         match p.fs.read_all(ino) {
             Ok(v) => Ok(v),
-            Err(crate::dev::fs::Fail::Need(b)) => Err(BootError::Need(vec![b])),
+            Err(crate::dev::fs::Fail::Need(b)) => Err(BootError::Need(b)),
             Err(crate::dev::fs::Fail::Errno(e)) => {
                 Err(BootError::Fail(format!("{path}: error {e}")))
             },
