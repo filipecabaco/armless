@@ -4,8 +4,9 @@
 //! (`Event::HttpRequest`) or a WebSocket to open (`Event::WsOpen`) — whatever it can reach the
 //! outside with: a browser's fetch() and WebSocket, or a native HTTP client behind a proxy.
 //!
-//! One request per connection (responses say `connection: close` and end with the
-//! connection), streamed both ways.
+//! HTTP/1.1 connections stay open: requests are answered one after another (pipelined ones
+//! wait their turn), each response framed by the host's Content-Length or chunked. HTTP/1.0,
+//! `connection: close` and responses that can't be framed end with the connection.
 
 pub mod cert;
 pub mod tls;
@@ -118,6 +119,8 @@ fn hop_by_hop(name: &str) -> bool {
 struct Head {
     method: String,
     target: String,
+    /// HTTP/1.1 or later (anything else is HTTP/1.0)
+    http11: bool,
     headers: Vec<(String, String)>,
     body_start: usize,
 }
@@ -128,6 +131,14 @@ impl Head {
             .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The client wants the connection to stay open after this request.
+    fn keep_alive(&self) -> bool {
+        self.http11
+            && !self
+                .get("connection")
+                .is_some_and(|c| c.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
     }
 }
 
@@ -140,6 +151,10 @@ fn parse_head(b: &[u8]) -> Option<Result<Head, ()>> {
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
         return Some(Err(()));
     };
+    let http11 = parts
+        .next()
+        .and_then(|v| v.strip_prefix("HTTP/"))
+        .is_some_and(|v| v != "1.0" && v != "0.9");
     let mut headers = Vec::new();
     for line in lines {
         let Some((k, v)) = line.split_once(':') else {
@@ -150,13 +165,15 @@ fn parse_head(b: &[u8]) -> Option<Result<Head, ()>> {
     Some(Ok(Head {
         method: method.to_string(),
         target: target.to_string(),
+        http11,
         headers,
         body_start: end + 4,
     }))
 }
 
-/// The whole body once it is in: Ok(None) while it is still arriving.
-fn body(head: &Head, b: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+/// The whole body once it is in, and where the request ends: Ok(None) while it is still
+/// arriving.
+fn body(head: &Head, b: &[u8]) -> Result<Option<(Vec<u8>, usize)>, ()> {
     let body = &b[head.body_start..];
     if head
         .get("transfer-encoding")
@@ -173,7 +190,16 @@ fn body(head: &Head, b: &[u8]) -> Result<Option<Vec<u8>>, ()> {
                 .map_err(|_| ())?;
             let data = at + eol + 2;
             if size == 0 {
-                return Ok(Some(out));
+                // Trailers (ignored), then an empty line
+                let end = if body[data..].starts_with(b"\r\n") {
+                    data + 2
+                } else {
+                    match find(&body[data..], b"\r\n\r\n") {
+                        Some(e) => data + e + 4,
+                        None => return Ok(None),
+                    }
+                };
+                return Ok(Some((out, head.body_start + end)));
             }
             if body.len() < data + size + 2 {
                 return Ok(None);
@@ -186,7 +212,7 @@ fn body(head: &Head, b: &[u8]) -> Result<Option<Vec<u8>>, ()> {
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    Ok((body.len() >= n).then(|| body[..n].to_vec()))
+    Ok((body.len() >= n).then(|| (body[..n].to_vec(), head.body_start + n)))
 }
 
 fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
@@ -218,6 +244,18 @@ enum Phase {
     Done,
 }
 
+/// How the response body is delimited for the guest.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Framing {
+    /// No body (HEAD, 204, 304)
+    None,
+    /// Content-Length: what is left of it
+    Length(u64),
+    Chunked,
+    /// The body ends with the connection
+    Close,
+}
+
 /// What to do after a step.
 #[derive(Default)]
 pub struct Out {
@@ -238,6 +276,11 @@ pub struct Web {
     phase: Phase,
     buf: Vec<u8>,
     head_only: bool,
+    /// The connection stays open after this response
+    keep_alive: bool,
+    framing: Framing,
+    /// The guest has finished sending: no request after the ones buffered
+    guest_done: bool,
     ws_message: Vec<u8>,
     ws_text: bool,
     ws_key: String,
@@ -255,6 +298,9 @@ impl Web {
             phase: Phase::Request,
             buf: Vec::new(),
             head_only: false,
+            keep_alive: false,
+            framing: Framing::Close,
+            guest_done: false,
             ws_message: Vec::new(),
             ws_text: false,
             ws_key: String::new(),
@@ -267,6 +313,20 @@ impl Web {
         match &mut self.tls {
             Some(t) => t.send(data, &mut out.to_guest),
             None => out.to_guest.extend_from_slice(data),
+        }
+    }
+
+    /// The response is complete: on to the guest's next request, or close.
+    fn next(&mut self, out: &mut Out) {
+        if !self.keep_alive {
+            return self.finish(out);
+        }
+        self.phase = Phase::Request;
+        self.head_only = false;
+        self.continued = false;
+        self.request(out);
+        if self.phase == Phase::Request && self.guest_done {
+            self.finish(out);
         }
     }
 
@@ -321,6 +381,7 @@ impl Web {
     /// The guest closed its side.
     pub fn guest_eof(&mut self) -> Out {
         let mut out = Out::default();
+        self.guest_done = true;
         if matches!(
             self.phase,
             Phase::Request | Phase::WsOpening | Phase::WebSocket
@@ -350,6 +411,16 @@ impl Web {
     }
 
     fn request(&mut self, out: &mut Out) {
+        // Empty lines before a request are allowed (RFC 9112 2.2)
+        let blank = self
+            .buf
+            .iter()
+            .take_while(|&&b| b == b'\r' || b == b'\n')
+            .count();
+        self.buf.drain(..blank);
+        if self.buf.is_empty() {
+            return;
+        }
         let head = match parse_head(&self.buf) {
             None => {
                 if self.buf.len() > 1 << 16 {
@@ -415,8 +486,11 @@ impl Web {
             },
             Ok(Some(b)) => b,
         };
-        self.buf.clear();
+        let (body, end) = body;
+        // A pipelined request after this one waits in the buffer
+        self.buf.drain(..end);
         self.head_only = head.method.eq_ignore_ascii_case("HEAD");
+        self.keep_alive = head.keep_alive();
         let url = self.url(&head, if self.https { "https" } else { "http" });
         let headers = head
             .headers
@@ -436,13 +510,45 @@ impl Web {
 
     // ------------------------------------------------------------ host answers
 
-    /// The response's status and headers. Lengths and encodings of the transfer are ours
-    /// (the body is streamed and ends with the connection).
+    /// The response's status and headers. The transfer's framing is ours: the host's
+    /// Content-Length is kept when there is one (and no Transfer-Encoding), else the body is
+    /// chunked, or ends with the connection.
     pub fn respond(&mut self, status: u16, reason: &str, headers: &[(String, String)]) -> Out {
         let mut out = Out::default();
         if self.phase != Phase::Waiting {
             return out;
         }
+        let get = |name: &str| {
+            headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.trim())
+                .collect::<Vec<_>>()
+        };
+        // Any Transfer-Encoding overrides Content-Length, and conflicting lengths mean none
+        let lengths: Vec<Option<u64>> = get("content-length")
+            .iter()
+            .map(|v| v.parse().ok())
+            .collect();
+        let length = match (lengths.first(), get("transfer-encoding").is_empty()) {
+            (Some(&Some(n)), true) if lengths.iter().all(|&l| l == Some(n)) => Some(n),
+            _ => None,
+        };
+        let interim = (100..200).contains(&status);
+        let no_body = self.head_only || status == 204 || status == 304 || interim;
+        if interim {
+            // Only a final response can be followed by another
+            self.keep_alive = false;
+        }
+        self.framing = if no_body {
+            Framing::None
+        } else if !self.keep_alive {
+            Framing::Close
+        } else if let Some(n) = length {
+            Framing::Length(n)
+        } else {
+            Framing::Chunked
+        };
         let mut head = format!(
             "HTTP/1.1 {status} {}\r\n",
             if reason.is_empty() { "OK" } else { reason }
@@ -451,13 +557,33 @@ impl Web {
             let lk = k.to_ascii_lowercase();
             if matches!(
                 lk.as_str(),
-                "content-length" | "transfer-encoding" | "connection" | "keep-alive"
+                "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "keep-alive"
+                    | "proxy-connection"
+                    | "trailer"
+                    | "upgrade"
             ) {
                 continue;
             }
             head.push_str(&format!("{k}: {v}\r\n"));
         }
-        head.push_str("connection: close\r\n\r\n");
+        match self.framing {
+            // A HEAD response says how long the body would have been
+            Framing::None if self.head_only && status != 204 && status != 304 => {
+                if let Some(n) = length {
+                    head.push_str(&format!("content-length: {n}\r\n"));
+                }
+            },
+            Framing::Length(n) => head.push_str(&format!("content-length: {n}\r\n")),
+            Framing::Chunked => head.push_str("transfer-encoding: chunked\r\n"),
+            _ => {},
+        }
+        if !self.keep_alive {
+            head.push_str("connection: close\r\n");
+        }
+        head.push_str("\r\n");
         self.send(head.as_bytes(), &mut out);
         self.phase = Phase::Responding;
         out
@@ -465,16 +591,45 @@ impl Web {
 
     pub fn body(&mut self, data: &[u8]) -> Out {
         let mut out = Out::default();
-        if self.phase == Phase::Responding && !self.head_only {
-            self.send(data, &mut out);
+        if self.phase != Phase::Responding || data.is_empty() {
+            return out;
+        }
+        match self.framing {
+            Framing::None => {},
+            Framing::Close => self.send(data, &mut out),
+            Framing::Chunked => {
+                let mut chunk = format!("{:x}\r\n", data.len()).into_bytes();
+                chunk.extend_from_slice(data);
+                chunk.extend_from_slice(b"\r\n");
+                self.send(&chunk, &mut out);
+            },
+            Framing::Length(left) => {
+                let n = (data.len() as u64).min(left) as usize;
+                self.send(&data[..n], &mut out);
+                self.framing = Framing::Length(left - n as u64);
+                if n < data.len() {
+                    // More than the host said: the guest has what it was promised, and the
+                    // connection can't carry on
+                    self.finish(&mut out);
+                }
+            },
         }
         out
     }
 
     pub fn end(&mut self) -> Out {
         let mut out = Out::default();
-        if matches!(self.phase, Phase::Responding | Phase::Waiting) {
-            self.finish(&mut out);
+        match (self.phase, self.framing) {
+            // Less than the host said: the guest sees the connection end early
+            (Phase::Responding, Framing::Length(n)) if n > 0 => self.finish(&mut out),
+            (Phase::Responding, Framing::Close) => self.finish(&mut out),
+            (Phase::Responding, Framing::Chunked) => {
+                self.send(b"0\r\n\r\n", &mut out);
+                self.next(&mut out);
+            },
+            (Phase::Responding, _) => self.next(&mut out),
+            (Phase::Waiting, _) => self.finish(&mut out),
+            _ => {},
         }
         out
     }
