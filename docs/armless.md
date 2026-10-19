@@ -72,9 +72,13 @@ the site's CA, end inside the machine:
   an ECDSA P-256 certificate minted per SNI name, signed by the site's CA (`cert.rs`).
   The guest trusts that CA. There is no resumption and no HelloRetryRequest. Every
   current OpenSSL, Node, Python, Go, Rust and Java client offers what it needs.
-- **HTTP/1.1** inside (`mod.rs`) takes one request per connection: Content-Length or
-  chunked bodies, `Expect: 100-continue`. Responses are streamed and end with the
-  connection.
+- **HTTP/1.1** inside (`mod.rs`) keeps connections open: Content-Length or chunked
+  bodies, `Expect: 100-continue`, and requests answered one at a time (a pipelined one
+  waits in the buffer, and is a new `HttpRequest` once the response before it ends).
+  Responses are streamed with the host's Content-Length, or chunked when it gave none
+  (fetch() never does); a host that sends less, or more, than it said closes the
+  connection. HTTP/1.0 and `connection: close` requests get a response that ends with
+  the connection, as does a guest that has finished sending, after its last request.
 - **WebSocket upgrades** become `WsOpen` and the frames become messages. Pings are
   answered in the machine.
 
