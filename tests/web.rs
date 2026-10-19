@@ -16,6 +16,13 @@ fn client(
     host: &str,
     groups: Option<&'static dyn rustls::crypto::SupportedKxGroup>,
 ) -> rustls::ClientConnection {
+    rustls::ClientConnection::new(config(groups), host.to_string().try_into().unwrap()).unwrap()
+}
+
+/// A client configuration; its connections share a session cache (for resumption).
+fn config(
+    groups: Option<&'static dyn rustls::crypto::SupportedKxGroup>,
+) -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(
@@ -31,7 +38,7 @@ fn client(
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    rustls::ClientConnection::new(Arc::new(config), host.to_string().try_into().unwrap()).unwrap()
+    Arc::new(config)
 }
 
 struct Pair {
@@ -53,6 +60,24 @@ impl Pair {
             web: Web::new(1, true, host.into()),
             keys: keys(),
             rng,
+            events: Vec::new(),
+            plain: Vec::new(),
+            closed: false,
+        }
+    }
+
+    /// Another connection to the same relay (its keys and randomness) from a client of
+    /// `config`.
+    fn next(self, config: &Arc<rustls::ClientConfig>, host: &str) -> Pair {
+        Pair {
+            client: rustls::ClientConnection::new(
+                config.clone(),
+                host.to_string().try_into().unwrap(),
+            )
+            .unwrap(),
+            web: Web::new(2, true, host.into()),
+            keys: self.keys,
+            rng: self.rng,
             events: Vec::new(),
             plain: Vec::new(),
             closed: false,
@@ -528,4 +553,210 @@ fn https_keep_alive() {
         assert!(text.ends_with("\r\n0\r\n\r\n"));
         assert!(!p.closed, "request {i} closed the connection");
     }
+}
+
+// ------------------------------------------------------------ resumption
+
+/// A request over the pair's connection, answered: the handshake is done after it.
+fn exchange(p: &mut Pair, path: &str) {
+    p.client
+        .writer()
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n").as_bytes())
+        .unwrap();
+    p.pump();
+    assert!(!p.client.is_handshaking());
+    let Some(Event::HttpRequest { url, .. }) = p.events.pop() else {
+        panic!("no request: {:?}", p.events)
+    };
+    assert_eq!(url, format!("https://example.com{path}"));
+    p.plain.clear();
+    let out = p
+        .web
+        .respond(200, "OK", &[("Content-Length".into(), "2".into())]);
+    p.take(out);
+    let out = p.web.body(b"ok");
+    p.take(out);
+    let out = p.web.end();
+    p.take(out);
+    assert!(
+        p.plain.ends_with(b"\r\n\r\nok"),
+        "{}",
+        String::from_utf8_lossy(&p.plain)
+    );
+    assert!(!p.closed);
+}
+
+/// A first connection that got a ticket, and the ClientHello the client resumes it with.
+fn ticketed() -> (Arc<rustls::ClientConfig>, Pair) {
+    let config = config(None);
+    let mut p = Pair::new("example.com", None);
+    p.client =
+        rustls::ClientConnection::new(config.clone(), "example.com".try_into().unwrap()).unwrap();
+    exchange(&mut p, "/first");
+    assert_eq!(p.client.handshake_kind(), Some(rustls::HandshakeKind::Full));
+    (config, p)
+}
+
+#[test]
+fn resumption_with_a_ticket() {
+    for group in [
+        rustls::crypto::ring::kx_group::X25519,
+        rustls::crypto::ring::kx_group::SECP256R1,
+    ] {
+        let config = config(Some(group));
+        let mut p = Pair::new("example.com", None);
+        p.client = rustls::ClientConnection::new(config.clone(), "example.com".try_into().unwrap())
+            .unwrap();
+        exchange(&mut p, "/first");
+        // The ticket from that connection, on a new one: no certificate, a fresh key exchange
+        for i in 0..2 {
+            let mut q = p.next(&config, "example.com");
+            exchange(&mut q, &format!("/again{i}"));
+            assert_eq!(
+                q.client.handshake_kind(),
+                Some(rustls::HandshakeKind::Resumed)
+            );
+            p = q;
+        }
+    }
+}
+
+/// A session cache that offers every name the same tickets (rustls itself keeps them per name).
+#[derive(Debug)]
+struct OneName(rustls::client::ClientSessionMemoryCache);
+
+type Name<'a> = rustls::pki_types::ServerName<'a>;
+
+fn one() -> Name<'static> {
+    "one.test".try_into().unwrap()
+}
+
+impl rustls::client::ClientSessionStore for OneName {
+    fn set_kx_hint(&self, _: Name<'static>, group: rustls::NamedGroup) {
+        self.0.set_kx_hint(one(), group)
+    }
+    fn kx_hint(&self, _: &Name<'_>) -> Option<rustls::NamedGroup> {
+        self.0.kx_hint(&one())
+    }
+    fn set_tls12_session(&self, _: Name<'static>, v: rustls::client::Tls12ClientSessionValue) {
+        self.0.set_tls12_session(one(), v)
+    }
+    fn tls12_session(&self, _: &Name<'_>) -> Option<rustls::client::Tls12ClientSessionValue> {
+        self.0.tls12_session(&one())
+    }
+    fn remove_tls12_session(&self, _: &Name<'static>) {
+        self.0.remove_tls12_session(&one())
+    }
+    fn insert_tls13_ticket(&self, _: Name<'static>, v: rustls::client::Tls13ClientSessionValue) {
+        self.0.insert_tls13_ticket(one(), v)
+    }
+    fn take_tls13_ticket(
+        &self,
+        _: &Name<'static>,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        self.0.take_tls13_ticket(&one())
+    }
+}
+
+#[test]
+fn tickets_are_bound_to_their_name() {
+    let mut c = (*config(None)).clone();
+    c.resumption = rustls::client::Resumption::store(Arc::new(OneName(
+        rustls::client::ClientSessionMemoryCache::new(256),
+    )));
+    let config = Arc::new(c);
+    let mut p = Pair::new("example.com", None);
+    p.client =
+        rustls::ClientConnection::new(config.clone(), "example.com".try_into().unwrap()).unwrap();
+    exchange(&mut p, "/first");
+    // The client offers example.com's ticket to another name: refused, a full handshake
+    let mut q = p.next(&config, "other.example.com");
+    q.client
+        .writer()
+        .write_all(b"GET / HTTP/1.1\r\nHost: other.example.com\r\n\r\n")
+        .unwrap();
+    q.pump();
+    assert!(!q.client.is_handshaking());
+    assert!(matches!(q.events.pop(), Some(Event::HttpRequest { .. })));
+    assert_eq!(q.client.handshake_kind(), Some(rustls::HandshakeKind::Full));
+    // The same store does resume when the name matches
+    let mut r = q.next(&config, "other.example.com");
+    r.client
+        .writer()
+        .write_all(b"GET / HTTP/1.1\r\nHost: other.example.com\r\n\r\n")
+        .unwrap();
+    r.pump();
+    assert_eq!(
+        r.client.handshake_kind(),
+        Some(rustls::HandshakeKind::Resumed)
+    );
+}
+
+#[test]
+fn tickets_from_before_a_reseed_mean_a_full_handshake() {
+    let (config, mut p) = ticketed();
+    // What Board::seed does after a restore
+    p.rng.seed(b"restored");
+    p.keys.forget_tickets();
+    let mut q = p.next(&config, "example.com");
+    exchange(&mut q, "/after-restore");
+    assert_eq!(q.client.handshake_kind(), Some(rustls::HandshakeKind::Full));
+    // And that connection's own ticket resumes
+    let mut r = q.next(&config, "example.com");
+    exchange(&mut r, "/resumed");
+    assert_eq!(
+        r.client.handshake_kind(),
+        Some(rustls::HandshakeKind::Resumed)
+    );
+}
+
+#[test]
+fn expired_tickets_mean_a_full_handshake() {
+    let (config, mut p) = ticketed();
+    // A day (the ticket's lifetime) and a moment later on the machine's clock
+    p.keys.now_ms += 86_400_000 + 1;
+    let mut q = p.next(&config, "example.com");
+    exchange(&mut q, "/later");
+    assert_eq!(q.client.handshake_kind(), Some(rustls::HandshakeKind::Full));
+}
+
+/// The resuming ClientHello record, and the relay it goes to.
+fn resuming_hello() -> (Vec<u8>, Pair) {
+    let (config, p) = ticketed();
+    let mut q = p.next(&config, "example.com");
+    let mut wire = Vec::new();
+    while q.client.wants_write() {
+        q.client.write_tls(&mut wire).unwrap();
+    }
+    // One record; pre_shared_key is the last extension: ... ticket, age(4), binders(2+1+32)
+    assert_eq!(wire[0], 22);
+    assert_eq!(
+        wire.len(),
+        5 + u16::from_be_bytes([wire[3], wire[4]]) as usize
+    );
+    assert_eq!(&wire[wire.len() - 35..wire.len() - 32], &[0, 33, 32]);
+    (wire, q)
+}
+
+#[test]
+fn a_wrong_binder_fails_the_handshake() {
+    let (mut wire, mut q) = resuming_hello();
+    let last = wire.len() - 1;
+    wire[last] ^= 1;
+    let out = q.web.from_guest(&wire, Some(&mut q.keys), &mut q.rng);
+    assert!(out.close);
+    assert!(out.events.is_empty());
+    // An alert (decrypt_error), not a ServerHello
+    assert_eq!(out.to_guest, [21, 3, 3, 0, 2, 2, 51]);
+}
+
+#[test]
+fn an_unknown_ticket_means_a_full_handshake() {
+    let (mut wire, mut q) = resuming_hello();
+    // The ticket's last byte (its AEAD tag), before the age and the binders
+    let at = wire.len() - 35 - 4 - 1;
+    wire[at] ^= 1;
+    let out = q.web.from_guest(&wire, Some(&mut q.keys), &mut q.rng);
+    assert!(!out.close);
+    assert_eq!(out.to_guest[0], 22, "a ServerHello");
 }
