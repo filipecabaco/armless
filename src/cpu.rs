@@ -1279,6 +1279,78 @@ impl<H: Host> Cpu<H> {
         })
     }
 
+    /// Atomic load of guest RAM at an aligned physical address that lies in RAM.
+    fn ram_load_atomic(&self, pa: u64, size: u32) -> u64 {
+        use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+        let p = unsafe { self.mem.as_mut_ptr().add(pa as usize) };
+        let o = Ordering::SeqCst;
+        unsafe {
+            match size {
+                1 => AtomicU8::from_ptr(p).load(o) as u64,
+                2 => AtomicU16::from_ptr(p as *mut u16).load(o) as u64,
+                4 => AtomicU32::from_ptr(p as *mut u32).load(o) as u64,
+                _ => AtomicU64::from_ptr(p as *mut u64).load(o),
+            }
+        }
+    }
+
+    /// An atomic read-modify-write of `size` bytes at `va` (the LSE instructions): `f` maps the
+    /// old value to the new one, or to None to leave memory as it is (a CAS whose compare fails).
+    /// Returns the old value. Unaligned addresses take an alignment fault; the access needs
+    /// write permission even if nothing is written.
+    pub(crate) fn atomic_rmw(
+        &mut self,
+        va: u64,
+        size: u32,
+        f: impl Fn(u64) -> Option<u64>,
+    ) -> Res<u64> {
+        if !va.is_multiple_of(size as u64) {
+            return Err(self.alignment_fault(va));
+        }
+        let pa = self.translate(va, crate::mmu::Access::Write, false)?;
+        if self.machine.ncpus > 1 && pa + size as u64 <= self.mem.len() as u64 {
+            // Several CPUs: compare-and-swap until no other CPU got in between.
+            let mut old = self.ram_load_atomic(pa, size);
+            loop {
+                let Some(new) = f(old) else {
+                    return Ok(old);
+                };
+                if self.ram_cmpxchg(pa, size, old, new) == Some(true) {
+                    break;
+                }
+                old = self.ram_load_atomic(pa, size);
+            }
+            if self
+                .jit
+                .code_page
+                .get((pa >> 12) as usize)
+                .is_some_and(|&b| b != 0)
+            {
+                self.jit.invalidate_page((pa >> 12) as usize);
+            }
+            if self.excl().is_some_and(|e| e & !0x3f == pa & !0x3f) {
+                self.set_excl(None);
+            }
+            return Ok(old);
+        }
+        // One CPU, or not RAM: an ordinary read and write.
+        let old = self.read(va, size, false)?;
+        if let Some(new) = f(old) {
+            self.write(va, size, new, false)?;
+        }
+        Ok(old)
+    }
+
+    /// The Data Abort for an unaligned atomic access.
+    pub(crate) fn alignment_fault(&self, va: u64) -> Event {
+        Event::Sync {
+            ec: if self.el == 0 { ec::DABT_LOW } else { ec::DABT_CUR },
+            iss: 0x21 | (1 << 6),
+            far: Some(va),
+            ret_next: false,
+        }
+    }
+
     /// Virtual read of `size` bytes with the current (or EL0, if `unpriv`) permissions.
     #[inline(always)]
     pub fn read(&mut self, va: u64, size: u32, unpriv: bool) -> Res<u64> {

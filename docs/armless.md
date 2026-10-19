@@ -25,7 +25,7 @@ config, notifications) and a legacy INTx line. The device tree marks the bus
 
 | | |
 |---|---|
-| `cpu.rs`, `a64.rs`, `advsimd.rs`, `fp.rs`, `simd*.rs`, `mmu.rs`, `sysreg.rs` | the CPU |
+| `cpu.rs`, `a64.rs`, `advsimd.rs`, `crypto.rs`, `fp.rs`, `simd*.rs`, `mmu.rs`, `sysreg.rs` | the CPU |
 | `jit/` | page-at-a-time translation to WebAssembly modules (wasm builds only) |
 | `gic.rs`, `rtc.rs`, `smp.rs` | shared machine state, multi-CPU GIC, PSCI, TLB shootdowns |
 | `dev/` | UART, PCI, virtio transport, console, 9p + filesystem, net + network stack |
@@ -128,6 +128,12 @@ touches them, under one lock: a vCPU doing MMIO, or the host delivering input. I
 CPUs sleep on a wake counter (`Atomics.wait` in workers) until their timer expires
 or something kicks them. Device DMA into a page holding translated code invalidates
 that code on every CPU (`Machine::code_pages`).
+
+With several CPUs, a store-exclusive succeeds if memory still holds what its load-exclusive
+read (a host compare-and-swap, as QEMU does), and the LSE atomics (CAS, SWP, LDADD...) are host
+compare-and-swap loops on guest RAM, so both are atomic against every other CPU. 128-bit pairs
+(STXP, CASP of X registers) are updated under one machine-wide lock. Unaligned atomics take an
+alignment fault; the JIT leaves atomics and the crypto instructions to the interpreter.
 
 For a snapshot every CPU is paused between instruction slices. A paused CPU counts
 as idle, so a running CPU waiting for TLB acknowledgements does not wait for it.

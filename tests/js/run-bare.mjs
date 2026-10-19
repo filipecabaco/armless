@@ -3,7 +3,7 @@
 // serial port on stdout. Runs the self-test guest and the differential tests
 // through WebAssembly, with or without the JIT.
 //
-//   node tests/js/run-bare.mjs BINARY [-m MB] [--jit-threshold N] [--jit-sync] [--no-jit] [--stats]
+//   node tests/js/run-bare.mjs BINARY [-m MB] [--jit-threshold N] [--jit-sync] [--no-jit] [--stats] [--cpus N]
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -20,12 +20,15 @@ const jit_sync = flag("--jit-sync");
 const stats = flag("--stats");
 const jit_threshold = Number(opt("--jit-threshold", "64"));
 const memory_mb = Number(opt("-m", "64"));
+const cpus = Number(opt("--cpus", "1"));
 const [binary] = args;
 
 const t0 = performance.now();
 const vm = new Armless({
   wasm: path.join(root, "build/armless.wasm"),
+  wasm_smp: path.join(root, "build/armless-smp.wasm"),
   memory_mb,
+  cpus,
   console: false,
   jit: !no_jit,
   jit_threshold,

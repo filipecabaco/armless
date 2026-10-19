@@ -604,7 +604,8 @@ impl<H: Host> Cpu<H> {
             sr::ID_AA64PFR0_EL1 => id::AA64PFR0,
             sr::ID_AA64MMFR0_EL1 => id::AA64MMFR0,
             sr::ID_AA64DFR0_EL1 => id::AA64DFR0,
-            sr::ID_AA64ISAR0_EL1 | sr::ID_AA64MMFR1_EL1 | sr::ID_AA64MMFR2_EL1 => 0,
+            sr::ID_AA64ISAR0_EL1 => id::AA64ISAR0,
+            sr::ID_AA64MMFR1_EL1 | sr::ID_AA64MMFR2_EL1 => 0,
             // With several CPUs DIC is 0: software must invalidate the
             // instruction cache after writing code, which tells other CPUs' JIT.
             sr::CTR_EL0 => {
@@ -853,10 +854,95 @@ impl<H: Host> Cpu<H> {
             self.ldst_imm9(insn)
         } else if field(insn, 10, 2) == 2 {
             self.ldst_regoff(insn)
+        } else if field(insn, 10, 2) == 0 {
+            self.atomic_memop(insn)
         } else {
-            // Atomic memory operations (LSE): not advertised.
-            Err(Event::undefined())
+            Err(Event::undefined()) // LDRAA/LDRAB (pointer authentication)
         }
+    }
+
+    /// LDADD, LDCLR, LDEOR, LDSET, LD{S,U}{MAX,MIN} and SWP (LSE), with their acquire and
+    /// release forms; ST<op> is LD<op> with XZR as the destination.
+    fn atomic_memop(&mut self, insn: u32) -> Res<()> {
+        let bytes = 1u32 << field(insn, 30, 2);
+        let o3 = bit(insn, 15);
+        let opc = field(insn, 12, 3);
+        let rs = field(insn, 16, 5);
+        let rt = insn & 31;
+        if o3 && opc != 0 {
+            return Err(Event::undefined()); // LDAPR (RCpc) and unallocated
+        }
+        let bits = bytes * 8;
+        let mask = crate::bits::ones(bits);
+        let v = self.xr(rs) & mask;
+        let addr = self.xs(field(insn, 5, 5));
+        let s = |x: u64| sext(x, bits);
+        let old = self.atomic_rmw(addr, bytes, |old| {
+            Some(match (o3, opc) {
+                (true, _) => v,
+                (_, 0) => old.wrapping_add(v) & mask,
+                (_, 1) => old & !v,
+                (_, 2) => old ^ v,
+                (_, 3) => old | v,
+                (_, 4) => s(old).max(s(v)) as u64 & mask,
+                (_, 5) => s(old).min(s(v)) as u64 & mask,
+                (_, 6) => old.max(v),
+                _ => old.min(v),
+            })
+        })?;
+        self.wr(rt, old);
+        Ok(())
+    }
+
+    /// CAS, CASA, CASL, CASAL (and the B and H forms).
+    fn cas(&mut self, insn: u32) -> Res<()> {
+        let bytes = 1u32 << field(insn, 30, 2);
+        let rs = field(insn, 16, 5);
+        let rt = insn & 31;
+        let mask = crate::bits::ones(bytes * 8);
+        let (cmp, new) = (self.xr(rs) & mask, self.xr(rt) & mask);
+        let addr = self.xs(field(insn, 5, 5));
+        let old = self.atomic_rmw(addr, bytes, |old| (old == cmp).then_some(new))?;
+        self.wr(rs, old);
+        Ok(())
+    }
+
+    /// CASP, CASPA, CASPL, CASPAL: a pair of even/odd registers.
+    fn casp(&mut self, insn: u32) -> Res<()> {
+        let wide = bit(insn, 30);
+        let rs = field(insn, 16, 5);
+        let rt = insn & 31;
+        if rs & 1 != 0 || rt & 1 != 0 {
+            return Err(Event::undefined());
+        }
+        let addr = self.xs(field(insn, 5, 5));
+        if !wide {
+            // Two words: one 64-bit compare-and-swap, the first register at the lower address.
+            let pair = |r: u32, cpu: &Self| (cpu.xr(r) as u32 as u64) | (cpu.xr(r + 1) << 32);
+            let (cmp, new) = (pair(rs, self), pair(rt, self));
+            let old = self.atomic_rmw(addr, 8, |old| (old == cmp).then_some(new))?;
+            self.wr(rs, old as u32 as u64);
+            self.wr(rs + 1, old >> 32);
+            return Ok(());
+        }
+        if !addr.is_multiple_of(16) {
+            return Err(self.alignment_fault(addr));
+        }
+        self.translate(addr, crate::mmu::Access::Write, false)?;
+        let (c1, c2) = (self.xr(rs), self.xr(rs + 1));
+        let (n1, n2) = (self.xr(rt), self.xr(rt + 1));
+        // No 128-bit atomics: like STXP, pairs are updated under a machine-wide lock.
+        let m = self.machine.clone();
+        let _guard = (m.ncpus > 1).then(|| m.pair_lock.lock());
+        let second = addr.wrapping_add(8);
+        let (a, b) = (self.read(addr, 8, false)?, self.read(second, 8, false)?);
+        if a == c1 && b == c2 {
+            self.write(addr, 8, n1, false)?;
+            self.write(second, 8, n2, false)?;
+        }
+        self.wr(rs, a);
+        self.wr(rs + 1, b);
+        Ok(())
     }
 
     /// LDR/STR (unsigned scaled 12-bit offset)
@@ -960,6 +1046,10 @@ impl<H: Host> Cpu<H> {
         let rn = field(insn, 5, 5);
         let rt = insn & 31;
         let bytes = 1u32 << size_log;
+        if o1 && rt2 == 31 && (o2 || size_log < 2) {
+            // LSE compare-and-swap: CAS (o2), CASP (sizes 0 and 1, which LDXP/STXP don't use)
+            return if o2 { self.cas(insn) } else { self.casp(insn) };
+        }
         let addr = self.xs(rn);
         // LDAR/STLR: Rs and Rt2 must be all ones (UNDEFINED otherwise, as in QEMU).
         if o2 && (rs != 31 || rt2 != 31) {
@@ -967,7 +1057,7 @@ impl<H: Host> Cpu<H> {
         }
         if o2 {
             if o1 || !bit(insn, 15) {
-                // CAS family (LSE) and LDLAR/STLLR (LORegions): not in ARMv8.0.
+                // LDLAR/STLLR (LORegions): not implemented.
                 return Err(Event::undefined());
             }
             // LDAR/STLR: ordinary accesses on a single core; with several, a
@@ -1296,8 +1386,20 @@ impl<H: Host> Cpu<H> {
         if bit(insn, 29) {
             return Err(Event::undefined());
         }
+        let opcode = field(insn, 10, 6);
+        if opcode & 0b111000 == 0b010000 {
+            // CRC32{B,H,W,X}, CRC32C{B,H,W,X}: only the X forms are 64-bit
+            let sz = opcode & 3;
+            if sf != (sz == 3) {
+                return Err(Event::undefined());
+            }
+            let acc = self.xr(rn) as u32;
+            let r = crate::crypto::crc32(acc, self.xr(rm), 1 << sz, opcode & 4 != 0);
+            self.wr(rd, r as u64);
+            return Ok(());
+        }
         let (a, b) = (self.xr(rn), self.xr(rm));
-        let r = match field(insn, 10, 6) {
+        let r = match opcode {
             0b000010 => {
                 if sf {
                     a.checked_div(b).unwrap_or(0)

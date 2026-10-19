@@ -1,8 +1,10 @@
-//! Advanced SIMD (vector and scalar forms), ARMv8.0 without crypto/FP16.
+//! Advanced SIMD (vector and scalar forms), ARMv8.0 with the Cryptographic Extension, without
+//! FP16.
 
 use crate::bits::{bit, field, ones};
 use crate::board::Host;
 use crate::cpu::{Cpu, Event, Res};
+use crate::crypto;
 use crate::fp::{self, Float, Fpst, Round};
 use crate::simd::{elem, set_elem, vfp_expand_imm};
 
@@ -107,8 +109,13 @@ impl<H: Host> Cpu<H> {
                         self.across(insn)
                     }
                 },
-                _ => Err(Event::undefined()), // crypto and later extensions
+                0b0100 if insn & 0xfffe_0c00 == 0x4e28_0800 => self.crypto_aes(insn),
+                0b0100 if insn & 0xfffe_0c00 == 0x5e28_0800 => self.crypto_sha2(insn),
+                _ => Err(Event::undefined()), // later extensions
             };
+        }
+        if insn & 0xffe0_8c00 == 0x5e00_0000 {
+            return self.crypto_sha3(insn);
         }
         if insn & 0x9fe0_8400 == 0x0e00_0400 || insn & 0xdfe0_8400 == 0x5e00_0400 {
             return self.copy(insn, scalar);
@@ -126,6 +133,48 @@ impl<H: Host> Cpu<H> {
             return self.tbl(insn);
         }
         Err(Event::undefined())
+    }
+
+    /// AESE, AESD, AESMC, AESIMC.
+    fn crypto_aes(&mut self, insn: u32) -> Res<()> {
+        let (rd, rn) = (insn & 31, field(insn, 5, 5));
+        let (d, n) = (self.v(rd), self.v(rn));
+        self.vreg[rd as usize] = match field(insn, 12, 5) {
+            0b00100 => crypto::aese(d, n),
+            0b00101 => crypto::aesd(d, n),
+            0b00110 => crypto::aesmc(n),
+            0b00111 => crypto::aesimc(n),
+            _ => return Err(Event::undefined()),
+        };
+        Ok(())
+    }
+
+    /// SHA1H, SHA1SU1, SHA256SU0.
+    fn crypto_sha2(&mut self, insn: u32) -> Res<()> {
+        let (rd, rn) = (insn & 31, field(insn, 5, 5));
+        let (d, n) = (self.v(rd), self.v(rn));
+        self.vreg[rd as usize] = match field(insn, 12, 5) {
+            0b00000 => crypto::sha1h(n as u32) as u128,
+            0b00001 => crypto::sha1su1(d, n),
+            0b00010 => crypto::sha256su0(d, n),
+            _ => return Err(Event::undefined()),
+        };
+        Ok(())
+    }
+
+    /// SHA1C, SHA1P, SHA1M, SHA1SU0, SHA256H, SHA256H2, SHA256SU1.
+    fn crypto_sha3(&mut self, insn: u32) -> Res<()> {
+        let (rd, rn, rm) = (insn & 31, field(insn, 5, 5), field(insn, 16, 5));
+        let (d, n, m) = (self.v(rd), self.v(rn), self.v(rm));
+        self.vreg[rd as usize] = match field(insn, 12, 3) {
+            op @ 0..=2 => crypto::sha1_rounds(op, d, n as u32, m),
+            3 => crypto::sha1su0(d, n, m),
+            4 => crypto::sha256_hash(d, n, m, true),
+            5 => crypto::sha256_hash(n, d, m, false),
+            6 => crypto::sha256su1(d, n, m),
+            _ => return Err(Event::undefined()),
+        };
+        Ok(())
     }
 
     #[inline(always)]
@@ -479,7 +528,14 @@ impl<H: Host> Cpu<H> {
         let (rd, rn, rm) = (insn & 31, field(insn, 5, 5), field(insn, 16, 5));
         let opcode = field(insn, 12, 4);
         if size == 3 {
-            return Err(Event::undefined());
+            if opcode != 0b1110 || u || scalar {
+                return Err(Event::undefined());
+            }
+            // PMULL/PMULL2 (1Q), from the Cryptographic Extension
+            let half = if q { 64 } else { 0 };
+            let (a, b) = ((self.v(rn) >> half) as u64, (self.v(rm) >> half) as u64);
+            self.vreg[rd as usize] = poly_mul(a, b, 64);
+            return Ok(());
         }
         let esize = 8u32 << size;
         let wsize = esize * 2;
