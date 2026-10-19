@@ -11,6 +11,8 @@ import sys
 import io
 import importlib
 
+import cdc
+
 # keep in sync with HASH_LENGTH in fs2json.py
 HASH_LENGTH = 10
 
@@ -59,6 +61,7 @@ def main():
     args.add_argument("from_path", metavar="from", help="from")
     args.add_argument("to_path", metavar="to", help="to")
     args.add_argument("--zstd", action="store_true", help="Use Zstandard compression")
+    cdc.add_args(args)
 
     args = args.parse_args()
 
@@ -77,11 +80,28 @@ def main():
         tar = None
 
     if tar:
-        handle_tar(logger, tar, to_path, args.zstd, zstd_module)
+        handle_tar(logger, tar, to_path, args, zstd_module)
     else:
-        handle_dir(logger, from_path, to_path, args.zstd, zstd_module)
+        handle_dir(logger, from_path, to_path, args, zstd_module)
 
-def handle_dir(logger, from_path: str, to_path: str, use_compression: bool, zstd_module):
+def copy_chunks(logger, f, to_path: str, use_compression: bool, zstd_module, what: str):
+    """Write each chunk of an open file as its own blob (as fs2json.py names them)."""
+    for c in cdc.chunks(f.read()):
+        file_hash = hashlib.sha256(c).hexdigest()
+        filename = file_hash[0:HASH_LENGTH] + (".bin.zst" if use_compression else ".bin")
+        to_abs = os.path.join(to_path, filename)
+        if os.path.exists(to_abs):
+            logger.info("Exists, skipped {} (chunk of {})".format(to_abs, what))
+        elif use_compression:
+            logger.info("Compressing chunk of {} {}".format(what, to_abs))
+            zstd_module.compress(io.BytesIO(c), to_abs)
+        else:
+            logger.info("Chunk of {} {}".format(what, to_abs))
+            with open(to_abs, "wb") as out:
+                out.write(c)
+
+def handle_dir(logger, from_path: str, to_path: str, args, zstd_module):
+    use_compression = args.zstd
     def onerror(oserror):
         logger.warning(oserror)
 
@@ -99,6 +119,11 @@ def handle_dir(logger, from_path: str, to_path: str, use_compression: bool, zstd
             if stat.S_ISLNK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode) or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
                 continue
 
+            if cdc.split(args, st.st_size):
+                with open(absname, "rb") as f:
+                    copy_chunks(logger, f, to_path, use_compression, zstd_module, absname)
+                continue
+
             file_hash = hash_file(absname)
             filename = file_hash[0:HASH_LENGTH] + (".bin.zst" if use_compression else ".bin")
             to_abs = os.path.join(to_path, filename)
@@ -113,10 +138,17 @@ def handle_dir(logger, from_path: str, to_path: str, use_compression: bool, zstd
                     logger.info("cp {} {}".format(absname, to_abs))
                     shutil.copyfile(absname, to_abs)
 
-def handle_tar(logger, tar, to_path: str, use_compression: bool, zstd_module):
+def handle_tar(logger, tar, to_path: str, args, zstd_module):
+    use_compression = args.zstd
     for member in tar.getmembers():
         if member.isfile() or member.islnk():
             f = tar.extractfile(member)
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(0)
+            if cdc.split(args, size):
+                copy_chunks(logger, f, to_path, use_compression, zstd_module, member.name)
+                continue
             file_hash = hash_fileobj(f)
             filename = file_hash[0:HASH_LENGTH] + (".bin.zst" if use_compression else ".bin")
             to_abs = os.path.join(to_path, filename)

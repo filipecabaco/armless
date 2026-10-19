@@ -53,8 +53,25 @@ Input goes through `console_input`, `console_resize` and `serial_input`. Console
 input is queued until the guest posts receive buffers, so nothing is dropped.
 
 A 9p request that needs a blob that hasn't arrived waits (its descriptor chain is
-held) and is answered when the blob arrives. Fetched blobs are cached up to
-256 MiB, oldest evicted first.
+held) and is answered when the blobs it needs have all arrived. Fetched blobs are
+cached up to 256 MiB, oldest evicted first, except the chunks a waiting read covers.
+
+## The filesystem
+
+`filesystem.json` is v86's format 3: `fsroot` lists `[name, size, mtime, mode, uid,
+gid, target]`, where `target` is a directory's children, a symlink's target, or a
+regular file's blob. A file can instead be in chunks, `[[blob, length], ...]`, whose
+lengths add up to `size`:
+
+```json
+["big.bin", 8388608, 0, 33188, 0, 0, [["0e2c9a7d41.bin.zst", 878612], ["...", 7509996]]]
+```
+
+A read fetches only the chunks it covers, and a write copies only the chunks it
+touches into memory (truncating keeps a prefix of a chunk without fetching it).
+Chunks are plain blobs to the host, so identical chunks are shared across files and
+images. `tests/fs/cdc.py` cuts them where the contents say (a gear hash, 256 KiB to
+4 MiB, about 1 MiB), so an insertion only changes the chunks around it.
 
 ## The network
 
@@ -137,7 +154,8 @@ as idle, so a running CPU waiting for TLB acknowledgements does not wait for it.
 ```text
 "ARMLESS\x03"  u64 RAM size  u32 CPUs  u64 meta length
 meta: CPUs, GIC, timers, RTC (state.rs), then the devices (UART, PCI functions,
-      virtio queues, console, the filesystem tree with files the guest wrote,
+      virtio queues, console, the filesystem tree with files the guest wrote
+      (of a chunked file, only the chunks it wrote),
       open 9p fids, waiting requests, network names), then tagged extensions
       (u32 tag + data; "P9OW": who each 9p fid belongs to, "VGID": the VM generation ID)
 RAM:  (u32 page, 4096 bytes) for every non-zero page, then u32 0xffffffff
@@ -145,6 +163,8 @@ RAM:  (u32 page, 4096 bytes) for every non-zero page, then u32 0xffffffff
 
 `StateLoader` streams this, zstd-compressed or not, straight into guest memory.
 Blobs are not saved; the guest's unmodified files are fetched again after a restore.
+Chunked files are a new content kind in the tree, so older armless can't load a snapshot
+that has one; snapshots without them are unchanged.
 Extensions go after the devices, so snapshots without them still load (9p fids then
 belong to root, as they used to).
 

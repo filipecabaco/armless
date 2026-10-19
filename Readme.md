@@ -11,7 +11,7 @@ natively. It is written in Rust:
   - a PL031 RTC and a 16550 UART (`ttyS0`);
   - virtio-console (`hvc0`, with the terminal size);
   - a 9p root filesystem built from content-addressed blobs that are fetched on
-    first read;
+    first read (large files in chunks: a read fetches only what it covers);
   - virtio-net with a user-mode network. DHCP, DNS and ping are answered
     locally.
   - a web relay inside the machine. HTTP and HTTPS (ports 80 and 443; HTTPS is
@@ -135,7 +135,9 @@ The wasm builds need clang and lld (for the C zstd decoder in `lib/zstd`).
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
 
 `tests/fs/make-9pfs.sh` builds the test filesystem, and `tests/fs/alpine/` builds
-a real Alpine image. See `docs/armless.md` for the design.
+a real Alpine image. `tests/fs/fs2json.py` and `copy-to-sha256.py` split files of 2 MiB
+and more into chunks (`--chunk-threshold`); `--no-chunks` makes images for armless 0.2.10
+and older. See `docs/armless.md` for the design.
 
 armless started as a fork of [v86](https://github.com/copy/v86). The v86-based
 version is kept on the `v86-fork` branch.

@@ -15,6 +15,8 @@ import logging
 import hashlib
 import tarfile
 
+import cdc
+
 VERSION = 3
 
 IDX_NAME = 0
@@ -26,7 +28,7 @@ IDX_GID = 5
 
 # target for symbolic links
 # child nodes for directories
-# filename for files
+# filename for files, or [[filename, length], ...] for a file in chunks
 IDX_TARGET = 6
 IDX_FILENAME = 6
 
@@ -46,6 +48,20 @@ def hash_fileobj(f) -> str:
     for b in iter(lambda: f.read(128*1024), b""):
         h.update(b)
     return h.hexdigest()
+
+def blob_name(file_hash, use_compression, filename_to_hash):
+    filename = file_hash[0:HASH_LENGTH] + (".bin.zst" if use_compression else ".bin")
+    existing = filename_to_hash.get(filename)
+    assert existing is None or existing == file_hash, "Collision in short hash (%s and %s)" % (existing, file_hash)
+    filename_to_hash[filename] = file_hash
+    return filename
+
+def file_target(f, size, args, filename_to_hash):
+    """The blob of an open file, or its chunks' blobs and lengths."""
+    if not cdc.split(args, size):
+        return blob_name(hash_fileobj(f), args.zstd, filename_to_hash)
+    return [[blob_name(hashlib.sha256(c).hexdigest(), args.zstd, filename_to_hash), len(c)]
+            for c in cdc.chunks(f.read())]
 
 def main():
     logging.basicConfig(format="%(message)s")
@@ -71,6 +87,7 @@ def main():
                       help="Base path or tar file to include in JSON")
     args.add_argument("--zstd", action="store_true",
                       help="Use Zstandard compression")
+    cdc.add_args(args)
 
     args = args.parse_args()
 
@@ -82,9 +99,9 @@ def main():
         tar = None
 
     if tar:
-        (root, total_size) = handle_tar(logger, tar, args.zstd)
+        (root, total_size) = handle_tar(logger, tar, args)
     else:
-        (root, total_size) = handle_dir(logger, path, args.exclude, args.zstd)
+        (root, total_size) = handle_dir(logger, path, args.exclude, args)
 
     if False:
         # normalize the order of children, useful to debug differences between
@@ -106,7 +123,7 @@ def main():
     logger.info("Creating json ...")
     json.dump(result, args.out, check_circular=False, separators=(',', ':'))
 
-def handle_dir(logger, path, exclude, use_compression):
+def handle_dir(logger, path, exclude, args):
     path = path + "/"
     exclude = exclude or []
     exclude = [os.path.join("/", os.path.normpath(p)) for p in exclude]
@@ -199,12 +216,8 @@ def handle_dir(logger, path, exclude, use_compression):
                 target = os.readlink(absname)
                 obj[IDX_TARGET] = target
             elif isfile:
-                file_hash = hash_file(absname)
-                filename = file_hash[0:HASH_LENGTH] + (".bin.zst" if use_compression else ".bin")
-                existing = filename_to_hash.get(filename)
-                assert existing is None or existing == file_hash, "Collision in short hash (%s and %s)" % (existing, file_hash)
-                filename_to_hash[filename] = file_hash
-                obj[IDX_FILENAME] = filename
+                with open(absname, "rb") as f:
+                    obj[IDX_FILENAME] = file_target(f, st.st_size, args, filename_to_hash)
 
             while obj[-1] is None:
                 obj.pop()
@@ -215,7 +228,7 @@ def handle_dir(logger, path, exclude, use_compression):
 
     return (mainroot, total_size)
 
-def handle_tar(logger, tar, use_compression):
+def handle_tar(logger, tar, args):
     mainroot = []
     filename_to_hash = {}
     total_size = 0
@@ -242,16 +255,12 @@ def handle_tar(logger, tar, use_compression):
         if member.isfile() or member.islnk():
             obj[IDX_MODE] |= S_IFREG
             f = tar.extractfile(member)
-            file_hash = hash_fileobj(f)
-            filename = file_hash[0:HASH_LENGTH] + (".bin.zst" if use_compression else ".bin")
-            existing = filename_to_hash.get(filename)
-            assert existing is None or existing == file_hash, "Collision in short hash (%s and %s)" % (existing, file_hash)
-            filename_to_hash[filename] = file_hash
-            obj[IDX_FILENAME] = filename
             if member.islnk():
                 # fix size for hard links
                 f.seek(0, os.SEEK_END)
                 obj[IDX_SIZE] = int(f.tell())
+                f.seek(0)
+            obj[IDX_FILENAME] = file_target(f, obj[IDX_SIZE], args, filename_to_hash)
         elif member.isdir():
             obj[IDX_MODE] |= S_IFDIR
             obj[IDX_TARGET] = []
