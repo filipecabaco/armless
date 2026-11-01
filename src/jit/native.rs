@@ -8,8 +8,8 @@
 //! zero-extended, as wasm adds it to its memory's base. The code `gen` writes never accesses
 //! memory out of bounds, so there are no bounds checks.
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I16, I32, I64, I8};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64, I8};
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, InstBuilder, JumpTableData, MemFlagsData, SigRef, Type, Value,
 };
@@ -998,6 +998,15 @@ impl<'a, 'b> Translator<'a, 'b> {
         Some(())
     }
 
+    fn fcompare(&mut self, cc: FloatCC) -> Option<()> {
+        let y = self.pop()?;
+        let x = self.pop()?;
+        let c = self.b.ins().fcmp(cc, x, y);
+        let v = self.b.ins().uextend(I32, c);
+        self.push(v);
+        Some(())
+    }
+
     fn eqz(&mut self) -> Option<()> {
         let x = self.pop()?;
         let c = self.b.ins().icmp_imm_u(IntCC::Equal, x, 0);
@@ -1161,6 +1170,43 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let n = b.ins().ireduce(I32, x);
                 b.ins().sextend(I64, n)
             })?,
+            // Floating point: comparisons, arithmetic, conversions and reinterpretation
+            0x5b | 0x61 => self.fcompare(FloatCC::Equal)?,
+            0x5c | 0x62 => self.fcompare(FloatCC::NotEqual)?,
+            0x5d | 0x63 => self.fcompare(FloatCC::LessThan)?,
+            0x5e | 0x64 => self.fcompare(FloatCC::GreaterThan)?,
+            0x5f | 0x65 => self.fcompare(FloatCC::LessThanOrEqual)?,
+            0x60 | 0x66 => self.fcompare(FloatCC::GreaterThanOrEqual)?,
+            0x8b | 0x99 => self.unary(|b, x| b.ins().fabs(x))?,
+            0x8c | 0x9a => self.unary(|b, x| b.ins().fneg(x))?,
+            0x8f | 0x9d => self.unary(|b, x| b.ins().trunc(x))?,
+            0x91 | 0x9f => self.unary(|b, x| b.ins().sqrt(x))?,
+            0x92 | 0xa0 => self.binary(|b, x, y| b.ins().fadd(x, y))?,
+            0x93 | 0xa1 => self.binary(|b, x, y| b.ins().fsub(x, y))?,
+            0x94 | 0xa2 => self.binary(|b, x, y| b.ins().fmul(x, y))?,
+            0x95 | 0xa3 => self.binary(|b, x, y| b.ins().fdiv(x, y))?,
+            0xb2 | 0xb4 => self.unary(|b, x| b.ins().fcvt_from_sint(F32, x))?,
+            0xb3 | 0xb5 => self.unary(|b, x| b.ins().fcvt_from_uint(F32, x))?,
+            0xb6 => self.unary(|b, x| b.ins().fdemote(F32, x))?,
+            0xb7 | 0xb9 => self.unary(|b, x| b.ins().fcvt_from_sint(F64, x))?,
+            0xb8 | 0xba => self.unary(|b, x| b.ins().fcvt_from_uint(F64, x))?,
+            0xbb => self.unary(|b, x| b.ins().fpromote(F64, x))?,
+            0xbc => self.unary(|b, x| b.ins().bitcast(I32, MemFlagsData::new(), x))?,
+            0xbd => self.unary(|b, x| b.ins().bitcast(I64, MemFlagsData::new(), x))?,
+            0xbe => self.unary(|b, x| b.ins().bitcast(F32, MemFlagsData::new(), x))?,
+            0xbf => self.unary(|b, x| b.ins().bitcast(F64, MemFlagsData::new(), x))?,
+            0xfc => {
+                // Saturating float to integer: what it saturates to never matters (the generated
+                // code only converts values in range), but unlike the trapping forms it can't
+                // end the process
+                let sub = r.leb_u()?;
+                let ty = if sub < 4 { I32 } else { I64 };
+                match sub {
+                    0 | 2 | 4 | 6 => self.unary(|b, x| b.ins().fcvt_to_sint_sat(ty, x))?,
+                    1 | 3 | 5 | 7 => self.unary(|b, x| b.ins().fcvt_to_uint_sat(ty, x))?,
+                    _ => return None,
+                }
+            },
             0xfe => {
                 // atomic.fence
                 if r.leb_u()? != 3 || r.byte()? != 0 {
@@ -1193,6 +1239,9 @@ fn immediates(op: u8, r: &mut Reader) -> Option<()> {
         },
         0x41 | 0x42 => {
             r.leb_s()?;
+        },
+        0xfc => {
+            r.leb_u()?;
         },
         0xfe => {
             r.leb_u()?;
@@ -1258,7 +1307,60 @@ mod tests {
         (0x9f3f_0c00, 0x0e20_0800), // two-register misc: SADDLP, SADALP, ...
         (0x9f20_0400, 0x0e20_0400), // three same: ADDP, ...
         (0xbf20_8c00, 0x0e00_0800), // UZP, TRN, ZIP
+        (0xffa0_0c00, 0x1e20_0800), // FP data-processing (2 source), single and double
+        (0xff80_0000, 0x1f00_0000), // FMADD, FMSUB, FNMADD, FNMSUB
+        (0xff20_7c00, 0x1e20_4000), // FP data-processing (1 source)
+        (0xff20_fc07, 0x1e20_2000), // FCMP, FCMPE
+        (0xff20_0c00, 0x1e20_0c00), // FCSEL
+        (0xff20_1fe0, 0x1e20_1000), // FMOV (immediate)
+        (0x7f20_fc00, 0x1e20_0000), // conversions between FP and integer
+        (0xdfff_fc00, 0x5e21_d800), // SCVTF / UCVTF (scalar, 32-bit)
+        (0xdfff_fc00, 0x5ea1_b800), // FCVTZS / FCVTZU (scalar, 32-bit)
+        (0xffe0_fc00, 0x5e00_0400), // DUP (element, scalar)
     ];
+
+    /// A small number with few significant bits: sums, products and quotients of these are
+    /// often exact.
+    fn fp_small(rng: &mut Rng, double: bool) -> u64 {
+        let v = (rng.below(65) as f64 - 32.0) / [1.0, 2.0, 4.0, 8.0][rng.below(4) as usize];
+        if double {
+            v.to_bits()
+        } else {
+            (v as f32).to_bits() as u64
+        }
+    }
+
+    /// A value worth computing with in the low lanes: mostly ordinary numbers whose results are
+    /// often exact, sometimes the edges (zeros, infinities, NaNs, subnormals, extremes).
+    fn fp_value(rng: &mut Rng, double: bool) -> u64 {
+        let f = |v: f64| if double { v.to_bits() } else { (v as f32).to_bits() as u64 };
+        match rng.below(10) {
+            0 => f(rng.below(33) as f64 - 16.0),
+            1 => f((rng.below(257) as f64 - 128.0) / 8.0),
+            2 => f((rng.below(1 << 20) as f64 - (1 << 19) as f64) * 1e-3),
+            3 => {
+                let edges: [u64; 10] = if double {
+                    [0, 1 << 63, 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000, 0x7ff8_0000_0000_0000,
+                     0x7ff0_0000_0000_0001, 1, 0x0010_0000_0000_0000, 0x7fef_ffff_ffff_ffff, 0x000f_ffff_ffff_ffff]
+                } else {
+                    [0, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7f80_0001, 1, 0x0080_0000, 0x7f7f_ffff, 0x007f_ffff]
+                };
+                edges[rng.below(10) as usize]
+            },
+            4 => {
+                // near the smallest normal and the largest finite
+                let e = if rng.below(2) == 0 { 1 + rng.below(3) } else { (if double { 0x7fd } else { 0xfc }) + rng.below(3) };
+                let (shift, mant) = if double { (52, rng.next() & ((1 << 52) - 1)) } else { (23, rng.next() & 0x7f_ffff) };
+                (rng.below(2) << if double { 63 } else { 31 }) | (e << shift) | mant
+            },
+            _ => {
+                // any normal with a moderate exponent
+                let e = rng.below(60) as i64 - 30;
+                let (bias, shift, mant) = if double { (1023, 52, rng.next() & ((1 << 52) - 1)) } else { (127, 23, rng.next() & 0x7f_ffff) };
+                (rng.below(2) << if double { 63 } else { 31 }) | (((bias + e) as u64) << shift) | mant
+            },
+        }
+    }
 
     /// Everything a block can change: registers, flags, exception state and RAM.
     fn state(c: &Cpu<NoDevices>) -> impl PartialEq + std::fmt::Debug {
@@ -1269,6 +1371,7 @@ mod tests {
             (c.n, c.z, c.c, c.v),
             (c.sys.esr, c.sys.far, c.sys.elr, c.sys.spsr),
             c.vreg,
+            (c.sys.fpcr, c.sys.fpsr),
         )
     }
 
@@ -1276,7 +1379,18 @@ mod tests {
     /// native code: registers, flags, exception state and RAM must match.
     #[test]
     fn compiled_blocks_do_what_the_interpreter_does() {
-        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        fuzz(0x2545_f491_4f6c_dd1d, 6000, BODY, false);
+    }
+
+    /// The same, for scalar floating point alone, with operands that make exact results and the
+    /// edges common: results and FPSR must match.
+    #[test]
+    fn compiled_fp_does_what_the_interpreter_does() {
+        fuzz(0x9e37_79b9_7f4a_7c15, 8000, &BODY[BODY.len() - 10..], true);
+    }
+
+    fn fuzz(seed: u64, cases: usize, body: &[(u32, u32)], fp_bias: bool) {
+        let mut rng = Rng(seed);
         let mut interp = Cpu::new(RAM, NoDevices);
         let mut jit = Cpu::new(RAM, NoDevices);
         if !jit.enable_native_jit() {
@@ -1284,7 +1398,7 @@ mod tests {
         }
         jit.jit.threshold = 1;
         let mut compared = 0;
-        for case in 0..3000 {
+        for case in 0..cases {
             let k = 1 + rng.below(12) as usize;
             let start_pc = CODE + rng.below((1024 - k - 1) as u64) * 4;
             let mut mem = vec![0u8; RAM];
@@ -1293,7 +1407,7 @@ mod tests {
             }
             let mut words: Vec<u32> = (0..k)
                 .map(|_| loop {
-                    let (mask, value) = BODY[rng.below(BODY.len() as u64) as usize];
+                    let (mask, value) = body[rng.below(body.len() as u64) as usize];
                     let i = (rng.next() as u32 & !mask) | value;
                     if (i >> 26) & 7 != 0b101 {
                         break i;
@@ -1317,8 +1431,20 @@ mod tests {
             let flags = rng.next();
             // SIMD&FP mostly usable (FPEN = 3), else any FPEN, which traps some ELs
             let fpen = if rng.below(4) == 0 { rng.below(4) } else { 3 };
-            let vregs: [u128; 32] =
-                std::array::from_fn(|_| ((rng.next() as u128) << 64) | rng.next() as u128);
+            let vregs: [u128; 32] = std::array::from_fn(|_| {
+                let hi = (rng.next() as u128) << 64;
+                match rng.below(if fp_bias { 6 } else { 3 }) {
+                    0 => hi | rng.next() as u128,
+                    3 | 4 => hi | (rng.next() as u128 & !0xffff_ffff) | fp_small(&mut rng, false) as u128,
+                    5 => hi | fp_small(&mut rng, true) as u128,
+                    1 => hi | (rng.next() as u128 & !0xffff_ffff) | fp_value(&mut rng, false) as u128,
+                    _ => hi | fp_value(&mut rng, true) as u128,
+                }
+            });
+            // FPCR mostly as Linux runs (all clear), else any rounding mode, FZ, DN or AHP
+            let fpcr = if rng.below(4) == 0 { rng.next() & 0x07c0_0000 } else { 0 };
+            // Exception flags mostly clear, so that one wrongly raised shows
+            let fpsr = if rng.below(4) == 0 { rng.next() & 0x9f } else { 0 };
             let load = |c: &mut Cpu<NoDevices>, drop_code: bool| {
                 c.mem[..].copy_from_slice(&mem);
                 if drop_code {
@@ -1339,6 +1465,7 @@ mod tests {
                 (c.sys.esr, c.sys.far, c.sys.elr, c.sys.spsr) = (0, 0, 0, 0);
                 c.vreg = vregs;
                 c.sys.cpacr = fpen << 20;
+                (c.sys.fpcr, c.sys.fpsr) = (fpcr, fpsr);
                 c.set_excl(None);
                 // Entered through a branch, as a block is
                 c.jit_entry = true;
@@ -1373,6 +1500,6 @@ mod tests {
                 "case {case}: RAM differs, block {words:08x?}"
             );
         }
-        assert!(compared > 2900, "only {compared} blocks ran as native code");
+        assert!(compared > cases * 95 / 100, "only {compared} blocks ran as native code");
     }
 }
