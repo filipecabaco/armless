@@ -755,6 +755,8 @@ impl<H: Host> Cpu<H> {
             daif: a(std::ptr::addr_of!(self.daif) as *const u8),
             vreg: a(self.vreg.as_ptr() as *const u8),
             cpacr: a(std::ptr::addr_of!(self.sys.cpacr) as *const u8),
+            fpcr: a(std::ptr::addr_of!(self.sys.fpcr) as *const u8),
+            fpsr: a(std::ptr::addr_of!(self.sys.fpsr) as *const u8),
             el: el as u64,
             spsel: spsel as u64,
             irq_dirty: a(self.attn_ptr()),

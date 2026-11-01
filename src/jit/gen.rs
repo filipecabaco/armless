@@ -17,6 +17,8 @@
 //! written in place, so state is precise at every instruction boundary.
 //! Instructions without a translation call back into the interpreter.
 
+mod fp;
+
 use super::wasm::{self, Code, FuncType, Import, EMPTY, I32, I64};
 use crate::bits::{bit, decode_bit_masks, field, sext};
 use crate::sysreg::sr;
@@ -51,6 +53,9 @@ pub struct Layout {
     /// The SIMD&FP registers (32 x u128) and CPACR_EL1 (u64, FPEN gates them).
     pub vreg: u64,
     pub cpacr: u64,
+    /// FPCR and FPSR (u64 each).
+    pub fpcr: u64,
+    pub fpsr: u64,
     /// Values (not addresses): the exception level and SPSel of this code.
     pub el: u64,
     pub spsel: u64,
@@ -1936,6 +1941,61 @@ impl Gen<'_> {
             0x9eaf_0000 => {
                 // FMOV Vd.D[1], Xn
                 self.vst(rd, 1, |g| g.xr(rn));
+                true
+            },
+            _ => self.simd_scalar(insn) || self.fp_scalar(insn),
+        }
+    }
+
+    /// Scalar Advanced SIMD: DUP (element) into a scalar, and the integer-float conversions
+    /// between 32-bit lanes (SCVTF / UCVTF / FCVTZS / FCVTZU Sd, Sn).
+    fn simd_scalar(&mut self, insn: u32) -> bool {
+        let rd = insn & 31;
+        let rn = field(insn, 5, 5);
+        if insn & 0xffe0_fc00 == 0x5e00_0400 {
+            // DUP (MOV) Vd, Vn.T[i]: the lane, zero-extended, the rest of Vd cleared
+            let imm5 = field(insn, 16, 5);
+            let size = imm5.trailing_zeros();
+            if size > 3 {
+                return false;
+            }
+            let e = 8 << size;
+            self.lane(rn, e, imm5 >> (size + 1), false);
+            self.c.set(T0);
+            self.vst(rd, 0, |g| g.c.get(T0));
+            self.vst(rd, 1, |g| g.c.i64c(0));
+            return true;
+        }
+        match insn & 0xffff_fc00 {
+            0x5e21_d800 | 0x7e21_d800 => {
+                // SCVTF / UCVTF Sd, Sn
+                let signed = insn & 0x2000_0000 == 0;
+                self.vld(rn, 0);
+                if signed {
+                    self.c.i64_extend32_s();
+                } else {
+                    self.c.i64c(0xffff_ffff);
+                    self.c.i64_and();
+                }
+                self.c.set(T0);
+                self.int_to_fp(insn, rd, signed, false, false);
+                true
+            },
+            0x5ea1_b800 | 0x7ea1_b800 => {
+                // FCVTZS / FCVTZU Sd, Sn
+                let signed = insn & 0x2000_0000 == 0;
+                self.vld(rn, 0);
+                self.c.i64c(0xffff_ffff);
+                self.c.i64_and();
+                self.c.set(T0);
+                self.fp_to_int(insn, signed, false, false, |g| {
+                    g.vst(rd, 0, |g| {
+                        g.c.get(T2);
+                        g.c.i64c(0xffff_ffff);
+                        g.c.i64_and();
+                    });
+                    g.vst(rd, 1, |g| g.c.i64c(0));
+                });
                 true
             },
             _ => false,
