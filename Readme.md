@@ -111,10 +111,13 @@ keeps up to `ARMLESS_JIT_CODE_MB` (default 16) MB of compiled code, stale code o
 replaced pages included, and starts over when that is full; its compiler gives back
 its working memory whenever it has nothing queued.
 
-Compiled code covers the integer instructions, the SIMD&FP loads and stores, and the common
-integer NEON operations (bitwise, add/sub, multiply-long, pairwise add, permutes); what it
-can't translate, scalar floating point among it, it hands to the interpreter one instruction at
-a time. `ARMLESS_JIT_HELPER_STATS=1` counts those by opcode (`Jit::helper_hist`), and
+Compiled code covers the integer instructions, the SIMD&FP loads and stores, the common
+integer NEON operations (bitwise, add/sub, multiply-long, pairwise add, permutes) and scalar
+floating point: single-precision arithmetic, fused multiply-add, compares, selects, moves and
+conversions, inline whenever FPCR is as Linux runs it and the numbers are ordinary, with the
+architecture's results and FPSR flags (NaNs, infinities, subnormals and underflow go to the
+interpreter). What it can't translate, double-precision arithmetic among it, it hands to the
+interpreter one instruction at a time. `ARMLESS_JIT_HELPER_STATS=1` counts those by opcode (`Jit::helper_hist`), and
 `ARMLESS_JIT_THRESHOLD` sets how often an entry runs before it is compiled (1024).
 
 A restore starts with no compiled code. `Runner::jit_profile` lists the pages a machine
