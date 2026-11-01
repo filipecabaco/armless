@@ -265,6 +265,36 @@ impl Runner {
         self.cpus.iter().map(|c| c.lock().unwrap().insn_count).sum()
     }
 
+    /// The code every CPU has compiled (see `Cpu::jit_profile`), one entry per page.
+    pub fn jit_profile(&self) -> Vec<crate::jit::profile::Page> {
+        let p = self.pause();
+        let mut pages = Vec::new();
+        for c in &p.guards {
+            crate::jit::profile::merge(&mut pages, &c.jit_profile(), usize::MAX);
+        }
+        // Several CPUs compiling the same page is still one run
+        for page in &mut pages {
+            page.runs = 1;
+        }
+        pages
+    }
+
+    /// Drop every CPU's compiled code, as a restore does: what is compiled from here on is what
+    /// a restored machine would compile doing the same.
+    pub fn jit_flush(&self) {
+        let mut p = self.pause();
+        for c in p.cpus() {
+            c.jit.flush_all();
+        }
+    }
+
+    /// Have every CPU compile the entry points of a profile now (see `Cpu::jit_prewarm`); the
+    /// compilers work through them while the machine runs. Returns the modules queued.
+    pub fn jit_prewarm(&self, pages: &[crate::jit::profile::Page]) -> usize {
+        let mut p = self.pause();
+        p.cpus().into_iter().map(|c| c.jit_prewarm(pages)).sum()
+    }
+
     /// Run `f` on a CPU (e.g. to read registers); pauses that CPU.
     pub fn with_cpu<T>(&self, i: usize, f: impl FnOnce(&mut NativeCpu) -> T) -> T {
         let mut p = self.pause();
@@ -403,3 +433,4 @@ mod tests {
         );
     }
 }
+

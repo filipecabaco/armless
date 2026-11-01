@@ -111,6 +111,20 @@ keeps up to `ARMLESS_JIT_CODE_MB` (default 16) MB of compiled code, stale code o
 replaced pages included, and starts over when that is full; its compiler gives back
 its working memory whenever it has nothing queued.
 
+Compiled code covers the integer instructions, the SIMD&FP loads and stores, and the common
+integer NEON operations (bitwise, add/sub, multiply-long, pairwise add, permutes); what it
+can't translate, scalar floating point among it, it hands to the interpreter one instruction at
+a time. `ARMLESS_JIT_HELPER_STATS=1` counts those by opcode (`Jit::helper_hist`), and
+`ARMLESS_JIT_THRESHOLD` sets how often an entry runs before it is compiled (1024).
+
+A restore starts with no compiled code. `Runner::jit_profile` lists the pages a machine
+compiled and ran (each with a hash of its contents), `jit::profile::merge` combines the
+profiles of many runs, ordered by how many used each page, and `Runner::jit_prewarm`
+compiles a profile's pages as soon as a machine restored from the same snapshot starts,
+behind whatever code it needs right away. A page that holds other code than when it was
+profiled is skipped. `HostOptions::blob_source` serves blobs from anywhere (an archive in
+memory, say) instead of a directory.
+
 `armless-run` is a command-line runner for kernels and bare-metal binaries
 (`cargo run --release --bin armless-run -- --help`).
 

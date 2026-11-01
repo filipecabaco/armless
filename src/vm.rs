@@ -149,6 +149,71 @@ impl Board {
         }
     }
 
+    /// Write a file into the guest's filesystem from the host (absolute guest path), making its
+    /// directories: how a host hands a guest its input. Write into a directory the guest has not
+    /// looked at yet: its kernel caches what it has seen (cache=loose).
+    pub fn fs_write_file(&self, path: &str, data: &[u8], mode: u32) -> Result<(), String> {
+        use crate::dev::fs;
+        let mut d = self.devices.lock();
+        let (_, p) = d.p9().ok_or("the machine has no filesystem")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let err = |e: fs::Fail| match e {
+            fs::Fail::Errno(n) => format!("{path}: errno {n}"),
+            fs::Fail::Need(b) => format!("{path}: needs blobs {b:?}"),
+        };
+        let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let (name, dirs) = parts.split_last().ok_or_else(|| format!("{path}: not a file path"))?;
+        let mut dir = fs::ROOT;
+        for c in dirs {
+            dir = match p.fs.lookup(dir, c.as_bytes()) {
+                Ok(i) => i,
+                Err(_) => p.fs.create(dir, c.as_bytes(), fs::S_IFDIR | 0o755, 0, 0, now).map_err(err)?,
+            };
+        }
+        let ino = match p.fs.lookup(dir, name.as_bytes()) {
+            Ok(i) => {
+                p.fs.truncate(i, 0).map_err(err)?;
+                i
+            },
+            Err(_) => p.fs.create(dir, name.as_bytes(), fs::S_IFREG | (mode & 0o7777), 0, 0, now).map_err(err)?,
+        };
+        p.fs.write(ino, 0, data, now).map_err(err)?;
+        Ok(())
+    }
+
+    /// The regular files under a guest directory, with paths relative to it: how a host takes
+    /// back what a guest wrote (after the guest's `sync`). None if there is no such directory.
+    pub fn fs_read_tree(&self, path: &str) -> Result<Option<Vec<(String, Vec<u8>)>>, String> {
+        use crate::dev::fs;
+        let mut d = self.devices.lock();
+        let (_, p) = d.p9().ok_or("the machine has no filesystem")?;
+        let Some(top) = p.fs.lookup_path(path) else { return Ok(None) };
+        let mut out = Vec::new();
+        let mut stack = vec![(top, String::new())];
+        while let Some((dir, prefix)) = stack.pop() {
+            let Ok(entries) = p.fs.list(dir) else { continue };
+            for (name, ino) in entries {
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                let rel = format!("{prefix}{}", String::from_utf8_lossy(&name));
+                let mode = p.fs.inode(ino).map(|i| i.mode).unwrap_or(0);
+                match mode & fs::S_IFMT {
+                    fs::S_IFDIR => stack.push((ino, rel + "/")),
+                    fs::S_IFREG => match p.fs.read_all(ino) {
+                        Ok(data) => out.push((rel, data)),
+                        Err(_) => return Err(format!("{path}/{rel}: contents not loaded")),
+                    },
+                    _ => {},
+                }
+            }
+        }
+        out.sort();
+        Ok(Some(out))
+    }
+
     pub fn forget_blobs(&self) {
         if let Some((_, p)) = self.devices.lock().p9() {
             p.fs.forget_blobs();

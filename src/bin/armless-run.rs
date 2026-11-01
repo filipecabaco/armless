@@ -178,6 +178,7 @@ fn main() {
         board.clone(),
         HostOptions {
             blobs,
+            blob_source: None,
             network: net,
             egress: armless::native::Egress {
                 allow_private,

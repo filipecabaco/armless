@@ -1553,6 +1553,12 @@ impl Gen<'_> {
     /// The common integer SIMD&FP instructions, inline. The rest, and any
     /// access CPACR_EL1 traps, go to the interpreter.
     fn simd(&mut self, insn: u32) -> bool {
+        self.fp_guarded(insn, |g| g.simd_ops(insn))
+    }
+
+    /// `f`'s translation of a SIMD&FP instruction, run when CPACR_EL1 lets this EL use SIMD&FP;
+    /// otherwise the interpreter takes the instruction (and its trap). False if `f` has none.
+    fn fp_guarded(&mut self, insn: u32, f: impl FnOnce(&mut Self) -> bool) -> bool {
         let start = self.c.b.len();
         // FPEN allows EL0 and EL1 (3), or only EL1 (1)
         let fpen = if self.l.el == 0 { 3 } else { 1 };
@@ -1565,7 +1571,7 @@ impl Gen<'_> {
         self.c.i64c(fpen);
         self.c.i64_eq();
         self.c.if_(EMPTY);
-        if !self.simd_ops(insn) {
+        if !f(self) {
             self.c.b.truncate(start);
             return false;
         }
@@ -1726,6 +1732,24 @@ impl Gen<'_> {
                     });
                     true
                 },
+                0b10111 if !u && (size != 3 || q) => {
+                    // ADDP (vector): adjacent pairs of Vm:Vn added
+                    let e = 8 << size;
+                    let per_reg = if q { 128 } else { 64 } / e;
+                    let elem = |g: &mut Self, i: u32| {
+                        if i < per_reg {
+                            g.lane(rn, e, i, false)
+                        } else {
+                            g.lane(rm, e, i - per_reg, false)
+                        }
+                    };
+                    self.vbuild(q, rd, e, |g, k| {
+                        elem(g, 2 * k);
+                        elem(g, 2 * k + 1);
+                        g.c.i64_add();
+                    });
+                    true
+                },
                 0b01000 if size == 3 && q => {
                     // SSHL / USHL (2D): by the signed low byte of each Vm lane
                     self.vlanes(true, rd, |g, h| {
@@ -1825,6 +1849,70 @@ impl Gen<'_> {
             }
             return true;
         }
+        if insn & 0x9f20_0c00 == 0x0e20_0000 && size != 3 {
+            // SMULL / UMULL / SMLAL / UMLAL / SMLSL / UMLSL (and their 2 forms, from the top half)
+            let opcode = field(insn, 12, 4);
+            let acc = match opcode {
+                0b1100 => None,
+                0b1000 => Some(false),
+                0b1010 => Some(true),
+                _ => return false,
+            };
+            let e = 8 << size;
+            let first = if q { 64 / e } else { 0 };
+            self.vbuild(true, rd, 2 * e, |g, k| {
+                if acc.is_some() {
+                    g.lane(rd, 2 * e, k, false);
+                }
+                g.lane(rn, e, first + k, !u);
+                g.lane(rm, e, first + k, !u);
+                g.c.i64_mul();
+                match acc {
+                    Some(false) => g.c.i64_add(),
+                    Some(true) => g.c.i64_sub(),
+                    None => {},
+                }
+            });
+            return true;
+        }
+        if insn & 0x9f3f_bc00 == 0x0e20_2800 && size != 3 {
+            // SADDLP / UADDLP / SADALP / UADALP: adjacent pairs added into lanes twice as wide
+            let acc = bit(insn, 14);
+            let e = 8 << size;
+            self.vbuild(q, rd, 2 * e, |g, k| {
+                if acc {
+                    g.lane(rd, 2 * e, k, false);
+                }
+                g.lane(rn, e, 2 * k, !u);
+                g.lane(rn, e, 2 * k + 1, !u);
+                g.c.i64_add();
+                if acc {
+                    g.c.i64_add();
+                }
+            });
+            return true;
+        }
+        if insn & 0xbf20_8c00 == 0x0e00_0800 && field(insn, 12, 2) != 0 && (size != 3 || q) {
+            // UZP1 / UZP2 / TRN1 / TRN2 / ZIP1 / ZIP2
+            let e = 8 << size;
+            let lanes = if q { 128 } else { 64 } / e;
+            let second = bit(insn, 14) as u32;
+            let op = field(insn, 12, 2);
+            self.vbuild(q, rd, e, |g, k| {
+                // Which element of Vn:Vm (Vn first) lands in lane k
+                let i = match op {
+                    0b01 => 2 * k + second,                                     // UZP
+                    0b10 => (k & !1) + second + if k & 1 == 1 { lanes } else { 0 }, // TRN
+                    _ => (k / 2) + second * lanes / 2 + if k & 1 == 1 { lanes } else { 0 }, // ZIP
+                };
+                if i < lanes {
+                    g.lane(rn, e, i, false)
+                } else {
+                    g.lane(rm, e, i - lanes, false)
+                }
+            });
+            return true;
+        }
         match insn & 0xffff_fc00 {
             0x1e26_0000 | 0x9e66_0000 | 0x9eae_0000 => {
                 // FMOV Wd, Sn / Xd, Dn / Xd, Vn.D[1]
@@ -1852,6 +1940,57 @@ impl Gen<'_> {
             },
             _ => false,
         }
+    }
+
+    /// Push lane `i` of Vr, `esize` bits wide, sign- or zero-extended to 64 bits.
+    fn lane(&mut self, r: u32, esize: u32, i: u32, signed: bool) {
+        let at = i * esize;
+        self.vld(r, at / 64);
+        if esize == 64 {
+            return;
+        }
+        let off = (at % 64) as i64;
+        if signed {
+            let top = 64 - off - esize as i64;
+            if top != 0 {
+                self.c.i64c(top);
+                self.c.i64_shl();
+            }
+            self.c.i64c(64 - esize as i64);
+            self.c.i64_shr_s();
+        } else {
+            if off != 0 {
+                self.c.i64c(off);
+                self.c.i64_shr_u();
+            }
+            self.c.i64c(((1u64 << esize) - 1) as i64);
+            self.c.i64_and();
+        }
+    }
+
+    /// Vd from its lanes, `esize` bits wide: `f` pushes lane k's value (bits above `esize` are
+    /// dropped). Both halves are worked out before Vd is written, so `f` may read Vd and the
+    /// sources may be Vd. A 64-bit (Q=0) result clears the top half. Uses T2 and T3.
+    fn vbuild(&mut self, q: bool, rd: u32, esize: u32, mut f: impl FnMut(&mut Self, u32)) {
+        let per_half = 64 / esize;
+        for h in 0..if q { 2 } else { 1 } {
+            self.c.i64c(0);
+            for j in 0..per_half {
+                f(self, h * per_half + j);
+                if esize < 64 {
+                    self.c.i64c(((1u64 << esize) - 1) as i64);
+                    self.c.i64_and();
+                    if j != 0 {
+                        self.c.i64c((j * esize) as i64);
+                        self.c.i64_shl();
+                    }
+                }
+                self.c.i64_or();
+            }
+            self.c.set(if h == 0 { T2 } else { T3 });
+        }
+        self.vst(rd, 0, |g| g.c.get(T2));
+        self.vst(rd, 1, |g| if q { g.c.get(T3) } else { g.c.i64c(0) });
     }
 
     /// local t: each lane of 2n bits keeps its low n bits, packed down
@@ -1933,7 +2072,15 @@ impl Gen<'_> {
 
     fn ldst(&mut self, insn: u32) -> bool {
         if bit(insn, 26) {
-            return false; // SIMD&FP
+            return self.fp_guarded(insn, |g| {
+                if insn & 0x3800_0000 == 0x2800_0000 {
+                    g.fp_ldst_pair(insn)
+                } else if insn & 0x3800_0000 == 0x3800_0000 {
+                    g.fp_ldst_reg(insn)
+                } else {
+                    false
+                }
+            });
         }
         if insn & 0x3f00_0000 == 0x0800_0000 {
             return self.ldst_exclusive(insn);
@@ -2014,65 +2161,11 @@ impl Gen<'_> {
     fn ldst_reg(&mut self, insn: u32) -> bool {
         let size_log = field(insn, 30, 2);
         let opc = field(insn, 22, 2);
-        let rn = field(insn, 5, 5);
         let rt = insn & 31;
         let size = 1u32 << size_log;
-        // Address into VA; writeback amount (if any) in `wb`
-        let mut wb: Option<(bool, i64)> = None; // (post-index, imm)
-        if bit(insn, 24) {
-            let imm = (field(insn, 10, 12) as i64) << size_log;
-            self.xs(rn);
-            if imm != 0 {
-                self.c.i64c(imm);
-                self.c.i64_add();
-            }
-            self.c.set(VA);
-        } else if !bit(insn, 21) {
-            let imm = sext(field(insn, 12, 9) as u64, 9);
-            match field(insn, 10, 2) {
-                0 => {
-                    self.xs(rn);
-                    self.c.i64c(imm);
-                    self.c.i64_add();
-                    self.c.set(VA);
-                },
-                1 => {
-                    self.xs(rn);
-                    self.c.set(VA);
-                    wb = Some((true, imm));
-                },
-                3 => {
-                    self.xs(rn);
-                    self.c.i64c(imm);
-                    self.c.i64_add();
-                    self.c.set(VA);
-                    wb = Some((false, imm));
-                },
-                _ => return false, // unprivileged
-            }
-        } else if field(insn, 10, 2) == 2 {
-            let rm = field(insn, 16, 5);
-            let option = field(insn, 13, 3);
-            if option & 2 == 0 {
-                return false;
-            }
-            let shift = if bit(insn, 12) { size_log } else { 0 };
-            self.xs(rn);
-            self.xr(rm);
-            match option {
-                2 => self.trunc32(false),
-                6 => self.c.i64_extend32_s(),
-                _ => {},
-            }
-            if shift != 0 {
-                self.c.i64c(shift as i64);
-                self.c.i64_shl();
-            }
-            self.c.i64_add();
-            self.c.set(VA);
-        } else {
+        let Some(wb) = self.ldst_reg_addr(insn, size_log) else {
             return false;
-        }
+        };
         match opc {
             0 => {
                 self.xr(rt);
@@ -2108,13 +2201,213 @@ impl Gen<'_> {
             },
             _ => return false,
         }
+        self.ldst_writeback(insn, wb);
+        true
+    }
+
+    /// The base register's writeback after a single-register load or store, if any.
+    fn ldst_writeback(&mut self, insn: u32, wb: Option<(bool, i64)>) {
         if let Some((post, imm)) = wb {
-            self.ws(rn, |g| {
+            self.ws(field(insn, 5, 5), |g| {
                 g.c.get(VA);
                 if post {
                     g.c.i64c(imm);
                     g.c.i64_add();
                 }
+            });
+        }
+    }
+
+    /// The address of a single-register load or store into VA (unsigned offset, unscaled,
+    /// pre- and post-index, register offset), with offsets scaled by `size_log`. Returns the
+    /// writeback it needs, `Some(None)` for none, or None for a form left to the interpreter.
+    fn ldst_reg_addr(&mut self, insn: u32, size_log: u32) -> Option<Option<(bool, i64)>> {
+        let rn = field(insn, 5, 5);
+        let mut wb: Option<(bool, i64)> = None; // (post-index, imm)
+        if bit(insn, 24) {
+            let imm = (field(insn, 10, 12) as i64) << size_log;
+            self.xs(rn);
+            if imm != 0 {
+                self.c.i64c(imm);
+                self.c.i64_add();
+            }
+            self.c.set(VA);
+        } else if !bit(insn, 21) {
+            let imm = sext(field(insn, 12, 9) as u64, 9);
+            match field(insn, 10, 2) {
+                0 => {
+                    self.xs(rn);
+                    self.c.i64c(imm);
+                    self.c.i64_add();
+                    self.c.set(VA);
+                },
+                1 => {
+                    self.xs(rn);
+                    self.c.set(VA);
+                    wb = Some((true, imm));
+                },
+                3 => {
+                    self.xs(rn);
+                    self.c.i64c(imm);
+                    self.c.i64_add();
+                    self.c.set(VA);
+                    wb = Some((false, imm));
+                },
+                _ => return None, // unprivileged
+            }
+        } else if field(insn, 10, 2) == 2 {
+            let rm = field(insn, 16, 5);
+            let option = field(insn, 13, 3);
+            if option & 2 == 0 {
+                return None;
+            }
+            let shift = if bit(insn, 12) { size_log } else { 0 };
+            self.xs(rn);
+            self.xr(rm);
+            match option {
+                2 => self.trunc32(false),
+                6 => self.c.i64_extend32_s(),
+                _ => {},
+            }
+            if shift != 0 {
+                self.c.i64c(shift as i64);
+                self.c.i64_shl();
+            }
+            self.c.i64_add();
+            self.c.set(VA);
+        } else {
+            return None;
+        }
+        Some(wb)
+    }
+
+    /// Load `size` bytes (1 to 16) at VA into Vt, zeroing the rest of it. A 16-byte access is two
+    /// 8-byte ones; Vt is written only once both have been read.
+    fn fp_load_vt(&mut self, size: u32, lo: u32, hi: u32) {
+        self.load(size.min(8));
+        self.c.set(lo);
+        if size == 16 {
+            self.c.get(VA);
+            self.c.i64c(8);
+            self.c.i64_add();
+            self.c.set(VA);
+            self.load(8);
+            self.c.set(hi);
+            self.c.get(VA);
+            self.c.i64c(8);
+            self.c.i64_sub();
+            self.c.set(VA);
+        }
+    }
+
+    /// Write a loaded value (locals lo, hi) into Vt.
+    fn fp_set_vt(&mut self, rt: u32, size: u32, lo: u32, hi: u32) {
+        self.vst(rt, 0, |g| g.c.get(lo));
+        self.vst(rt, 1, |g| {
+            if size == 16 {
+                g.c.get(hi);
+            } else {
+                g.c.i64c(0);
+            }
+        });
+    }
+
+    /// Store `size` bytes (1 to 16) of Vt at VA (VA is left as it was).
+    fn fp_store_vt(&mut self, rt: u32, size: u32) {
+        self.vld(rt, 0);
+        self.c.set(DATA);
+        self.store(size.min(8));
+        if size == 16 {
+            self.vld(rt, 1);
+            self.c.set(DATA);
+            self.c.get(VA);
+            self.c.i64c(8);
+            self.c.i64_add();
+            self.c.set(VA);
+            self.store(8);
+            self.c.get(VA);
+            self.c.i64c(8);
+            self.c.i64_sub();
+            self.c.set(VA);
+        }
+    }
+
+    /// LDR / STR (immediate, unscaled, pre/post-index, register offset) of B, H, S, D and Q
+    /// registers: bits moved between memory and a SIMD&FP register.
+    fn fp_ldst_reg(&mut self, insn: u32) -> bool {
+        let size_bits = field(insn, 30, 2);
+        let opc = field(insn, 22, 2);
+        let rt = insn & 31;
+        // opc bit 1 with size 0 is the 128-bit (Q) form; with any other size, unallocated
+        let (size_log, load) = match (size_bits, opc) {
+            (s, 0) => (s, false),
+            (s, 1) => (s, true),
+            (0, 2) => (4, false),
+            (0, 3) => (4, true),
+            _ => return false,
+        };
+        let size = 1u32 << size_log;
+        let Some(wb) = self.ldst_reg_addr(insn, size_log) else {
+            return false;
+        };
+        if load {
+            self.fp_load_vt(size, T2, T3);
+            self.fp_set_vt(rt, size, T2, T3);
+        } else {
+            self.fp_store_vt(rt, size);
+        }
+        self.ldst_writeback(insn, wb);
+        true
+    }
+
+    /// LDP / STP / LDNP / STNP of S, D and Q registers.
+    fn fp_ldst_pair(&mut self, insn: u32) -> bool {
+        let size: u32 = match field(insn, 30, 2) {
+            0 => 4,
+            1 => 8,
+            2 => 16,
+            _ => return false,
+        };
+        let mode = field(insn, 23, 2);
+        let load = bit(insn, 22);
+        let rt2 = field(insn, 10, 5);
+        let rn = field(insn, 5, 5);
+        let rt = insn & 31;
+        if load && rt == rt2 {
+            return false; // CONSTRAINED UNPREDICTABLE: as the interpreter does
+        }
+        let imm = sext(field(insn, 15, 7) as u64, 7) * size as i64;
+        // base in T1, address in VA
+        self.xs(rn);
+        self.c.set(T1);
+        self.c.get(T1);
+        if mode != 1 {
+            self.c.i64c(imm);
+            self.c.i64_add();
+        }
+        self.c.set(VA);
+        if load {
+            self.fp_load_vt(size, T2, T3);
+            self.c.get(VA);
+            self.c.i64c(size as i64);
+            self.c.i64_add();
+            self.c.set(VA);
+            self.fp_load_vt(size, T4, T0);
+            self.fp_set_vt(rt, size, T2, T3);
+            self.fp_set_vt(rt2, size, T4, T0);
+        } else {
+            self.fp_store_vt(rt, size);
+            self.c.get(VA);
+            self.c.i64c(size as i64);
+            self.c.i64_add();
+            self.c.set(VA);
+            self.fp_store_vt(rt2, size);
+        }
+        if mode == 1 || mode == 3 {
+            self.ws(rn, |g| {
+                g.c.get(T1);
+                g.c.i64c(imm);
+                g.c.i64_add();
             });
         }
         true
