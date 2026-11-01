@@ -426,6 +426,170 @@ pub fn module(imports: &[Import], locals: &[(u32, u8)], code: &Code, shared: boo
     out
 }
 
+/// Floating-point operations (scalar f32/f64 on the stack; values in locals stay i64 bits).
+impl Code {
+    // Float to integer, saturating (0xfc prefix): never traps, as the trapping forms would
+    // natively (a trap in compiled code ends the process)
+    pub fn i32_trunc_sat_f32_s(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, 0);
+    }
+    pub fn i32_trunc_sat_f32_u(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, 1);
+    }
+    pub fn i32_trunc_sat_f64_s(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, 2);
+    }
+    pub fn i32_trunc_sat_f64_u(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, 3);
+    }
+    pub fn i64_trunc_sat_f32_s(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, 4);
+    }
+    pub fn i64_trunc_sat_f32_u(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, 5);
+    }
+    pub fn i64_trunc_sat_f64_s(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, 6);
+    }
+    pub fn i64_trunc_sat_f64_u(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, 7);
+    }
+    pub fn f32_eq(&mut self) {
+        self.op(0x5b)
+    }
+    pub fn f32_ne(&mut self) {
+        self.op(0x5c)
+    }
+    pub fn f32_lt(&mut self) {
+        self.op(0x5d)
+    }
+    pub fn f32_gt(&mut self) {
+        self.op(0x5e)
+    }
+    pub fn f32_le(&mut self) {
+        self.op(0x5f)
+    }
+    pub fn f32_ge(&mut self) {
+        self.op(0x60)
+    }
+    pub fn f64_eq(&mut self) {
+        self.op(0x61)
+    }
+    pub fn f64_ne(&mut self) {
+        self.op(0x62)
+    }
+    pub fn f64_lt(&mut self) {
+        self.op(0x63)
+    }
+    pub fn f64_gt(&mut self) {
+        self.op(0x64)
+    }
+    pub fn f64_le(&mut self) {
+        self.op(0x65)
+    }
+    pub fn f64_ge(&mut self) {
+        self.op(0x66)
+    }
+    pub fn f32_abs(&mut self) {
+        self.op(0x8b)
+    }
+    pub fn f32_neg(&mut self) {
+        self.op(0x8c)
+    }
+    pub fn f32_trunc(&mut self) {
+        self.op(0x8f)
+    }
+    pub fn f32_sqrt(&mut self) {
+        self.op(0x91)
+    }
+    pub fn f32_add(&mut self) {
+        self.op(0x92)
+    }
+    pub fn f32_sub(&mut self) {
+        self.op(0x93)
+    }
+    pub fn f32_mul(&mut self) {
+        self.op(0x94)
+    }
+    pub fn f32_div(&mut self) {
+        self.op(0x95)
+    }
+    pub fn f64_abs(&mut self) {
+        self.op(0x99)
+    }
+    pub fn f64_neg(&mut self) {
+        self.op(0x9a)
+    }
+    pub fn f64_trunc(&mut self) {
+        self.op(0x9d)
+    }
+    pub fn f64_sqrt(&mut self) {
+        self.op(0x9f)
+    }
+    pub fn f64_add(&mut self) {
+        self.op(0xa0)
+    }
+    pub fn f64_sub(&mut self) {
+        self.op(0xa1)
+    }
+    pub fn f64_mul(&mut self) {
+        self.op(0xa2)
+    }
+    pub fn f64_div(&mut self) {
+        self.op(0xa3)
+    }
+    pub fn f32_convert_i32_s(&mut self) {
+        self.op(0xb2)
+    }
+    pub fn f32_convert_i32_u(&mut self) {
+        self.op(0xb3)
+    }
+    pub fn f32_convert_i64_s(&mut self) {
+        self.op(0xb4)
+    }
+    pub fn f32_convert_i64_u(&mut self) {
+        self.op(0xb5)
+    }
+    pub fn f32_demote_f64(&mut self) {
+        self.op(0xb6)
+    }
+    pub fn f64_convert_i32_s(&mut self) {
+        self.op(0xb7)
+    }
+    pub fn f64_convert_i32_u(&mut self) {
+        self.op(0xb8)
+    }
+    pub fn f64_convert_i64_s(&mut self) {
+        self.op(0xb9)
+    }
+    pub fn f64_convert_i64_u(&mut self) {
+        self.op(0xba)
+    }
+    pub fn f64_promote_f32(&mut self) {
+        self.op(0xbb)
+    }
+    pub fn i32_reinterpret_f32(&mut self) {
+        self.op(0xbc)
+    }
+    pub fn i64_reinterpret_f64(&mut self) {
+        self.op(0xbd)
+    }
+    pub fn f32_reinterpret_i32(&mut self) {
+        self.op(0xbe)
+    }
+    pub fn f64_reinterpret_i64(&mut self) {
+        self.op(0xbf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
