@@ -19,7 +19,8 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use super::wasm;
 
@@ -97,6 +98,8 @@ enum Job {
     },
     /// Free the module and compile into a new one: nothing compiled before is reachable any more.
     Reset,
+    /// Something was queued in `later`.
+    Wake,
 }
 
 /// A compiled slot: the address of its function, or 0 if it could not be compiled.
@@ -115,6 +118,8 @@ struct Shared {
     code_bytes: AtomicUsize,
     compiles: AtomicU64,
     compile_ns: AtomicU64,
+    /// Jobs that wait for the compiler to have nothing else to do (`submit_later`).
+    later: Mutex<VecDeque<Job>>,
 }
 
 /// One CPU's native JIT: a compiler thread of its own owns the generated code, so the CPU goes on
@@ -169,16 +174,24 @@ impl Native {
                     let job = match job_rx.try_recv() {
                         Ok(job) => job,
                         Err(TryRecvError::Disconnected) => return,
-                        Err(TryRecvError::Empty) => {
-                            // Nothing queued: give back what compiling took, until the next job
-                            compiler.release_scratch();
-                            match job_rx.recv() {
-                                Ok(job) => job,
-                                Err(_) => return,
-                            }
+                        Err(TryRecvError::Empty) => match {
+                            // (not held while waiting below: `submit_later` takes it)
+                            let next = thread_shared.later.lock().unwrap().pop_front();
+                            next
+                        } {
+                            Some(job) => job,
+                            None => {
+                                // Nothing queued: give back what compiling took, until the next job
+                                compiler.release_scratch();
+                                match job_rx.recv() {
+                                    Ok(job) => job,
+                                    Err(_) => return,
+                                }
+                            },
                         },
                     };
                     match job {
+                        Job::Wake => {},
                         Job::Compile {
                             generation,
                             slot,
@@ -210,6 +223,14 @@ impl Native {
                             thread_shared.in_flight.fetch_sub(1, Ordering::Release);
                         },
                         Job::Reset => {
+                            // What waits for later is for the old module: answer it, uncompiled
+                            for job in std::mem::take(&mut *thread_shared.later.lock().unwrap()) {
+                                if let Job::Compile { generation, slot, .. } = job {
+                                    let _ = done_tx.send(Done { generation, slot, function: 0 });
+                                    thread_shared.pending.fetch_add(1, Ordering::Release);
+                                    thread_shared.in_flight.fetch_sub(1, Ordering::Release);
+                                }
+                            }
                             let Some(fresh) = Compiler::new() else {
                                 return;
                             };
@@ -251,6 +272,21 @@ impl Native {
             self.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
         sent
+    }
+
+    /// `submit`, for code that is not needed yet (a profile's, see `Cpu::jit_prewarm`): compiled
+    /// when nothing submitted is waiting.
+    pub fn submit_later(&mut self, slot: u32, body: Vec<u8>, cached: Vec<Cached>) -> bool {
+        let Some(jobs) = self.jobs.as_ref() else { return false };
+        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.shared.later.lock().unwrap().push_back(Job::Compile {
+            generation: self.generation,
+            slot,
+            body,
+            cached,
+        });
+        let _ = jobs.send(Job::Wake);
+        true
     }
 
     /// Testing aid: wait until every submitted page is compiled (the results still to be taken).
@@ -1214,6 +1250,14 @@ mod tests {
         (0x3b20_0000, 0x3800_0000), // LDUR/STUR, pre/post, LDTR
         (0x3a00_0000, 0x2800_0000), // LDP/STP
         (0x0e00_0000, 0x0e00_0000), // SIMD/FP
+        (0x3f00_0000, 0x3d00_0000), // LDR/STR (SIMD&FP) unsigned offset
+        (0x3f20_0000, 0x3c00_0000), // LDUR/STUR (SIMD&FP), pre/post
+        (0x3f20_0c00, 0x3c20_0800), // LDR/STR (SIMD&FP) register offset
+        (0x3e00_0000, 0x2c00_0000), // LDP/STP (SIMD&FP)
+        (0x9f20_0c00, 0x0e20_0000), // three different: SMULL, SMLAL, ... (and what stays interpreted)
+        (0x9f3f_0c00, 0x0e20_0800), // two-register misc: SADDLP, SADALP, ...
+        (0x9f20_0400, 0x0e20_0400), // three same: ADDP, ...
+        (0xbf20_8c00, 0x0e00_0800), // UZP, TRN, ZIP
     ];
 
     /// Everything a block can change: registers, flags, exception state and RAM.
@@ -1271,6 +1315,8 @@ mod tests {
             let el = if rng.below(5) == 0 { 0 } else { 1 };
             let (sp0, sp1) = (0x10000 + rng.below(0x20000), 0x10000 + rng.below(0x20000));
             let flags = rng.next();
+            // SIMD&FP mostly usable (FPEN = 3), else any FPEN, which traps some ELs
+            let fpen = if rng.below(4) == 0 { rng.below(4) } else { 3 };
             let vregs: [u128; 32] =
                 std::array::from_fn(|_| ((rng.next() as u128) << 64) | rng.next() as u128);
             let load = |c: &mut Cpu<NoDevices>, drop_code: bool| {
@@ -1292,6 +1338,7 @@ mod tests {
                 c.daif = 0x3c0;
                 (c.sys.esr, c.sys.far, c.sys.elr, c.sys.spsr) = (0, 0, 0, 0);
                 c.vreg = vregs;
+                c.sys.cpacr = fpen << 20;
                 c.set_excl(None);
                 // Entered through a branch, as a block is
                 c.jit_entry = true;

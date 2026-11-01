@@ -14,6 +14,7 @@
 //! slow path, which does the invalidation.
 
 pub mod gen;
+pub mod profile;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
 pub mod native;
 pub mod wasm;
@@ -108,6 +109,14 @@ pub struct Jit {
     pub(crate) yielded: bool,
     /// Executions of an entry before it is compiled.
     pub threshold: u32,
+    /// Compiles are a profile's (`jit_prewarm`), so they wait for the ones code needs now.
+    prewarming: bool,
+    /// Whether each slot's module has run since it was compiled: a profile keeps only the pages
+    /// whose code ran, not everything compiled (a profile's pages are compiled whether or not
+    /// they run).
+    slot_used: Vec<bool>,
+    /// Whether each slot compiling is a profile's, still waiting behind code needed now.
+    slot_later: Vec<bool>,
     lookup_key: Vec<u64>,
     lookup_slot: Vec<u32>,
     hot_key: Vec<u64>,
@@ -134,6 +143,9 @@ pub struct Jit {
     /// Instructions retired inside modules, and those of them interpreted.
     pub block_insns: u64,
     pub helper_interps: u64,
+    /// ARMLESS_JIT_HELPER_STATS: instructions compiled code hands to the interpreter, by opcode
+    /// (registers masked out) with how many and one of them: what the JIT should translate next.
+    pub helper_hist: Option<HashMap<u32, (u64, u32)>>,
     /// The native JIT's compiled code (None: pages go to the host, i.e. the browser) and the
     /// address of each slot's function in it.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
@@ -159,7 +171,11 @@ impl Jit {
             enabled: false,
             sync_compile: false,
             yielded: false,
-            threshold: 1024,
+            // ARMLESS_JIT_THRESHOLD: executions of an entry before it is compiled
+            threshold: std::env::var("ARMLESS_JIT_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(1024).max(1),
+            prewarming: false,
+            slot_used: vec![false; SLOTS as usize],
+            slot_later: vec![false; SLOTS as usize],
             lookup_key: vec![u64::MAX; LOOKUP],
             lookup_slot: vec![0; LOOKUP],
             hot_key: vec![u64::MAX; LOOKUP],
@@ -178,6 +194,7 @@ impl Jit {
             page_invalidations: 0,
             block_insns: 0,
             helper_interps: 0,
+            helper_hist: std::env::var_os("ARMLESS_JIT_HELPER_STATS").map(|_| HashMap::new()),
             #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
             native: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
@@ -453,7 +470,14 @@ impl<H: Host> Cpu<H> {
             self.jit.lookup_slot[i] = slot;
             return false;
         }
-        if info.covers(off) {
+        // An entry that got hot on a page a profile queued is needed now: it gets a module of its
+        // own at once rather than waiting behind the rest of the profile
+        let queued_later = |s: &u32| self.jit.slot_later[*s as usize];
+        let waits_for_later = !self.jit.prewarming
+            && info.compiling.as_ref().is_some_and(queued_later)
+            && info.compiling_entries.contains(&off)
+            && !info.extra_compiling.iter().any(|(_, e)| e.contains(&off));
+        if info.covers(off) && !waits_for_later {
             return false;
         }
         let busy = info.compiling.is_some();
@@ -527,6 +551,8 @@ impl<H: Host> Cpu<H> {
         }
         self.jit.slot_page[slot as usize] = page_key;
         self.jit.slot_state[slot as usize] = SlotState::Compiling;
+        self.jit.slot_used[slot as usize] = false;
+        self.jit.slot_later[slot as usize] = self.jit.prewarming;
         self.jit.compiled += 1;
         // Stores to this page must take the slow path from now on.
         for f in self.fast.iter_mut() {
@@ -568,7 +594,12 @@ impl<H: Host> Cpu<H> {
             let flags = [layout.n, layout.z, layout.c, layout.v]
                 .into_iter()
                 .map(|addr| native::Cached { addr, byte: true });
-            return n.submit(slot, code.b.clone(), wide.chain(flags).collect());
+            let cached = wide.chain(flags).collect();
+            return if self.jit.prewarming {
+                n.submit_later(slot, code.b.clone(), cached)
+            } else {
+                n.submit(slot, code.b.clone(), cached)
+            };
         }
         let wasm = wasm::module(&gen::imports(), gen::LOCALS, code, layout.smp != 0);
         self.host.jit_compile(SLOT_BASE + slot, &wasm)
@@ -611,6 +642,69 @@ impl<H: Host> Cpu<H> {
                 if done.generation == generation { done.function } else { 0 };
             self.jit.ready(SLOT_BASE + done.slot);
         }
+    }
+
+    /// The code this CPU has compiled and run: each page with its entry points and a
+    /// hash of what the page holds. Pages are physical (with their EL and SPSel), so a profile
+    /// stays meaningful across a save and restore; the hash tells `jit_prewarm` whether a page
+    /// still holds the same code (a new process can land on other pages from run to run).
+    pub fn jit_profile(&self) -> Vec<profile::Page> {
+        let mut pages: Vec<profile::Page> = self
+            .jit
+            .pages
+            .iter()
+            .filter_map(|(&key, info)| {
+                let used = |s: &u32| self.jit.slot_used[*s as usize];
+                // The entries of the modules that ran
+                let mut entries: Vec<u16> = info
+                    .slot
+                    .iter()
+                    .filter(|s| used(s))
+                    .flat_map(|_| &info.entries)
+                    .chain(info.extra.iter().filter(|(s, _)| used(s)).flat_map(|(_, e)| e))
+                    .copied()
+                    .collect();
+                if entries.is_empty() {
+                    return None;
+                }
+                entries.sort_unstable();
+                entries.dedup();
+                Some(profile::Page { key, hash: self.jit_page_hash(key)?, runs: 1, entries })
+            })
+            .collect();
+        pages.sort_unstable_by_key(|p| (p.key, p.hash));
+        pages
+    }
+
+    fn jit_page_hash(&self, page_key: u64) -> Option<u64> {
+        let pa = (page_key >> 2) as usize;
+        self.mem.get(pa..pa + 0x1000).map(profile::hash)
+    }
+
+    /// Compile the pages of a profile now, in its order, instead of waiting for each entry to
+    /// run `threshold` times. A page that holds something else now than when it was profiled
+    /// is skipped. Code is translated from what memory holds and dropped when the guest writes
+    /// the page, as always. Returns the modules queued.
+    pub fn jit_prewarm(&mut self, pages: &[profile::Page]) -> usize {
+        if !self.jit.enabled {
+            return 0;
+        }
+        let mut queued = 0;
+        for page in pages {
+            if page.entries.is_empty() || self.jit_page_hash(page.key) != Some(page.hash) {
+                continue;
+            }
+            let mut offs = page.entries.clone();
+            offs.truncate(MAX_ENTRIES);
+            // The rest go into the same module as warm entries
+            self.jit.pages.entry(page.key).or_default().warm = offs[1..].to_vec();
+            self.jit.prewarming = true;
+            if self.jit_compile(page.key | ((offs[0] as u64) << 2)) {
+                queued += 1;
+            }
+            self.jit.prewarming = false;
+        }
+        queued
     }
 
     /// Turn the JIT on with the native compiler (false where the host has no Cranelift backend).
@@ -694,6 +788,7 @@ impl<H: Host> Cpu<H> {
             if f == 0 {
                 return JitStep::NotCompiled;
             }
+            self.jit.slot_used[slot as usize] = true;
             // SAFETY: `f` is the function compiled for this slot, in the module the JIT holds; the
             // block reaches this CPU through the addresses in its layout, and its helpers through
             // CURRENT, while nothing else uses the CPU.
@@ -780,6 +875,11 @@ impl<H: Host> Cpu<H> {
     /// Interpret one instruction for a block. See `gen` for the status codes.
     pub fn jit_helper_interp(&mut self, insn: u32, pc: u64) -> i32 {
         self.jit.helper_interps += 1;
+        if let Some(h) = self.jit.helper_hist.as_mut() {
+            // By opcode: the register fields (Rd, Rn, Rm) masked out
+            let e = h.entry(insn & 0xffe0_fc00).or_insert((0, insn));
+            e.0 += 1;
+        }
         self.pc = pc;
         self.next_pc = pc.wrapping_add(4);
         let system = insn & 0xffc0_0000 == 0xd500_0000;
