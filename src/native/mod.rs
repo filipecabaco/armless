@@ -28,10 +28,22 @@ pub use egress::Egress;
 use crate::dev::Event;
 use crate::vm::Board;
 
+/// Where blobs come from besides a directory (an archive, memory): a blob's contents by name.
+#[derive(Clone)]
+pub struct BlobSource(pub Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>);
+
+impl std::fmt::Debug for BlobSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlobSource")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HostOptions {
     /// Directory holding the filesystem's blobs.
     pub blobs: Option<PathBuf>,
+    /// Or where else to get them (instead of `blobs`).
+    pub blob_source: Option<BlobSource>,
     /// Let the guest reach the outside world.
     pub network: bool,
     /// How (see [`Egress::from_env`]).
@@ -209,11 +221,15 @@ fn event_loop(
             observer(&e);
             match e {
                 Event::Blob(name) => {
-                    let data = options
-                        .blobs
-                        .as_ref()
-                        .filter(|_| !name.contains('/') && !name.contains(".."))
-                        .and_then(|dir| std::fs::read(dir.join(&name)).ok());
+                    let safe = !name.contains('/') && !name.contains("..");
+                    let data = match &options.blob_source {
+                        Some(source) => (source.0)(&name),
+                        None => options
+                            .blobs
+                            .as_ref()
+                            .filter(|_| safe)
+                            .and_then(|dir| std::fs::read(dir.join(&name)).ok()),
+                    };
                     match data {
                         Some(d) => {
                             if board.provide_blob(&name, d).is_err() {
