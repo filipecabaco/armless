@@ -927,11 +927,6 @@ impl Fs {
         (used, files)
     }
 
-    pub fn reset_refs(&mut self) {
-        for i in self.inodes.iter_mut().flatten() {
-            i.refs = 0;
-        }
-    }
 
     /// Free inodes that are neither named nor referenced (after a restore).
     pub fn collect(&mut self) {

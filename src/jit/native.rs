@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use super::wasm;
 
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+#[allow(unsafe_code)]
 mod code;
 
 /// Code memory for a module (`code::CodeMemory`) and how far from where it is written its code
@@ -117,6 +118,9 @@ struct Shared {
     in_flight: AtomicUsize,
     code_bytes: AtomicUsize,
     compiles: AtomicU64,
+    /// Compiles that failed (the block stays interpreted): `gen` made something this does not
+    /// translate.
+    failures: AtomicU64,
     compile_ns: AtomicU64,
     /// Jobs that wait for the compiler to have nothing else to do (`submit_later`).
     later: Mutex<VecDeque<Job>>,
@@ -139,6 +143,7 @@ pub struct Native {
 /// (seccomp, gVisor): there, ask first and stay with the interpreter if neither command it uses is
 /// available. (`CodeMemory` needs no system call for it.)
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[allow(unsafe_code)]
 fn can_publish_code() -> bool {
     const QUERY: libc::c_long = 0;
     const GLOBAL: libc::c_long = 1;
@@ -203,6 +208,9 @@ impl Native {
                                 .compile(&body, locals, &helpers, &cached)
                                 .map_or(0, |f| f as usize);
                             thread_shared.compiles.fetch_add(1, Ordering::Relaxed);
+                            if function == 0 {
+                                thread_shared.failures.fetch_add(1, Ordering::Relaxed);
+                            }
                             thread_shared
                                 .compile_ns
                                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -302,6 +310,7 @@ impl Native {
         self.shared.pending.load(Ordering::Relaxed) != 0
     }
 
+    #[allow(unsafe_code)]
     pub fn take_done(&mut self) -> Vec<Done> {
         let done: Vec<Done> = self.done.try_iter().collect();
         self.shared.pending.fetch_sub(done.len(), Ordering::Acquire);
@@ -336,6 +345,11 @@ impl Native {
     }
 
     /// Statistics: (functions compiled, nanoseconds spent compiling them).
+    /// Compiles that failed, leaving their blocks to the interpreter.
+    pub fn failures(&self) -> u64 {
+        self.shared.failures.load(Ordering::Relaxed)
+    }
+
     pub fn stats(&self) -> (u64, u64) {
         (
             self.shared.compiles.load(Ordering::Relaxed),
@@ -476,6 +490,7 @@ impl Compiler {
 
 /// Hands memory the allocator holds free back to the system: malloc keeps the pages of what is
 /// freed, and counts them as the process's, until asked.
+#[allow(unsafe_code)]
 fn return_freed_memory() {
     #[cfg(target_os = "macos")]
     {
@@ -493,6 +508,7 @@ fn return_freed_memory() {
 }
 
 impl Drop for Compiler {
+    #[allow(unsafe_code)]
     fn drop(&mut self) {
         // SAFETY: a compiler is dropped on a reset (every slot flushed first) or with its CPU, so
         // none of its code is reachable any more; `module` is not used again.
@@ -935,11 +951,8 @@ impl<'a, 'b> Translator<'a, 'b> {
             0x29 => ins.load(I64, flags, p, 0),
             0x2d => ins.uload8(I32, flags, p, 0),
             0x31 => ins.uload8(I64, flags, p, 0),
-            0x30 => ins.sload8(I64, flags, p, 0),
             0x33 => ins.uload16(I64, flags, p, 0),
-            0x32 => ins.sload16(I64, flags, p, 0),
             0x35 => ins.uload32(flags, p, 0),
-            0x34 => ins.sload32(flags, p, 0),
             _ => return None,
         };
         if let Some(k) = key {
@@ -956,8 +969,8 @@ impl<'a, 'b> Translator<'a, 'b> {
         let dynamic = *self.stack.last()?;
         let width = match op {
             0x37 => 8,
-            0x36 | 0x3e => 4,
-            0x3b | 0x3d => 2,
+            0x3e => 4,
+            0x3d => 2,
             _ => 1,
         };
         let key = match op {
@@ -976,9 +989,9 @@ impl<'a, 'b> Translator<'a, 'b> {
         let flags = MemFlagsData::new().with_notrap();
         let ins = self.b.ins();
         match op {
-            0x36 | 0x37 => ins.store(flags, v, p, 0),
+            0x37 => ins.store(flags, v, p, 0),
             0x3a | 0x3c => ins.istore8(flags, v, p, 0),
-            0x3b | 0x3d => ins.istore16(flags, v, p, 0),
+            0x3d => ins.istore16(flags, v, p, 0),
             0x3e => ins.istore32(flags, v, p, 0),
             _ => return None,
         };
@@ -1041,14 +1054,6 @@ impl<'a, 'b> Translator<'a, 'b> {
             },
             0x05 => self.else_()?,
             0x0b => self.end()?,
-            0x0c => {
-                let depth = r.leb_u()? as usize;
-                let args = self.branch_args(depth)?;
-                let target = self.target(depth)?;
-                self.b.ins().jump(target, &args);
-                self.reaches(depth)?;
-                self.unreachable = true;
-            },
             0x0d => {
                 let depth = r.leb_u()? as usize;
                 let c = self.pop()?;
@@ -1130,13 +1135,12 @@ impl<'a, 'b> Translator<'a, 'b> {
             },
             0x45 | 0x50 => self.eqz()?,
             0x46 | 0x51 => self.compare(IntCC::Equal)?,
-            0x47 | 0x52 => self.compare(IntCC::NotEqual)?,
-            0x49 | 0x54 => self.compare(IntCC::UnsignedLessThan)?,
+            0x52 => self.compare(IntCC::NotEqual)?,
+            0x54 => self.compare(IntCC::UnsignedLessThan)?,
             0x4d | 0x58 => self.compare(IntCC::UnsignedLessThanOrEqual)?,
             0x53 => self.compare(IntCC::SignedLessThan)?,
             0x55 => self.compare(IntCC::SignedGreaterThan)?,
             0x56 => self.compare(IntCC::UnsignedGreaterThan)?,
-            0x57 => self.compare(IntCC::SignedLessThanOrEqual)?,
             0x59 => self.compare(IntCC::SignedGreaterThanOrEqual)?,
             0x5a => self.compare(IntCC::UnsignedGreaterThanOrEqual)?,
             0x67 | 0x79 => self.unary(|b, x| b.ins().clz(x))?,
@@ -1148,15 +1152,13 @@ impl<'a, 'b> Translator<'a, 'b> {
             0x80 => self.binary(|b, x, y| b.ins().udiv(x, y))?,
             0x71 | 0x83 => self.binary(|b, x, y| b.ins().band(x, y))?,
             0x72 | 0x84 => self.binary(|b, x, y| b.ins().bor(x, y))?,
-            0x73 | 0x85 => self.binary(|b, x, y| b.ins().bxor(x, y))?,
+            0x85 => self.binary(|b, x, y| b.ins().bxor(x, y))?,
             // Shift counts are taken modulo the width, in wasm and in Cranelift alike
             0x74 | 0x86 => self.binary(|b, x, y| b.ins().ishl(x, y))?,
             0x76 | 0x88 => self.binary(|b, x, y| b.ins().ushr(x, y))?,
             0x87 => self.binary(|b, x, y| b.ins().sshr(x, y))?,
-            0x89 => self.binary(|b, x, y| b.ins().rotl(x, y))?,
             0x8a => self.binary(|b, x, y| b.ins().rotr(x, y))?,
             0xa7 => self.unary(|b, x| b.ins().ireduce(I32, x))?,
-            0xac => self.unary(|b, x| b.ins().sextend(I64, x))?,
             0xad => self.unary(|b, x| b.ins().uextend(I64, x))?,
             0xc2 => self.unary(|b, x| {
                 let n = b.ins().ireduce(I8, x);
@@ -1174,22 +1176,19 @@ impl<'a, 'b> Translator<'a, 'b> {
             0x5b | 0x61 => self.fcompare(FloatCC::Equal)?,
             0x5c | 0x62 => self.fcompare(FloatCC::NotEqual)?,
             0x5d | 0x63 => self.fcompare(FloatCC::LessThan)?,
-            0x5e | 0x64 => self.fcompare(FloatCC::GreaterThan)?,
-            0x5f | 0x65 => self.fcompare(FloatCC::LessThanOrEqual)?,
             0x60 | 0x66 => self.fcompare(FloatCC::GreaterThanOrEqual)?,
-            0x8b | 0x99 => self.unary(|b, x| b.ins().fabs(x))?,
             0x8c | 0x9a => self.unary(|b, x| b.ins().fneg(x))?,
             0x8f | 0x9d => self.unary(|b, x| b.ins().trunc(x))?,
-            0x91 | 0x9f => self.unary(|b, x| b.ins().sqrt(x))?,
+            0x91 => self.unary(|b, x| b.ins().sqrt(x))?,
             0x92 | 0xa0 => self.binary(|b, x, y| b.ins().fadd(x, y))?,
             0x93 | 0xa1 => self.binary(|b, x, y| b.ins().fsub(x, y))?,
-            0x94 | 0xa2 => self.binary(|b, x, y| b.ins().fmul(x, y))?,
-            0x95 | 0xa3 => self.binary(|b, x, y| b.ins().fdiv(x, y))?,
-            0xb2 | 0xb4 => self.unary(|b, x| b.ins().fcvt_from_sint(F32, x))?,
-            0xb3 | 0xb5 => self.unary(|b, x| b.ins().fcvt_from_uint(F32, x))?,
+            0xa2 => self.binary(|b, x, y| b.ins().fmul(x, y))?,
+            0x95 => self.binary(|b, x, y| b.ins().fdiv(x, y))?,
+            0xb4 => self.unary(|b, x| b.ins().fcvt_from_sint(F32, x))?,
+            0xb5 => self.unary(|b, x| b.ins().fcvt_from_uint(F32, x))?,
             0xb6 => self.unary(|b, x| b.ins().fdemote(F32, x))?,
-            0xb7 | 0xb9 => self.unary(|b, x| b.ins().fcvt_from_sint(F64, x))?,
-            0xb8 | 0xba => self.unary(|b, x| b.ins().fcvt_from_uint(F64, x))?,
+            0xb9 => self.unary(|b, x| b.ins().fcvt_from_sint(F64, x))?,
+            0xba => self.unary(|b, x| b.ins().fcvt_from_uint(F64, x))?,
             0xbb => self.unary(|b, x| b.ins().fpromote(F64, x))?,
             0xbc => self.unary(|b, x| b.ins().bitcast(I32, MemFlagsData::new(), x))?,
             0xbd => self.unary(|b, x| b.ins().bitcast(I64, MemFlagsData::new(), x))?,
@@ -1199,11 +1198,10 @@ impl<'a, 'b> Translator<'a, 'b> {
                 // Saturating float to integer: what it saturates to never matters (the generated
                 // code only converts values in range), but unlike the trapping forms it can't
                 // end the process
-                let sub = r.leb_u()?;
-                let ty = if sub < 4 { I32 } else { I64 };
-                match sub {
-                    0 | 2 | 4 | 6 => self.unary(|b, x| b.ins().fcvt_to_sint_sat(ty, x))?,
-                    1 | 3 | 5 | 7 => self.unary(|b, x| b.ins().fcvt_to_uint_sat(ty, x))?,
+                // to i64 (4 to 7; `gen` makes no i32 ones)
+                match r.leb_u()? {
+                    4 | 6 => self.unary(|b, x| b.ins().fcvt_to_sint_sat(I64, x))?,
+                    5 | 7 => self.unary(|b, x| b.ins().fcvt_to_uint_sat(I64, x))?,
                     _ => return None,
                 }
             },
@@ -1319,6 +1317,22 @@ mod tests {
         (0xffe0_fc00, 0x5e00_0400), // DUP (element, scalar)
     ];
 
+    /// Narrow groups `BODY` rarely draws (each is a sliver of its class): what a refactor of the
+    /// translator is likeliest to break without the wide fuzzing noticing.
+    const NARROW: &[(u32, u32)] = &[
+        (0x7fff_e000, 0x5ac0_0000), // RBIT, REV16, REV32, REV, CLZ, CLS (and unallocated)
+        (0xff60_fc00, 0x9b40_7c00), // SMULH, UMULH
+        (0x7fe0_fc00, 0x1ac0_2c00), // RORV
+        (0x7fa0_0000, 0x1380_0000), // EXTR (ROR immediate)
+        (0x7fe0_f000, 0x1ac0_2000), // LSLV, LSRV, ASRV, RORV
+        (0xbfe0_fc00, 0x0e00_0c00), // DUP (general)
+        (0xbf3f_fc00, 0x0e21_2800), // XTN, XTN2
+        (0x3f00_0000, 0x0800_0000), // load/store exclusive, acquire/release, CAS
+        (0x3f20_0c00, 0x3820_0000), // LSE atomics: LDADD, LDCLR, LDEOR, LDSET, SWP, ...
+        (0xbf20_8400, 0x2e00_0000), // EXT
+        (0xbf3f_fc00, 0x0e20_9800), // CMEQ, CMGE, CMGT, CMLE, CMLT (zero)
+    ];
+
     /// A small number with few significant bits: sums, products and quotients of these are
     /// often exact.
     fn fp_small(rng: &mut Rng, double: bool) -> u64 {
@@ -1380,6 +1394,74 @@ mod tests {
     #[test]
     fn compiled_blocks_do_what_the_interpreter_does() {
         fuzz(0x2545_f491_4f6c_dd1d, 6000, BODY, false);
+    }
+
+    /// A CPU at the start of a two-instruction block (`add x0, x0, #1; b EXIT`) at CODE.
+    fn at_block(threshold: u32) -> Option<Cpu<NoDevices>> {
+        let mut c = Cpu::new(RAM, NoDevices);
+        if !c.enable_native_jit() {
+            return None; // no Cranelift backend for this host
+        }
+        c.jit.threshold = threshold;
+        let words = [0x9100_0400u32, 0x1400_0000 | ((EXIT - CODE - 4) / 4) as u32];
+        for (i, w) in words.iter().enumerate() {
+            let a = CODE as usize + 4 * i;
+            c.mem.write(a, &w.to_le_bytes());
+        }
+        c.mem.write(EXIT as usize, &0x1400_0000u32.to_le_bytes());
+        (c.el, c.spsel, c.daif) = (1, true, 0x3c0);
+        Some(c)
+    }
+
+    /// Enter the block (as a branch does) and run it.
+    fn enter(c: &mut Cpu<NoDevices>) {
+        c.pc = CODE;
+        c.jit_entry = true;
+        c.run(2);
+    }
+
+    /// A profile of what one machine compiled and ran makes another compile it before its first
+    /// run, unless the page holds other code now.
+    #[test]
+    fn a_profile_prewarms_the_same_code_and_skips_changed_pages() {
+        let Some(mut a) = at_block(1) else { return };
+        for _ in 0..3 {
+            enter(&mut a);
+            a.wait_native_jit();
+        }
+        let profile = a.jit_profile();
+        let page = profile
+            .iter()
+            .find(|p| p.key >> 14 == CODE >> 12)
+            .unwrap_or_else(|| panic!("CODE's page is not in {profile:?}"));
+        assert!(page.entries.contains(&0), "{page:?}");
+
+        // A profile survives its encoding
+        let mut b = at_block(u32::MAX).unwrap();
+        let back = crate::jit::profile::read(&crate::jit::profile::write(&profile)).unwrap();
+        assert_eq!(b.jit_prewarm(&back), profile.len());
+        b.wait_native_jit();
+        let runs = b.jit.block_runs;
+        enter(&mut b);
+        assert_eq!(b.jit.block_runs, runs + 1, "the first run was not compiled code");
+        assert_eq!(b.x[0], 1);
+        assert_eq!(b.pc, EXIT);
+
+        // Other code on the page: nothing compiled for it, and it still runs (interpreted)
+        let mut c = at_block(u32::MAX).unwrap();
+        c.mem.write(CODE as usize, &0x9100_0800u32.to_le_bytes());
+        assert_eq!(c.jit_prewarm(&profile), profile.len() - 1);
+        c.wait_native_jit();
+        let runs = c.jit.block_runs;
+        enter(&mut c);
+        assert_eq!(c.jit.block_runs, runs);
+        assert_eq!(c.x[0], 2);
+    }
+
+    /// The same, for the narrow groups.
+    #[test]
+    fn compiled_narrow_groups_do_what_the_interpreter_does() {
+        fuzz(0x51_7cc1_b727_220a, 6000, NARROW, false);
     }
 
     /// The same, for scalar floating point alone, with operands that make exact results and the
@@ -1446,7 +1528,7 @@ mod tests {
             // Exception flags mostly clear, so that one wrongly raised shows
             let fpsr = if rng.below(4) == 0 { rng.next() & 0x9f } else { 0 };
             let load = |c: &mut Cpu<NoDevices>, drop_code: bool| {
-                c.mem[..].copy_from_slice(&mem);
+                c.mem.write(0, &mem);
                 if drop_code {
                     c.jit.invalidate_page((CODE >> 12) as usize);
                 }
@@ -1496,10 +1578,11 @@ mod tests {
                 "case {case}: block {words:08x?}"
             );
             assert!(
-                jit.mem[..] == interp.mem[..],
+                jit.mem.to_vec() == interp.mem.to_vec(),
                 "case {case}: RAM differs, block {words:08x?}"
             );
         }
         assert!(compared > cases * 95 / 100, "only {compared} blocks ran as native code");
+        assert_eq!(jit.native_jit_failures(), 0, "blocks `gen` made that did not compile");
     }
 }

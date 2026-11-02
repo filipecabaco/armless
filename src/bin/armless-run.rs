@@ -33,7 +33,10 @@ fn usage() -> ! {
   --console-after TEXT type them once the console printed TEXT
   --trap-undef         stop on the first undefined instruction
   --skip-idle          fast-forward time while the guest idles (1 CPU)
-  --stats              print instruction count and speed at exit"
+  --stats              print instruction count, speed and what the JIT did at exit
+  --stats-json FILE    write the same as JSON to FILE (for scripts: bench/run.exs)
+  --fallbacks          count, by opcode, the instructions compiled code hands back to the
+                       interpreter, and print the most common (slows those down a little)"
     );
     std::process::exit(2);
 }
@@ -76,6 +79,8 @@ fn main() {
     let mut trap_undef = false;
     let mut skip_idle = false;
     let mut stats = false;
+    let mut stats_json: Option<PathBuf> = None;
+    let mut fallbacks = false;
     let mut ncpus = 1usize;
 
     let mut args = std::env::args().skip(1);
@@ -107,6 +112,8 @@ fn main() {
             "--trap-undef" => trap_undef = true,
             "--skip-idle" => skip_idle = true,
             "--stats" => stats = true,
+            "--stats-json" => stats_json = Some(PathBuf::from(val())),
+            "--fallbacks" => fallbacks = true,
             "--smp" => ncpus = parse_num(&val()) as usize,
             _ => usage(),
         }
@@ -125,6 +132,9 @@ fn main() {
     let (mut vm, clock) = runner::new_vm(config).unwrap_or_else(|e| die(e));
     for c in vm.cpus.iter_mut() {
         c.trap_undefined = trap_undef;
+        if fallbacks {
+            c.jit.helper_hist.get_or_insert_with(Default::default);
+        }
     }
 
     let mut blobs = None;
@@ -231,17 +241,132 @@ fn main() {
     };
     // Let the host thread print the last output.
     std::thread::sleep(Duration::from_millis(50));
-    if stats {
+    if stats || stats_json.is_some() || fallbacks {
         let secs = start.elapsed().as_secs_f64();
         let n = runner.insn_count();
-        eprintln!(
-            "armless-run: {n} instructions on {ncpus} CPU(s) in {secs:.2}s ({:.1} MIPS)",
-            n as f64 / secs / 1e6
-        );
-        let last = runner.with_cpu(0, |c| c.last_undefined);
-        if let Some((pc, insn)) = last {
-            eprintln!("armless-run: last undefined instruction {insn:#010x} at {pc:#x}");
+        let cpus: Vec<CpuStats> = (0..ncpus).map(|i| runner.with_cpu(i, CpuStats::of)).collect();
+        if stats || fallbacks {
+            eprintln!(
+                "armless-run: {n} instructions on {ncpus} CPU(s) in {secs:.2}s ({:.1} MIPS)",
+                n as f64 / secs / 1e6
+            );
+            for (i, c) in cpus.iter().enumerate() {
+                c.print(i, fallbacks);
+            }
+            let last = runner.with_cpu(0, |c| c.last_undefined);
+            if let Some((pc, insn)) = last {
+                eprintln!("armless-run: last undefined instruction {insn:#010x} at {pc:#x}");
+            }
+        }
+        if let Some(path) = stats_json {
+            let cpus: Vec<String> = cpus.iter().map(CpuStats::json).collect();
+            let json = format!(
+                "{{\"instructions\":{n},\"seconds\":{secs},\"cpus\":[{}]}}\n",
+                cpus.join(",")
+            );
+            std::fs::write(&path, json).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
         }
     }
     std::process::exit(code);
+}
+
+/// What one CPU's JIT did, for `--stats`, `--stats-json` and `--fallbacks`.
+struct CpuStats {
+    instructions: u64,
+    /// Instructions retired inside compiled code, and of those, handed back to the interpreter.
+    compiled_insns: u64,
+    helper_insns: u64,
+    block_runs: u64,
+    modules: u64,
+    page_invalidations: u64,
+    flushes: u64,
+    /// Native compiler: compiles, those that failed, time spent and code held.
+    native_compiles: u64,
+    native_failures: u64,
+    native_compile_ns: u64,
+    native_code_bytes: usize,
+    /// (count, an example encoding) by opcode, most common first.
+    fallbacks: Vec<(u64, u32)>,
+}
+
+impl CpuStats {
+    fn of(c: &mut armless::runner::NativeCpu) -> CpuStats {
+        let j = &c.jit;
+        let mut fallbacks: Vec<(u64, u32)> =
+            j.helper_hist.iter().flat_map(|h| h.values().copied()).collect();
+        fallbacks.sort_unstable_by(|a, b| b.cmp(a));
+        #[cfg(feature = "native-jit")]
+        let ((native_compiles, native_compile_ns), native_failures, native_code_bytes) =
+            (c.native_jit_stats(), c.native_jit_failures(), c.native_jit_code_bytes());
+        #[cfg(not(feature = "native-jit"))]
+        let ((native_compiles, native_compile_ns), native_failures, native_code_bytes) =
+            ((0, 0), 0, 0);
+        CpuStats {
+            instructions: c.insn_count,
+            compiled_insns: j.block_insns,
+            helper_insns: j.helper_interps,
+            block_runs: j.block_runs,
+            modules: j.compiled,
+            page_invalidations: j.page_invalidations,
+            flushes: j.flushes,
+            native_compiles,
+            native_failures,
+            native_compile_ns,
+            native_code_bytes,
+            fallbacks,
+        }
+    }
+
+    fn print(&self, cpu: usize, fallbacks: bool) {
+        let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+        eprintln!(
+            "armless-run: cpu{cpu}: {} instructions, {:.1}% in compiled code ({} block runs, {:.1} \
+             instructions each), {:.2}% of those handed to the interpreter",
+            self.instructions,
+            pct(self.compiled_insns, self.instructions),
+            self.block_runs,
+            self.compiled_insns as f64 / self.block_runs.max(1) as f64,
+            pct(self.helper_insns, self.compiled_insns),
+        );
+        eprintln!(
+            "armless-run: cpu{cpu}: {} modules compiled ({} natively, {} failed, {:.1} ms \
+             compiling, {} KiB of code), {} pages invalidated, {} flushes",
+            self.modules,
+            self.native_compiles,
+            self.native_failures,
+            self.native_compile_ns as f64 / 1e6,
+            self.native_code_bytes >> 10,
+            self.page_invalidations,
+            self.flushes,
+        );
+        if fallbacks {
+            eprintln!("armless-run: cpu{cpu}: handed to the interpreter, by opcode (count, example):");
+            for (n, insn) in self.fallbacks.iter().take(20) {
+                eprintln!("armless-run:   {n:>12}  {insn:#010x}");
+            }
+        }
+    }
+
+    fn json(&self) -> String {
+        let fallbacks: Vec<String> =
+            self.fallbacks.iter().map(|(n, insn)| format!("[{insn},{n}]")).collect();
+        format!(
+            "{{\"instructions\":{},\"compiled_insns\":{},\"helper_insns\":{},\"block_runs\":{},\
+             \"modules\":{},\"page_invalidations\":{},\"flushes\":{},\"native_compiles\":{},\
+             \"native_failures\":{},\"native_compile_ns\":{},\"native_code_bytes\":{},\
+             \"fallbacks\":[{}]}}",
+            self.instructions,
+            self.compiled_insns,
+            self.helper_insns,
+            self.block_runs,
+            self.modules,
+            self.page_invalidations,
+            self.flushes,
+            self.native_compiles,
+            self.native_failures,
+            self.native_compile_ns,
+            self.native_code_bytes,
+            fallbacks.join(",")
+        )
+    }
 }

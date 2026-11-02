@@ -28,60 +28,57 @@ use crate::cpu::{Cpu, Exit, StopReason};
 use crate::dev::{DeviceConfig, Event};
 use crate::vm::{BootError, Config, StateLoader, Vm};
 
+// SAFETY: armless.js provides these, with these signatures. None has preconditions: they take
+// numbers, and `jit_compile` only reads the bytes it is given.
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
-extern "C" {
+unsafe extern "C" {
     /// Monotonic milliseconds.
-    fn microtick() -> f64;
+    safe fn microtick() -> f64;
     /// Milliseconds since the Unix epoch (`Date.now()`).
-    fn wall_clock_ms() -> f64;
+    safe fn wall_clock_ms() -> f64;
     /// Compile the JIT module at ptr/len into table slot `table_index`
     /// (asynchronously; JS calls armless_jit_ready). Returns 0 if unsupported.
-    fn jit_compile(table_index: u32, ptr: u32, len: u32) -> u32;
+    safe fn jit_compile(table_index: u32, ptr: u32, len: u32) -> u32;
     /// Events are waiting (called once until they are drained).
-    fn host_notify();
+    safe fn host_notify();
 }
 
 // Native stand-ins so `cargo check --features wasm-api` type-checks this file.
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn microtick() -> f64 {
+fn microtick() -> f64 {
     0.0
 }
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn wall_clock_ms() -> f64 {
+fn wall_clock_ms() -> f64 {
     0.0
 }
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn jit_compile(_table_index: u32, _ptr: u32, _len: u32) -> u32 {
+fn jit_compile(_table_index: u32, _ptr: u32, _len: u32) -> u32 {
     0
 }
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn host_notify() {}
+extern "C" fn host_notify() {}
 
 pub struct JsPlatform;
 
 impl Platform for JsPlatform {
     fn now_ns(&mut self) -> u64 {
-        (unsafe { microtick() } * 1e6) as u64
+        (microtick() * 1e6) as u64
     }
 
     fn wall_clock_secs(&mut self) -> u64 {
-        (unsafe { wall_clock_ms() } / 1000.0) as u64
+        (wall_clock_ms() / 1000.0) as u64
     }
 
     fn jit_compile(&mut self, table_index: u32, wasm: &[u8]) -> bool {
-        unsafe {
-            jit_compile(
-                table_index,
-                wasm.as_ptr() as usize as u32,
-                wasm.len() as u32,
-            ) != 0
-        }
+        jit_compile(table_index, wasm.as_ptr() as usize as u32, wasm.len() as u32) != 0
     }
 
     fn yield_now(&mut self) {
         // vCPU workers may block: sleep ~20 µs so the vCPU we wait for can run.
         #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+        // SAFETY: waits on a static atomic nobody notifies, for at most 20 µs.
         unsafe {
             static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             core::arch::wasm32::memory_atomic_wait32(NEVER.as_ptr() as *mut i32, 0, 20_000);
@@ -90,14 +87,13 @@ impl Platform for JsPlatform {
 }
 
 fn js_clock() -> u64 {
-    (unsafe { wall_clock_ms() } / 1000.0) as u64
+    (wall_clock_ms() / 1000.0) as u64
 }
 
 type JsCpu = Cpu<BoardHost<JsPlatform>>;
 
 /// The machine. Shared by every instance on the same memory.
 static mut VM: Option<Vm<JsPlatform>> = None;
-static mut LOADER: Option<(StateLoader, Option<crate::zstd::Stream>)> = None;
 
 std::thread_local! {
     /// The CPU this instance drives (`armless_smp_attach`); CPU 0 by default.
@@ -108,12 +104,18 @@ std::thread_local! {
     static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Last error message.
     static ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// A snapshot being restored (on the main thread), and its decompressor.
+    static LOADER: std::cell::RefCell<Option<(StateLoader, Option<crate::zstd::Stream>)>> =
+        const { std::cell::RefCell::new(None) };
     /// When `armless_run` returned 1: when to run again, in microtick() ms, or -1.
     static WAKE_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
 }
 
 #[allow(static_mut_refs)]
 fn vm() -> &'static mut Vm<JsPlatform> {
+    // SAFETY: `armless_create` sets VM once, before any other export runs, and nothing replaces
+    // it. Each instance (a thread) uses its own CPU of it, and the main thread touches the rest
+    // only while the workers are paused (snapshots) or through the board's locks.
     unsafe { VM.as_mut().expect("armless_create not called") }
 }
 
@@ -133,16 +135,24 @@ fn out(data: Vec<u8>) -> u32 {
     })
 }
 
+/// The bytes JavaScript wrote at `ptr` (in memory it got from `armless_alloc`).
+///
+/// # Safety
+/// `ptr..ptr + len` is memory of this instance that nothing changes while the slice lives.
 unsafe fn slice<'a>(ptr: u32, len: u32) -> &'a [u8] {
     if len == 0 {
         &[]
     } else {
-        std::slice::from_raw_parts(ptr as *const u8, len as usize)
+        // SAFETY: the caller's promise
+        unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }
     }
 }
 
+/// # Safety
+/// As for `slice`.
 unsafe fn string(ptr: u32, len: u32) -> String {
-    String::from_utf8_lossy(slice(ptr, len)).into_owned()
+    // SAFETY: the caller's promise
+    String::from_utf8_lossy(unsafe { slice(ptr, len) }).into_owned()
 }
 
 /// Device flags for `armless_create`.
@@ -186,6 +196,7 @@ pub unsafe extern "C" fn armless_create(
             #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
             {
                 let m = v.board.machine().clone();
+                // SAFETY: notifies (wakes) waiters on an atomic of the machine, which `m` keeps.
                 m.clone().set_waker(Box::new(move |cpu| unsafe {
                     // Wake the worker waiting (Atomics.wait) on this CPU's counter.
                     core::arch::wasm32::memory_atomic_notify(
@@ -194,7 +205,7 @@ pub unsafe extern "C" fn armless_create(
                     );
                 }));
             }
-            v.board.set_notify(Box::new(|| unsafe { host_notify() }));
+            v.board.set_notify(Box::new(|| host_notify()));
             VM = Some(v);
             0
         },
@@ -310,6 +321,7 @@ pub unsafe extern "C" fn armless_free(ptr: u32, len: u32) {
 pub extern "C" fn armless_alloc_aligned(len: u32, align: u32) -> u32 {
     let layout =
         std::alloc::Layout::from_size_align(len.max(1) as usize, align.max(1) as usize).unwrap();
+    // SAFETY: never zero-sized (`max(1)`); never freed.
     unsafe { std::alloc::alloc_zeroed(layout) as u32 }
 }
 
@@ -700,9 +712,7 @@ pub extern "C" fn armless_save_state() -> u32 {
 pub extern "C" fn armless_state_begin(compressed: u32) {
     let loader = StateLoader::new(&vm().board);
     let stream = (compressed != 0).then(crate::zstd::Stream::new);
-    unsafe {
-        LOADER = Some((loader, stream));
-    }
+    LOADER.set(Some((loader, stream)));
 }
 
 /// Feed snapshot bytes. Returns 0 or -1 (see `armless_error`).
@@ -710,9 +720,19 @@ pub extern "C" fn armless_state_begin(compressed: u32) {
 /// # Safety
 /// `ptr` must reference `len` readable bytes.
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub unsafe extern "C" fn armless_state_feed(ptr: u32, len: u32) -> i32 {
-    let Some((loader, stream)) = LOADER.as_mut() else {
+    // SAFETY: the caller's promise, passed on
+    LOADER.with_borrow_mut(|l| unsafe { state_feed(l, ptr, len) })
+}
+
+/// # Safety
+/// As for `armless_state_feed`.
+unsafe fn state_feed(
+    l: &mut Option<(StateLoader, Option<crate::zstd::Stream>)>,
+    ptr: u32,
+    len: u32,
+) -> i32 {
+    let Some((loader, stream)) = l.as_mut() else {
         return -1;
     };
     let board = &vm().board;
@@ -737,7 +757,7 @@ pub unsafe extern "C" fn armless_state_feed(ptr: u32, len: u32) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             set_error(e);
-            LOADER = None;
+            *l = None;
             -1
         },
     }
@@ -745,9 +765,8 @@ pub unsafe extern "C" fn armless_state_feed(ptr: u32, len: u32) -> i32 {
 
 /// Apply the snapshot (all CPUs stopped). Returns 0 or -1.
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn armless_state_finish() -> i32 {
-    let Some((loader, _)) = (unsafe { LOADER.take() }) else {
+    let Some((loader, _)) = LOADER.take() else {
         return -1;
     };
     let v = vm();

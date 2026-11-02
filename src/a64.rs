@@ -402,7 +402,7 @@ impl<H: Host> Cpu<H> {
             return Err(Event::undefined());
         }
         match opc {
-            0 | 1 | 2 if op3 == 0 && op4 == 0 => {
+            0..=2 if op3 == 0 && op4 == 0 => {
                 let target = self.xr(rn);
                 if opc == 1 {
                     self.x[30] = self.pc.wrapping_add(4);
@@ -1302,13 +1302,8 @@ impl<H: Host> Cpu<H> {
         let cond = field(insn, 12, 4);
         if self.cond_holds(cond) {
             let y = if bit(insn, 11) { rm as u64 } else { self.xr(rm) };
-            let x = self.xr(rn);
-            let (_, n, z, c, v) = if bit(insn, 30) {
-                add_with_carry(x, !y, true, sf)
-            } else {
-                add_with_carry(x, y, false, sf)
-            };
-            self.set_flags(n, z, c, v);
+            // CMP (bit 30) or CMN, setting the flags (bit 29 is set)
+            self.addsub(insn, self.xr(rn), y, sf);
         } else {
             self.set_nzcv(((insn & 0xf) as u64) << 28);
         }
@@ -1343,33 +1338,6 @@ impl<H: Host> Cpu<H> {
     }
 
     #[inline(always)]
-    pub(crate) fn dp_2src_leaf(&mut self, insn: u32) -> Res<()> {
-        self.dp_2src(
-            insn,
-            bit(insn, 31),
-            insn & 31,
-            field(insn, 5, 5),
-            field(insn, 16, 5),
-        )
-    }
-
-    #[inline(always)]
-    pub(crate) fn dp_1src_leaf(&mut self, insn: u32) -> Res<()> {
-        self.dp_1src(insn, bit(insn, 31), insn & 31, field(insn, 5, 5))
-    }
-
-    #[inline(always)]
-    pub(crate) fn dp_3src_leaf(&mut self, insn: u32) -> Res<()> {
-        self.dp_3src(
-            insn,
-            bit(insn, 31),
-            insn & 31,
-            field(insn, 5, 5),
-            field(insn, 16, 5),
-        )
-    }
-
-    #[inline(always)]
     fn addsub(&mut self, insn: u32, x: u64, y: u64, sf: bool) -> u64 {
         let (r, n, z, c, v) = if bit(insn, 30) {
             add_with_carry(x, !y, true, sf)
@@ -1382,7 +1350,8 @@ impl<H: Host> Cpu<H> {
         trunc(r, sf)
     }
 
-    fn dp_2src(&mut self, insn: u32, sf: bool, rd: u32, rn: u32, rm: u32) -> Res<()> {
+    pub(crate) fn dp_2src_leaf(&mut self, insn: u32) -> Res<()> {
+        let (sf, rd, rn, rm) = (bit(insn, 31), insn & 31, field(insn, 5, 5), field(insn, 16, 5));
         if bit(insn, 29) {
             return Err(Event::undefined());
         }
@@ -1430,7 +1399,8 @@ impl<H: Host> Cpu<H> {
         Ok(())
     }
 
-    fn dp_1src(&mut self, insn: u32, sf: bool, rd: u32, rn: u32) -> Res<()> {
+    pub(crate) fn dp_1src_leaf(&mut self, insn: u32) -> Res<()> {
+        let (sf, rd, rn) = (bit(insn, 31), insn & 31, field(insn, 5, 5));
         if bit(insn, 29) || field(insn, 16, 5) != 0 {
             return Err(Event::undefined());
         }
@@ -1468,7 +1438,8 @@ impl<H: Host> Cpu<H> {
         Ok(())
     }
 
-    fn dp_3src(&mut self, insn: u32, sf: bool, rd: u32, rn: u32, rm: u32) -> Res<()> {
+    pub(crate) fn dp_3src_leaf(&mut self, insn: u32) -> Res<()> {
+        let (sf, rd, rn, rm) = (bit(insn, 31), insn & 31, field(insn, 5, 5), field(insn, 16, 5));
         if field(insn, 29, 2) != 0 {
             return Err(Event::undefined());
         }

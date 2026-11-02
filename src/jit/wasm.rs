@@ -65,7 +65,6 @@ pub struct Code {
     pub b: Vec<u8>,
 }
 
-#[allow(dead_code)]
 impl Code {
     pub fn new() -> Code {
         Code::default()
@@ -89,10 +88,6 @@ impl Code {
     }
     pub fn end(&mut self) {
         self.b.push(0x0b);
-    }
-    pub fn br(&mut self, depth: u32) {
-        self.b.push(0x0c);
-        leb_u(&mut self.b, depth as u64);
     }
     pub fn br_if(&mut self, depth: u32) {
         self.b.push(0x0d);
@@ -157,23 +152,11 @@ impl Code {
     pub fn i64_load8_u(&mut self, off: u64) {
         self.mem(0x31, 0, off)
     }
-    pub fn i64_load8_s(&mut self, off: u64) {
-        self.mem(0x30, 0, off)
-    }
     pub fn i64_load16_u(&mut self, off: u64) {
         self.mem(0x33, 1, off)
     }
-    pub fn i64_load16_s(&mut self, off: u64) {
-        self.mem(0x32, 1, off)
-    }
     pub fn i64_load32_u(&mut self, off: u64) {
         self.mem(0x35, 2, off)
-    }
-    pub fn i64_load32_s(&mut self, off: u64) {
-        self.mem(0x34, 2, off)
-    }
-    pub fn i32_store(&mut self, off: u64) {
-        self.mem(0x36, 2, off)
     }
     pub fn i64_store(&mut self, off: u64) {
         self.mem(0x37, 3, off)
@@ -215,12 +198,6 @@ impl Code {
     pub fn i32_eq(&mut self) {
         self.op(0x46)
     }
-    pub fn i32_ne(&mut self) {
-        self.op(0x47)
-    }
-    pub fn i32_lt_u(&mut self) {
-        self.op(0x49)
-    }
     pub fn i32_le_u(&mut self) {
         self.op(0x4d)
     }
@@ -235,9 +212,6 @@ impl Code {
     }
     pub fn i32_or(&mut self) {
         self.op(0x72)
-    }
-    pub fn i32_xor(&mut self) {
-        self.op(0x73)
     }
     pub fn i32_shl(&mut self) {
         self.op(0x74)
@@ -267,9 +241,6 @@ impl Code {
     }
     pub fn i64_gt_u(&mut self) {
         self.op(0x56)
-    }
-    pub fn i64_le_s(&mut self) {
-        self.op(0x57)
     }
     pub fn i64_le_u(&mut self) {
         self.op(0x58)
@@ -316,9 +287,6 @@ impl Code {
     pub fn i64_shr_u(&mut self) {
         self.op(0x88)
     }
-    pub fn i64_rotl(&mut self) {
-        self.op(0x89)
-    }
     pub fn i64_rotr(&mut self) {
         self.op(0x8a)
     }
@@ -326,9 +294,6 @@ impl Code {
     // conversions
     pub fn i32_wrap_i64(&mut self) {
         self.op(0xa7)
-    }
-    pub fn i64_extend_i32_s(&mut self) {
-        self.op(0xac)
     }
     pub fn i64_extend_i32_u(&mut self) {
         self.op(0xad)
@@ -430,22 +395,6 @@ pub fn module(imports: &[Import], locals: &[(u32, u8)], code: &Code, shared: boo
 impl Code {
     // Float to integer, saturating (0xfc prefix): never traps, as the trapping forms would
     // natively (a trap in compiled code ends the process)
-    pub fn i32_trunc_sat_f32_s(&mut self) {
-        self.op(0xfc);
-        leb_u(&mut self.b, 0);
-    }
-    pub fn i32_trunc_sat_f32_u(&mut self) {
-        self.op(0xfc);
-        leb_u(&mut self.b, 1);
-    }
-    pub fn i32_trunc_sat_f64_s(&mut self) {
-        self.op(0xfc);
-        leb_u(&mut self.b, 2);
-    }
-    pub fn i32_trunc_sat_f64_u(&mut self) {
-        self.op(0xfc);
-        leb_u(&mut self.b, 3);
-    }
     pub fn i64_trunc_sat_f32_s(&mut self) {
         self.op(0xfc);
         leb_u(&mut self.b, 4);
@@ -471,12 +420,6 @@ impl Code {
     pub fn f32_lt(&mut self) {
         self.op(0x5d)
     }
-    pub fn f32_gt(&mut self) {
-        self.op(0x5e)
-    }
-    pub fn f32_le(&mut self) {
-        self.op(0x5f)
-    }
     pub fn f32_ge(&mut self) {
         self.op(0x60)
     }
@@ -489,17 +432,8 @@ impl Code {
     pub fn f64_lt(&mut self) {
         self.op(0x63)
     }
-    pub fn f64_gt(&mut self) {
-        self.op(0x64)
-    }
-    pub fn f64_le(&mut self) {
-        self.op(0x65)
-    }
     pub fn f64_ge(&mut self) {
         self.op(0x66)
-    }
-    pub fn f32_abs(&mut self) {
-        self.op(0x8b)
     }
     pub fn f32_neg(&mut self) {
         self.op(0x8c)
@@ -516,23 +450,14 @@ impl Code {
     pub fn f32_sub(&mut self) {
         self.op(0x93)
     }
-    pub fn f32_mul(&mut self) {
-        self.op(0x94)
-    }
     pub fn f32_div(&mut self) {
         self.op(0x95)
-    }
-    pub fn f64_abs(&mut self) {
-        self.op(0x99)
     }
     pub fn f64_neg(&mut self) {
         self.op(0x9a)
     }
     pub fn f64_trunc(&mut self) {
         self.op(0x9d)
-    }
-    pub fn f64_sqrt(&mut self) {
-        self.op(0x9f)
     }
     pub fn f64_add(&mut self) {
         self.op(0xa0)
@@ -543,15 +468,6 @@ impl Code {
     pub fn f64_mul(&mut self) {
         self.op(0xa2)
     }
-    pub fn f64_div(&mut self) {
-        self.op(0xa3)
-    }
-    pub fn f32_convert_i32_s(&mut self) {
-        self.op(0xb2)
-    }
-    pub fn f32_convert_i32_u(&mut self) {
-        self.op(0xb3)
-    }
     pub fn f32_convert_i64_s(&mut self) {
         self.op(0xb4)
     }
@@ -560,12 +476,6 @@ impl Code {
     }
     pub fn f32_demote_f64(&mut self) {
         self.op(0xb6)
-    }
-    pub fn f64_convert_i32_s(&mut self) {
-        self.op(0xb7)
-    }
-    pub fn f64_convert_i32_u(&mut self) {
-        self.op(0xb8)
     }
     pub fn f64_convert_i64_s(&mut self) {
         self.op(0xb9)

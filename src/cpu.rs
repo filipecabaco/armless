@@ -190,8 +190,9 @@ pub struct Cpu<H: Host> {
     pub last_undefined: Option<(u64, u32)>,
 }
 
-// A CPU moves to its host thread once; the raw pointers it holds point into
-// its own `machine`, which it keeps alive.
+// SAFETY: a CPU moves to its host thread once; the raw pointer it holds (`attn`) points into its
+// own `machine`, which it keeps alive, at an atomic.
+#[allow(unsafe_code)]
 unsafe impl<H: Host + Send> Send for Cpu<H> {}
 
 const FAST_ENTRIES: usize = 256;
@@ -354,9 +355,11 @@ impl<H: Host> Cpu<H> {
         cpu
     }
 
+    /// Checked before every instruction: a pointer saves the walk through `machine.cpus`.
     #[inline(always)]
+    #[allow(unsafe_code)]
     fn attn(&self) -> &AtomicU8 {
-        // Points into `self.machine`, which this CPU keeps alive.
+        // SAFETY: points into `self.machine`, which this CPU keeps alive.
         unsafe { &*self.attn }
     }
 
@@ -558,18 +561,7 @@ impl<H: Host> Cpu<H> {
         self.set_irq_dirty();
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub(crate) fn sync_exception_pub(
-        &mut self,
-        ec: u32,
-        iss: u32,
-        far: Option<u64>,
-        ret: u64,
-    ) -> Result<(), StopReason> {
-        self.sync_exception(ec, iss, far, ret)
-    }
-
-    fn sync_exception(
+    pub(crate) fn sync_exception(
         &mut self,
         ec: u32,
         iss: u32,
@@ -1061,7 +1053,7 @@ impl<H: Host> Cpu<H> {
             f.code_page = pc >> 12;
             f.code_base = f.code_bases[i];
             let a = f.code_base + (pc & 0xffc) as usize;
-            return Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()));
+            return Ok(self.mem.load(a, 4) as u32);
         }
         let pa = self.translate(pc, crate::mmu::Access::Exec, false)?;
         let a = pa as usize;
@@ -1077,7 +1069,7 @@ impl<H: Host> Cpu<H> {
                 f.code_tag[i] = pc >> 12;
                 f.code_bases[i] = page;
             }
-            Ok(u32::from_le_bytes(self.mem[a..a + 4].try_into().unwrap()))
+            Ok(self.mem.load(a, 4) as u32)
         } else {
             // Executing from MMIO is not supported: synchronous external abort.
             Err(Event::Sync {
@@ -1093,27 +1085,15 @@ impl<H: Host> Cpu<H> {
 
     /// Physical read. `None` = nothing there.
     pub fn phys_read(&mut self, pa: u64, size: u32) -> Option<u64> {
-        let a = pa as usize;
-        let len = self.mem.len();
-        if (pa as u128) + (size as u128) <= len as u128 {
-            let s = &self.mem[a..a + size as usize];
-            return Some(match size {
-                1 => s[0] as u64,
-                2 => u16::from_le_bytes([s[0], s[1]]) as u64,
-                4 => u32::from_le_bytes(s.try_into().unwrap()) as u64,
-                8 => u64::from_le_bytes(s.try_into().unwrap()),
-                _ => unreachable!(),
-            });
+        if (pa as u128) + (size as u128) <= self.mem.len() as u128 {
+            return Some(self.mem.load(pa as usize, size));
         }
         self.mmio_read(pa, size)
     }
 
     pub fn phys_write(&mut self, pa: u64, size: u32, value: u64) -> bool {
-        let a = pa as usize;
-        let len = self.mem.len();
-        if (pa as u128) + (size as u128) <= len as u128 {
-            let bytes = value.to_le_bytes();
-            self.mem[a..a + size as usize].copy_from_slice(&bytes[..size as usize]);
+        if (pa as u128) + (size as u128) <= self.mem.len() as u128 {
+            self.mem.store(pa as usize, size, value);
             return true;
         }
         self.mmio_write(pa, size, value)
@@ -1185,33 +1165,13 @@ impl<H: Host> Cpu<H> {
     /// fast tables hold, with the access inside it, or a range compared with the RAM size).
     #[inline(always)]
     fn ram_load(&self, a: usize, size: u32) -> u64 {
-        debug_assert!(a + size as usize <= self.mem.len());
-        // SAFETY: in RAM, see above; guest accesses need not be aligned.
-        unsafe {
-            let p = self.mem.as_ptr().add(a);
-            match size {
-                1 => *p as u64,
-                2 => u16::from_le((p as *const u16).read_unaligned()) as u64,
-                4 => u32::from_le((p as *const u32).read_unaligned()) as u64,
-                _ => u64::from_le((p as *const u64).read_unaligned()),
-            }
-        }
+        self.mem.load(a, size)
     }
 
     /// Store `size` bytes of RAM at `a`, which the caller has checked lies in RAM.
     #[inline(always)]
     fn ram_store(&mut self, a: usize, size: u32, value: u64) {
-        debug_assert!(a + size as usize <= self.mem.len());
-        // SAFETY: in RAM, see `ram_load`.
-        unsafe {
-            let p = self.mem.as_mut_ptr().add(a);
-            match size {
-                1 => *p = value as u8,
-                2 => (p as *mut u16).write_unaligned((value as u16).to_le()),
-                4 => (p as *mut u32).write_unaligned((value as u32).to_le()),
-                _ => (p as *mut u64).write_unaligned(value.to_le()),
-            }
-        }
+        self.mem.store(a, size, value)
     }
 
     /// WFE with several CPUs: wait until something may have changed what the
@@ -1254,44 +1214,12 @@ impl<H: Host> Cpu<H> {
     /// Atomic compare-and-swap of guest RAM at an aligned physical address
     /// (STXR with several CPUs). None if `pa` is not RAM or not aligned.
     pub(crate) fn ram_cmpxchg(&self, pa: u64, size: u32, expected: u64, new: u64) -> Option<bool> {
-        use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
-        if !pa.is_multiple_of(size as u64) || pa + size as u64 > self.mem.len() as u64 {
-            return None;
-        }
-        // In bounds and naturally aligned (RAM is page-aligned on the host).
-        let p = unsafe { self.mem.as_mut_ptr().add(pa as usize) };
-        let (o, f) = (Ordering::SeqCst, Ordering::SeqCst);
-        Some(unsafe {
-            match size {
-                1 => AtomicU8::from_ptr(p)
-                    .compare_exchange(expected as u8, new as u8, o, f)
-                    .is_ok(),
-                2 => AtomicU16::from_ptr(p as *mut u16)
-                    .compare_exchange(expected as u16, new as u16, o, f)
-                    .is_ok(),
-                4 => AtomicU32::from_ptr(p as *mut u32)
-                    .compare_exchange(expected as u32, new as u32, o, f)
-                    .is_ok(),
-                _ => AtomicU64::from_ptr(p as *mut u64)
-                    .compare_exchange(expected, new, o, f)
-                    .is_ok(),
-            }
-        })
+        self.mem.cmpxchg(pa, size, expected, new)
     }
 
     /// Atomic load of guest RAM at an aligned physical address that lies in RAM.
     fn ram_load_atomic(&self, pa: u64, size: u32) -> u64 {
-        use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
-        let p = unsafe { self.mem.as_mut_ptr().add(pa as usize) };
-        let o = Ordering::SeqCst;
-        unsafe {
-            match size {
-                1 => AtomicU8::from_ptr(p).load(o) as u64,
-                2 => AtomicU16::from_ptr(p as *mut u16).load(o) as u64,
-                4 => AtomicU32::from_ptr(p as *mut u32).load(o) as u64,
-                _ => AtomicU64::from_ptr(p as *mut u64).load(o),
-            }
-        }
+        self.mem.load_atomic(pa, size).unwrap_or(0)
     }
 
     /// An atomic read-modify-write of `size` bytes at `va` (the LSE instructions): `f` maps the

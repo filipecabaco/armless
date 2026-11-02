@@ -13,11 +13,11 @@
 //! entered into the fast write TLB, so guest stores to them always reach the
 //! slow path, which does the invalidation.
 
-pub mod gen;
+pub(crate) mod gen;
 pub mod profile;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
 pub mod native;
-pub mod wasm;
+pub(crate) mod wasm;
 
 use std::collections::HashMap;
 
@@ -295,16 +295,6 @@ impl Jit {
         }
     }
 
-    pub fn invalidate_range(&mut self, start: u64, len: u64) {
-        if len == 0 {
-            return;
-        }
-        let first = (start >> 12) as usize;
-        let last = ((start + len - 1) >> 12) as usize;
-        for p in first..=last.min(self.code_page.len().saturating_sub(1)) {
-            self.invalidate_page(p);
-        }
-    }
 
     pub fn flush_all(&mut self) {
         self.flushes += 1;
@@ -524,11 +514,12 @@ impl<H: Host> Cpu<H> {
         };
         // flush_all may have removed the page info
         let page_pa = (page_key >> 2) as usize;
-        if page_pa + 0x1000 > self.mem.len() {
+        let mut page = [0u8; 0x1000];
+        if !self.mem.read(page_pa, &mut page) {
             self.jit.free.push(slot);
             return false;
         }
-        let words: Vec<u32> = self.mem[page_pa..page_pa + 0x1000]
+        let words: Vec<u32> = page
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
@@ -611,6 +602,13 @@ impl<H: Host> Cpu<H> {
         self.jit.native.as_ref().map_or((0, 0), |n| n.stats())
     }
 
+    /// Native compiles that failed (their blocks stay interpreted): zero unless `gen` makes
+    /// something the native compiler does not translate.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    pub fn native_jit_failures(&self) -> u64 {
+        self.jit.native.as_ref().map_or(0, |n| n.failures())
+    }
+
     /// Bytes of code the native JIT holds for this CPU, stale functions included until its next
     /// reset.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
@@ -677,8 +675,8 @@ impl<H: Host> Cpu<H> {
     }
 
     fn jit_page_hash(&self, page_key: u64) -> Option<u64> {
-        let pa = (page_key >> 2) as usize;
-        self.mem.get(pa..pa + 0x1000).map(profile::hash)
+        let mut page = [0u8; 0x1000];
+        self.mem.read((page_key >> 2) as usize, &mut page).then(|| profile::hash(&page))
     }
 
     /// Compile the pages of a profile now, in its order, instead of waiting for each entry to
@@ -775,10 +773,12 @@ impl<H: Host> Cpu<H> {
     }
 
     #[cfg(any(target_arch = "wasm32", feature = "native-jit"))]
+    #[allow(unsafe_code)]
     fn jit_run(&mut self, slot: u32, budget: u64) -> JitStep {
         let before = self.insn_count;
         self.jit_limit = before.wrapping_add(budget.clamp(1, CHAIN_BUDGET));
         let pc = self.pc;
+        // SAFETY: the table entry the host filled with this slot's compiled function, of this type
         #[cfg(target_arch = "wasm32")]
         let status = unsafe {
             let f: extern "C" fn(i64) -> i32 = std::mem::transmute((SLOT_BASE + slot) as usize);
@@ -791,10 +791,10 @@ impl<H: Host> Cpu<H> {
                 return JitStep::NotCompiled;
             }
             self.jit.slot_used[slot as usize] = true;
+            let previous = CURRENT.replace(self as *mut Self as *mut ());
             // SAFETY: `f` is the function compiled for this slot, in the module the JIT holds; the
             // block reaches this CPU through the addresses in its layout, and its helpers through
             // CURRENT, while nothing else uses the CPU.
-            let previous = CURRENT.replace(self as *mut Self as *mut ());
             let status = unsafe {
                 let f: extern "C" fn(i64) -> i32 = std::mem::transmute(f);
                 f(pc as i64)
@@ -806,8 +806,8 @@ impl<H: Host> Cpu<H> {
         let ran = self.insn_count.wrapping_sub(before);
         self.jit.block_insns += ran;
         match status {
-            0 | 1 => JitStep::Ran(ran),
-            3 => JitStep::Wfi(ran),
+            gen::STATUS_DONE | gen::STATUS_REDIRECT => JitStep::Ran(ran),
+            gen::STATUS_WFI => JitStep::Wfi(ran),
             _ => match self.jit_take_pending() {
                 Ok(()) => JitStep::Ran(ran),
                 Err(r) => JitStep::Stop(r),
@@ -839,7 +839,7 @@ impl<H: Host> Cpu<H> {
                         }
                     }
                 }
-                self.sync_exception_pub(ec, iss, far, ret)
+                self.sync_exception(ec, iss, far, ret)
             },
             Some(Event::Stop(r)) => Err(r),
             _ => Ok(()),
@@ -892,20 +892,20 @@ impl<H: Host> Cpu<H> {
                     // (EL, SPSel, translation, unmasked interrupts) changed:
                     // end the block and continue in the run loop.
                     self.pc = self.next_pc;
-                    1
+                    gen::STATUS_REDIRECT
                 } else {
-                    0
+                    gen::STATUS_DONE
                 }
             },
             Err(Event::Wfi) => {
                 self.pc = self.next_pc;
-                3
+                gen::STATUS_WFI
             },
             Err(e) => {
                 self.pc = pc;
                 self.jit_pending = Some(e);
                 self.jit_pending_flag = 1;
-                2
+                gen::STATUS_PENDING
             },
         }
     }
@@ -1001,6 +1001,7 @@ fn current<H: Host>() -> *mut Cpu<H> {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+#[allow(unsafe_code)]
 extern "C" fn native_read<H: Host>(va: i64, size: i32) -> i64 {
     // SAFETY: only blocks call the helpers, and only from `jit_run`, which set CURRENT to its CPU
     // (of this H) for the duration of the call.
@@ -1009,6 +1010,7 @@ extern "C" fn native_read<H: Host>(va: i64, size: i32) -> i64 {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+#[allow(unsafe_code)]
 extern "C" fn native_write<H: Host>(va: i64, size: i32, value: i64) {
     // SAFETY: only blocks call the helpers, and only from `jit_run`, which set CURRENT to its CPU
     // (of this H) for the duration of the call.
@@ -1017,6 +1019,7 @@ extern "C" fn native_write<H: Host>(va: i64, size: i32, value: i64) {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+#[allow(unsafe_code)]
 extern "C" fn native_interp<H: Host>(insn: i32, pc: i64) -> i32 {
     // SAFETY: only blocks call the helpers, and only from `jit_run`, which set CURRENT to its CPU
     // (of this H) for the duration of the call.

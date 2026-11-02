@@ -2,7 +2,7 @@
 //! filesystem (zstd blobs), talk to the guest over the virtio console, save
 //! a snapshot, restore it into a fresh machine and keep talking.
 //!
-//! Needs a kernel and a filesystem made by tests/arm/make-9pfs.sh:
+//! Needs a kernel and a filesystem made by tests/fs/make-9pfs.sh:
 //!   ARMLESS_9PFS=DIR cargo test --release --test vm
 //! (DIR has vmlinuz, fs.json and blobs/). Skipped without it.
 
@@ -106,7 +106,7 @@ fn run(m: &Machine, cmd: &str, marker: &str) -> String {
 
 fn snapshot_flow(cpus: usize) {
     let Some(dir) = assets() else {
-        eprintln!("skipping: set ARMLESS_9PFS to a directory made by tests/arm/make-9pfs.sh");
+        eprintln!("skipping: set ARMLESS_9PFS to a directory made by tests/fs/make-9pfs.sh");
         return;
     };
     let mut a = machine(&dir, cpus, true);

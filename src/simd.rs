@@ -39,26 +39,6 @@ impl<H: Host> Cpu<H> {
         Ok(())
     }
 
-    /// Run `f` with an FP status context; FPSR flags are written back.
-    #[inline]
-    fn with_fp<R>(&mut self, f: impl FnOnce(&mut Fpst) -> R) -> R {
-        let mut fpsr = self.sys.fpsr;
-        let r = {
-            let mut st = Fpst {
-                fpcr: self.sys.fpcr,
-                fpsr: &mut fpsr,
-            };
-            f(&mut st)
-        };
-        self.sys.fpsr = fpsr;
-        r
-    }
-
-    #[inline(always)]
-    fn vr(&self, r: u32) -> u128 {
-        self.vreg[r as usize]
-    }
-
     pub(crate) fn simd_fp(&mut self, insn: u32) -> Res<()> {
         self.check_fp_access()?;
         if insn & 0x5e00_0000 == 0x1e00_0000 {
@@ -119,8 +99,8 @@ impl<H: Host> Cpu<H> {
         if op > 8 {
             return Err(Event::undefined());
         }
-        let (a, b) = (self.vr(rn) as u64, self.vr(rm) as u64);
-        let r = self.with_fp(|st| {
+        let (a, b) = (self.v(rn) as u64, self.v(rm) as u64);
+        let r = self.fpst_run(|st| {
             if ty == 32 {
                 fp_bin::<f32>(st, op, a, b)
             } else {
@@ -135,7 +115,7 @@ impl<H: Host> Cpu<H> {
         let ty = field(insn, 22, 2);
         let op = field(insn, 15, 6);
         let (rd, rn) = (insn & 31, field(insn, 5, 5));
-        let a = self.vr(rn) as u64;
+        let a = self.v(rn) as u64;
         // FCVT between precisions
         if op & 0b111100 == 0b000100 {
             let to = op & 3;
@@ -143,7 +123,7 @@ impl<H: Host> Cpu<H> {
                 return Err(Event::undefined());
             }
             let ahp = self.sys.fpcr & (1 << 26) != 0;
-            let r = self.with_fp(|st| {
+            let r = self.fpst_run(|st| {
                 let v: f64 = match ty {
                     0 => fp::f32_to_f64(st, f32::from_bits(a as u32)),
                     1 => f64::from_bits(a),
@@ -177,7 +157,7 @@ impl<H: Host> Cpu<H> {
                             }
                         } else {
                             // double -> half rounds once from the double value
-                            f64_to_f16_direct(st, v, ahp) as u64
+                            fp::f64_to_f16(st, v, ahp) as u64
                         }
                     },
                 }
@@ -188,7 +168,7 @@ impl<H: Host> Cpu<H> {
         if ty > 1 {
             return Err(Event::undefined());
         }
-        let r = self.with_fp(|st| -> Option<u64> {
+        let r = self.fpst_run(|st| -> Option<u64> {
             Some(if ty == 0 { fp_un::<f32>(st, op, a)? } else { fp_un::<f64>(st, op, a)? })
         });
         match r {
@@ -208,9 +188,9 @@ impl<H: Host> Cpu<H> {
         let zero = bit(insn, 3);
         let signal = bit(insn, 4);
         let (rn, rm) = (field(insn, 5, 5), field(insn, 16, 5));
-        let a = self.vr(rn) as u64;
-        let b = if zero { 0 } else { self.vr(rm) as u64 };
-        let nzcv = self.with_fp(|st| {
+        let a = self.v(rn) as u64;
+        let b = if zero { 0 } else { self.v(rm) as u64 };
+        let nzcv = self.fpst_run(|st| {
             if ty == 32 {
                 fp::compare(st, f32::from_bits64(a), f32::from_bits64(b), signal)
             } else {
@@ -227,8 +207,8 @@ impl<H: Host> Cpu<H> {
         let cond = field(insn, 12, 4);
         let signal = bit(insn, 4);
         if self.cond_holds(cond) {
-            let (a, b) = (self.vr(rn) as u64, self.vr(rm) as u64);
-            let nzcv = self.with_fp(|st| {
+            let (a, b) = (self.v(rn) as u64, self.v(rm) as u64);
+            let nzcv = self.fpst_run(|st| {
                 if ty == 32 {
                     fp::compare(st, f32::from_bits64(a), f32::from_bits64(b), signal)
                 } else {
@@ -246,7 +226,7 @@ impl<H: Host> Cpu<H> {
         let ty = Self::fp_type(insn)?;
         let (rd, rn, rm) = (insn & 31, field(insn, 5, 5), field(insn, 16, 5));
         let src = if self.cond_holds(field(insn, 12, 4)) { rn } else { rm };
-        let v = self.vr(src) & ones(ty) as u128;
+        let v = self.v(src) & ones(ty) as u128;
         self.vreg[rd as usize] = v;
         Ok(())
     }
@@ -271,12 +251,12 @@ impl<H: Host> Cpu<H> {
         );
         let o1 = bit(insn, 21);
         let o0 = bit(insn, 15);
-        let (a, n, m) = (self.vr(ra) as u64, self.vr(rn) as u64, self.vr(rm) as u64);
+        let (a, n, m) = (self.v(ra) as u64, self.v(rn) as u64, self.v(rm) as u64);
         let sign = if ty == 32 { 1u64 << 31 } else { 1u64 << 63 };
         // FMADD: a + n*m; FMSUB: a + (-n)*m; FNMADD: -a + (-n)*m; FNMSUB: -a + n*m
         let n = if o0 != o1 { n ^ sign } else { n };
         let a = if o1 { a ^ sign } else { a };
-        let r = self.with_fp(|st| {
+        let r = self.fpst_run(|st| {
             if ty == 32 {
                 fp::muladd(
                     st,
@@ -314,7 +294,7 @@ impl<H: Host> Cpu<H> {
                     (false, 0, 0) | (true, 1, 0) => {
                         let bits = if sf { 64 } else { 32 };
                         if to_gen {
-                            let v = (self.vr(rn) as u64) & ones(bits);
+                            let v = (self.v(rn) as u64) & ones(bits);
                             self.wr(rd, v);
                         } else {
                             self.vreg[rd as usize] = (self.xr(rn) & ones(bits)) as u128;
@@ -322,10 +302,10 @@ impl<H: Host> Cpu<H> {
                     },
                     (true, 2, 1) => {
                         if to_gen {
-                            let v = (self.vr(rn) >> 64) as u64;
+                            let v = (self.v(rn) >> 64) as u64;
                             self.wr(rd, v);
                         } else {
-                            let lo = self.vr(rd) & u64::MAX as u128;
+                            let lo = self.v(rd) & u64::MAX as u128;
                             self.vreg[rd as usize] = lo | (self.xr(rn) as u128) << 64;
                         }
                     },
@@ -348,8 +328,8 @@ impl<H: Host> Cpu<H> {
                     _ => return Err(Event::undefined()),
                 };
                 if to_int {
-                    let a = self.vr(rn) as u64;
-                    let r = self.with_fp(|st| {
+                    let a = self.v(rn) as u64;
+                    let r = self.fpst_run(|st| {
                         if fbits == 32 {
                             fp::to_int(st, f32::from_bits64(a), ibits, unsigned, 0, mode)
                         } else {
@@ -362,7 +342,7 @@ impl<H: Host> Cpu<H> {
                     if !unsigned && !sf {
                         x = x as u32 as i32 as i64 as u64;
                     }
-                    let r = self.with_fp(|st| {
+                    let r = self.fpst_run(|st| {
                         if fbits == 32 {
                             fp::from_int::<f32>(st, x, !unsigned, 0).bits()
                         } else {
@@ -391,8 +371,8 @@ impl<H: Host> Cpu<H> {
         match (rmode, opcode) {
             (3, 0) | (3, 1) => {
                 let unsigned = opcode == 1;
-                let a = self.vr(rn) as u64;
-                let r = self.with_fp(|st| {
+                let a = self.v(rn) as u64;
+                let r = self.fpst_run(|st| {
                     if ty == 0 {
                         fp::to_int(st, f32::from_bits64(a), ibits, unsigned, fbits, Round::Zero)
                     } else {
@@ -407,7 +387,7 @@ impl<H: Host> Cpu<H> {
                 if !unsigned && !sf {
                     x = x as u32 as i32 as i64 as u64;
                 }
-                let r = self.with_fp(|st| {
+                let r = self.fpst_run(|st| {
                     if ty == 0 {
                         fp::from_int::<f32>(st, x, !unsigned, fbits).bits()
                     } else {
@@ -463,22 +443,15 @@ fn fp_un<F: Float>(st: &mut Fpst, op: u32, a: u64) -> Option<u64> {
     })
 }
 
-/// f64 -> f16 directly (FCVT Hd, Dn) honouring NaN payload rules for doubles.
-fn f64_to_f16_direct(st: &mut Fpst, v: f64, ahp: bool) -> u16 {
-    fp::f64_to_f16(st, v, ahp)
-}
-
 /// VFPExpandImm: 8-bit immediate to a single/double constant.
 pub fn vfp_expand_imm(imm8: u64, bits: u32) -> u64 {
     let a = (imm8 >> 7) & 1;
     let b = (imm8 >> 6) & 1;
-    let cdefgh = imm8 & 0x3f;
     if bits == 32 {
         let exp = ((1 - b) << 7) | (if b == 1 { 0x7c } else { 0 }) | ((imm8 >> 4) & 3);
         (a << 31) | (exp << 23) | ((imm8 & 0xf) << 19)
     } else {
         let exp = ((1 - b) << 10) | (if b == 1 { 0x3fc } else { 0 }) | ((imm8 >> 4) & 3);
-        let _ = cdefgh;
         (a << 63) | (exp << 52) | ((imm8 & 0xf) << 48)
     }
 }

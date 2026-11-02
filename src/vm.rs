@@ -491,13 +491,13 @@ pub fn save_state_cpus<H: Host>(
     out.extend_from_slice(&(n as u32).to_le_bytes());
     out.extend_from_slice(&(meta.0.len() as u64).to_le_bytes());
     out.extend_from_slice(&meta.0);
-    for (i, page) in mem.chunks(PAGE).enumerate() {
-        if page.iter().any(|&b| b != 0) {
+    for (i, at) in (0..mem.len()).step_by(PAGE).enumerate() {
+        let n = PAGE.min(mem.len() - at);
+        if !mem.is_zero(at, n) {
             out.extend_from_slice(&(i as u32).to_le_bytes());
-            out.extend_from_slice(page);
-            if page.len() < PAGE {
-                out.resize(out.len() + PAGE - page.len(), 0);
-            }
+            let start = out.len();
+            out.resize(start + PAGE, 0);
+            mem.read(at, &mut out[start..start + n]);
         }
     }
     out.extend_from_slice(&END.to_le_bytes());
@@ -507,14 +507,13 @@ pub fn save_state_cpus<H: Host>(
 /// Zero the RAM pages the snapshot didn't write. Reading an untouched page doesn't commit it (the
 /// host maps its zero page), so only pages the guest had dirtied get written.
 fn zero_unwritten(mem: &crate::ram::Ram, written: &[u64]) {
-    for (page, chunk) in mem.chunks(PAGE).enumerate() {
+    for (page, at) in (0..mem.len()).step_by(PAGE).enumerate() {
         if written[page / 64] & (1 << (page % 64)) != 0 {
             continue;
         }
-        // Word at a time: RAM is page-aligned, so the middle is all of it
-        let (head, words, tail) = unsafe { chunk.align_to::<u64>() };
-        if head.iter().any(|&b| b != 0) || words.iter().any(|&w| w != 0) || tail.iter().any(|&b| b != 0) {
-            unsafe { std::ptr::write_bytes(mem.as_mut_ptr().add(page * PAGE), 0, chunk.len()) };
+        let n = PAGE.min(mem.len() - at);
+        if !mem.is_zero(at, n) {
+            mem.zero(at, n);
         }
     }
 }
@@ -638,13 +637,7 @@ impl StateLoader {
                     let n = (PAGE - at).min(data.len());
                     let base = page * PAGE + at;
                     let fit = n.min(mem.len().saturating_sub(base));
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            mem.as_mut_ptr().add(base),
-                            fit,
-                        );
-                    }
+                    mem.write(base, &data[..fit]);
                     data = &data[n..];
                     self.stage = if at + n == PAGE {
                         Stage::PageNumber
@@ -695,19 +688,16 @@ mod restore_tests {
             ..Default::default()
         })
         .unwrap();
-        let ptr = vm.board.io.mem.as_mut_ptr();
-        unsafe { *ptr.add(5 * PAGE + 7) = 0xab };
+        let mem = vm.board.io.mem.alias();
+        mem.store(5 * PAGE + 7, 1, 0xab);
         let state = vm.save_state();
 
         // After the snapshot: a page it doesn't have gets dirty, one it has changes
-        unsafe {
-            *ptr.add(9 * PAGE + 1) = 0xcd;
-            *ptr.add(5 * PAGE + 7) = 0x11;
-        }
+        mem.store(9 * PAGE + 1, 1, 0xcd);
+        mem.store(5 * PAGE + 7, 1, 0x11);
         vm.load_state(&state).unwrap();
-        let mem = &vm.board.io.mem;
-        assert_eq!(mem[5 * PAGE + 7], 0xab, "a page from the snapshot is restored");
-        assert_eq!(mem[9 * PAGE + 1], 0, "a page the snapshot doesn't have is zero again");
-        assert!(mem[12 * PAGE..13 * PAGE].iter().all(|&b| b == 0), "untouched pages stay zero");
+        assert_eq!(mem.load(5 * PAGE + 7, 1), 0xab, "a page from the snapshot is restored");
+        assert_eq!(mem.load(9 * PAGE + 1, 1), 0, "a page the snapshot doesn't have is zero again");
+        assert!(mem.is_zero(12 * PAGE, PAGE), "untouched pages stay zero");
     }
 }

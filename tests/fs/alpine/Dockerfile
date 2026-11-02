@@ -1,5 +1,5 @@
 # An arm64 Alpine guest prepared the way snowglobe's boot layer prepares one
-# (internal/boot/boot.Dockerfile), for tests/arm/alpine.mjs.
+# (internal/boot/boot.Dockerfile), for tests/js/alpine.mjs.
 FROM --platform=linux/arm64 alpine:3.24
 
 RUN apk add --no-cache openrc alpine-base agetty linux-virt linux-firmware-none curl ca-certificates

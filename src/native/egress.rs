@@ -440,15 +440,6 @@ impl Read for Chunked {
     }
 }
 
-const SKIP_REQUEST: &[&str] = &[
-    "host",
-    "connection",
-    "content-length",
-    "transfer-encoding",
-    "keep-alive",
-    "proxy-connection",
-];
-
 impl Egress {
     /// Make an HTTP request (the guest's, as the web relay saw it).
     pub fn request(
@@ -463,7 +454,7 @@ impl Egress {
         let (mut conn, target) = self.open(&t)?;
         let mut req = format!("{method} {target} HTTP/1.1\r\nHost: {}\r\n", t.authority());
         for (k, v) in headers {
-            if !SKIP_REQUEST.contains(&k.to_ascii_lowercase().as_str()) {
+            if !crate::dev::web::not_forwarded(&k.to_ascii_lowercase()) {
                 req.push_str(&format!("{k}: {v}\r\n"));
             }
         }
@@ -561,57 +552,6 @@ impl Egress {
             .unwrap_or_default();
         Ok((protocol, r))
     }
-}
-
-/// A WebSocket frame from a server (unmasked): (fin, opcode, payload).
-pub fn read_frame(r: &mut impl Read) -> io::Result<(bool, u8, Vec<u8>)> {
-    let mut h = [0u8; 2];
-    r.read_exact(&mut h)?;
-    let mut len = (h[1] & 127) as u64;
-    if len == 126 {
-        let mut b = [0u8; 2];
-        r.read_exact(&mut b)?;
-        len = u16::from_be_bytes(b) as u64;
-    } else if len == 127 {
-        let mut b = [0u8; 8];
-        r.read_exact(&mut b)?;
-        len = u64::from_be_bytes(b);
-    }
-    let mask = if h[1] & 128 != 0 {
-        let mut m = [0u8; 4];
-        r.read_exact(&mut m)?;
-        Some(m)
-    } else {
-        None
-    };
-    if len > 64 << 20 {
-        return Err(io::Error::other("WebSocket frame too large"));
-    }
-    let mut payload = vec![0u8; len as usize];
-    r.read_exact(&mut payload)?;
-    if let Some(m) = mask {
-        for (i, x) in payload.iter_mut().enumerate() {
-            *x ^= m[i & 3];
-        }
-    }
-    Ok((h[0] & 0x80 != 0, h[0] & 15, payload))
-}
-
-/// A WebSocket frame to a server (clients must mask).
-pub fn client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
-    let n = payload.len();
-    let mut f = vec![0x80 | opcode];
-    if n < 126 {
-        f.push(0x80 | n as u8);
-    } else if n < 65536 {
-        f.extend_from_slice(&[0x80 | 126, (n >> 8) as u8, n as u8]);
-    } else {
-        f.push(0x80 | 127);
-        f.extend_from_slice(&(n as u64).to_be_bytes());
-    }
-    f.extend_from_slice(&mask);
-    f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
-    f
 }
 
 #[cfg(test)]

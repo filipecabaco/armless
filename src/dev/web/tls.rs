@@ -354,9 +354,6 @@ impl Default for Tls {
 }
 
 impl Tls {
-    pub fn is_open(&self) -> bool {
-        self.state == State::Open
-    }
 
     pub fn receive(&mut self, bytes: &[u8], keys: Option<&mut TlsKeys>, rng: &mut Rng) -> Received {
         let mut r = Received::default();

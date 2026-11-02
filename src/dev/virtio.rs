@@ -238,9 +238,6 @@ impl Transport {
         self.status & STATUS_DRIVER_OK != 0 && self.status & STATUS_NEEDS_RESET == 0
     }
 
-    pub fn has_feature(&self, f: u64) -> bool {
-        self.driver_features & f != 0
-    }
 
     fn set_line(&mut self, io: &Io) {
         let level = self.isr != 0;

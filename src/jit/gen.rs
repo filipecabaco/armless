@@ -19,7 +19,7 @@
 
 mod fp;
 
-use super::wasm::{self, Code, FuncType, Import, EMPTY, I32, I64};
+use super::wasm::{Code, FuncType, Import, EMPTY, I32, I64};
 use crate::bits::{bit, decode_bit_masks, field, sext};
 use crate::sysreg::sr;
 
@@ -72,9 +72,16 @@ pub struct Layout {
     pub write_base: u64,
 }
 
+// What a block returns, and what the interpreter helper returns to it (a non-zero one ends the
+// block with that status)
+/// Ran to its end, or to the next block's PC.
 pub const STATUS_DONE: i32 = 0;
+/// The helper changed the control flow or state the block depends on: continue at `cpu.pc`.
 pub const STATUS_REDIRECT: i32 = 1;
+/// An exception is pending (`jit_pending`), at `cpu.pc`.
 pub const STATUS_PENDING: i32 = 2;
+/// WFI: wait for an interrupt.
+pub const STATUS_WFI: i32 = 3;
 
 // Imported helpers (function indices).
 const H_READ: u32 = 0;
@@ -492,6 +499,14 @@ impl Gen<'_> {
             self.check_pending();
         }
         self.c.end();
+    }
+
+    /// VA += n (the next element or register of a multiple-register access).
+    fn va_add(&mut self, n: i64) {
+        self.c.get(VA);
+        self.c.i64c(n);
+        self.c.i64_add();
+        self.c.set(VA);
     }
 
     /// Push (tag[idx] == VA >> 12) && ((VA & 0xfff) + size <= 0x1000); sets IDX and PAGE.
@@ -1170,7 +1185,7 @@ impl Gen<'_> {
     /// CPU struct. Everything else in the system space is interpreted.
     fn system(&mut self, insn: u32) -> bool {
         if insn & 0xffff_f01f == 0xd503_301f
-            && matches!(field(insn, 5, 3), 4 | 5 | 6)
+            && matches!(field(insn, 5, 3), 4..=6)
             && insn & 0xf00 != 0
         {
             // DSB/DMB (CRm != 0) and ISB. With several CPUs a DSB may have to
@@ -2180,10 +2195,7 @@ impl Gen<'_> {
         if load {
             self.load(size);
             self.c.set(T2);
-            self.c.get(VA);
-            self.c.i64c(size as i64);
-            self.c.i64_add();
-            self.c.set(VA);
+            self.va_add(size as i64);
             self.load(size);
             self.c.set(T3);
             let ext = |g: &mut Self, l: u32| {
@@ -2202,10 +2214,7 @@ impl Gen<'_> {
             self.store(size);
             self.c.get(T2);
             self.c.set(DATA);
-            self.c.get(VA);
-            self.c.i64c(size as i64);
-            self.c.i64_add();
-            self.c.set(VA);
+            self.va_add(size as i64);
             self.store(size);
         }
         if mode == 1 || mode == 3 {
@@ -2347,10 +2356,7 @@ impl Gen<'_> {
         self.load(size.min(8));
         self.c.set(lo);
         if size == 16 {
-            self.c.get(VA);
-            self.c.i64c(8);
-            self.c.i64_add();
-            self.c.set(VA);
+            self.va_add(8);
             self.load(8);
             self.c.set(hi);
             self.c.get(VA);
@@ -2380,10 +2386,7 @@ impl Gen<'_> {
         if size == 16 {
             self.vld(rt, 1);
             self.c.set(DATA);
-            self.c.get(VA);
-            self.c.i64c(8);
-            self.c.i64_add();
-            self.c.set(VA);
+            self.va_add(8);
             self.store(8);
             self.c.get(VA);
             self.c.i64c(8);
@@ -2448,19 +2451,13 @@ impl Gen<'_> {
         self.c.set(VA);
         if load {
             self.fp_load_vt(size, T2, T3);
-            self.c.get(VA);
-            self.c.i64c(size as i64);
-            self.c.i64_add();
-            self.c.set(VA);
+            self.va_add(size as i64);
             self.fp_load_vt(size, T4, T0);
             self.fp_set_vt(rt, size, T2, T3);
             self.fp_set_vt(rt2, size, T4, T0);
         } else {
             self.fp_store_vt(rt, size);
-            self.c.get(VA);
-            self.c.i64c(size as i64);
-            self.c.i64_add();
-            self.c.set(VA);
+            self.va_add(size as i64);
             self.fp_store_vt(rt2, size);
         }
         if mode == 1 || mode == 3 {
@@ -2480,27 +2477,16 @@ pub fn block_insns(words: &[u32], start: usize, max: usize) -> &[u32] {
     while end < words.len() && end - start < max {
         let insn = words[end];
         end += 1;
-        if ends_block(insn) && !is_hint(insn) {
+        if ends_block(insn) {
             break;
         }
     }
     &words[start..end]
 }
 
-/// Translate the blocks at `entries` (sorted, distinct byte offsets) of the
-/// page whose instruction words are `words` into a wasm module.
-pub fn translate_page(
-    layout: &Layout,
-    words: &[u32],
-    entries: &[u16],
-    max_block: usize,
-) -> Vec<u8> {
-    let code = translate_page_code(layout, words, entries, max_block);
-    wasm::module(&imports(), LOCALS, &code, layout.smp != 0)
-}
-
-/// The body of the function `translate_page` puts in its module, `(pc: i64) -> i32` with
-/// `LOCALS` (the native JIT compiles it directly).
+/// Translate the blocks at `entries` (sorted, distinct byte offsets) of the page whose instruction
+/// words are `words`: the body of a function `(pc: i64) -> i32` with `LOCALS`, which the JIT puts
+/// in a wasm module (`wasm::module`) or the native JIT compiles directly.
 pub fn translate_page_code(
     layout: &Layout,
     words: &[u32],
@@ -2568,13 +2554,13 @@ fn translate_block(g: &mut Gen, insns: &[u32]) {
         // exception generation go to the interpreter and also end it.
         let start = g.c.b.len();
         if g.insn(insn) {
-            if ends_block(insn) && !is_hint(insn) {
+            if ends_block(insn) {
                 return;
             }
         } else {
             g.c.b.truncate(start);
             g.interp(insn);
-            if ends_block(insn) && !is_hint(insn) {
+            if ends_block(insn) {
                 // Interpreted control flow fell through: continue after it
                 let off = g.off + 4;
                 g.goto(off, n);
@@ -2584,10 +2570,6 @@ fn translate_block(g: &mut Gen, insns: &[u32]) {
     }
     let off = 4 * n as i64;
     g.goto(off, n);
-}
-
-fn is_hint(insn: u32) -> bool {
-    insn & 0xffff_f01f == 0xd503_201f && !matches!(field(insn, 5, 7), 2 | 3)
 }
 
 /// The top bit of every lane of 8 << size bits in a 64-bit half.

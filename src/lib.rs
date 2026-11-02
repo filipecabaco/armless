@@ -13,39 +13,50 @@
     all(target_arch = "wasm32", target_feature = "atomics"),
     feature(stdarch_wasm_atomic_wait)
 )]
+// `unsafe` lives where nothing else will do, and says why it is sound: guest RAM (`ram`), the
+// spinlock (`smp`), the decoded-page cache (`predecode`), a CPU's own pointers (`cpu`), running
+// compiled code and its memory (`jit`), and the boundaries with C and JavaScript (`zstd`, `wasm`).
+// Anywhere else it does not compile; each allowance below is where it may.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
-pub mod a64;
-pub mod advsimd;
-pub mod bits;
+pub(crate) mod a64;
+pub(crate) mod advsimd;
+pub(crate) mod bits;
 pub mod board;
 pub mod cpu;
-pub mod crypto;
+pub(crate) mod crypto;
 pub mod dev;
-pub mod dtb;
-pub mod fp;
-pub mod gic;
+pub(crate) mod dtb;
+pub(crate) mod fp;
+pub(crate) mod gic;
 pub mod jit;
-pub mod kernel;
-pub mod mmu;
+pub(crate) mod kernel;
+pub(crate) mod mmu;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod platform;
-pub mod predecode;
-pub mod ram;
-pub mod rtc;
+pub(crate) mod predecode;
+#[allow(unsafe_code)]
+pub(crate) mod ram;
+pub(crate) mod rtc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod runner;
-pub mod ser;
-pub mod simd;
-pub mod simd_ls;
-pub mod smp;
-pub mod state;
-pub mod sysreg;
+pub(crate) mod ser;
+pub(crate) mod simd;
+pub(crate) mod simd_ls;
+pub(crate) mod smp;
+pub(crate) mod state;
+pub(crate) mod sysreg;
 pub mod vm;
+#[allow(unsafe_code)]
 pub mod zstd;
 
+// The exports JavaScript calls: raw pointers into the wasm memory and the one VM, throughout
 #[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
 pub mod wasm;
 
 pub use board::{Host, Platform};
@@ -131,10 +142,10 @@ pub fn boot_linux<H: Host>(
     }
 
     cpu.reset();
-    cpu.mem[kernel_addr as usize..kernel_addr as usize + image.len()].copy_from_slice(image);
-    cpu.mem[dtb_addr as usize..dtb_addr as usize + dtb.len()].copy_from_slice(&dtb);
+    load(cpu, kernel_addr, image)?;
+    load(cpu, dtb_addr, &dtb)?;
     if let (Some(rd), Some((s, _))) = (initrd, initrd_range) {
-        cpu.mem[s as usize..s as usize + rd.len()].copy_from_slice(rd);
+        load(cpu, s, rd)?;
     }
     cpu.x[0] = dtb_addr;
     cpu.pc = kernel_addr;
@@ -144,6 +155,14 @@ pub fn boot_linux<H: Host>(
         dtb_addr,
         initrd: initrd_range,
     })
+}
+
+/// Copy `data` into RAM at `addr`.
+fn load<H: Host>(cpu: &Cpu<H>, addr: u64, data: &[u8]) -> Result<(), String> {
+    match usize::try_from(addr) {
+        Ok(a) if cpu.mem.write(a, data) => Ok(()),
+        _ => Err(format!("{} bytes at {addr:#x} do not fit in RAM", data.len())),
+    }
 }
 
 /// Load a raw bare-metal binary at `addr` and start executing it there.
@@ -162,8 +181,8 @@ pub fn boot_raw<H: Host>(cpu: &mut Cpu<H>, bin: &[u8], addr: u64) -> Result<Boot
         ncpus: cpu.machine.ncpus,
     });
     cpu.reset();
-    cpu.mem[addr as usize..end as usize].copy_from_slice(bin);
-    cpu.mem[dtb_addr as usize..dtb_addr as usize + dtb.len()].copy_from_slice(&dtb);
+    load(cpu, addr, bin)?;
+    load(cpu, dtb_addr, &dtb)?;
     cpu.x[0] = dtb_addr;
     cpu.pc = addr;
     Ok(BootLayout {

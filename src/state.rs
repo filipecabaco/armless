@@ -24,11 +24,6 @@ macro_rules! sys_fields {
 }
 
 impl<H: Host> Cpu<H> {
-    /// Snapshot of a single-CPU machine.
-    pub fn save_cpu_state(&mut self) -> Vec<u8> {
-        assert_eq!(self.machine.ncpus, 1, "use save_machine_state");
-        Self::save_machine_state(&mut [self])
-    }
 
     /// Snapshot of the machine whose CPUs (all of them, in order, stopped) are `cpus`.
     pub fn save_machine_state(cpus: &mut [&mut Cpu<H>]) -> Vec<u8> {
@@ -102,10 +97,6 @@ impl<H: Host> Cpu<H> {
         w.u64(self.excl_value2);
     }
 
-    /// Restore a single-CPU machine.
-    pub fn load_cpu_state(&mut self, data: &[u8]) -> Result<(), String> {
-        Self::load_machine_state(&mut [self], data)
-    }
 
     /// Restore the machine whose CPUs (all of them, in order, stopped) are `cpus`.
     pub fn load_machine_state(cpus: &mut [&mut Cpu<H>], data: &[u8]) -> Result<(), String> {

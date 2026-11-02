@@ -30,7 +30,12 @@ pub struct SpinLock<T> {
     value: UnsafeCell<T>,
 }
 
+// SAFETY: the value is only reached through a guard, and `locked` lets one guard exist at a time
+// (acquire on lock, release on unlock), as for a Mutex.
+#[allow(unsafe_code)]
 unsafe impl<T: Send> Sync for SpinLock<T> {}
+// SAFETY: owning the lock is owning the value.
+#[allow(unsafe_code)]
 unsafe impl<T: Send> Send for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
@@ -70,13 +75,17 @@ pub struct SpinGuard<'a, T> {
 
 impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
+    #[allow(unsafe_code)]
     fn deref(&self) -> &T {
+        // SAFETY: this guard holds the lock, so nothing else reaches the value
         unsafe { &*self.lock.value.get() }
     }
 }
 
 impl<T> DerefMut for SpinGuard<'_, T> {
+    #[allow(unsafe_code)]
     fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`, and `&mut self` makes this the only reference through the guard
         unsafe { &mut *self.lock.value.get() }
     }
 }
@@ -265,9 +274,6 @@ impl Machine {
         cores == 0 || self.ncpus as u32 >= cores
     }
 
-    pub fn all_cpus_mask(&self) -> u32 {
-        (1u32 << self.ncpus) - 1
-    }
 
     /// Request a machine-wide stop (power off or reset) and tell every CPU.
     pub fn request_stop(&self, kind: u32) {

@@ -161,36 +161,15 @@ impl Io {
         }
     }
 
-    fn in_ram(&self, addr: u64, len: usize) -> bool {
-        (addr as u128) + (len as u128) <= self.mem.len() as u128
-    }
-
     /// Copy guest memory out. False if the range is not RAM.
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        if !self.in_ram(addr, buf.len()) {
-            return false;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.mem.as_mut_ptr().add(addr as usize),
-                buf.as_mut_ptr(),
-                buf.len(),
-            );
-        }
-        true
+        usize::try_from(addr).is_ok_and(|a| self.mem.read(a, buf))
     }
 
     /// Copy into guest memory (DMA), dropping JIT code of the pages written.
     pub fn write(&self, addr: u64, data: &[u8]) -> bool {
-        if !self.in_ram(addr, data.len()) {
+        if !usize::try_from(addr).is_ok_and(|a| self.mem.write(a, data)) {
             return false;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.mem.as_mut_ptr().add(addr as usize),
-                data.len(),
-            );
         }
         if !data.is_empty() {
             let first = addr >> 12;
@@ -223,23 +202,13 @@ impl Io {
     }
     /// Ring bookkeeping writes (not code).
     pub fn write_u16(&self, addr: u64, v: u16) {
-        if self.in_ram(addr, 2) {
-            unsafe {
-                std::ptr::write_unaligned(
-                    self.mem.as_mut_ptr().add(addr as usize) as *mut u16,
-                    v.to_le(),
-                )
-            }
+        if let Ok(a) = usize::try_from(addr) {
+            self.mem.write(a, &v.to_le_bytes());
         }
     }
     pub fn write_u32(&self, addr: u64, v: u32) {
-        if self.in_ram(addr, 4) {
-            unsafe {
-                std::ptr::write_unaligned(
-                    self.mem.as_mut_ptr().add(addr as usize) as *mut u32,
-                    v.to_le(),
-                )
-            }
+        if let Ok(a) = usize::try_from(addr) {
+            self.mem.write(a, &v.to_le_bytes());
         }
     }
 }

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 pub use egress::Egress;
 
-use crate::dev::web::parse_frame;
+use crate::dev::web::ws;
 use crate::dev::Event;
 use crate::vm::Board;
 
@@ -422,28 +422,24 @@ fn websocket(
     let mut buf = reader.buffer().to_vec();
     let mut conn = reader.into_inner();
     let _ = conn.tcp().set_read_timeout(Some(Duration::from_millis(20)));
-    let mut message = Vec::new();
-    let mut text = false;
+    let mut messages = ws::Messages::default();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
         if is_closed(conns, id) {
-            let _ = conn.write_all(&egress::client_frame(8, &1001u16.to_be_bytes(), mask()));
+            let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(1001)));
             return;
         }
         loop {
             match out.try_recv() {
                 Ok(WsOut::Message(t, data)) => {
-                    if conn
-                        .write_all(&egress::client_frame(if t { 1 } else { 2 }, &data, mask()))
-                        .is_err()
-                    {
+                    let opcode = if t { ws::TEXT } else { ws::BINARY };
+                    if conn.write_all(&client_frame(opcode, &data)).is_err() {
                         board.ws_close(id, 1006);
                         return;
                     }
                 },
                 Ok(WsOut::Close(code)) => {
-                    let payload = if code == 1005 { vec![] } else { code.to_be_bytes().to_vec() };
-                    let _ = conn.write_all(&egress::client_frame(8, &payload, mask()));
+                    let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(code)));
                     let _ = conn.flush();
                     return;
                 },
@@ -469,30 +465,20 @@ fn websocket(
             },
         }
         // Whole frames from the server
-        while let Some((fin, opcode, payload, used)) = parse_frame(&buf) {
+        while let Some((frame, used)) = ws::parse(&buf) {
             buf.drain(..used);
-            match opcode {
-                8 => {
-                    let code = if payload.len() >= 2 {
-                        u16::from_be_bytes([payload[0], payload[1]])
-                    } else {
-                        1005
-                    };
-                    board.ws_close(id, code);
+            match frame.opcode {
+                ws::CLOSE => {
+                    board.ws_close(id, ws::close_code(&frame.payload));
                     return;
                 },
-                9 => {
-                    let _ = conn.write_all(&egress::client_frame(10, &payload, mask()));
+                ws::PING => {
+                    let _ = conn.write_all(&client_frame(ws::PONG, &frame.payload));
                 },
-                10 => {},
-                op => {
-                    if op != 0 {
-                        text = op == 1;
-                        message.clear();
-                    }
-                    message.extend_from_slice(&payload);
-                    if fin {
-                        board.ws_send(id, text, &std::mem::take(&mut message));
+                ws::PONG => {},
+                _ => {
+                    if let Some((text, data)) = messages.push(frame) {
+                        board.ws_send(id, text, &data);
                         backpressure(board, conns, id);
                     }
                 },
@@ -528,13 +514,13 @@ fn tunnel(
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
         if is_closed(conns, id) {
-            let _ = conn.write_all(&egress::client_frame(8, &1000u16.to_be_bytes(), mask()));
+            let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(1000)));
             return;
         }
         loop {
             match out.try_recv() {
                 Ok(Some(data)) => {
-                    if conn.write_all(&egress::client_frame(2, &data, mask())).is_err() {
+                    if conn.write_all(&client_frame(ws::BINARY, &data)).is_err() {
                         board.tcp_abort(id);
                         return;
                     }
@@ -542,7 +528,7 @@ fn tunnel(
                 // A WebSocket can't half-close: close it, and keep reading until the far side
                 // answers with its own close
                 Ok(None) => {
-                    let _ = conn.write_all(&egress::client_frame(8, &1000u16.to_be_bytes(), mask()));
+                    let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(1000)));
                 },
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
@@ -565,20 +551,20 @@ fn tunnel(
                 return;
             },
         }
-        while let Some((_, opcode, payload, used)) = parse_frame(&buf) {
+        while let Some((frame, used)) = ws::parse(&buf) {
             buf.drain(..used);
-            match opcode {
-                8 => {
+            match frame.opcode {
+                ws::CLOSE => {
                     board.tcp_close(id);
                     return;
                 },
-                9 => {
-                    let _ = conn.write_all(&egress::client_frame(10, &payload, mask()));
+                ws::PING => {
+                    let _ = conn.write_all(&client_frame(ws::PONG, &frame.payload));
                 },
-                10 => {},
+                ws::PONG => {},
                 // A byte stream: fragments and text frames are just more bytes
                 _ => {
-                    board.tcp_send(id, &payload);
+                    board.tcp_send(id, &frame.payload);
                     backpressure(board, conns, id);
                 },
             }
@@ -586,8 +572,9 @@ fn tunnel(
     }
 }
 
-fn mask() -> [u8; 4] {
-    random_bytes(4).try_into().unwrap()
+/// A frame to a server: clients mask theirs, with a fresh random key each.
+fn client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    ws::encode(opcode, payload, Some(random_bytes(4).try_into().unwrap()))
 }
 
 /// Pump a socket and a guest connection into each other.
