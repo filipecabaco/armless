@@ -40,6 +40,25 @@ jobs:
             build/armless-smp.wasm
             js/armless.js
 
+  # An aarch64 host: the interpreter's floating point checked against the host FPU (src/fp.rs),
+  # and the native JIT through Cranelift's arm64 backend
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Unit tests and bare-metal guest
+        run: cargo test --release
+      - name: Unit tests with overflow checks
+        run: cargo test
+
   linux:
     runs-on: ubuntu-24.04
     steps:

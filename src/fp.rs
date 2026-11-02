@@ -323,14 +323,45 @@ fn overflow_result<F: Float>(negative: bool, mode: Round) -> F {
     }
 }
 
-/// Common tail: flags for an inexact / overflowed / tiny result, rounding
-/// mode adjustment and output flushing.
-fn finish<F: Float>(st: &mut Fpst, r: F, err: i32, exact_overflow: bool) -> F {
+/// The round-to-nearest result overflowed (the exact one is at least max + ulp/2). Rounded the
+/// other ways it may not have: toward zero, an exact result below 2^(emax+1) rounds to the largest
+/// finite number, inexact but no overflow. `reaches_2emax1` says whether it gets there.
+fn overflowed<F: Float>(st: &mut Fpst, negative: bool, reaches_2emax1: impl FnOnce() -> bool) -> F {
     let mode = st.rmode();
-    if exact_overflow {
-        st.flag(OFC | IXC);
-        return overflow_result(r.sign(), mode);
+    let toward_zero = match mode {
+        Round::Nearest | Round::TiesAway => false,
+        Round::PlusInf => negative,
+        Round::MinusInf => !negative,
+        Round::Zero => true,
+    };
+    st.flag(if toward_zero && !reaches_2emax1() { IXC } else { OFC | IXC });
+    overflow_result(negative, mode)
+}
+
+/// `x` halved, when that is exact (any normal number above the smallest exponent). Smaller
+/// numbers stay as they are: next to a result near overflow only their sign can count.
+fn halve<F: Float>(x: F) -> F {
+    let exp = (x.bits() >> F::MANT) & crate::bits::ones(F::BITS - 1 - F::MANT);
+    if exp > 1 && !x.is_inf() && !x.is_nan() {
+        x.mul(F::from_bits64(if F::BITS == 32 { 0x3f00_0000 } else { 0x3fe0_0000_0000_0000 }))
+    } else {
+        x
     }
+}
+
+/// Whether an operation's result, rounded toward zero, reaches 2^emax: given halved operands, whether
+/// the exact result of the operation on the originals reaches 2^(emax+1) (a power of two, so
+/// rounding toward zero keeps which side of it a number is).
+fn reaches_2emax<F: Float>(op: impl FnOnce(&mut Fpst) -> F) -> bool {
+    let mut fpsr = 0;
+    let r = op(&mut Fpst { fpcr: 3 << 22, fpsr: &mut fpsr });
+    // 2^emax: the largest exponent, nothing below it
+    r.absf().bits() >= (F::INF - 1) & !crate::bits::ones(F::MANT)
+}
+
+/// Common tail: flags for an inexact or tiny result, rounding mode adjustment and output flushing.
+fn finish<F: Float>(st: &mut Fpst, r: F, err: i32) -> F {
+    let mode = st.rmode();
     // Tininess is judged on the exact (unrounded) value: |exact| < MIN_NORMAL.
     // `r` is the round-to-nearest result and `err` the sign of exact - r.
     let toward_zero = (err < 0 && !r.sign()) || (err > 0 && r.sign());
@@ -503,7 +534,7 @@ pub fn add<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
     }
     let r = a.add(b);
     if r.is_inf() && !a.is_inf() && !b.is_inf() {
-        return finish(st, r, 1, true);
+        return overflowed(st, r.sign(), || reaches_2emax(|h| add(h, halve(a), halve(b))));
     }
     // TwoSum error term
     let bb = r.sub(a);
@@ -521,7 +552,7 @@ pub fn add<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
     } else {
         r
     };
-    finish(st, r, sign_of(err), false)
+    finish(st, r, sign_of(err))
 }
 
 pub fn sub<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
@@ -544,7 +575,9 @@ pub fn mul<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
     }
     let r = a.mul(b);
     if r.is_inf() && !a.is_inf() && !b.is_inf() {
-        return finish(st, r, 1, true);
+        // Halving the larger operand halves the product exactly
+        let (a, b) = if a.absf().bits() >= b.absf().bits() { (halve(a), b) } else { (a, halve(b)) };
+        return overflowed(st, r.sign(), || reaches_2emax(|h| mul(h, a, b)));
     }
     let err = if a.is_zero() || b.is_zero() || r.is_inf() {
         0
@@ -553,7 +586,7 @@ pub fn mul<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
     } else {
         err_mul64(a.to_f64(), b.to_f64(), r.to_f64())
     };
-    finish(st, r, err, false)
+    finish(st, r, err)
 }
 
 /// FMULX: like FMUL but 0 x inf = 2.0 with the XOR of the signs.
@@ -583,7 +616,7 @@ pub fn div<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
     }
     let r = a.div(b);
     if r.is_inf() && !a.is_inf() && !b.is_zero() {
-        return finish(st, r, if r.sign() { -1 } else { 1 }, true);
+        return overflowed(st, r.sign(), || reaches_2emax(|h| div(h, halve(a), b)));
     }
     let err = if r.is_inf() || a.is_zero() || b.is_inf() {
         0 // x/0, 0/x and x/inf are exact
@@ -598,7 +631,7 @@ pub fn div<F: Float>(st: &mut Fpst, a: F, b: F) -> F {
     } else {
         err_div64(a.to_f64(), b.to_f64(), r.to_f64())
     };
-    finish(st, r, err, false)
+    finish(st, r, err)
 }
 
 pub fn sqrt<F: Float>(st: &mut Fpst, a: F) -> F {
@@ -618,7 +651,7 @@ pub fn sqrt<F: Float>(st: &mut Fpst, a: F) -> F {
     } else {
         err_sqrt64(a.to_f64(), r.to_f64())
     };
-    finish(st, r, err, false)
+    finish(st, r, err)
 }
 
 /// FMADD-style fused multiply-add: a + b*c (the addend is the first operand,
@@ -642,7 +675,8 @@ pub fn muladd<F: Float>(st: &mut Fpst, addend: F, b: F, c: F) -> F {
     }
     let r = b.fma(c, addend);
     if r.is_inf() && !prod_inf && !addend.is_inf() {
-        return finish(st, r, if r.sign() { -1 } else { 1 }, true);
+        let (hb, hc) = if b.absf().bits() >= c.absf().bits() { (halve(b), c) } else { (b, halve(c)) };
+        return overflowed(st, r.sign(), || reaches_2emax(|h| muladd(h, halve(addend), hb, hc)));
     }
     // Exact zero result sign
     if r.is_zero() {
@@ -668,7 +702,14 @@ pub fn muladd<F: Float>(st: &mut Fpst, addend: F, b: F, c: F) -> F {
     } else {
         err_fma64(addend.to_f64(), b.to_f64(), c.to_f64(), r.to_f64())
     };
-    finish(st, r, err, false)
+    // An exact zero from terms that cancel is -0 when rounding toward minus infinity (the
+    // round-to-nearest fma made it +0)
+    let r = if r.is_zero() && err == 0 && st.rmode() == Round::MinusInf {
+        F::from_bits64(F::SIGN)
+    } else {
+        r
+    };
+    finish(st, r, err)
 }
 
 /// FPCompare: NZCV for FCMP/FCCMP. `signal_all` makes quiet NaNs invalid too (FCMPE).
@@ -918,8 +959,7 @@ pub fn f64_to_f32(st: &mut Fpst, a: f64) -> f32 {
     }
     let r = a as f32; // round-to-nearest-even
     if r.is_infinite() {
-        st.flag(OFC | IXC);
-        return overflow_result::<f32>(a < 0.0, st.rmode());
+        return overflowed(st, a < 0.0, || a.abs() >= 2f64.powi(128));
     }
     let err = a - r as f64;
     let s = if err == 0.0 {
@@ -995,6 +1035,8 @@ pub fn f16_to_f64(st: &mut Fpst, h: u16, ahp: bool) -> f64 {
 
 /// f64 -> IEEE half precision with the FPCR rounding mode.
 pub fn f64_to_f16(st: &mut Fpst, a: f64, ahp: bool) -> u16 {
+    // FZ flushes a subnormal double (FPUnpack), as for any other conversion
+    let a = flush_in(st, a);
     let b = a.to_bits();
     let sign = ((b >> 63) as u16) << 15;
     if a.is_nan() {
@@ -1048,12 +1090,6 @@ pub fn f64_to_f16(st: &mut Fpst, a: f64, ahp: bool) -> u16 {
     if up {
         q += 1;
     }
-    if inexact {
-        st.flag(IXC);
-        if e < min_exp {
-            st.flag(UFC);
-        }
-    }
     // Reassemble: value = q * 2^ulp_exp
     let mut exp_field: i32;
     let mut mant: u64;
@@ -1076,11 +1112,19 @@ pub fn f64_to_f16(st: &mut Fpst, a: f64, ahp: bool) -> u16 {
         }
     }
     let max_exp = if ahp { 31 } else { 30 };
-    if exp_field > max_exp {
-        if ahp {
-            st.flag(IOC);
-            return sign | 0x7fff;
+    if exp_field > max_exp && ahp {
+        // The alternative format has no infinity: the largest number, an invalid operation and
+        // nothing else (not inexact)
+        st.flag(IOC);
+        return sign | 0x7fff;
+    }
+    if inexact {
+        st.flag(IXC);
+        if e < min_exp {
+            st.flag(UFC);
         }
+    }
+    if exp_field > max_exp {
         st.flag(OFC | IXC);
         let to_inf = match st.rmode() {
             Round::Nearest | Round::TiesAway => true,
@@ -1343,5 +1387,309 @@ mod tests {
         assert_eq!(f16_to_f64(&mut s, 0x3c00, false), 1.0);
         assert_eq!(f64_to_f16(&mut s, 65504.0, false), 0x7bff);
         assert_eq!(f64_to_f16(&mut s, 5.960464477539063e-08, false), 0x0001);
+    }
+}
+
+/// The interpreter's floating point is the oracle the JITs are fuzzed against: here it is checked
+/// against the host's own FPU (an AArch64 host is the architecture), bit for bit and flag for
+/// flag, over random operands and every FPCR mode Linux or a program can set.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[allow(unsafe_code)]
+mod host_fpu {
+    use super::*;
+    use std::arch::asm;
+
+    const FLAGS: u64 = IOC | DZC | OFC | UFC | IXC | IDC;
+
+    /// Rounding modes, FZ, DN and AHP, alone and together.
+    const FPCRS: [u64; 9] = [
+        0,
+        1 << 22,
+        2 << 22,
+        3 << 22,
+        1 << 24,
+        1 << 25,
+        3 << 24,
+        1 << 26,
+        (1 << 26) | (3 << 24) | (2 << 22),
+    ];
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn fpcr(&mut self) -> u64 {
+            FPCRS[self.below(FPCRS.len() as u64) as usize]
+        }
+    }
+
+    /// Operand bits: any bits, else ordinary numbers or the edges (signed zeros, infinities,
+    /// NaNs of both kinds, subnormals, the extremes, and numbers near where results under- or
+    /// overflow).
+    fn operand(rng: &mut Rng, double: bool) -> u64 {
+        let (exp_bits, frac_bits) = if double { (11, 52) } else { (8, 23) };
+        let sign = rng.below(2) << (exp_bits + frac_bits);
+        let frac = rng.next() & ((1 << frac_bits) - 1);
+        let max_exp = (1u64 << exp_bits) - 1;
+        let bias = max_exp / 2;
+        let exp = match rng.below(8) {
+            0 => return rng.next() & crate::bits::ones(exp_bits + frac_bits + 1),
+            1 => 0,                                         // zero, subnormal
+            2 => max_exp,                                   // infinity, NaN
+            3 => 1 + rng.below(3),                          // smallest normals
+            4 => max_exp - 1 - rng.below(3),                // largest finite
+            5 => bias - 1 + rng.below(3),                   // near 1
+            _ => bias - 30 + rng.below(60),                 // moderate
+        };
+        let frac = match rng.below(4) {
+            0 => 0,
+            1 => frac & !((1 << (frac_bits - 3)) - 1), // few significant bits: exact results
+            _ => frac,
+        };
+        sign | (exp << frac_bits) | frac
+    }
+
+    /// One instruction on the host FPU with FPCR set: (result, cumulative flags it raised).
+    macro_rules! host {
+        ($fpcr:expr, $insn:literal, $ty:ty, $($name:ident = $val:expr),*) => {{
+            let r: $ty;
+            let fpsr: u64;
+            // SAFETY: only FPCR and FPSR change, and FPCR is restored; FPSR's flags are this
+            // thread's and cumulative, so clearing them first hides nothing the test relies on.
+            unsafe {
+                asm!(
+                    "mrs {saved}, fpcr",
+                    "msr fpcr, {fpcr}",
+                    "msr fpsr, xzr",
+                    $insn,
+                    "mrs {fpsr}, fpsr",
+                    "msr fpcr, {saved}",
+                    fpcr = in(reg) $fpcr,
+                    saved = out(reg) _,
+                    fpsr = out(reg) fpsr,
+                    r = out(vreg) r,
+                    $($name = in(vreg) $val,)*
+                    options(nostack),
+                );
+            }
+            (r, fpsr & FLAGS)
+        }};
+    }
+
+    /// The interpreter's (result, flags).
+    fn ours<T>(fpcr: u64, f: impl FnOnce(&mut Fpst) -> T) -> (T, u64) {
+        let mut fpsr = 0;
+        let r = f(&mut Fpst { fpcr, fpsr: &mut fpsr });
+        (r, fpsr & FLAGS)
+    }
+
+    const CASES: usize = 20_000;
+
+    /// Run `check` on CASES random (FPCR, operands) and report the first mismatch with them.
+    fn each(seed: u64, mut check: impl FnMut(&mut Rng) -> Option<String>) {
+        let mut rng = Rng(seed);
+        for case in 0..CASES {
+            if let Some(m) = check(&mut rng) {
+                panic!("case {case}: {m}");
+            }
+        }
+    }
+
+    macro_rules! unary {
+        ($name:ident, $seed:expr, $f:ty, $double:expr, $insn:literal, $ours:expr) => {
+            #[test]
+            fn $name() {
+                each($seed, |rng| {
+                    let fpcr = rng.fpcr();
+                    let a = <$f>::from_bits(operand(rng, $double) as _);
+                    let (h, hf) = host!(fpcr, $insn, $f, a = a);
+                    let (o, of) = ours(fpcr, |st| $ours(st, a));
+                    (h.to_bits() != o.to_bits() || hf != of).then(|| {
+                        format!("fpcr {fpcr:#x} a {:#x}: host {:#x} {hf:#x}, ours {:#x} {of:#x}",
+                            a.to_bits(), h.to_bits(), o.to_bits())
+                    })
+                })
+            }
+        };
+    }
+
+    macro_rules! binary {
+        ($name:ident, $seed:expr, $f:ty, $double:expr, $insn:literal, $ours:expr) => {
+            #[test]
+            fn $name() {
+                each($seed, |rng| {
+                    let fpcr = rng.fpcr();
+                    let a = <$f>::from_bits(operand(rng, $double) as _);
+                    let b = <$f>::from_bits(operand(rng, $double) as _);
+                    let (h, hf) = host!(fpcr, $insn, $f, a = a, b = b);
+                    let (o, of) = ours(fpcr, |st| $ours(st, a, b));
+                    (h.to_bits() != o.to_bits() || hf != of).then(|| {
+                        format!("fpcr {fpcr:#x} a {:#x} b {:#x}: host {:#x} {hf:#x}, ours {:#x} {of:#x}",
+                            a.to_bits(), b.to_bits(), h.to_bits(), o.to_bits())
+                    })
+                })
+            }
+        };
+    }
+
+    // The estimates and steps: no cargo test reached them before, only qemu in CI
+    unary!(frecpe_s, 1, f32, false, "frecpe {r:s}, {a:s}", recip_est::<f32>);
+    unary!(frecpe_d, 2, f64, true, "frecpe {r:d}, {a:d}", recip_est::<f64>);
+    unary!(frsqrte_s, 3, f32, false, "frsqrte {r:s}, {a:s}", rsqrt_est::<f32>);
+    unary!(frsqrte_d, 4, f64, true, "frsqrte {r:d}, {a:d}", rsqrt_est::<f64>);
+    unary!(frecpx_s, 5, f32, false, "frecpx {r:s}, {a:s}", recpx::<f32>);
+    unary!(frecpx_d, 6, f64, true, "frecpx {r:d}, {a:d}", recpx::<f64>);
+    binary!(frecps_s, 7, f32, false, "frecps {r:s}, {a:s}, {b:s}", recip_step::<f32>);
+    binary!(frecps_d, 8, f64, true, "frecps {r:d}, {a:d}, {b:d}", recip_step::<f64>);
+    binary!(frsqrts_s, 9, f32, false, "frsqrts {r:s}, {a:s}, {b:s}", rsqrt_step::<f32>);
+    binary!(frsqrts_d, 10, f64, true, "frsqrts {r:d}, {a:d}, {b:d}", rsqrt_step::<f64>);
+    // Precision conversions
+    unary!(fcvt_d_to_s, 11, f64, true, "fcvt {r:s}, {a:d}", |st, a| {
+        f64::from_bits(f64_to_f32(st, a).to_bits() as u64)
+    });
+    // The arithmetic the JITs inline and the interpreter backs
+    binary!(fadd_d, 13, f64, true, "fadd {r:d}, {a:d}, {b:d}", add::<f64>);
+    binary!(fsub_s, 14, f32, false, "fsub {r:s}, {a:s}, {b:s}", sub::<f32>);
+    binary!(fmul_d, 15, f64, true, "fmul {r:d}, {a:d}, {b:d}", mul::<f64>);
+    binary!(fdiv_d, 16, f64, true, "fdiv {r:d}, {a:d}, {b:d}", div::<f64>);
+    binary!(fdiv_s, 17, f32, false, "fdiv {r:s}, {a:s}, {b:s}", div::<f32>);
+    binary!(fmulx_d, 18, f64, true, "fmulx {r:d}, {a:d}, {b:d}", mulx::<f64>);
+    unary!(fsqrt_d, 19, f64, true, "fsqrt {r:d}, {a:d}", sqrt::<f64>);
+    unary!(fsqrt_s, 20, f32, false, "fsqrt {r:s}, {a:s}", sqrt::<f32>);
+
+    #[test]
+    fn fmadd_d() {
+        each(21, |rng| {
+            let fpcr = rng.fpcr();
+            let [a, b, c] = std::array::from_fn(|_| f64::from_bits(operand(rng, true)));
+            let (h, hf) = host!(fpcr, "fmadd {r:d}, {a:d}, {b:d}, {c:d}", f64, a = a, b = b, c = c);
+            let (o, of) = ours(fpcr, |st| muladd(st, c, a, b));
+            (h.to_bits() != o.to_bits() || hf != of).then(|| {
+                format!("fpcr {fpcr:#x} {a:e} * {b:e} + {c:e}: host {:#x} {hf:#x}, ours {:#x} {of:#x}",
+                    h.to_bits(), o.to_bits())
+            })
+        })
+    }
+
+    #[test]
+    fn fcvt_s_to_d() {
+        each(12, |rng| {
+            let fpcr = rng.fpcr();
+            let a = f32::from_bits(operand(rng, false) as u32);
+            let (h, hf) = host!(fpcr, "fcvt {r:d}, {a:s}", f64, a = a);
+            let (o, of) = ours(fpcr, |st| f32_to_f64(st, a));
+            (h.to_bits() != o.to_bits() || hf != of).then(|| {
+                format!("fpcr {fpcr:#x} {:#x}: host {:#x} {hf:#x}, ours {:#x} {of:#x}",
+                    a.to_bits(), h.to_bits(), o.to_bits())
+            })
+        })
+    }
+
+    /// Results just around the largest finite number, in every rounding mode: between "max plus
+    /// half an ulp" and the next power of two, rounding toward zero gives max without overflow.
+    #[test]
+    fn near_overflow() {
+        let mut rng = Rng(23);
+        // A number with the top exponent, and one close to 1 (above or below)
+        let big = |rng: &mut Rng, double: bool| {
+            let (frac, top) = if double { (52, 0x7fe) } else { (23, 0xfe) };
+            (rng.below(2) << (frac + if double { 11 } else { 8 }))
+                | ((top - rng.below(2)) << frac)
+                | (rng.next() & ((1 << frac) - 1))
+        };
+        let near_one = |rng: &mut Rng, double: bool| {
+            let (frac, bias) = if double { (52, 0x3ff) } else { (23, 0x7f) };
+            ((bias - rng.below(2)) << frac) | (rng.next() & ((1 << frac) - 1)) & !(rng.below(2) * ((1 << (frac - 4)) - 1))
+        };
+        // Exact results in [max + ulp/2, 2^(emax+1)), and both signs of each
+        let max = f64::MAX.to_bits();
+        let crafted: [(&str, [u64; 3]); 4] = [
+            ("fadd", [max, 0x7c90_0000_0000_0000, 0]),           // max + ulp/2
+            ("fmul", [max - 1, 0x3ff0_0000_0000_0001, 0]),       // (max - ulp)(1 + 2^-52)
+            ("fdiv", [max - 1, 0x3fef_ffff_ffff_ffff, 0]),       // (max - ulp)/(1 - 2^-53)
+            ("fmadd", [0x7fe0_0000_0000_0000, 0x4000_0000_0000_0000, 0xc000_0000_0000_0000]), // 2^1024 - 2
+        ];
+        for (op, [x, y, z]) in crafted {
+            for sign in [0, 1u64 << 63] {
+                let (a, b, c) = (f64::from_bits(x ^ sign), f64::from_bits(y), f64::from_bits(z ^ sign));
+                for fpcr in [0, 1 << 22, 2 << 22, 3 << 22] {
+                    let ((h, hf), (o, of)) = match op {
+                        "fadd" => (host!(fpcr, "fadd {r:d}, {a:d}, {b:d}", f64, a = a, b = f64::from_bits(y ^ sign)),
+                                   ours(fpcr, |st| add(st, a, f64::from_bits(y ^ sign)))),
+                        "fmul" => (host!(fpcr, "fmul {r:d}, {a:d}, {b:d}", f64, a = a, b = b), ours(fpcr, |st| mul(st, a, b))),
+                        "fdiv" => (host!(fpcr, "fdiv {r:d}, {a:d}, {b:d}", f64, a = a, b = b), ours(fpcr, |st| div(st, a, b))),
+                        _ => (host!(fpcr, "fmadd {r:d}, {a:d}, {b:d}, {c:d}", f64, a = a, b = b, c = c),
+                              ours(fpcr, |st| muladd(st, c, a, b))),
+                    };
+                    assert!(h.to_bits() == o.to_bits() && hf == of,
+                        "{op} sign {sign:#x} fpcr {fpcr:#x}: host {:#x} {hf:#x}, ours {:#x} {of:#x}", h.to_bits(), o.to_bits());
+                }
+            }
+        }
+        for case in 0..CASES {
+            let fpcr = [0, 1 << 22, 2 << 22, 3 << 22][case & 3] | if case & 4 != 0 { 3 << 24 } else { 0 };
+            let check = |what: &str, h: u64, hf: u64, o: u64, of: u64, ops: &[u64]| {
+                assert!(h == o && hf == of,
+                    "case {case} {what}, fpcr {fpcr:#x} {ops:#x?}: host {h:#x} {hf:#x}, ours {o:#x} {of:#x}");
+            };
+            let (a, b, c) = (f64::from_bits(big(&mut rng, true)), f64::from_bits(near_one(&mut rng, true)), f64::from_bits(big(&mut rng, true)));
+            let ops = [a.to_bits(), b.to_bits(), c.to_bits()];
+            let (h, hf) = host!(fpcr, "fadd {r:d}, {a:d}, {c:d}", f64, a = a, c = c);
+            let (o, of) = ours(fpcr, |st| add(st, a, c));
+            check("fadd", h.to_bits(), hf, o.to_bits(), of, &ops);
+            let (h, hf) = host!(fpcr, "fmul {r:d}, {a:d}, {b:d}", f64, a = a, b = b);
+            let (o, of) = ours(fpcr, |st| mul(st, a, b));
+            check("fmul", h.to_bits(), hf, o.to_bits(), of, &ops);
+            let (h, hf) = host!(fpcr, "fdiv {r:d}, {a:d}, {b:d}", f64, a = a, b = b);
+            let (o, of) = ours(fpcr, |st| div(st, a, b));
+            check("fdiv", h.to_bits(), hf, o.to_bits(), of, &ops);
+            let (h, hf) = host!(fpcr, "fmadd {r:d}, {a:d}, {b:d}, {c:d}", f64, a = a, b = b, c = c);
+            let (o, of) = ours(fpcr, |st| muladd(st, c, a, b));
+            check("fmadd", h.to_bits(), hf, o.to_bits(), of, &ops);
+            let (a, b) = (f32::from_bits(big(&mut rng, false) as u32), f32::from_bits(near_one(&mut rng, false) as u32));
+            let ops = [a.to_bits() as u64, b.to_bits() as u64];
+            let (h, hf) = host!(fpcr, "fmul {r:s}, {a:s}, {b:s}", f32, a = a, b = b);
+            let (o, of) = ours(fpcr, |st| mul(st, a, b));
+            check("fmul.s", h.to_bits() as u64, hf, o.to_bits() as u64, of, &ops);
+            let (h, hf) = host!(fpcr, "fadd {r:s}, {a:s}, {b:s}", f32, a = a, b = a);
+            let (o, of) = ours(fpcr, |st| add(st, a, a));
+            check("fadd.s", h.to_bits() as u64, hf, o.to_bits() as u64, of, &ops);
+            // Narrowing a double just past f32's largest finite
+            let d = f64::from(f32::MAX) * f64::from_bits(near_one(&mut rng, true)).abs();
+            let (h, hf) = host!(fpcr, "fcvt {r:s}, {a:d}", f32, a = d);
+            let (o, of) = ours(fpcr, |st| f64_to_f32(st, d));
+            check("fcvt", h.to_bits() as u64, hf, o.to_bits() as u64, of, &[d.to_bits()]);
+        }
+    }
+
+    /// Half precision both ways, IEEE and the alternative format (FPCR.AHP).
+    #[test]
+    fn fcvt_half() {
+        each(22, |rng| {
+            let fpcr = rng.fpcr();
+            let ahp = fpcr & (1 << 26) != 0;
+            let a = f64::from_bits(operand(rng, true));
+            let (h, hf): (f64, u64) = host!(fpcr, "fcvt {r:h}, {a:d}", f64, a = a);
+            let (o, of) = ours(fpcr, |st| f64_to_f16(st, a, ahp));
+            if h.to_bits() as u16 as u64 != o as u64 || hf != of {
+                return Some(format!("to half, fpcr {fpcr:#x} {:#x}: host {:#x} {hf:#x}, ours {o:#x} {of:#x}",
+                    a.to_bits(), h.to_bits() as u16));
+            }
+            let half = rng.next() as u16;
+            let x = f64::from_bits(half as u64);
+            let (h, hf): (f64, u64) = host!(fpcr, "fcvt {r:d}, {a:h}", f64, a = x);
+            let (o, of) = ours(fpcr, |st| f16_to_f64(st, half, ahp));
+            (h.to_bits() != o.to_bits() || hf != of).then(|| {
+                format!("from half, fpcr {fpcr:#x} {half:#x}: host {:#x} {hf:#x}, ours {:#x} {of:#x}",
+                    h.to_bits(), o.to_bits())
+            })
+        })
     }
 }
