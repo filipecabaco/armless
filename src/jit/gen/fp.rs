@@ -241,9 +241,12 @@ impl Gen<'_> {
             return self.fp_int_conv(insn, rd, rn, double);
         }
         if double {
-            // Double precision: conversion to single only
+            // Double precision: conversion to single, and addition and subtraction
             if insn & 0xffff_fc00 == 0x1e62_4000 {
                 return self.fp_narrow(insn, rd, rn);
+            }
+            if insn & 0xffe0_ec00 == 0x1e60_2800 {
+                return self.fp_add_double(insn, rd, rn, rm);
             }
             return false;
         }
@@ -370,6 +373,66 @@ impl Gen<'_> {
             self.is_zero32(T1); // division by zero
             self.c.i32_or();
         }
+        self.fp_split(insn, |g| g.fp_result(rd, T3, Some(T4)));
+        true
+    }
+
+    /// FADD / FSUB (double): s = a + b' rounded once by the host, as Arm rounds it; inexact iff
+    /// TwoSum's error term is non-zero. TwoSum is exact in binary64 itself, as long as nothing in
+    /// it overflows: operands from 2^1022 up go to the interpreter, as do the special cases the
+    /// single-precision path sends there.
+    fn fp_add_double(&mut self, insn: u32, rd: u32, rn: u32, rm: u32) -> bool {
+        let sub = bit(insn, 12);
+        self.fload(rn, true, T0);
+        self.fload(rm, true, T1);
+        let b = |g: &mut Self| {
+            g.fget(T1, true);
+            if sub {
+                g.c.f64_neg();
+            }
+        };
+        self.fget(T0, true);
+        b(self);
+        self.c.f64_add();
+        self.fset(T3, true); // s
+        self.fget(T3, true);
+        self.fget(T0, true);
+        self.c.f64_sub();
+        self.fset(T2, true); // bb = s - a
+        // e = (a - (s - bb)) + (b' - bb)
+        self.fget(T0, true);
+        self.fget(T3, true);
+        self.fget(T2, true);
+        self.c.f64_sub();
+        self.c.f64_sub();
+        b(self);
+        self.fget(T2, true);
+        self.c.f64_sub();
+        self.c.f64_add();
+        self.c.i64c(0);
+        self.c.f64_reinterpret_i64();
+        self.c.f64_ne();
+        self.c.i64_extend_i32_u();
+        self.c.set(T4); // inexact
+        self.fpcr_unusual();
+        for t in [T0, T1, T3] {
+            self.special(t, true);
+            self.c.i32_or();
+        }
+        for t in [T0, T1] {
+            // |x| >= 2^1022
+            self.c.get(t);
+            self.c.i64c(0x7fff_ffff_ffff_ffff);
+            self.c.i64_and();
+            self.c.i64c(0x7fd0_0000_0000_0000);
+            self.c.i64_ge_u();
+            self.c.i32_or();
+        }
+        self.c.get(T4);
+        self.c.i32_wrap_i64();
+        self.zero_or_least(T3, true);
+        self.c.i32_and();
+        self.c.i32_or();
         self.fp_split(insn, |g| g.fp_result(rd, T3, Some(T4)));
         true
     }

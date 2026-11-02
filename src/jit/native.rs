@@ -87,6 +87,8 @@ pub struct Helpers {
     pub write: usize,
     /// (insn: i32, pc: i64) -> i32
     pub interp: usize,
+    /// (op: i32, x: i64, y: i64, d: i64) -> i64
+    pub fp3: usize,
 }
 
 /// A request to a CPU's compiler thread.
@@ -562,7 +564,7 @@ struct Translator<'a, 'b> {
     unreachable: bool,
     /// Blocks opened inside unreachable code.
     skipped: u32,
-    sigs: [Option<SigRef>; 3],
+    sigs: [Option<SigRef>; 4],
     /// The fields whose values are remembered, and what is known of them here.
     cached: &'a [Cached],
     known: Known,
@@ -675,7 +677,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             }],
             unreachable: false,
             skipped: 0,
-            sigs: [None; 3],
+            sigs: [None; 4],
             cached,
             known: Known::new(),
             consts: std::collections::HashMap::new(),
@@ -891,7 +893,8 @@ impl<'a, 'b> Translator<'a, 'b> {
         let (params, ret): (&[Type], Option<Type>) = match i {
             0 => (&[I64, I32], Some(I64)),
             1 => (&[I64, I32, I64], None),
-            _ => (&[I32, I64], Some(I32)),
+            2 => (&[I32, I64], Some(I32)),
+            _ => (&[I32, I64, I64, I64], Some(I64)),
         };
         s.params.extend(params.iter().map(|&t| AbiParam::new(t)));
         s.returns.extend(ret.map(AbiParam::new));
@@ -905,6 +908,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             0 => (0, self.h.read, 2),
             1 => (1, self.h.write, 3),
             2 => (2, self.h.interp, 2),
+            3 => (3, self.h.fp3, 4),
             _ => return None,
         };
         let sig = self.sig(i);
@@ -915,9 +919,9 @@ impl<'a, 'b> Translator<'a, 'b> {
         if let Some(&v) = self.b.inst_results(call).first() {
             self.push(v);
         }
-        // An interpreted instruction may change any field; reads and writes of guest memory
-        // change none (a fault is only recorded, and taken after the block).
-        if f == 2 {
+        // An interpreted instruction may change any field, and `fp3` changes FPSR; reads and
+        // writes of guest memory change none (a fault is only recorded, and taken after the block).
+        if f >= 2 {
             self.known.clear();
         }
         Some(())
@@ -1330,7 +1334,11 @@ mod tests {
         (0x3f00_0000, 0x0800_0000), // load/store exclusive, acquire/release, CAS
         (0x3f20_0c00, 0x3820_0000), // LSE atomics: LDADD, LDCLR, LDEOR, LDSET, SWP, ...
         (0xbf20_8400, 0x2e00_0000), // EXT
-        (0xbf3f_fc00, 0x0e20_9800), // CMEQ, CMGE, CMGT, CMLE, CMLT (zero)
+        // (U free: CMGE and CMLE are the U forms)
+        (0x9f3f_fc00, 0x0e20_8800), // CMGT, CMGE (zero)
+        (0x9f3f_fc00, 0x0e20_9800), // CMEQ, CMLE (zero)
+        (0x9f3f_fc00, 0x0e20_a800), // CMLT (zero)
+        (0x9f20_c400, 0x0e20_c400), // three same, floating point: FMLA, FADD, FMUL, FDIV, ...
     ];
 
     /// A small number with few significant bits: sums, products and quotients of these are
@@ -1394,6 +1402,79 @@ mod tests {
     #[test]
     fn compiled_blocks_do_what_the_interpreter_does() {
         fuzz(0x2545_f491_4f6c_dd1d, 6000, BODY, false);
+    }
+
+    /// Indirect branches (BLR, RET) within a page continue in compiled code; across pages, to an
+    /// address no block starts at, or misaligned (a PC alignment fault), they must still do
+    /// exactly what the interpreter does.
+    #[test]
+    fn indirect_branches_do_what_the_interpreter_does() {
+        // CODE:     blr x1        ; to x1
+        // CODE+4:   b EXIT
+        // CODE+8:   add x0, x0, #1
+        // CODE+12:  ret           ; to CODE+4
+        // VECTORS + 0x200 (synchronous, from EL1 with SP_EL1): b .
+        const VECTORS: u64 = 0x3000;
+        let words = [
+            (CODE, 0xd63f_0020u32),
+            (CODE + 4, 0x1400_0000 | ((EXIT - CODE - 4) / 4) as u32),
+            (CODE + 8, 0x9100_0400),
+            (CODE + 12, 0xd65f_03c0),
+            (EXIT, 0x1400_0000),
+            (VECTORS + 0x200, 0x1400_0000),
+        ];
+        let target_page = 0x4000;
+        let cases = [
+            ("same page", CODE + 8),
+            ("misaligned, same page", CODE + 10),
+            ("another page", target_page),
+            ("misaligned, another page", target_page + 2),
+        ];
+        for (what, target) in cases {
+            let setup = |c: &mut Cpu<NoDevices>| {
+                for &(a, w) in &words {
+                    c.mem.write(a as usize, &w.to_le_bytes());
+                }
+                // At the other page: add x0, x0, #1; ret
+                c.mem.write(target_page as usize, &0x9100_0400u32.to_le_bytes());
+                c.mem.write(target_page as usize + 4, &0xd65f_03c0u32.to_le_bytes());
+                (c.el, c.spsel, c.daif) = (1, true, 0x3c0);
+                c.sys.vbar = VECTORS;
+            };
+            let mut interp = Cpu::new(RAM, NoDevices);
+            setup(&mut interp);
+            let Some(mut jit) = at_block(1) else { return };
+            setup(&mut jit);
+            // The page compiled with every entry at once, so that they chain to one another
+            let mut page = [0u8; 0x1000];
+            jit.mem.read(CODE as usize & !0xfff, &mut page);
+            let key = ((CODE & !0xfff) << 2) | 0b11; // EL1, SP_EL1
+            let entries = vec![0, 4, 8, 12];
+            let hash = crate::jit::profile::hash(&page);
+            let prewarm = [crate::jit::profile::Page { key, hash, runs: 1, entries }];
+            assert_eq!(jit.jit_prewarm(&prewarm), 1, "{what}");
+            jit.wait_native_jit();
+            // First to CODE+8, so that it is an entry by the time `target` (perhaps next to it)
+            // is taken
+            for round in 0..6 {
+                for c in [&mut interp, &mut jit] {
+                    c.x[1] = if round < 3 { CODE + 8 } else { target };
+                    c.x[0] = round;
+                    c.pc = CODE;
+                    c.jit_entry = true;
+                    c.run(40);
+                }
+                jit.wait_native_jit();
+                let state = |c: &Cpu<NoDevices>| (c.x[0], c.x[30], c.pc, c.sys.esr, c.sys.elr, c.sys.far);
+                assert_eq!(state(&jit), state(&interp), "{what}, round {round}");
+            }
+            assert!(jit.jit.block_runs > 0, "{what}: nothing ran compiled");
+            if target & 3 != 0 {
+                // The architecture's answer, not only the interpreter's: a PC alignment fault
+                assert_eq!(interp.sys.esr >> 26, crate::cpu::ec::PC_ALIGN as u64, "{what}");
+                assert_eq!((interp.sys.elr, interp.sys.far), (target, target), "{what}");
+            }
+        }
     }
 
     /// A CPU at the start of a two-instruction block (`add x0, x0, #1; b EXIT`) at CODE.

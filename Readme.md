@@ -112,12 +112,16 @@ replaced pages included, and starts over when that is full; its compiler gives b
 its working memory whenever it has nothing queued.
 
 Compiled code covers the integer instructions, the SIMD&FP loads and stores, the common
-integer NEON operations (bitwise, add/sub, multiply-long, pairwise add, permutes) and scalar
-floating point: single-precision arithmetic, fused multiply-add, compares, selects, moves and
-conversions, inline whenever FPCR is as Linux runs it and the numbers are ordinary, with the
-architecture's results and FPSR flags (NaNs, infinities, subnormals and underflow go to the
-interpreter). What it can't translate, double-precision arithmetic among it, it hands to the
-interpreter one instruction at a time. `ARMLESS_JIT_HELPER_STATS=1` (or `armless-run --fallbacks`) counts those by opcode (`Jit::helper_hist`), and
+integer NEON operations (bitwise, add/sub, compares with zero, multiply-long, pairwise add,
+permutes, EXT) and scalar floating point: single-precision arithmetic, fused multiply-add,
+double-precision addition and subtraction, compares, selects, moves and conversions, inline
+whenever FPCR is as Linux runs it and the numbers are ordinary, with the architecture's results
+and FPSR flags (NaNs, infinities, subnormals and underflow go to the interpreter). Vector floating
+point (FMLA, FMUL, FADD, FDIV, ...) runs lane by lane through the interpreter's own arithmetic,
+without decoding the instruction each time. Indirect branches within a page stay in compiled
+code. What it can't translate it hands to the interpreter one instruction at a time.
+`ARMLESS_JIT_HELPER_STATS=1` (or `armless-run --fallbacks`) counts those by opcode
+(`Jit::helper_hist`), and
 `ARMLESS_JIT_THRESHOLD` sets how often an entry runs before it is compiled (1024).
 
 A restore starts with no compiled code. `Runner::jit_profile` lists the pages a machine

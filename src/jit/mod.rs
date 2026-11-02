@@ -143,6 +143,8 @@ pub struct Jit {
     /// Instructions retired inside modules, and those of them interpreted.
     pub block_insns: u64,
     pub helper_interps: u64,
+    /// Lanes of floating-point vector instructions compiled code computed through `fp3`.
+    pub helper_fp_lanes: u64,
     /// ARMLESS_JIT_HELPER_STATS: instructions compiled code hands to the interpreter, by opcode
     /// (registers masked out) with how many and one of them: what the JIT should translate next.
     pub helper_hist: Option<HashMap<u32, (u64, u32)>>,
@@ -194,6 +196,7 @@ impl Jit {
             page_invalidations: 0,
             block_insns: 0,
             helper_interps: 0,
+            helper_fp_lanes: 0,
             helper_hist: std::env::var_os("ARMLESS_JIT_HELPER_STATS").map(|_| HashMap::new()),
             #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
             native: None,
@@ -389,6 +392,10 @@ impl<H: Host> Cpu<H> {
     /// Physical address of the current PC if its page is in the fetch cache.
     #[inline(always)]
     fn jit_pc_pa(&mut self) -> Option<u64> {
+        // A misaligned PC is no block's entry: the interpreter takes its alignment fault
+        if self.pc & 3 != 0 {
+            return None;
+        }
         let f = &self.fast[self.el as usize];
         if self.pc >> 12 != f.code_page {
             // Fill the fetch cache; a fault is left for the interpreter.
@@ -712,6 +719,7 @@ impl<H: Host> Cpu<H> {
             read: native_read::<H> as *const () as usize,
             write: native_write::<H> as *const () as usize,
             interp: native_interp::<H> as *const () as usize,
+            fp3: native_fp3::<H> as *const () as usize,
         };
         self.jit.native = native::Native::new(gen::LOCALS, helpers);
         self.jit.enabled = self.jit.native.is_some();
@@ -874,6 +882,18 @@ impl<H: Host> Cpu<H> {
         }
     }
 
+    /// One lane of a three-same floating-point vector instruction for a block (`advsimd::fp3`):
+    /// `op` the operation plus 256 for double precision, with FPCR and FPSR as the
+    /// interpreter has them.
+    pub fn jit_helper_fp3(&mut self, op: u32, x: u64, y: u64, d: u64) -> u64 {
+        self.jit.helper_fp_lanes += 1;
+        let mut fpsr = self.sys.fpsr;
+        let mut st = crate::fp::Fpst { fpcr: self.sys.fpcr, fpsr: &mut fpsr };
+        let r = crate::advsimd::fp3_helper(&mut st, op, x, y, d).unwrap_or(0);
+        self.sys.fpsr = fpsr;
+        r
+    }
+
     /// Interpret one instruction for a block. See `gen` for the status codes.
     pub fn jit_helper_interp(&mut self, insn: u32, pc: u64) -> i32 {
         self.jit.helper_interps += 1;
@@ -1016,6 +1036,15 @@ extern "C" fn native_write<H: Host>(va: i64, size: i32, value: i64) {
     // (of this H) for the duration of the call.
     let cpu = unsafe { &mut *current::<H>() };
     cpu.jit_helper_write(va as u64, size as u32, value as u64)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+#[allow(unsafe_code)]
+extern "C" fn native_fp3<H: Host>(op: i32, x: i64, y: i64, d: i64) -> i64 {
+    // SAFETY: only blocks call the helpers, and only from `jit_run`, which set CURRENT to its CPU
+    // (of this H) for the duration of the call.
+    let cpu = unsafe { &mut *current::<H>() };
+    cpu.jit_helper_fp3(op as u32, x as u64, y as u64, d as u64) as i64
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
