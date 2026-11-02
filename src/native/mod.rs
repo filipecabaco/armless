@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 pub use egress::Egress;
 
+use crate::dev::web::parse_frame;
 use crate::dev::Event;
 use crate::vm::Board;
 
@@ -589,36 +590,6 @@ fn mask() -> [u8; 4] {
     random_bytes(4).try_into().unwrap()
 }
 
-/// A whole frame at the start of `b`: (fin, opcode, payload, bytes used).
-fn parse_frame(b: &[u8]) -> Option<(bool, u8, Vec<u8>, usize)> {
-    if b.len() < 2 {
-        return None;
-    }
-    let mut len = (b[1] & 127) as usize;
-    let mut at = 2;
-    if len == 126 {
-        len = u16::from_be_bytes([*b.get(2)?, *b.get(3)?]) as usize;
-        at = 4;
-    } else if len == 127 {
-        len = u64::from_be_bytes(b.get(2..10)?.try_into().ok()?) as usize;
-        at = 10;
-    }
-    let mask = if b[1] & 128 != 0 {
-        let m: [u8; 4] = b.get(at..at + 4)?.try_into().ok()?;
-        at += 4;
-        Some(m)
-    } else {
-        None
-    };
-    let mut payload = b.get(at..at + len)?.to_vec();
-    if let Some(m) = mask {
-        for (i, x) in payload.iter_mut().enumerate() {
-            *x ^= m[i & 3];
-        }
-    }
-    Some((b[0] & 0x80 != 0, b[0] & 15, payload, at + len))
-}
-
 /// Pump a socket and a guest connection into each other.
 fn attach(board: &Arc<Board>, conns: &Shared, id: u32, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
@@ -684,7 +655,14 @@ mod tests {
         assert_eq!(any.host, None);
         assert!(any.matches("anything", 6379));
 
-        for bad in ["5432", "db:5432=tcp://x", ":5432=ws://x", "db:0=ws://x", "db:nope=ws://x", "=ws://x"] {
+        for bad in [
+            "5432",
+            "db:5432=tcp://x",
+            ":5432=ws://x",
+            "db:0=ws://x",
+            "db:nope=ws://x",
+            "=ws://x",
+        ] {
             assert_eq!(Tunnel::parse(bad), None, "{bad}");
         }
     }

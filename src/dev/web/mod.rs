@@ -201,11 +201,16 @@ fn body(head: &Head, b: &[u8]) -> Result<Option<(Vec<u8>, usize)>, ()> {
                 };
                 return Ok(Some((out, head.body_start + end)));
             }
-            if body.len() < data + size + 2 {
+            // The size is the guest's: one past usize would wrap the bounds below
+            let next = data
+                .checked_add(size)
+                .and_then(|e| e.checked_add(2))
+                .ok_or(())?;
+            if body.len() < next {
                 return Ok(None);
             }
             out.extend_from_slice(&body[data..data + size]);
-            at = data + size + 2;
+            at = next;
         }
     }
     let n: usize = head
@@ -213,6 +218,39 @@ fn body(head: &Head, b: &[u8]) -> Result<Option<(Vec<u8>, usize)>, ()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     Ok((body.len() >= n).then(|| (body[..n].to_vec(), head.body_start + n)))
+}
+
+/// A whole WebSocket frame at the start of `b`, unmasked: (fin, opcode, payload, bytes used).
+/// None while it is still arriving. The length is the peer's (the guest's, or a server's), so
+/// it is checked arithmetic throughout: a length no buffer can hold never completes.
+pub(crate) fn parse_frame(b: &[u8]) -> Option<(bool, u8, Vec<u8>, usize)> {
+    let (&b0, &b1) = (b.first()?, b.get(1)?);
+    let (len, mut at) = match b1 & 127 {
+        126 => (
+            u16::from_be_bytes(b.get(2..4)?.try_into().ok()?) as usize,
+            4,
+        ),
+        127 => (
+            usize::try_from(u64::from_be_bytes(b.get(2..10)?.try_into().ok()?)).ok()?,
+            10,
+        ),
+        n => (n as usize, 2),
+    };
+    let mask = if b1 & 128 != 0 {
+        let m: [u8; 4] = b.get(at..at + 4)?.try_into().ok()?;
+        at += 4;
+        Some(m)
+    } else {
+        None
+    };
+    let end = at.checked_add(len)?;
+    let mut payload = b.get(at..end)?.to_vec();
+    if let Some(m) = mask {
+        for (i, x) in payload.iter_mut().enumerate() {
+            *x ^= m[i & 3];
+        }
+    }
+    Some((b0 & 0x80 != 0, b0 & 15, payload, end))
 }
 
 fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
@@ -695,41 +733,11 @@ impl Web {
 
     /// The guest's frames: masked, and a message may span several.
     fn frames(&mut self, out: &mut Out) {
-        while self.phase == Phase::WebSocket && self.buf.len() >= 2 {
-            let b = &self.buf;
-            let mut len = (b[1] & 127) as usize;
-            let mut at = 2;
-            if len == 126 {
-                if b.len() < 4 {
-                    return;
-                }
-                len = u16::from_be_bytes([b[2], b[3]]) as usize;
-                at = 4;
-            } else if len == 127 {
-                if b.len() < 10 {
-                    return;
-                }
-                len = u64::from_be_bytes(b[2..10].try_into().unwrap()) as usize;
-                at = 10;
-            }
-            let masked = b[1] & 128 != 0;
-            let mask_at = at;
-            if masked {
-                at += 4;
-            }
-            if b.len() < at + len {
+        while self.phase == Phase::WebSocket {
+            let Some((fin, opcode, payload, used)) = parse_frame(&self.buf) else {
                 return;
-            }
-            let fin = b[0] & 0x80 != 0;
-            let opcode = b[0] & 15;
-            let mut payload = b[at..at + len].to_vec();
-            if masked {
-                let mask: [u8; 4] = b[mask_at..mask_at + 4].try_into().unwrap();
-                for (i, x) in payload.iter_mut().enumerate() {
-                    *x ^= mask[i & 3];
-                }
-            }
-            self.buf.drain(..at + len);
+            };
+            self.buf.drain(..used);
             match opcode {
                 8 => {
                     // Close: echo it, and tell the host

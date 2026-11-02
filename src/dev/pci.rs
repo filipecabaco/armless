@@ -88,7 +88,8 @@ impl Function {
 
     fn config_read(&self, reg: usize, size: u32) -> u32 {
         let mut v = 0u32;
-        for i in 0..size as usize {
+        // A 64-bit access gets the 32 bits a register has (no shift past the word)
+        for i in 0..size.min(4) as usize {
             let b = match reg + i {
                 0x10..=0x13 => self.bar0.to_le_bytes()[reg + i - 0x10],
                 r if r < 256 => self.config[r],
@@ -100,7 +101,7 @@ impl Function {
     }
 
     fn config_write(&mut self, reg: usize, size: u32, value: u32) {
-        for i in 0..size as usize {
+        for i in 0..size.min(4) as usize {
             let b = (value >> (8 * i)) as u8;
             match reg + i {
                 0x04 | 0x05 | 0x3c => self.config[reg + i] = b,
@@ -244,5 +245,26 @@ impl Bus {
             f.device.load(r)?;
         }
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::console::Console;
+
+    #[test]
+    fn a_64_bit_config_access_is_the_32_bits_there() {
+        let mut bus = Bus::default();
+        bus.add(1, Device::Console(Console::default()));
+        let at = 1 << 15;
+        let id = bus.config_read(at, 4);
+        assert_eq!(id & 0xffff, 0x1af4, "virtio's vendor id");
+        assert_eq!(bus.config_read(at, 8), id);
+        // The BAR, written 64 bits wide (size probing), keeps only what 32 bits say
+        bus.config_write(at + 0x10, 8, u32::MAX);
+        assert_eq!(bus.config_read(at + 0x10, 4), !(BAR_SIZE - 1));
+        // Nothing past the 256 bytes of a function's configuration
+        assert_eq!(bus.config_read(at + 0xffc, 8), 0);
     }
 }

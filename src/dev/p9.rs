@@ -603,7 +603,8 @@ impl P9 {
 
     pub fn load(&mut self, r: &mut R) -> Option<()> {
         self.fs = Fs::load(r)?;
-        self.msize = r.u32()?;
+        // As a Tversion would: the replies size their payloads from it
+        self.msize = r.u32()?.clamp(4096, MAX_MSIZE);
         self.fids.clear();
         for _ in 0..r.u32()? {
             let id = r.u32()?;
@@ -677,5 +678,25 @@ mod tests {
         assert_eq!(r[4], TREAD + 1);
         assert_eq!(&r[7..11], &4u32.to_le_bytes());
         assert_eq!(&r[11..], b"bcde");
+    }
+
+    #[test]
+    fn a_snapshot_cannot_set_a_message_size_replies_do_not_fit() {
+        let json = br#"{"version":3,"fsroot":[["f",3,0,33188,0,0,"a"]]}"#;
+        for (saved, loaded) in [(0, 4096), (11, 4096), (1 << 30, MAX_MSIZE), (8192, 8192)] {
+            let mut p = P9::new("t", Fs::from_json(json).unwrap());
+            p.msize = saved;
+            let mut w = W::new();
+            p.save(&mut w);
+            let mut back = P9::new("t", Fs::from_json(json).unwrap());
+            back.load(&mut R(&w.0)).unwrap();
+            assert_eq!(back.msize, loaded, "saved {saved}");
+            // A read sizes its reply from msize: no underflow
+            back.fs.provide_blob("a", b"abc".to_vec()).unwrap();
+            let io = Io::new(Arc::new(crate::smp::Machine::new(1 << 20, 1)), || 0);
+            let f = back.fs.lookup_path("/f").unwrap();
+            back.set_fid(7, f, 0);
+            back.handle(&io, &tread(7, 0, 64)).unwrap();
+        }
     }
 }
