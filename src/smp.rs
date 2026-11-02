@@ -125,7 +125,11 @@ pub struct PerCpu {
     pub run_state: AtomicU32,
 }
 
-pub const CODE_RING: usize = 256;
+/// Instruction-cache invalidations kept for CPUs that have not applied them yet. A CPU further
+/// behind can't know which pages changed and drops all its compiled code, so this is sized for
+/// guests whose own JIT writes code on one CPU while another runs (a JVM invalidated over 1800
+/// pages ahead of its other CPU; 256 meant a full flush every few seconds).
+pub const CODE_RING: usize = 16384;
 pub const TLB_RING: usize = 256;
 pub const TLB_ALL: u64 = u64::MAX;
 pub const CODE_ALL: u32 = u32::MAX;
@@ -133,14 +137,14 @@ pub const CODE_ALL: u32 = u32::MAX;
 pub struct CodeInval {
     /// Invalidations so far; entry `n` lives at `ring[n % CODE_RING]`.
     pub gen: u64,
-    pub ring: [u32; CODE_RING],
+    pub ring: Box<[u32]>,
 }
 
 impl Default for CodeInval {
     fn default() -> Self {
         CodeInval {
             gen: 0,
-            ring: [0; CODE_RING],
+            ring: vec![0; CODE_RING].into_boxed_slice(),
         }
     }
 }
