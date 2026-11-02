@@ -132,6 +132,9 @@ pub struct Jit {
     pub code_page: Vec<u8>,
     /// The interpreter's pre-decoded pages, dropped with the page's compiled code.
     pub pre: crate::predecode::Cache,
+    /// Physical page -> the instruction words its compiled blocks cover (1024 bits). A write to
+    /// the page drops its compiled code only if it touches one of them.
+    covered: HashMap<u32, Box<[u64; 16]>>,
     /// Statistics
     pub compiled: u64,
     pub invalidated: u64,
@@ -140,6 +143,8 @@ pub struct Jit {
     pub flushes: u64,
     /// Pages dropped because they were written.
     pub page_invalidations: u64,
+    /// Writes to pages with code that touched none of it, and kept it.
+    pub code_writes_kept: u64,
     /// Instructions retired inside modules, and those of them interpreted.
     pub block_insns: u64,
     pub helper_interps: u64,
@@ -193,11 +198,13 @@ impl Jit {
             page_keys: HashMap::new(),
             code_page: vec![0; memory_size.div_ceil(4096)],
             pre: crate::predecode::Cache::new(memory_size),
+            covered: HashMap::new(),
             compiled: 0,
             invalidated: 0,
             block_runs: 0,
             flushes: 0,
             page_invalidations: 0,
+            code_writes_kept: 0,
             block_insns: 0,
             helper_interps: 0,
             helper_fp_lanes: 0,
@@ -295,6 +302,7 @@ impl Jit {
         self.code_page[page] = 0;
         self.page_invalidations += 1;
         self.pre.drop_page(page);
+        self.covered.remove(&(page as u32));
         if let Some(keys) = self.page_keys.remove(&(page as u32)) {
             for k in keys {
                 self.remove_page(k);
@@ -302,6 +310,38 @@ impl Jit {
         }
     }
 
+    /// The guest wrote `size` bytes at physical address `pa`, on a page with code. Compiled code
+    /// is dropped only if the write touches words its blocks were translated from (then the
+    /// decoded instructions of the words written go too). A JVM, say, writes new code and data
+    /// next to compiled code: dropping the whole page each time threw away code that was still
+    /// right.
+    pub(crate) fn code_written(&mut self, pa: u64, size: u32) {
+        let page = (pa >> 12) as usize;
+        let Some(&flags) = self.code_page.get(page) else {
+            return;
+        };
+        if flags == 0 || size == 0 {
+            return;
+        }
+        // Decoded instructions alone are cheap to decode again, and dropping them lets writes to
+        // the page take the fast path again: only compiled code is worth keeping
+        if flags & 1 == 0 {
+            self.invalidate_page(page);
+            return;
+        }
+        let first = ((pa & 0xfff) >> 2) as usize;
+        let last = (((pa & 0xfff) + size as u64 - 1).min(0xfff) >> 2) as usize;
+        let hit = match self.covered.get(&(page as u32)) {
+            Some(c) => (first..=last).any(|w| c[w / 64] & (1 << (w % 64)) != 0),
+            None => true, // compiled code with no record of what it covers: drop it
+        };
+        if hit {
+            self.invalidate_page(page);
+        } else {
+            self.pre.forget_words(page, first, last);
+            self.code_writes_kept += 1;
+        }
+    }
     pub fn flush_all(&mut self) {
         self.flushes += 1;
         let keys: Vec<u64> = self.pages.keys().copied().collect();
@@ -309,6 +349,7 @@ impl Jit {
             self.remove_page(k);
         }
         self.page_keys.clear();
+        self.covered.clear();
         self.code_page.fill(0);
         self.pre.clear();
         self.hot_key.fill(u64::MAX);
@@ -539,6 +580,18 @@ impl<H: Host> Cpu<H> {
         let code = gen::translate_page_code(&layout, &words, &entries, MAX_BLOCK);
 
         let page = page_pa >> 12;
+        // The words these blocks were translated from: writes to them drop the page's code
+        let covered = self
+            .jit
+            .covered
+            .entry(page as u32)
+            .or_insert_with(|| Box::new([0; 16]));
+        for &e in &entries {
+            let start = e as usize / 4;
+            for w in start..start + gen::block_insns(&words, start, MAX_BLOCK).len() {
+                covered[w / 64] |= 1 << (w % 64);
+            }
+        }
         self.jit.code_page[page] |= 1;
         self.machine.code_pages[page].store(1, std::sync::atomic::Ordering::Relaxed);
         let keys = self.jit.page_keys.entry(page as u32).or_default();
