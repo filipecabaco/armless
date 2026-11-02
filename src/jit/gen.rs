@@ -524,7 +524,7 @@ impl Gen<'_> {
         self.c.i64_shr_u();
         self.c.tee(PAGE);
         self.c.i32_wrap_i64();
-        self.c.i32c(255);
+        self.c.i32c(crate::cpu::FAST_ENTRIES as i32 - 1);
         self.c.i32_and();
         self.c.tee(IDX);
         self.c.i32c(3);
@@ -1218,6 +1218,24 @@ impl Gen<'_> {
     /// Barriers (no-ops on one core) and MRS/MSR of registers kept in the
     /// CPU struct. Everything else in the system space is interpreted.
     fn system(&mut self, insn: u32) -> bool {
+        if insn & 0xffff_ffe0 == 0xd50b_7420 {
+            // DC ZVA: the 64-byte block (DCZID_EL0) holding Xt zeroed, as eight stores. The
+            // block never crosses a page, so a fault comes at the first one, before any is made.
+            let rt = insn & 31;
+            self.xr(rt);
+            self.c.i64c(!63);
+            self.c.i64_and();
+            self.c.set(VA);
+            self.c.i64c(0);
+            self.c.set(DATA);
+            for i in 0..8 {
+                if i != 0 {
+                    self.va_add(8);
+                }
+                self.store(8);
+            }
+            return true;
+        }
         if insn & 0xffff_f01f == 0xd503_301f
             && matches!(field(insn, 5, 3), 4..=6)
             && insn & 0xf00 != 0
@@ -1246,6 +1264,11 @@ impl Gen<'_> {
         let key = field(insn, 5, 16);
         let rt = insn & 31;
         let el1 = l.el == 1;
+        if mrs && key == crate::sysreg::DCZID_EL0 {
+            // A constant: DC ZVA permitted, 64-byte blocks
+            self.wr(rt, |g| g.c.i64c(crate::sysreg::id::DCZID as i64));
+            return true;
+        }
         let (addr, wide) = match key {
             k if k == sr(3, 3, 13, 0, 2) => (l.tpidr_el0, true),
             k if k == sr(3, 3, 13, 0, 3) && (mrs || el1) => (l.tpidrro_el0, true),
@@ -1438,6 +1461,47 @@ impl Gen<'_> {
             // Data-processing (1 source): RBIT/REV16/REV/REV32/CLZ/CLS
             let opc = field(insn, 10, 6);
             match (opc, sf) {
+                (0, _) => {
+                    // RBIT: bits swapped within each byte (1, 2, 4 at a time), then the bytes
+                    // reversed as REV reverses them (within the low word for 32 bits)
+                    self.xr(rn);
+                    self.c.set(T0);
+                    self.swap_units(T0, 1, 0x5555_5555_5555_5555);
+                    self.swap_units(T0, 2, 0x3333_3333_3333_3333);
+                    self.swap_units(T0, 4, 0x0f0f_0f0f_0f0f_0f0f);
+                    self.swap_units(T0, 8, 0x00ff_00ff_00ff_00ff);
+                    self.swap_units(T0, 16, 0x0000_ffff_0000_ffff);
+                    if sf {
+                        self.c.get(T0);
+                        self.c.i64c(32);
+                        self.c.i64_rotr();
+                        self.c.set(T0);
+                    }
+                    self.wr(rd, |g| {
+                        g.c.get(T0);
+                        g.trunc32(sf);
+                    });
+                },
+                (5, _) => {
+                    // CLS: leading bits equal to the sign bit, the sign bit itself not counted:
+                    // CLZ(x ^ (x >> 1, arithmetic)) - 1
+                    // (a 32-bit value is sign-extended: 32 more of the same bits in front of it)
+                    self.xr(rn);
+                    if !sf {
+                        self.c.i64_extend32_s();
+                    }
+                    self.c.set(T0);
+                    self.wr(rd, |g| {
+                        g.c.get(T0);
+                        g.c.get(T0);
+                        g.c.i64c(1);
+                        g.c.i64_shr_s();
+                        g.c.i64_xor();
+                        g.c.i64_clz();
+                        g.c.i64c(if sf { 1 } else { 33 });
+                        g.c.i64_sub();
+                    });
+                },
                 (4, _) => {
                     // CLZ
                     self.wr(rd, |g| {
@@ -1473,6 +1537,59 @@ impl Gen<'_> {
                 },
                 _ => return false,
             }
+            return true;
+        }
+        if insn & 0x1fe0_fc00 == 0x1a00_0000 {
+            // ADC / ADCS / SBC / SBCS (NGC, NGCS): Rn + Rm (or ~Rm) + C
+            let (sub, set_flags) = (bit(insn, 30), bit(insn, 29));
+            let l = *self.l;
+            self.xr(rn);
+            self.trunc32(sf);
+            self.c.set(T0);
+            self.xr(rm);
+            if sub {
+                self.c.i64c(-1);
+                self.c.i64_xor();
+            }
+            self.trunc32(sf);
+            self.c.set(T1);
+            self.c.i32c(0);
+            self.c.i32_load8_u(l.c);
+            self.c.i64_extend_i32_u();
+            self.c.set(T2);
+            // the sum, in 64 bits: for 32-bit operands bit 32 is the carry out
+            self.c.get(T0);
+            self.c.get(T1);
+            self.c.i64_add();
+            self.c.get(T2);
+            self.c.i64_add();
+            self.c.set(T3);
+            if set_flags {
+                self.c.get(T3);
+                self.trunc32(sf);
+                self.c.set(T4);
+                self.flags_addsub(T0, T1, T4, T3, false, sf);
+                if sf {
+                    // The carry out of x + y + c: the sum wrapped below x, or equals it with a
+                    // carry in (y + c wrapped to 0)
+                    self.set_flag(l.c, |g| {
+                        g.c.get(T4);
+                        g.c.get(T0);
+                        g.c.i64_lt_u();
+                        g.c.get(T4);
+                        g.c.get(T0);
+                        g.c.i64_eq();
+                        g.c.get(T2);
+                        g.c.i32_wrap_i64();
+                        g.c.i32_and();
+                        g.c.i32_or();
+                    });
+                }
+            }
+            self.wr(rd, |g| {
+                g.c.get(T3);
+                g.trunc32(sf);
+            });
             return true;
         }
         if insn & 0x7fe0_f800 == 0x1ac0_0800 {
@@ -1808,6 +1925,51 @@ impl Gen<'_> {
                     });
                     true
                 },
+                0b01100 | 0b01101 | 0b10100 | 0b10101 if size != 3 => {
+                    // SMAX / UMAX / SMIN / UMIN, and their pairwise forms (SMAXP ... UMINP:
+                    // adjacent pairs of Vm:Vn)
+                    let e = 8 << size;
+                    let pairwise = opcode & 0b10000 != 0;
+                    let max = opcode & 1 == 0;
+                    let per_reg = if q { 128 } else { 64 } / e;
+                    let elem = |g: &mut Self, i: u32| {
+                        if i < per_reg {
+                            g.lane(rn, e, i, !u)
+                        } else {
+                            g.lane(rm, e, i - per_reg, !u)
+                        }
+                    };
+                    self.vbuild(q, rd, e, |g, k| {
+                        if pairwise {
+                            elem(g, 2 * k);
+                            g.c.set(T0);
+                            elem(g, 2 * k + 1);
+                            g.c.set(T1);
+                        } else {
+                            g.lane(rn, e, k, !u);
+                            g.c.set(T0);
+                            g.lane(rm, e, k, !u);
+                            g.c.set(T1);
+                        }
+                        g.c.get(T0);
+                        g.c.get(T1);
+                        // max: T0 > T1; min: T1 > T0
+                        if max {
+                            g.c.get(T0);
+                            g.c.get(T1);
+                        } else {
+                            g.c.get(T1);
+                            g.c.get(T0);
+                        }
+                        if u {
+                            g.c.i64_gt_u();
+                        } else {
+                            g.c.i64_gt_s();
+                        }
+                        g.c.select();
+                    });
+                    true
+                },
                 0b10111 if !u && (size != 3 || q) => {
                     // ADDP (vector): adjacent pairs of Vm:Vn added
                     let e = 8 << size;
@@ -1965,6 +2127,65 @@ impl Gen<'_> {
                 if acc {
                     g.c.i64_add();
                 }
+            });
+            return true;
+        }
+        if insn & 0xbfe0_fc00 == 0x0e00_3c00 || insn & 0xbfe0_fc00 == 0x0e00_2c00 {
+            // UMOV / SMOV (MOV Rd, Vn.T[i]): a lane, zero- or sign-extended, to a general register
+            let signed = !bit(insn, 12);
+            let imm5 = field(insn, 16, 5);
+            let size = imm5.trailing_zeros();
+            let ok = match (signed, size, q) {
+                (false, 0..=2, false) | (false, 3, true) => true, // UMOV Wd (B, H, S); Xd (D)
+                (true, 0 | 1, _) | (true, 2, true) => true,      // SMOV Wd/Xd (B, H); Xd (S)
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+            let e = 8 << size;
+            self.lane(rn, e, imm5 >> (size + 1), signed);
+            self.c.set(T0);
+            self.wr(rd, |g| {
+                g.c.get(T0);
+                // SMOV to Wd: the sign-extended lane, as 32 bits
+                g.trunc32(q || !signed);
+            });
+            return true;
+        }
+        if insn & 0x9f80_fc00 == 0x0f00_a400 && field(insn, 19, 4) != 0 && field(insn, 22, 1) == 0 {
+            // SSHLL / USHLL (SXTL / UXTL): the lanes of one half, widened and shifted left
+            let immh = field(insn, 19, 4);
+            let e = 8u32 << (31 - immh.leading_zeros());
+            let shift = (field(insn, 16, 7) - e) as i64;
+            let first = if q { 64 / e } else { 0 };
+            self.vbuild(true, rd, 2 * e, |g, k| {
+                g.lane(rn, e, first + k, !u);
+                if shift != 0 {
+                    g.c.i64c(shift);
+                    g.c.i64_shl();
+                }
+            });
+            return true;
+        }
+        if insn & 0x9ff8_0400 == 0x0f00_0400 {
+            // MOVI / MVNI / ORR / BIC / FMOV (vector, immediate): the interpreter's expansion
+            use crate::advsimd::{mod_imm_op, ModImm};
+            let Some(op) = mod_imm_op(insn) else {
+                return false;
+            };
+            self.vlanes(q, rd, |g, h| match op {
+                ModImm::Set(v) => g.c.i64c(v as i64),
+                ModImm::Orr(v) => {
+                    g.vld(rd, h);
+                    g.c.i64c(v as i64);
+                    g.c.i64_or();
+                },
+                ModImm::Bic(v) => {
+                    g.vld(rd, h);
+                    g.c.i64c(!v as i64);
+                    g.c.i64_and();
+                },
             });
             return true;
         }
@@ -2249,6 +2470,9 @@ impl Gen<'_> {
     }
 
     fn ldst(&mut self, insn: u32) -> bool {
+        if insn & 0x3b00_0000 == 0x1800_0000 {
+            return self.ldr_literal(insn);
+        }
         if bit(insn, 26) {
             return self.fp_guarded(insn, |g| {
                 if insn & 0x3800_0000 == 0x2800_0000 {
@@ -2270,6 +2494,44 @@ impl Gen<'_> {
             return self.ldst_reg(insn);
         }
         false
+    }
+
+    /// LDR (literal): a load from this instruction's address plus imm19 * 4: Wt, Xt, LDRSW, and
+    /// St, Dt, Qt; PRFM (literal) is a hint.
+    fn ldr_literal(&mut self, insn: u32) -> bool {
+        let opc = field(insn, 30, 2);
+        let simd = bit(insn, 26);
+        let rt = insn & 31;
+        let at = |g: &mut Self| {
+            let off = g.off + crate::bits::sext(field(insn, 5, 19) as u64, 19) * 4;
+            g.pc_at(off);
+            g.c.set(VA);
+        };
+        if simd {
+            let size = match opc {
+                0 => 4,
+                1 => 8,
+                2 => 16,
+                _ => return false,
+            };
+            return self.fp_guarded(insn, |g| {
+                at(g);
+                g.fp_load_vt(size, T2, T3);
+                g.fp_set_vt(rt, size, T2, T3);
+                true
+            });
+        }
+        if opc == 3 {
+            return true; // PRFM
+        }
+        at(self);
+        self.load(if opc == 1 { 8 } else { 4 });
+        if opc == 2 {
+            self.c.i64_extend32_s(); // LDRSW
+        }
+        self.c.set(T0);
+        self.wr(rt, |g| g.c.get(T0));
+        true
     }
 
     fn ldst_pair(&mut self, insn: u32) -> bool {

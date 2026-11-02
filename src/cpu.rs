@@ -203,7 +203,8 @@ fn same_aligned_page(pc: u64, page: u64) -> bool {
     pc.rotate_right(2) >> 10 == page
 }
 
-const FAST_ENTRIES: usize = 256;
+/// Entries of each fast table (a power of two; compiled code indexes them with this, too).
+pub(crate) const FAST_ENTRIES: usize = 256;
 /// Executable pages remembered besides the current one (`code_page`).
 const CODE_ENTRIES: usize = 64;
 
@@ -627,12 +628,16 @@ impl<H: Host> Cpu<H> {
         };
         let v = fire(&mut self.sys.cntv_ctl, self.sys.cntv_cval);
         let p = fire(&mut self.sys.cntp_ctl, self.sys.cntp_cval);
-        {
+        let changed = {
             let mut g = self.machine.gic.lock();
-            g.set_line(self.index, board::PPI_VIRT_TIMER, v);
-            g.set_line(self.index, board::PPI_PHYS_TIMER, p);
-        }
-        self.set_irq_dirty();
+            g.set_line(self.index, board::PPI_VIRT_TIMER, v)
+                | g.set_line(self.index, board::PPI_PHYS_TIMER, p)
+        };
+        // Only a timer line that changed can change what is pending: re-examining interrupts on
+        // every poll (a lock and a scan of every line, each 1024 instructions) found nothing new
+        // almost always. Everything else that can make an interrupt deliverable (DAIF, the GIC's
+        // registers, devices) raises the flag itself.
+        self.kick(changed);
     }
 
     /// Host time at which the earliest armed timer will fire.

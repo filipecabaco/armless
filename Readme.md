@@ -112,8 +112,9 @@ replaced pages included, and starts over when that is full; its compiler gives b
 its working memory whenever it has nothing queued.
 
 Compiled code covers the integer instructions, the SIMD&FP loads and stores, the common
-integer NEON operations (bitwise, add/sub, compares with zero, multiply-long, pairwise add,
-permutes, EXT) and scalar floating point: single-precision arithmetic, fused multiply-add,
+integer NEON operations (bitwise, add/sub, compares with zero, max/min, multiply-long, pairwise
+add, widening shifts, permutes, EXT, lane moves, immediates), PC-relative loads, DC ZVA, and
+scalar floating point: single-precision arithmetic, fused multiply-add,
 double-precision addition and subtraction, compares, selects, moves and conversions, inline
 whenever FPCR is as Linux runs it and the numbers are ordinary, with the architecture's results
 and FPSR flags (NaNs, infinities, subnormals and underflow go to the interpreter). Vector floating
@@ -155,7 +156,9 @@ The wasm builds need clang and lld (for the C zstd decoder in `lib/zstd`).
 | `ARMLESS_9PFS=DIR cargo test --release --test vm` | the snowglobe flow natively: 9p root, console, snapshot, restore |
 | `node tests/js/flow.mjs DIR [CPUS]` | the same through `armless.js`, plus HTTP over fetch and port forwarding |
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
-| `elixir bench/run.exs` | the benchmark guest under the interpreter and the native JIT: phase times, what the JIT did, comparisons and profiles (`docs/profiling.md`) |
+| `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node): phase times, what the JIT did, comparisons and profiles (`docs/profiling.md`) |
+| `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands, natively, per site and compared with a saved run |
+| `cargo bench --bench machine` | host-side costs with criterion: an instruction interpreted and compiled, a page's compile, a snapshot |
 
 `tests/fs/make-9pfs.sh` builds the test filesystem, and `tests/fs/alpine/` builds
 a real Alpine image. `tests/fs/fs2json.py` and `copy-to-sha256.py` split files of 2 MiB

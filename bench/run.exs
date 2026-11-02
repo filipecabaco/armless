@@ -1,6 +1,7 @@
 #!/usr/bin/env elixir
 # The armless benchmark: builds armless-run and the benchmark guest (guest/bench.c), runs it under
-# the interpreter and the native JIT, and reports each phase's median time with its spread, plus
+# the interpreter and the native JIT (and, with --modes ...,wasm, through armless.js and the wasm
+# JIT in node, as a page runs it), and reports each phase's median time with its spread, plus
 # what the JIT did (how much ran compiled, how much went back to the interpreter, and which
 # instructions those were).
 #
@@ -8,8 +9,10 @@
 #   elixir bench/run.exs --save before        # ... and keep the results as "before"
 #   elixir bench/run.exs --compare before     # ... and compare with them
 #   elixir bench/run.exs --profile native     # samply profile of one run: where the host's time goes
+#   elixir bench/run.exs --summarize P.json --thread vcpu0   # the same summary of any samply profile
+#                                             # (saved with --save-only --unstable-presymbolicate)
 #
-# Options: --runs N, --modes interp,native, --out DIR (results; default build/bench),
+# Options: --runs N, --modes interp,native,wasm (default interp,native), --out DIR (results; default build/bench),
 # --profile MODE, --top N (profile rows, default 30), --no-build.
 #
 # See docs/profiling.md.
@@ -17,7 +20,8 @@
 defmodule Bench do
   @root Path.expand("..", __DIR__)
   @phases ~w(int mem tlb call fp64 fp32 u-orr u-ext u-cmeq0 u-fadd-s u-fadd-d u-fmla-2d u-ttbr u-isb total)
-  @modes %{"interp" => [], "native" => [{"ARMLESS_JIT", "native"}]}
+  # armless-run's environment for each native mode; "wasm" is armless.js in node
+  @modes %{"interp" => [], "native" => [{"ARMLESS_JIT", "native"}], "wasm" => :node}
 
   def main(argv) do
     {opts, _} =
@@ -30,17 +34,24 @@ defmodule Bench do
           out: :string,
           profile: :string,
           top: :integer,
-          build: :boolean
+          build: :boolean,
+          summarize: :string,
+          thread: :string
         ]
       )
+
+    if file = opts[:summarize] do
+      Profile.report(file, Keyword.get(opts, :thread, "vcpu0"), Keyword.get(opts, :top, 30))
+      System.halt(0)
+    end
 
     runs = Keyword.get(opts, :runs, 5)
     modes = opts |> Keyword.get(:modes, "interp,native") |> String.split(",", trim: true)
     out = Path.expand(Keyword.get(opts, :out, "build/bench"), @root)
     File.mkdir_p!(out)
 
-    Enum.each(modes, &(Map.has_key?(@modes, &1) or die("unknown mode #{&1}: interp or native")))
-    if Keyword.get(opts, :build, true), do: build(out)
+    Enum.each(modes, &(Map.has_key?(@modes, &1) or die("unknown mode #{&1}: interp, native or wasm")))
+    if Keyword.get(opts, :build, true), do: build(out, "wasm" in modes)
     run_bin = Path.join(out, "target/release/armless-run")
     guest = Path.join(out, "guest/bench.bin")
 
@@ -52,7 +63,7 @@ defmodule Bench do
 
   # ---------------------------------------------------------------- build
 
-  defp build(out) do
+  defp build(out, wasm) do
     IO.puts(:stderr, "building armless-run (release, with line tables) and the guest ...")
     # Its own target directory: line tables for profiles without rebuilding the usual one
     cmd!("cargo", ~w(build --release --bin armless-run),
@@ -69,6 +80,9 @@ defmodule Bench do
         {"OBJCOPY", tool(["llvm-objcopy", "rust-objcopy"])}
       ]
     )
+
+    # build/armless.wasm, which tests/js/run-bare.mjs loads
+    if wasm, do: cmd!("sh", [Path.join(@root, "build-wasm.sh")], cd: @root)
   end
 
   # Installed, or the copy rustc ships (as tests/guest.rs does)
@@ -117,18 +131,37 @@ defmodule Bench do
     end
   end
 
+  # In node, as a page runs it: armless.js's own JIT threshold (0 keeps armless's default)
+  defp run(_run_bin, guest, "wasm", _out, _fallbacks) do
+    script = Path.join(@root, "tests/js/run-bare.mjs")
+    args = [script, guest, "-m", "512", "--jit-threshold", "0", "--stats"]
+    {output, status} = System.cmd("node", args, stderr_to_stdout: true)
+    status == 0 or die("wasm: run-bare.mjs exited with #{status}:\n#{output}")
+    [n, secs, modules, runs] =
+      Regex.run(~r/run-bare: (\d+) instructions in ([\d.]+)s .* jit compiled (\d+) invalidated \d+ runs (\d+)/, output,
+        capture: :all_but_first
+      ) || die("wasm: no statistics in:\n#{output}")
+
+    {n, runs} = {String.to_integer(n), String.to_integer(runs)}
+    cpu = %{"instructions" => n, "block_runs" => runs, "modules" => String.to_integer(modules)}
+    %{phases: phases(output, "wasm"), stats: %{"instructions" => n, "seconds" => String.to_float(secs), "cpus" => [cpu]}}
+  end
+
   defp run(run_bin, guest, mode, out, fallbacks) do
     stats_path = Path.join(out, "stats-#{mode}.json")
     args = ~w(--raw #{guest} --timeout 600 --stats-json #{stats_path}) ++ if(fallbacks, do: ["--fallbacks"], else: [])
     {output, status} = System.cmd(run_bin, args, env: @modes[mode], stderr_to_stdout: true)
     status == 0 or die("#{mode}: armless-run exited with #{status}:\n#{output}")
+    %{phases: phases(output, mode), stats: stats_path |> File.read!() |> JSON.decode!()}
+  end
 
+  defp phases(output, mode) do
     phases =
       Regex.scan(~r/^bench (\S+) (\d+)\r?$/m, output, capture: :all_but_first)
       |> Map.new(fn [name, us] -> {name, String.to_integer(us)} end)
 
     map_size(phases) > 0 or die("#{mode}: no bench lines in:\n#{output}")
-    %{phases: phases, stats: stats_path |> File.read!() |> JSON.decode!()}
+    phases
   end
 
   defp summarize(samples) do
@@ -196,7 +229,14 @@ defmodule Bench do
     rows =
       Enum.map(modes, fn m ->
         c = results[m]["cpu"]
-        pct = fn a, b -> if b > 0, do: "#{Float.round(100 * a / b, 2)}%", else: "-" end
+        # (the wasm build reports fewer counters: "-" for the rest)
+        pct = fn
+          a, b when is_number(a) and is_number(b) and b > 0 -> "#{Float.round(100 * a / b, 2)}%"
+          _, _ -> "-"
+        end
+
+        failed = if c["native_failures"], do: " (#{c["native_failures"]} failed)", else: ""
+        compile = if c["native_compile_ns"], do: "#{Float.round(c["native_compile_ns"] / 1.0e6, 1)}", else: "-"
 
         [
           m,
@@ -204,8 +244,8 @@ defmodule Bench do
           pct.(c["compiled_insns"], c["instructions"]),
           pct.(c["helper_insns"], c["compiled_insns"]),
           "#{c["block_runs"]}",
-          "#{c["modules"]} (#{c["native_failures"]} failed)",
-          "#{Float.round(c["native_compile_ns"] / 1.0e6, 1)}"
+          "#{c["modules"]}#{failed}",
+          compile
         ]
       end)
 
@@ -273,7 +313,7 @@ defmodule Bench do
   # One run under samply; then where the vCPU thread's samples are, by function (self: the
   # function itself; inclusive: with what it calls)
   defp profile(run_bin, guest, mode, out, top) do
-    Map.has_key?(@modes, mode) or die("unknown mode #{mode}")
+    (Map.has_key?(@modes, mode) and mode != "wasm") or die("profiles are of interp or native")
     runs?("samply") or die("samply is not installed: cargo install samply")
     path = Path.join(out, "profile-#{mode}.json")
     IO.puts(:stderr, "recording #{mode} with samply ...")

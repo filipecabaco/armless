@@ -1,7 +1,7 @@
 # Measuring armless
 
-Where the time goes, before changing anything for speed: three tools, from the cheapest to the
-most detailed.
+Where the time goes, before changing anything for speed: from the cheapest look to real
+workloads.
 
 ## `armless-run --stats`
 
@@ -34,6 +34,8 @@ elixir bench/run.exs                    # build, then 5 runs under the interpret
 elixir bench/run.exs --save before      # keep the results (build/bench/before.json)
 elixir bench/run.exs --compare before   # after a change: each phase against them
 elixir bench/run.exs --profile native   # where the host's time goes (needs samply)
+elixir bench/run.exs --modes native,wasm   # and through armless.js and the wasm JIT, in node
+elixir bench/run.exs --summarize P.json --thread vcpu0   # any samply profile, summarized
 ```
 
 It builds `armless-run` (release, with line tables, in `build/bench`) and the benchmark guest
@@ -62,9 +64,46 @@ instructions handed to the interpreter, and `native_read`/`native_write` are mem
 missed the fast TLB. `samply load build/bench/profile-MODE.json` opens the whole profile in the
 Firefox profiler.
 
+## `bench/sites.exs`: real workloads
+
+```sh
+elixir bench/sites.exs ../snowglobe                     # every site built in ../snowglobe/dist
+elixir bench/sites.exs ../snowglobe --save main         # keep as build/bench/sites-main.json
+elixir bench/sites.exs ../snowglobe --compare main      # after a change
+elixir bench/sites.exs ../snowglobe --sites java --profile   # interpreted vs compiled time
+```
+
+[snowglobe](https://github.com/filipecabaco/snowglobe) sites are the workloads armless runs for
+real: Python with Rich, a JVM's jshell, Elixir's iex and its BEAM JIT, PostgreSQL, Supabase,
+Node with TypeScript, Rust and shell tools. This builds snowglobe's native runtime against this
+checkout (snowglobe itself is left as it was), restores each built site and feeds it the
+commands its `transcript.json` lists, with the native JIT. Per site: the job's time and
+instructions, how much compiled code handed to the interpreter, what the JIT compiled (and how
+long that took), pages dropped because the guest wrote them, and full flushes; then, over every
+site, which instructions compiled code still hands to the interpreter: what to translate next.
+
+What it showed: workloads that run their own JIT (the JVM, the BEAM, V8) write code as they go,
+so armless drops what it compiled from those pages and runs the new code interpreted until it is
+hot. With `--profile`, a third to half of a vCPU's time is in the interpreter on short commands
+(Java, Python, iex): code that runs fewer than `ARMLESS_JIT_THRESHOLD` times never compiles.
+Lowering the threshold or compiling with cheaper Cranelift settings made every site slower, so
+that time is the interpreter's to win.
+
+## `cargo bench --bench machine`
+
+Host-side costs with [criterion](https://github.com/bheisler/criterion.rs): one guest
+instruction interpreted and compiled (a fixed loop, as instructions per second), compiling one
+page, and saving and restoring a 64 MiB machine. `-- --save-baseline NAME` and
+`-- --baseline NAME` compare runs, with criterion's statistics.
+
 ## In tests
 
 The fuzzers in `src/jit/native.rs` and the bare-metal suite under the native JIT
 (`tests/guest.rs`) fail if a block does not compile, or if fewer than 95% of the fuzzed blocks ran
 as compiled code: a change that quietly sends code back to the interpreter is caught as a test
-failure, not later as a slowdown.
+failure, not later as a slowdown. `translated_groups_never_reach_the_interpreter` goes further
+for the groups real workloads used to hand back (RBIT, ADC/SBC, DC ZVA, MOVI, max/min, LDR
+literal, lane moves, widening shifts): compiled, none of them may call the interpreter, since
+results alone can't show it (the interpreter's are the same). `benchmark_guest_stays_compiled`
+(`tests/guest.rs`) runs the benchmark guest under the native JIT and checks what the JIT did:
+almost everything compiled, almost nothing interpreted, no failed compile.
