@@ -57,13 +57,22 @@ fn skip(what: &str) {
     eprintln!("skipping: {what} (needs clang, and ld.lld and llvm-objcopy or rustc's own)");
 }
 
-/// Builds `guest/` once for all the tests here.
+/// Builds `guest/` once for all the tests here: the CPU suite (tests.bin) and the benchmark
+/// (bench.bin).
 fn guest_image() -> Option<Vec<u8>> {
-    static IMAGE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-    IMAGE.get_or_init(build_guest).clone()
+    built().and_then(|out| std::fs::read(out.join("tests.bin")).ok())
 }
 
-fn build_guest() -> Option<Vec<u8>> {
+fn bench_image() -> Option<Vec<u8>> {
+    built().and_then(|out| std::fs::read(out.join("bench.bin")).ok())
+}
+
+fn built() -> Option<PathBuf> {
+    static OUT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    OUT.get_or_init(build_guest).clone()
+}
+
+fn build_guest() -> Option<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out = std::env::temp_dir().join(format!("armless-guest-{}", std::process::id()));
     let (ld, objcopy) = linker_and_objcopy()?;
@@ -77,7 +86,7 @@ fn build_guest() -> Option<Vec<u8>> {
     if !status.success() {
         return None;
     }
-    std::fs::read(out.join("tests.bin")).ok()
+    Some(out)
 }
 
 /// The bare-metal CPU suite, interpreted or with every block compiled on its first run.
@@ -231,3 +240,32 @@ fn smp_atomics_interpreted() {
 fn smp_atomics_native_jit() {
     smp_atomics(true);
 }
+
+/// The benchmark guest (guest/bench.c, what bench/run.exs times) under the native JIT, checked by
+/// what the JIT did rather than by time: almost everything runs compiled, almost nothing goes back
+/// to the interpreter, and every compile works. A change that quietly sends code back to the
+/// interpreter fails here, not later as a slowdown.
+#[cfg(feature = "native-jit")]
+#[test]
+fn benchmark_guest_stays_compiled() {
+    let Some(image) = bench_image() else {
+        return skip("could not build the benchmark guest");
+    };
+    let (mut vm, clock) = runner::new_vm(Config::default()).unwrap();
+    if !vm.cpus[0].enable_native_jit() {
+        return eprintln!("skipping: no native JIT backend for this host");
+    }
+    armless::boot_raw(&mut vm.cpus[0], &image, armless::board::KERNEL_OFFSET).unwrap();
+    let _host = NativeHost::spawn(vm.board.clone(), HostOptions::default(), Box::new(|_| {}));
+    let mut runner = Runner::new(vm, clock, true);
+    runner.start();
+    assert_eq!(runner.wait(Some(Duration::from_secs(300))), Some(Stopped::PowerOff));
+    let (insns, compiled, helped, failed) = runner.with_cpu(0, |c| {
+        (c.insn_count, c.jit.block_insns, c.jit.helper_interps, c.native_jit_failures())
+    });
+    assert_eq!(failed, 0, "blocks that did not compile");
+    assert!(compiled * 100 >= insns * 98, "{compiled} of {insns} instructions ran compiled");
+    // The guest's one TTBR write per round of its context-switch phase is all that remains
+    assert!(helped * 1000 <= compiled, "{helped} of {compiled} compiled instructions interpreted");
+}
+

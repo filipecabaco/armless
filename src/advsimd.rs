@@ -1121,75 +1121,18 @@ impl<H: Host> Cpu<H> {
     // ====================================================== modified immediate
 
     fn mod_imm(&mut self, insn: u32) -> Res<()> {
-        let q = bit(insn, 30);
-        let op = bit(insn, 29);
-        let cmode = field(insn, 12, 4);
-        if bit(insn, 11) {
+        let Some(op) = mod_imm_op(insn) else {
             return Err(Event::undefined());
-        }
+        };
         let rd = insn & 31;
-        let imm8 = ((field(insn, 16, 3) << 5) | field(insn, 5, 5)) as u64;
-        let rep = |v: u64, w: u32| -> u64 {
-            let mut r = 0u64;
-            let mut i = 0;
-            while i < 64 {
-                r |= v << i;
-                i += w;
-            }
-            r
-        };
-        let imm64: u64 = match cmode >> 1 {
-            0 => rep(imm8, 32),
-            1 => rep(imm8 << 8, 32),
-            2 => rep(imm8 << 16, 32),
-            3 => rep(imm8 << 24, 32),
-            4 => rep(imm8, 16),
-            5 => rep(imm8 << 8, 16),
-            6 => {
-                if cmode & 1 == 0 {
-                    rep((imm8 << 8) | 0xff, 32)
-                } else {
-                    rep((imm8 << 16) | 0xffff, 32)
-                }
-            },
-            _ => match (cmode & 1, op) {
-                (0, false) => rep(imm8, 8),
-                (0, true) => {
-                    let mut r = 0u64;
-                    for b in 0..8 {
-                        if imm8 & (1 << b) != 0 {
-                            r |= 0xff << (8 * b);
-                        }
-                    }
-                    r
-                },
-                (_, false) => rep(vfp_expand_imm(imm8, 32), 32),
-                (_, true) => {
-                    if !q {
-                        return Err(Event::undefined());
-                    }
-                    vfp_expand_imm(imm8, 64)
-                },
-            },
-        };
-        let imm = (imm64 as u128) | (imm64 as u128) << 64;
+        let wide = |v: u64| (v as u128) | (v as u128) << 64;
         let d = self.v(rd);
-        let orr_bic = cmode & 1 == 1 && cmode < 0b1100;
-        let r = if orr_bic {
-            if op {
-                d & !imm
-            } else {
-                d | imm
-            }
-        } else {
-            let mvn = op && cmode != 0b1110 && cmode != 0b1111;
-            if mvn {
-                !imm
-            } else {
-                imm
-            }
+        let r = match op {
+            ModImm::Set(v) => wide(v),
+            ModImm::Orr(v) => d | wide(v),
+            ModImm::Bic(v) => d & !wide(v),
         };
-        self.vset(rd, r, q);
+        self.vset(rd, r, bit(insn, 30));
         Ok(())
     }
 
@@ -1621,6 +1564,80 @@ impl<H: Host> Cpu<H> {
 
 /// Per-lane FP three-same operations, by the `Op` discriminant order used in
 /// `three_same_fp` (and 4/5/10/11 reused by the indexed forms).
+/// What an Advanced SIMD modified-immediate instruction (MOVI, MVNI, ORR, BIC, FMOV) does to
+/// each 64-bit half of Vd.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum ModImm {
+    Set(u64),
+    Orr(u64),
+    Bic(u64),
+}
+
+/// The operation of a modified-immediate instruction, or None if it is unallocated.
+pub(crate) fn mod_imm_op(insn: u32) -> Option<ModImm> {
+    let q = bit(insn, 30);
+    let op = bit(insn, 29);
+    let cmode = field(insn, 12, 4);
+    if bit(insn, 11) {
+        return None;
+    }
+    let imm8 = ((field(insn, 16, 3) << 5) | field(insn, 5, 5)) as u64;
+    let rep = |v: u64, w: u32| -> u64 {
+        let mut r = 0u64;
+        let mut i = 0;
+        while i < 64 {
+            r |= v << i;
+            i += w;
+        }
+        r
+    };
+    let imm64: u64 = match cmode >> 1 {
+        0 => rep(imm8, 32),
+        1 => rep(imm8 << 8, 32),
+        2 => rep(imm8 << 16, 32),
+        3 => rep(imm8 << 24, 32),
+        4 => rep(imm8, 16),
+        5 => rep(imm8 << 8, 16),
+        6 => {
+            if cmode & 1 == 0 {
+                rep((imm8 << 8) | 0xff, 32)
+            } else {
+                rep((imm8 << 16) | 0xffff, 32)
+            }
+        },
+        _ => match (cmode & 1, op) {
+            (0, false) => rep(imm8, 8),
+            (0, true) => {
+                let mut r = 0u64;
+                for b in 0..8 {
+                    if imm8 & (1 << b) != 0 {
+                        r |= 0xff << (8 * b);
+                    }
+                }
+                r
+            },
+            (_, false) => rep(vfp_expand_imm(imm8, 32), 32),
+            (_, true) => {
+                if !q {
+                    return None;
+                }
+                vfp_expand_imm(imm8, 64)
+            },
+        },
+    };
+    Some(if cmode & 1 == 1 && cmode < 0b1100 {
+        if op {
+            ModImm::Bic(imm64)
+        } else {
+            ModImm::Orr(imm64)
+        }
+    } else if op && cmode != 0b1110 && cmode != 0b1111 {
+        ModImm::Set(!imm64)
+    } else {
+        ModImm::Set(imm64)
+    })
+}
+
 /// The three-same floating-point operations (Advanced SIMD), numbered as `fp3` takes them.
 #[derive(Clone, Copy, PartialEq, Debug)]
 #[repr(u32)]

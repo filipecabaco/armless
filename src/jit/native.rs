@@ -1539,6 +1539,52 @@ mod tests {
         assert_eq!(c.x[0], 2);
     }
 
+    /// Groups that are translated in full: what real workloads (bench/sites.exs) used to hand to
+    /// the interpreter. Compiled, none of them may reach it.
+    const STRICT: &[(u32, u32)] = &[
+        (0x7fff_fc00, 0x5ac0_0000), // RBIT
+        (0x7fff_fc00, 0x5ac0_1400), // CLS
+        (0x7fff_f800, 0x5ac0_1000), // CLZ, CLS
+        (0x1fe0_fc00, 0x1a00_0000), // ADC, ADCS, SBC, SBCS (NGC)
+        (0xffff_ffe0, 0xd50b_7420), // DC ZVA
+        (0xffff_ffe0, 0xd53b_00e0), // MRS Xt, DCZID_EL0
+        (0x9ff8_9c00, 0x0f00_0400), // MOVI, MVNI (vector, immediate): 32-bit shifted (cmode 0xx0)
+        (0x9ff8_9c00, 0x0f00_1400), // ORR, BIC (vector, immediate): 32-bit shifted (cmode 0xx1)
+        (0x9ff8_dc00, 0x0f00_8400), // MOVI, MVNI: 16-bit shifted (cmode 10x0)
+        (0x9ff8_dc00, 0x0f00_9400), // ORR, BIC: 16-bit shifted (cmode 10x1)
+        (0x9ff8_ec00, 0x0f00_c400), // ... 32-bit shifting ones
+        (0xbff8_fc00, 0x0f00_e400), // MOVI 8-bit; MOVI 64-bit (U=1)
+        (0xfff8_fc00, 0x4f00_f400), // FMOV (vector, immediate) .4S
+        (0xfff8_fc00, 0x6f00_f400), // FMOV (vector, immediate) .2D
+        (0x9f60_f400, 0x0e20_6400), // SMAX, UMAX, SMIN, UMIN (8- and 16-bit lanes)
+        (0x9f60_f400, 0x0ea0_6400), // ... 32-bit lanes
+        (0x9f60_f400, 0x0e20_a400), // SMAXP, UMAXP, SMINP, UMINP (8- and 16-bit lanes)
+        (0x9f60_f400, 0x0ea0_a400), // ... 32-bit lanes
+        (0xbf00_0000, 0x1800_0000), // LDR Wt, Xt (literal)
+        (0xff00_0000, 0x9800_0000), // LDRSW (literal)
+        (0xff00_0000, 0xd800_0000), // PRFM (literal)
+        (0xff00_0000, 0x1c00_0000), // LDR St (literal)
+        (0xff00_0000, 0x5c00_0000), // LDR Dt (literal)
+        (0xff00_0000, 0x9c00_0000), // LDR Qt (literal)
+        (0xffe1_fc00, 0x0e01_3c00), // UMOV Wd, Vn.B[i]
+        (0xffe3_fc00, 0x0e02_3c00), // UMOV Wd, Vn.H[i]
+        (0xffe7_fc00, 0x0e04_3c00), // UMOV Wd, Vn.S[i]
+        (0xffef_fc00, 0x4e08_3c00), // UMOV Xd, Vn.D[i]
+        (0xbfe1_fc00, 0x0e01_2c00), // SMOV Wd/Xd, Vn.B[i]
+        (0xbfe3_fc00, 0x0e02_2c00), // SMOV Wd/Xd, Vn.H[i]
+        (0xffe7_fc00, 0x4e04_2c00), // SMOV Xd, Vn.S[i]
+        (0x9ff8_fc00, 0x0f08_a400), // SSHLL / USHLL (8-bit lanes)
+        (0x9ff0_fc00, 0x0f10_a400), // ... 16-bit lanes
+        (0x9fe0_fc00, 0x0f20_a400), // ... 32-bit lanes
+    ];
+    /// The system instructions among them (MRS DCZID_EL0 too).
+    const STRICT_SYSTEM: &[(u32, u32)] = &[(0xffff_ffe0, 0xd50b_7420), (0xffff_ffe0, 0xd53b_00e0)];
+
+    #[test]
+    fn translated_groups_never_reach_the_interpreter() {
+        fuzz_with(0x6a09_e667_f3bc_c908, 4000, STRICT, false, true, STRICT_SYSTEM);
+    }
+
     /// The same, for the narrow groups.
     #[test]
     fn compiled_narrow_groups_do_what_the_interpreter_does() {
@@ -1553,6 +1599,19 @@ mod tests {
     }
 
     fn fuzz(seed: u64, cases: usize, body: &[(u32, u32)], fp_bias: bool) {
+        fuzz_with(seed, cases, body, fp_bias, false, &[])
+    }
+
+    /// `strict`: every instruction `body` makes is translated, so a compiled block of them never
+    /// hands one to the interpreter (results alone can't tell: the interpreter's are the same).
+    fn fuzz_with(
+        seed: u64,
+        cases: usize,
+        body: &[(u32, u32)],
+        fp_bias: bool,
+        strict: bool,
+        system: &[(u32, u32)],
+    ) {
         let mut rng = Rng(seed);
         let mut interp = Cpu::new(RAM, NoDevices);
         let mut jit = Cpu::new(RAM, NoDevices);
@@ -1572,7 +1631,8 @@ mod tests {
                 .map(|_| loop {
                     let (mask, value) = body[rng.below(body.len() as u64) as usize];
                     let i = (rng.next() as u32 & !mask) | value;
-                    if (i >> 26) & 7 != 0b101 {
+                    // (no branches or system instructions, but those `system` lets through)
+                    if (i >> 26) & 7 != 0b101 || system.iter().any(|&(m, v)| i & m == v) {
                         break i;
                     }
                 })
@@ -1593,7 +1653,8 @@ mod tests {
             let (sp0, sp1) = (0x10000 + rng.below(0x20000), 0x10000 + rng.below(0x20000));
             let flags = rng.next();
             // SIMD&FP mostly usable (FPEN = 3), else any FPEN, which traps some ELs
-            let fpen = if rng.below(4) == 0 { rng.below(4) } else { 3 };
+            // (strictly translated code must not be trapped either: a trap is the interpreter's)
+            let fpen = if !strict && rng.below(4) == 0 { rng.below(4) } else { 3 };
             let vregs: [u128; 32] = std::array::from_fn(|_| {
                 let hi = (rng.next() as u128) << 64;
                 match rng.below(if fp_bias { 6 } else { 3 }) {
@@ -1648,10 +1709,15 @@ mod tests {
             }
             load(&mut jit, false);
             let runs = jit.jit.block_runs;
+            let helped = jit.jit.helper_interps;
             jit.run(1);
             if jit.jit.block_runs == runs {
                 continue; // e.g. a block that stores into its own page is never kept compiled
             }
+            assert!(
+                !strict || jit.jit.helper_interps == helped,
+                "case {case}: compiled code handed an instruction to the interpreter: {words:08x?}"
+            );
             compared += 1;
             assert_eq!(
                 state(&jit),

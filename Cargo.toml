@@ -50,6 +50,10 @@ native-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-
 # Compile the wasm export layer natively, to type-check it without a wasm target.
 wasm-api = []
 
+[[bench]]
+name = "machine"
+harness = false
+
 [[bin]]
 name = "armless-run"
 path = "src/bin/armless-run.rs"
@@ -63,3 +67,6 @@ lto = true
 opt-level = 3
 panic = "abort"
 codegen-units = 1
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "rayon"] }
