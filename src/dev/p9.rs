@@ -646,6 +646,9 @@ impl P9 {
 }
 
 #[cfg(test)]
+mod client_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 

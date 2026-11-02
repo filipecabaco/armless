@@ -927,7 +927,6 @@ impl Fs {
         (used, files)
     }
 
-
     /// Free inodes that are neither named nor referenced (after a restore).
     pub fn collect(&mut self) {
         let ids: Vec<Ino> = (0..self.inodes.len() as Ino).collect();

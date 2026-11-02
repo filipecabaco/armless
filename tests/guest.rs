@@ -28,14 +28,27 @@ fn tool(names: &[&str]) -> Option<OsString> {
     static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
     let bin = BIN.get_or_init(|| {
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-        let out = |arg| Command::new(&rustc).arg(arg).output().ok().filter(|o| o.status.success());
+        let out = |arg| {
+            Command::new(&rustc)
+                .arg(arg)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+        };
         let sysroot = String::from_utf8(out("--print=sysroot")?.stdout).ok()?;
         let version = String::from_utf8(out("-vV")?.stdout).ok()?;
         let host = version.lines().find_map(|l| l.strip_prefix("host: "))?;
-        Some(PathBuf::from(sysroot.trim()).join("lib/rustlib").join(host).join("bin"))
+        Some(
+            PathBuf::from(sysroot.trim())
+                .join("lib/rustlib")
+                .join(host)
+                .join("bin"),
+        )
     });
     let installed = names.iter().map(OsString::from);
-    let shipped = bin.iter().flat_map(|b| names.iter().map(move |n| b.join(n).into_os_string()));
+    let shipped = bin
+        .iter()
+        .flat_map(|b| names.iter().map(move |n| b.join(n).into_os_string()));
     installed.chain(shipped).find(runs)
 }
 
@@ -63,6 +76,7 @@ fn guest_image() -> Option<Vec<u8>> {
     built().and_then(|out| std::fs::read(out.join("tests.bin")).ok())
 }
 
+#[cfg(feature = "native-jit")]
 fn bench_image() -> Option<Vec<u8>> {
     built().and_then(|out| std::fs::read(out.join("bench.bin")).ok())
 }
@@ -259,13 +273,26 @@ fn benchmark_guest_stays_compiled() {
     let _host = NativeHost::spawn(vm.board.clone(), HostOptions::default(), Box::new(|_| {}));
     let mut runner = Runner::new(vm, clock, true);
     runner.start();
-    assert_eq!(runner.wait(Some(Duration::from_secs(300))), Some(Stopped::PowerOff));
+    assert_eq!(
+        runner.wait(Some(Duration::from_secs(300))),
+        Some(Stopped::PowerOff)
+    );
     let (insns, compiled, helped, failed) = runner.with_cpu(0, |c| {
-        (c.insn_count, c.jit.block_insns, c.jit.helper_interps, c.native_jit_failures())
+        (
+            c.insn_count,
+            c.jit.block_insns,
+            c.jit.helper_interps,
+            c.native_jit_failures(),
+        )
     });
     assert_eq!(failed, 0, "blocks that did not compile");
-    assert!(compiled * 100 >= insns * 98, "{compiled} of {insns} instructions ran compiled");
+    assert!(
+        compiled * 100 >= insns * 98,
+        "{compiled} of {insns} instructions ran compiled"
+    );
     // The guest's one TTBR write per round of its context-switch phase is all that remains
-    assert!(helped * 1000 <= compiled, "{helped} of {compiled} compiled instructions interpreted");
+    assert!(
+        helped * 1000 <= compiled,
+        "{helped} of {compiled} compiled instructions interpreted"
+    );
 }
-

@@ -48,6 +48,9 @@ impl Default for Config {
     }
 }
 
+/// A file's path and contents.
+pub type FileContents = (String, Vec<u8>);
+
 /// The devices and everything a host does with them.
 pub struct Board {
     pub io: Io,
@@ -164,12 +167,17 @@ impl Board {
             fs::Fail::Need(b) => format!("{path}: needs blobs {b:?}"),
         };
         let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-        let (name, dirs) = parts.split_last().ok_or_else(|| format!("{path}: not a file path"))?;
+        let (name, dirs) = parts
+            .split_last()
+            .ok_or_else(|| format!("{path}: not a file path"))?;
         let mut dir = fs::ROOT;
         for c in dirs {
             dir = match p.fs.lookup(dir, c.as_bytes()) {
                 Ok(i) => i,
-                Err(_) => p.fs.create(dir, c.as_bytes(), fs::S_IFDIR | 0o755, 0, 0, now).map_err(err)?,
+                Err(_) => {
+                    p.fs.create(dir, c.as_bytes(), fs::S_IFDIR | 0o755, 0, 0, now)
+                        .map_err(err)?
+                },
             };
         }
         let ino = match p.fs.lookup(dir, name.as_bytes()) {
@@ -177,7 +185,17 @@ impl Board {
                 p.fs.truncate(i, 0).map_err(err)?;
                 i
             },
-            Err(_) => p.fs.create(dir, name.as_bytes(), fs::S_IFREG | (mode & 0o7777), 0, 0, now).map_err(err)?,
+            Err(_) => {
+                p.fs.create(
+                    dir,
+                    name.as_bytes(),
+                    fs::S_IFREG | (mode & 0o7777),
+                    0,
+                    0,
+                    now,
+                )
+                .map_err(err)?
+            },
         };
         p.fs.write(ino, 0, data, now).map_err(err)?;
         Ok(())
@@ -185,15 +203,19 @@ impl Board {
 
     /// The regular files under a guest directory, with paths relative to it: how a host takes
     /// back what a guest wrote (after the guest's `sync`). None if there is no such directory.
-    pub fn fs_read_tree(&self, path: &str) -> Result<Option<Vec<(String, Vec<u8>)>>, String> {
+    pub fn fs_read_tree(&self, path: &str) -> Result<Option<Vec<FileContents>>, String> {
         use crate::dev::fs;
         let mut d = self.devices.lock();
         let (_, p) = d.p9().ok_or("the machine has no filesystem")?;
-        let Some(top) = p.fs.lookup_path(path) else { return Ok(None) };
+        let Some(top) = p.fs.lookup_path(path) else {
+            return Ok(None);
+        };
         let mut out = Vec::new();
         let mut stack = vec![(top, String::new())];
         while let Some((dir, prefix)) = stack.pop() {
-            let Ok(entries) = p.fs.list(dir) else { continue };
+            let Ok(entries) = p.fs.list(dir) else {
+                continue;
+            };
             for (name, ino) in entries {
                 if name == b"." || name == b".." {
                     continue;
@@ -696,8 +718,16 @@ mod restore_tests {
         mem.store(9 * PAGE + 1, 1, 0xcd);
         mem.store(5 * PAGE + 7, 1, 0x11);
         vm.load_state(&state).unwrap();
-        assert_eq!(mem.load(5 * PAGE + 7, 1), 0xab, "a page from the snapshot is restored");
-        assert_eq!(mem.load(9 * PAGE + 1, 1), 0, "a page the snapshot doesn't have is zero again");
+        assert_eq!(
+            mem.load(5 * PAGE + 7, 1),
+            0xab,
+            "a page from the snapshot is restored"
+        );
+        assert_eq!(
+            mem.load(9 * PAGE + 1, 1),
+            0,
+            "a page the snapshot doesn't have is zero again"
+        );
         assert!(mem.is_zero(12 * PAGE, PAGE), "untouched pages stay zero");
     }
 }

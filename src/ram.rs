@@ -220,14 +220,18 @@ impl Ram {
         // SAFETY: as in `load_atomic`.
         self.atomic(at, size, |p| unsafe {
             match size {
-                1 => AtomicU8::from_ptr(p).compare_exchange(expected as u8, new as u8, o, o).is_ok(),
+                1 => AtomicU8::from_ptr(p)
+                    .compare_exchange(expected as u8, new as u8, o, o)
+                    .is_ok(),
                 2 => AtomicU16::from_ptr(p as *mut u16)
                     .compare_exchange(expected as u16, new as u16, o, o)
                     .is_ok(),
                 4 => AtomicU32::from_ptr(p as *mut u32)
                     .compare_exchange(expected as u32, new as u32, o, o)
                     .is_ok(),
-                _ => AtomicU64::from_ptr(p as *mut u64).compare_exchange(expected, new, o, o).is_ok(),
+                _ => AtomicU64::from_ptr(p as *mut u64)
+                    .compare_exchange(expected, new, o, o)
+                    .is_ok(),
             }
         })
     }

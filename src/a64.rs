@@ -1351,7 +1351,12 @@ impl<H: Host> Cpu<H> {
     }
 
     pub(crate) fn dp_2src_leaf(&mut self, insn: u32) -> Res<()> {
-        let (sf, rd, rn, rm) = (bit(insn, 31), insn & 31, field(insn, 5, 5), field(insn, 16, 5));
+        let (sf, rd, rn, rm) = (
+            bit(insn, 31),
+            insn & 31,
+            field(insn, 5, 5),
+            field(insn, 16, 5),
+        );
         if bit(insn, 29) {
             return Err(Event::undefined());
         }
@@ -1439,7 +1444,12 @@ impl<H: Host> Cpu<H> {
     }
 
     pub(crate) fn dp_3src_leaf(&mut self, insn: u32) -> Res<()> {
-        let (sf, rd, rn, rm) = (bit(insn, 31), insn & 31, field(insn, 5, 5), field(insn, 16, 5));
+        let (sf, rd, rn, rm) = (
+            bit(insn, 31),
+            insn & 31,
+            field(insn, 5, 5),
+            field(insn, 16, 5),
+        );
         if field(insn, 29, 2) != 0 {
             return Err(Event::undefined());
         }

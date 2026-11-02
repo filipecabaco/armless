@@ -72,7 +72,11 @@ impl Platform for JsPlatform {
     }
 
     fn jit_compile(&mut self, table_index: u32, wasm: &[u8]) -> bool {
-        jit_compile(table_index, wasm.as_ptr() as usize as u32, wasm.len() as u32) != 0
+        jit_compile(
+            table_index,
+            wasm.as_ptr() as usize as u32,
+            wasm.len() as u32,
+        ) != 0
     }
 
     fn yield_now(&mut self) {
@@ -646,8 +650,10 @@ pub unsafe extern "C" fn armless_http_respond(
     let text = string(hdrs, hdrs_len);
     let parts: Vec<&str> = text.split('\0').collect();
     let headers: Vec<(String, String)> = parts
-        .chunks_exact(2)
-        .map(|kv| (kv[0].to_string(), kv[1].to_string()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[k, v]| (k.to_string(), v.to_string()))
         .collect();
     vm().board
         .http_respond(id, status as u16, &string(reason, reason_len), &headers);

@@ -28,8 +28,14 @@ pub struct Frame {
 pub fn parse(b: &[u8]) -> Option<(Frame, usize)> {
     let (&b0, &b1) = (b.first()?, b.get(1)?);
     let (len, mut at) = match b1 & 127 {
-        126 => (u16::from_be_bytes(b.get(2..4)?.try_into().ok()?) as usize, 4),
-        127 => (usize::try_from(u64::from_be_bytes(b.get(2..10)?.try_into().ok()?)).ok()?, 10),
+        126 => (
+            u16::from_be_bytes(b.get(2..4)?.try_into().ok()?) as usize,
+            4,
+        ),
+        127 => (
+            usize::try_from(u64::from_be_bytes(b.get(2..10)?.try_into().ok()?)).ok()?,
+            10,
+        ),
         n => (n as usize, 2),
     };
     let mask = if b1 & 128 != 0 {
@@ -44,7 +50,14 @@ pub fn parse(b: &[u8]) -> Option<(Frame, usize)> {
     if let Some(m) = mask {
         apply_mask(&mut payload, m);
     }
-    Some((Frame { fin: b0 & 0x80 != 0, opcode: b0 & 15, payload }, end))
+    Some((
+        Frame {
+            fin: b0 & 0x80 != 0,
+            opcode: b0 & 15,
+            payload,
+        },
+        end,
+    ))
 }
 
 /// A whole (final) frame of `payload`. Clients mask what they send, servers don't.
@@ -131,7 +144,14 @@ mod tests {
                 assert_eq!(f[1] & 0x80 != 0, mask.is_some());
                 let (back, used) = parse(&f).unwrap();
                 assert_eq!(used, f.len());
-                assert_eq!(back, Frame { fin: true, opcode: BINARY, payload: payload.clone() });
+                assert_eq!(
+                    back,
+                    Frame {
+                        fin: true,
+                        opcode: BINARY,
+                        payload: payload.clone()
+                    }
+                );
                 // Any prefix is still arriving
                 for cut in [0, 1, header - 1, f.len() - 1] {
                     if cut < f.len() {
@@ -147,8 +167,13 @@ mod tests {
         // 5.7: a single-frame unmasked "Hello", and the same masked
         let hello = [0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f];
         assert_eq!(encode(TEXT, b"Hello", None), hello);
-        let masked = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
-        assert_eq!(encode(TEXT, b"Hello", Some([0x37, 0xfa, 0x21, 0x3d])), masked);
+        let masked = [
+            0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58,
+        ];
+        assert_eq!(
+            encode(TEXT, b"Hello", Some([0x37, 0xfa, 0x21, 0x3d])),
+            masked
+        );
         assert_eq!(parse(&masked).unwrap().0.payload, b"Hello");
         // A fragmented unmasked text message: "Hel", then "lo"
         let mut m = Messages::default();
@@ -183,11 +208,21 @@ mod tests {
     #[test]
     fn a_new_message_drops_an_unfinished_one() {
         let mut m = Messages::default();
-        let frame = |fin, opcode, p: &[u8]| Frame { fin, opcode, payload: p.to_vec() };
+        let frame = |fin, opcode, p: &[u8]| Frame {
+            fin,
+            opcode,
+            payload: p.to_vec(),
+        };
         assert_eq!(m.push(frame(false, BINARY, b"lost")), None);
-        assert_eq!(m.push(frame(true, TEXT, b"kept")), Some((true, b"kept".to_vec())));
+        assert_eq!(
+            m.push(frame(true, TEXT, b"kept")),
+            Some((true, b"kept".to_vec()))
+        );
         assert_eq!(m.push(frame(false, BINARY, &[1])), None);
         assert_eq!(m.push(frame(false, CONTINUATION, &[2])), None);
-        assert_eq!(m.push(frame(true, CONTINUATION, &[3])), Some((false, vec![1, 2, 3])));
+        assert_eq!(
+            m.push(frame(true, CONTINUATION, &[3])),
+            Some((false, vec![1, 2, 3]))
+        );
     }
 }

@@ -865,7 +865,8 @@ impl<H: Host> Cpu<H> {
             let mut r = 0u128;
             for i in 0..lanes {
                 let x = elem(a, i, esize);
-                let v = if esize == 32 { fp_misc::<f32>(st, m, x) } else { fp_misc::<f64>(st, m, x) };
+                let v =
+                    if esize == 32 { fp_misc::<f32>(st, m, x) } else { fp_misc::<f64>(st, m, x) };
                 set_elem(&mut r, i, esize, v);
             }
             r
@@ -1703,7 +1704,10 @@ impl Fp3 {
 
     /// Takes adjacent pairs of Vm:Vn rather than lanes of each.
     pub(crate) fn pairwise(self) -> bool {
-        matches!(self, Fp3::MaxNmP | Fp3::MinNmP | Fp3::AddP | Fp3::MaxP | Fp3::MinP)
+        matches!(
+            self,
+            Fp3::MaxNmP | Fp3::MinNmP | Fp3::AddP | Fp3::MaxP | Fp3::MinP
+        )
     }
 
     fn from_u32(v: u32) -> Option<Fp3> {
@@ -1730,7 +1734,14 @@ pub(crate) fn fp3_lane(st: &mut Fpst, op: Fp3, double: bool, x: u64, y: u64, d: 
 /// `fp3_lane` for compiled code: `op` is the operation, plus 256 for double precision.
 /// None for a number that is no operation.
 pub(crate) fn fp3_helper(st: &mut Fpst, op: u32, x: u64, y: u64, d: u64) -> Option<u64> {
-    Some(fp3_lane(st, Fp3::from_u32(op & 0xff)?, op & 0x100 != 0, x, y, d))
+    Some(fp3_lane(
+        st,
+        Fp3::from_u32(op & 0xff)?,
+        op & 0x100 != 0,
+        x,
+        y,
+        d,
+    ))
 }
 
 fn fp3<F: Float>(st: &mut Fpst, op: u32, x: u64, y: u64, d: u64) -> u64 {
@@ -1831,7 +1842,7 @@ fn urecpe(x: u32) -> u32 {
     let a = (x >> 23) as u64; // 9 bits: 256..511
     let a = a * 2 + 1;
     let b = (1u64 << 19) / a;
-    let est = (b + 1) / 2;
+    let est = b.div_ceil(2);
     ((est as u32) & 0x1ff) << 23
 }
 
@@ -1846,7 +1857,7 @@ fn ursqrte(x: u32) -> u32 {
     while a * (b + 1) * (b + 1) < (1u64 << 28) {
         b += 1;
     }
-    let est = (b + 1) / 2;
+    let est = b.div_ceil(2);
     ((est as u32) & 0x1ff) << 23
 }
 
@@ -1882,7 +1893,9 @@ mod host_estimates {
     #[test]
     fn unsigned_estimates_match_the_host() {
         let mut x = 0x2545_f491u32;
-        let mut inputs: Vec<u32> = (0..32).flat_map(|b| [1u32 << b, (1u32 << b).wrapping_sub(1)]).collect();
+        let mut inputs: Vec<u32> = (0..32)
+            .flat_map(|b| [1u32 << b, (1u32 << b).wrapping_sub(1)])
+            .collect();
         inputs.extend((0..100_000).map(|_| {
             x ^= x << 13;
             x ^= x >> 17;

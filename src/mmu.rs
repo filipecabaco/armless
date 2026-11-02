@@ -364,7 +364,7 @@ impl<H: Host> Cpu<H> {
         }
     }
 
-    /// The canonical VA page named by a TLBI operand (VA[55:12] in bits 43:0).
+    /// The canonical VA page named by a TLBI operand (`VA[55:12]` in bits 43:0).
     pub fn tlbi_operand_page(op: u64) -> u64 {
         let page = op & 0x0fff_ffff_ffff;
         if page & (1 << 43) != 0 {
@@ -427,9 +427,15 @@ mod tests {
     fn tables(c: &Cpu<NoDevices>, base: u64, pa: u64, global_pa: u64) {
         let w = |at: u64, v: u64| c.mem.write(at as usize, &v.to_le_bytes());
         w(base + 8 * (VA >> 30), (base + 0x1000) | 3);
-        w(base + 0x1000 + 8 * ((VA >> 21) & 0x1ff), (base + 0x2000) | 3);
+        w(
+            base + 0x1000 + 8 * ((VA >> 21) & 0x1ff),
+            (base + 0x2000) | 3,
+        );
         w(base + 0x2000 + 8 * ((VA >> 12) & 0x1ff), pa | PAGE | NG);
-        w(base + 0x2000 + 8 * (((VA + 0x1000) >> 12) & 0x1ff), global_pa | PAGE);
+        w(
+            base + 0x2000 + 8 * (((VA + 0x1000) >> 12) & 0x1ff),
+            global_pa | PAGE,
+        );
     }
 
     #[test]
@@ -455,9 +461,11 @@ mod tests {
         // 16-bit ASIDs (TCR.AS): ASIDs that agree in their low byte are still different
         c.sys.tcr |= 1 << 36;
         c.write_sysreg(crate::sysreg::TCR_EL1, c.sys.tcr).unwrap();
-        c.write_sysreg(crate::sysreg::TTBR0_EL1, 0x10_0000 | (0x101 << 48)).unwrap();
+        c.write_sysreg(crate::sysreg::TTBR0_EL1, 0x10_0000 | (0x101 << 48))
+            .unwrap();
         assert_eq!(at(&mut c, VA), Some(0x20_0000));
-        c.write_sysreg(crate::sysreg::TTBR0_EL1, 0x18_0000 | (0x201 << 48)).unwrap();
+        c.write_sysreg(crate::sysreg::TTBR0_EL1, 0x18_0000 | (0x201 << 48))
+            .unwrap();
         assert_eq!(at(&mut c, VA), Some(0x21_0000));
         // ASID from TTBR1 (TCR.A1)
         c.sys.tcr |= 1 << 22;

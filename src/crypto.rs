@@ -205,9 +205,9 @@ pub fn sha256su1(d: u128, n: u128, m: u128) -> u128 {
     let t0 = ((m as u32 as u128) << 96) | (n >> 32);
     let mut r = [0u32; 4];
     let sigma = |x: u32| x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10);
-    for e in 0..2 {
+    for (e, out) in r[..2].iter_mut().enumerate() {
         let x = lane(m, e as u32 + 2);
-        r[e] = sigma(x)
+        *out = sigma(x)
             .wrapping_add(lane(d, e as u32))
             .wrapping_add(lane(t0, e as u32));
     }

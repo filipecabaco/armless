@@ -670,7 +670,10 @@ impl Web {
     pub fn ws_close(&mut self, code: u16) -> Out {
         let mut out = Out::default();
         if self.phase == Phase::WebSocket {
-            self.send(&ws::encode(ws::CLOSE, &ws::close_payload(code), None), &mut out);
+            self.send(
+                &ws::encode(ws::CLOSE, &ws::close_payload(code), None),
+                &mut out,
+            );
             self.finish(&mut out);
         }
         out
@@ -688,7 +691,10 @@ impl Web {
                     // Close: echo it, and tell the host
                     let p = &frame.payload;
                     self.send(&ws::encode(ws::CLOSE, &p[..p.len().min(2)], None), out);
-                    out.events.push(Event::WsClose { id: self.id, code: ws::close_code(p) });
+                    out.events.push(Event::WsClose {
+                        id: self.id,
+                        code: ws::close_code(p),
+                    });
                     self.finish(out);
                     return;
                 },
@@ -697,7 +703,11 @@ impl Web {
                 ws::PONG => {},
                 _ => {
                     if let Some((text, data)) = self.ws_messages.push(frame) {
-                        out.events.push(Event::WsMessage { id: self.id, text, data });
+                        out.events.push(Event::WsMessage {
+                            id: self.id,
+                            text,
+                            data,
+                        });
                     }
                 },
             }

@@ -244,7 +244,9 @@ fn main() {
     if stats || stats_json.is_some() || fallbacks {
         let secs = start.elapsed().as_secs_f64();
         let n = runner.insn_count();
-        let cpus: Vec<CpuStats> = (0..ncpus).map(|i| runner.with_cpu(i, CpuStats::of)).collect();
+        let cpus: Vec<CpuStats> = (0..ncpus)
+            .map(|i| runner.with_cpu(i, CpuStats::of))
+            .collect();
         if stats || fallbacks {
             eprintln!(
                 "armless-run: {n} instructions on {ncpus} CPU(s) in {secs:.2}s ({:.1} MIPS)",
@@ -294,12 +296,18 @@ struct CpuStats {
 impl CpuStats {
     fn of(c: &mut armless::runner::NativeCpu) -> CpuStats {
         let j = &c.jit;
-        let mut fallbacks: Vec<(u64, u32)> =
-            j.helper_hist.iter().flat_map(|h| h.values().copied()).collect();
+        let mut fallbacks: Vec<(u64, u32)> = j
+            .helper_hist
+            .iter()
+            .flat_map(|h| h.values().copied())
+            .collect();
         fallbacks.sort_unstable_by(|a, b| b.cmp(a));
         #[cfg(feature = "native-jit")]
-        let ((native_compiles, native_compile_ns), native_failures, native_code_bytes) =
-            (c.native_jit_stats(), c.native_jit_failures(), c.native_jit_code_bytes());
+        let ((native_compiles, native_compile_ns), native_failures, native_code_bytes) = (
+            c.native_jit_stats(),
+            c.native_jit_failures(),
+            c.native_jit_code_bytes(),
+        );
         #[cfg(not(feature = "native-jit"))]
         let ((native_compiles, native_compile_ns), native_failures, native_code_bytes) =
             ((0, 0), 0, 0);
@@ -345,7 +353,9 @@ impl CpuStats {
             self.flushes,
         );
         if fallbacks {
-            eprintln!("armless-run: cpu{cpu}: handed to the interpreter, by opcode (count, example):");
+            eprintln!(
+                "armless-run: cpu{cpu}: handed to the interpreter, by opcode (count, example):"
+            );
             for (n, insn) in self.fallbacks.iter().take(20) {
                 eprintln!("armless-run:   {n:>12}  {insn:#010x}");
             }
@@ -353,8 +363,11 @@ impl CpuStats {
     }
 
     fn json(&self) -> String {
-        let fallbacks: Vec<String> =
-            self.fallbacks.iter().map(|(n, insn)| format!("[{insn},{n}]")).collect();
+        let fallbacks: Vec<String> = self
+            .fallbacks
+            .iter()
+            .map(|(n, insn)| format!("[{insn},{n}]"))
+            .collect();
         format!(
             "{{\"instructions\":{},\"compiled_insns\":{},\"helper_insns\":{},\"fp_lanes\":{},\
              \"block_runs\":{},\

@@ -354,7 +354,6 @@ impl Default for Tls {
 }
 
 impl Tls {
-
     pub fn receive(&mut self, bytes: &[u8], keys: Option<&mut TlsKeys>, rng: &mut Rng) -> Received {
         let mut r = Received::default();
         if self.state == State::Closed {
@@ -627,7 +626,7 @@ impl Tls {
 
         let mut signed = vec![0x20u8; 64];
         signed.extend_from_slice(b"TLS 1.3, server CertificateVerify\0");
-        signed.extend_from_slice(&sha256(&[&transcript]));
+        signed.extend_from_slice(&sha256(&[transcript]));
         let sig: p256::ecdsa::Signature = keys.leaf_key.sign(&signed);
         let sig = sig.to_der();
         let mut vbody = ECDSA_P256_SHA256.to_be_bytes().to_vec();

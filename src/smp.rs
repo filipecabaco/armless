@@ -278,7 +278,6 @@ impl Machine {
         cores == 0 || self.ncpus as u32 >= cores
     }
 
-
     /// Request a machine-wide stop (power off or reset) and tell every CPU.
     pub fn request_stop(&self, kind: u32) {
         let _ = self
