@@ -117,7 +117,7 @@ floating point: single-precision arithmetic, fused multiply-add, compares, selec
 conversions, inline whenever FPCR is as Linux runs it and the numbers are ordinary, with the
 architecture's results and FPSR flags (NaNs, infinities, subnormals and underflow go to the
 interpreter). What it can't translate, double-precision arithmetic among it, it hands to the
-interpreter one instruction at a time. `ARMLESS_JIT_HELPER_STATS=1` counts those by opcode (`Jit::helper_hist`), and
+interpreter one instruction at a time. `ARMLESS_JIT_HELPER_STATS=1` (or `armless-run --fallbacks`) counts those by opcode (`Jit::helper_hist`), and
 `ARMLESS_JIT_THRESHOLD` sets how often an entry runs before it is compiled (1024).
 
 A restore starts with no compiled code. `Runner::jit_profile` lists the pages a machine
@@ -151,11 +151,11 @@ The wasm builds need clang and lld (for the C zstd decoder in `lib/zstd`).
 | `ARMLESS_9PFS=DIR cargo test --release --test vm` | the snowglobe flow natively: 9p root, console, snapshot, restore |
 | `node tests/js/flow.mjs DIR [CPUS]` | the same through `armless.js`, plus HTTP over fetch and port forwarding |
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
+| `elixir bench/run.exs` | the benchmark guest under the interpreter and the native JIT: phase times, what the JIT did, comparisons and profiles (`docs/profiling.md`) |
 
 `tests/fs/make-9pfs.sh` builds the test filesystem, and `tests/fs/alpine/` builds
 a real Alpine image. `tests/fs/fs2json.py` and `copy-to-sha256.py` split files of 2 MiB
 and more into chunks (`--chunk-threshold`); `--no-chunks` makes images for armless 0.2.10
 and older. See `docs/armless.md` for the design.
 
-armless started as a fork of [v86](https://github.com/copy/v86). The v86-based
-version is kept on the `v86-fork` branch.
+armless started as a fork of [v86](https://github.com/copy/v86).

@@ -10,6 +10,7 @@
 
 pub mod cert;
 pub mod tls;
+pub(crate) mod ws;
 
 use sha2::{Digest, Sha256};
 
@@ -99,12 +100,12 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Request headers that describe this hop, not the request.
-fn hop_by_hop(name: &str) -> bool {
+/// Headers about the connection or the message's framing (RFC 9110 7.6.1), which each hop sets
+/// for itself: never passed on, either way. `name` is lowercase.
+pub(crate) fn per_hop(name: &str) -> bool {
     matches!(
         name,
-        "host"
-            | "connection"
+        "connection"
             | "keep-alive"
             | "proxy-connection"
             | "transfer-encoding"
@@ -112,8 +113,13 @@ fn hop_by_hop(name: &str) -> bool {
             | "upgrade"
             | "te"
             | "trailer"
-            | "expect"
     )
+}
+
+/// Request headers not passed on: those, and the ones the next hop makes itself (the host, from
+/// the URL; whether to wait for 100 Continue). `name` is lowercase.
+pub(crate) fn not_forwarded(name: &str) -> bool {
+    per_hop(name) || matches!(name, "host" | "expect")
 }
 
 struct Head {
@@ -220,54 +226,6 @@ fn body(head: &Head, b: &[u8]) -> Result<Option<(Vec<u8>, usize)>, ()> {
     Ok((body.len() >= n).then(|| (body[..n].to_vec(), head.body_start + n)))
 }
 
-/// A whole WebSocket frame at the start of `b`, unmasked: (fin, opcode, payload, bytes used).
-/// None while it is still arriving. The length is the peer's (the guest's, or a server's), so
-/// it is checked arithmetic throughout: a length no buffer can hold never completes.
-pub(crate) fn parse_frame(b: &[u8]) -> Option<(bool, u8, Vec<u8>, usize)> {
-    let (&b0, &b1) = (b.first()?, b.get(1)?);
-    let (len, mut at) = match b1 & 127 {
-        126 => (
-            u16::from_be_bytes(b.get(2..4)?.try_into().ok()?) as usize,
-            4,
-        ),
-        127 => (
-            usize::try_from(u64::from_be_bytes(b.get(2..10)?.try_into().ok()?)).ok()?,
-            10,
-        ),
-        n => (n as usize, 2),
-    };
-    let mask = if b1 & 128 != 0 {
-        let m: [u8; 4] = b.get(at..at + 4)?.try_into().ok()?;
-        at += 4;
-        Some(m)
-    } else {
-        None
-    };
-    let end = at.checked_add(len)?;
-    let mut payload = b.get(at..end)?.to_vec();
-    if let Some(m) = mask {
-        for (i, x) in payload.iter_mut().enumerate() {
-            *x ^= m[i & 3];
-        }
-    }
-    Some((b0 & 0x80 != 0, b0 & 15, payload, end))
-}
-
-fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let n = payload.len();
-    let mut f = vec![0x80 | opcode];
-    if n < 126 {
-        f.push(n as u8);
-    } else if n < 65536 {
-        f.extend_from_slice(&[126, (n >> 8) as u8, n as u8]);
-    } else {
-        f.push(127);
-        f.extend_from_slice(&(n as u64).to_be_bytes());
-    }
-    f.extend_from_slice(payload);
-    f
-}
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Phase {
     /// Reading the request
@@ -319,8 +277,7 @@ pub struct Web {
     framing: Framing,
     /// The guest has finished sending: no request after the ones buffered
     guest_done: bool,
-    ws_message: Vec<u8>,
-    ws_text: bool,
+    ws_messages: ws::Messages,
     ws_key: String,
     /// "100 Continue" was sent
     continued: bool,
@@ -339,8 +296,7 @@ impl Web {
             keep_alive: false,
             framing: Framing::Close,
             guest_done: false,
-            ws_message: Vec::new(),
-            ws_text: false,
+            ws_messages: ws::Messages::default(),
             ws_key: String::new(),
             continued: false,
         }
@@ -533,7 +489,7 @@ impl Web {
         let headers = head
             .headers
             .iter()
-            .filter(|(k, _)| !hop_by_hop(k))
+            .filter(|(k, _)| !not_forwarded(k))
             .cloned()
             .collect();
         self.phase = Phase::Waiting;
@@ -592,17 +548,7 @@ impl Web {
             if reason.is_empty() { "OK" } else { reason }
         );
         for (k, v) in headers {
-            let lk = k.to_ascii_lowercase();
-            if matches!(
-                lk.as_str(),
-                "content-length"
-                    | "transfer-encoding"
-                    | "connection"
-                    | "keep-alive"
-                    | "proxy-connection"
-                    | "trailer"
-                    | "upgrade"
-            ) {
+            if per_hop(&k.to_ascii_lowercase()) {
                 continue;
             }
             head.push_str(&format!("{k}: {v}\r\n"));
@@ -715,7 +661,8 @@ impl Web {
     pub fn ws_send(&mut self, text: bool, data: &[u8]) -> Out {
         let mut out = Out::default();
         if self.phase == Phase::WebSocket {
-            self.send(&frame(if text { 1 } else { 2 }, data), &mut out);
+            let opcode = if text { ws::TEXT } else { ws::BINARY };
+            self.send(&ws::encode(opcode, data, None), &mut out);
         }
         out
     }
@@ -723,9 +670,7 @@ impl Web {
     pub fn ws_close(&mut self, code: u16) -> Out {
         let mut out = Out::default();
         if self.phase == Phase::WebSocket {
-            let payload =
-                if code == 0 || code == 1005 { vec![] } else { code.to_be_bytes().to_vec() };
-            self.send(&frame(8, &payload), &mut out);
+            self.send(&ws::encode(ws::CLOSE, &ws::close_payload(code), None), &mut out);
             self.finish(&mut out);
         }
         out
@@ -734,38 +679,25 @@ impl Web {
     /// The guest's frames: masked, and a message may span several.
     fn frames(&mut self, out: &mut Out) {
         while self.phase == Phase::WebSocket {
-            let Some((fin, opcode, payload, used)) = parse_frame(&self.buf) else {
+            let Some((frame, used)) = ws::parse(&self.buf) else {
                 return;
             };
             self.buf.drain(..used);
-            match opcode {
-                8 => {
+            match frame.opcode {
+                ws::CLOSE => {
                     // Close: echo it, and tell the host
-                    let code = if payload.len() >= 2 {
-                        u16::from_be_bytes([payload[0], payload[1]])
-                    } else {
-                        1005
-                    };
-                    self.send(&frame(8, &payload[..payload.len().min(2)]), out);
-                    out.events.push(Event::WsClose { id: self.id, code });
+                    let p = &frame.payload;
+                    self.send(&ws::encode(ws::CLOSE, &p[..p.len().min(2)], None), out);
+                    out.events.push(Event::WsClose { id: self.id, code: ws::close_code(p) });
                     self.finish(out);
                     return;
                 },
                 // Ping: answered here; the host keeps its own connection alive
-                9 => self.send(&frame(10, &payload), out),
-                10 => {},
-                op => {
-                    if op != 0 {
-                        self.ws_text = op == 1;
-                        self.ws_message.clear();
-                    }
-                    self.ws_message.extend_from_slice(&payload);
-                    if fin {
-                        out.events.push(Event::WsMessage {
-                            id: self.id,
-                            text: self.ws_text,
-                            data: std::mem::take(&mut self.ws_message),
-                        });
+                ws::PING => self.send(&ws::encode(ws::PONG, &frame.payload, None), out),
+                ws::PONG => {},
+                _ => {
+                    if let Some((text, data)) = self.ws_messages.push(frame) {
+                        out.events.push(Event::WsMessage { id: self.id, text, data });
                     }
                 },
             }

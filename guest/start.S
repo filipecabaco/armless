@@ -5,6 +5,12 @@
 _start:
     // x0 = DTB address from the loader; keep it for kmain.
     mov     x19, x0
+#ifdef ENABLE_FP
+    // The benchmark's C uses SIMD&FP registers (the test suite traps on them, so leaves it off)
+    mov     x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
+#endif
     ldr     x1, =__stack_top
     mov     sp, x1
     // Zero .bss

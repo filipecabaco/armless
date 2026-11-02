@@ -18,8 +18,16 @@ jobs:
           rustup component add rust-src
       - name: Unit tests and bare-metal guest
         run: cargo test --release
+      # The dev profile checks arithmetic for overflow; release wraps silently
+      - name: Unit tests with overflow checks
+        run: cargo test
       - name: Type-check the wasm layer natively
         run: cargo check --features wasm-api
+      - name: Lints (unsafe only where allowed, and documented), natively and for wasm32
+        run: |
+          rustup component add clippy
+          cargo clippy --release --all-targets --features wasm-api
+          cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wasm-api
       - name: Build armless.wasm and armless-smp.wasm
         run: |
           sh build-wasm.sh

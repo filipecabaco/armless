@@ -69,8 +69,7 @@ pub fn read(data: &[u8]) -> Result<Vec<Page>, String> {
         Ok(a)
     };
     let mut pages = Vec::new();
-    loop {
-        let Ok(key) = take(8) else { break };
+    while let Ok(key) = take(8) {
         let key = u64::from_le_bytes(key.try_into().unwrap());
         let hash = u64::from_le_bytes(take(8)?.try_into().unwrap());
         let runs = u32::from_le_bytes(take(4)?.try_into().unwrap());

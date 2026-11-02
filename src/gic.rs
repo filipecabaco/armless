@@ -157,11 +157,6 @@ impl Gic {
         self.audience(cpu, i)
     }
 
-    /// Current level of a shared device input line.
-    pub fn line_level(&self, irq: u32) -> bool {
-        let i = irq as usize;
-        (NUM_BANKED..NUM_IRQS).contains(&i) && self.shared[i - NUM_BANKED].line
-    }
 
     fn running_priority(&self, cpu: usize) -> u32 {
         self.cpu[cpu]

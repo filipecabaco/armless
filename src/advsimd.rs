@@ -178,7 +178,7 @@ impl<H: Host> Cpu<H> {
     }
 
     #[inline(always)]
-    fn v(&self, r: u32) -> u128 {
+    pub(crate) fn v(&self, r: u32) -> u128 {
         self.vreg[r as usize]
     }
 
@@ -187,7 +187,8 @@ impl<H: Host> Cpu<H> {
         self.vreg[rd as usize] = if q { v } else { v & u64::MAX as u128 };
     }
 
-    fn fpst_run<R>(&mut self, f: impl FnOnce(&mut Fpst) -> R) -> R {
+    /// Run `f` with an FP status context; FPSR flags are written back.
+    pub(crate) fn fpst_run<R>(&mut self, f: impl FnOnce(&mut Fpst) -> R) -> R {
         let mut fpsr = self.sys.fpsr;
         let r = {
             let mut st = Fpst {
@@ -764,7 +765,7 @@ impl<H: Host> Cpu<H> {
                     set_elem(&mut r, i, esize, out);
                 }
             },
-            0b01000 | 0b01001 | 0b01010 => {
+            0b01000..=0b01010 => {
                 // CMGT/CMGE #0, CMEQ/CMLE #0, CMLT #0
                 if (scalar && size != 3) || (size == 3 && !q && !scalar) || (opcode == 0b01010 && u)
                 {
@@ -864,23 +865,7 @@ impl<H: Host> Cpu<H> {
             return Err(Event::undefined());
         }
         let lanes = if scalar { 1 } else { (if q { 128 } else { 64 }) / esize };
-        #[derive(Clone, Copy)]
-        enum M {
-            Rint(Round, bool),
-            RintCur(bool),
-            ToInt(Round, bool),
-            FromInt(bool),
-            Cmp(u32),
-            Abs,
-            Neg,
-            Sqrt,
-            Recpe,
-            Rsqrte,
-            Urecpe,
-            Ursqrte,
-            Recpx,
-        }
-        use M::*;
+        use MiscOp::*;
         let m = match (u, a_bit, opcode) {
             (false, false, 0b11000) => Rint(Round::Nearest, false),
             (false, false, 0b11001) => Rint(Round::MinusInf, false),
@@ -936,39 +921,11 @@ impl<H: Host> Cpu<H> {
             let mut r = 0u128;
             for i in 0..lanes {
                 let x = elem(a, i, esize);
-                let v = match m {
-                    Urecpe | Ursqrte => {
-                        let x = x as u32;
-                        (if matches!(m, Urecpe) { urecpe(x) } else { ursqrte(x) }) as u64
-                    },
-                    _ => {
-                        if esize == 32 {
-                            fp_misc::<f32>(st, m_code(&m), x)
-                        } else {
-                            fp_misc::<f64>(st, m_code(&m), x)
-                        }
-                    },
-                };
+                let v = if esize == 32 { fp_misc::<f32>(st, m, x) } else { fp_misc::<f64>(st, m, x) };
                 set_elem(&mut r, i, esize, v);
             }
             r
         });
-        fn m_code(m: &M) -> MiscOp {
-            match *m {
-                M::Rint(r, x) => MiscOp::Rint(r, x),
-                M::RintCur(x) => MiscOp::RintCur(x),
-                M::ToInt(r, u) => MiscOp::ToInt(r, u),
-                M::FromInt(u) => MiscOp::FromInt(u),
-                M::Cmp(c) => MiscOp::Cmp(c),
-                M::Abs => MiscOp::Abs,
-                M::Neg => MiscOp::Neg,
-                M::Sqrt => MiscOp::Sqrt,
-                M::Recpe => MiscOp::Recpe,
-                M::Rsqrte => MiscOp::Rsqrte,
-                M::Recpx => MiscOp::Recpx,
-                _ => MiscOp::Abs,
-            }
-        }
         if scalar {
             self.vreg[rd as usize] = r & ones(esize) as u128;
         } else {
@@ -1769,6 +1726,9 @@ enum MiscOp {
     Sqrt,
     Recpe,
     Rsqrte,
+    /// URECPE and URSQRTE: estimates of unsigned fixed-point (32-bit lanes only)
+    Urecpe,
+    Ursqrte,
     Recpx,
 }
 
@@ -1802,6 +1762,8 @@ fn fp_misc<F: Float>(st: &mut Fpst, op: MiscOp, x: u64) -> u64 {
         MiscOp::Recpe => fp::recip_est(st, a).bits(),
         MiscOp::Rsqrte => fp::rsqrt_est(st, a).bits(),
         MiscOp::Recpx => fp::recpx(st, a).bits(),
+        MiscOp::Urecpe => urecpe(x as u32) as u64,
+        MiscOp::Ursqrte => ursqrte(x as u32) as u64,
     }
 }
 
@@ -1853,4 +1815,43 @@ fn fcvt_round_odd(st: &mut Fpst, a: f64) -> u32 {
         bits |= 1;
     }
     bits
+}
+
+/// URECPE and URSQRTE checked against the host's own (an AArch64 host is the architecture).
+#[cfg(all(test, target_arch = "aarch64"))]
+#[allow(unsafe_code)]
+mod host_estimates {
+    use super::{urecpe, ursqrte};
+
+    #[test]
+    fn unsigned_estimates_match_the_host() {
+        let mut x = 0x2545_f491u32;
+        let mut inputs: Vec<u32> = (0..32).flat_map(|b| [1u32 << b, (1u32 << b).wrapping_sub(1)]).collect();
+        inputs.extend((0..100_000).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        }));
+        for a in inputs {
+            let (re, rs): (u32, u32);
+            // SAFETY: vector arithmetic on registers only.
+            unsafe {
+                std::arch::asm!(
+                    "fmov s0, {a:w}",
+                    "urecpe v1.2s, v0.2s",
+                    "ursqrte v2.2s, v0.2s",
+                    "fmov {re:w}, s1",
+                    "fmov {rs:w}, s2",
+                    a = in(reg) a,
+                    re = out(reg) re,
+                    rs = out(reg) rs,
+                    out("v0") _, out("v1") _, out("v2") _,
+                    options(nomem, nostack),
+                );
+            }
+            assert_eq!(urecpe(a), re, "URECPE {a:#x}");
+            assert_eq!(ursqrte(a), rs, "URSQRTE {a:#x}");
+        }
+    }
 }

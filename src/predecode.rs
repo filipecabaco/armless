@@ -181,6 +181,7 @@ impl Cache {
 
     /// Entry `i` of the current page, if `base` is that page (0: not decoded yet).
     #[inline(always)]
+    #[allow(unsafe_code)]
     pub(crate) fn current(&self, base: usize, i: usize) -> u64 {
         debug_assert!(i < PAGE_INSNS);
         if base != self.cur_base {
@@ -193,6 +194,7 @@ impl Cache {
 
     /// Record entry `i` of the current page.
     #[inline(always)]
+    #[allow(unsafe_code)]
     pub(crate) fn set_current_entry(&mut self, i: usize, e: u64) {
         debug_assert!(i < PAGE_INSNS && self.cur_base != usize::MAX);
         // SAFETY: as in `current`.
@@ -319,7 +321,7 @@ mod tests {
     }
 
     fn put(c: &mut Cpu<NoDevices>, addr: usize, insn: u32) {
-        c.mem[addr..addr + 4].copy_from_slice(&insn.to_le_bytes());
+        c.mem.write(addr, &insn.to_le_bytes());
     }
 
     /// Runs the one instruction at `pc`.
