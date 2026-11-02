@@ -6,7 +6,7 @@
 //!   ARMLESS_9PFS=DIR cargo test --release --test vm
 //! (DIR has vmlinuz, fs.json and blobs/). Skipped without it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,7 @@ struct Machine {
     _host: NativeHost,
 }
 
-fn machine(dir: &PathBuf, cpus: usize, boot: bool) -> Machine {
+fn machine(dir: &Path, cpus: usize, boot: bool) -> Machine {
     let config = Config {
         memory_size: 256 << 20,
         cpus,

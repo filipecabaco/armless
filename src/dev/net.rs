@@ -1,4 +1,4 @@
-//! virtio-net, wired to the user-mode network in [`netstack`].
+//! virtio-net, wired to the user-mode network in [`netstack`](super::netstack).
 //!
 //! No offloads: frames are at most 1514 bytes with checksums filled in, and
 //! the 12-byte virtio-net header is all zeros (num_buffers = 1).

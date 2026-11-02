@@ -157,7 +157,6 @@ impl Gic {
         self.audience(cpu, i)
     }
 
-
     fn running_priority(&self, cpu: usize) -> u32 {
         self.cpu[cpu]
             .active_stack
@@ -525,7 +524,10 @@ mod tests {
         let mut out = Vec::new();
         g.save_cpus(&mut out, 1);
         assert!(Gic::new(1).load(&mut out.as_slice()).is_some());
-        assert!(Gic::new(4).load(&mut out.as_slice()).is_none(), "the CPU count is checked");
+        assert!(
+            Gic::new(4).load(&mut out.as_slice()).is_none(),
+            "the CPU count is checked"
+        );
     }
 
     #[test]

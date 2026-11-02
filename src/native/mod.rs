@@ -31,7 +31,10 @@ use crate::vm::Board;
 
 /// Where blobs come from besides a directory (an archive, memory): a blob's contents by name.
 #[derive(Clone)]
-pub struct BlobSource(pub Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>);
+pub struct BlobSource(pub Arc<BlobFn>);
+
+/// A blob's contents by name, if there is such a blob.
+pub type BlobFn = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync;
 
 impl std::fmt::Debug for BlobSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,7 +88,11 @@ impl Tunnel {
     }
 
     pub fn matches(&self, host: &str, port: u16) -> bool {
-        self.port == port && self.host.as_ref().is_none_or(|h| h.eq_ignore_ascii_case(host))
+        self.port == port
+            && self
+                .host
+                .as_ref()
+                .is_none_or(|h| h.eq_ignore_ascii_case(host))
     }
 }
 
@@ -123,15 +130,18 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
     b
 }
 
+/// Where a connection's bytes go (`None`: the guest has finished sending).
+type Bytes = Sender<Option<Vec<u8>>>;
+
 /// What the host keeps per connection.
 #[derive(Default)]
 struct Conns {
     /// Raw TCP: the host side's socket
-    sockets: HashMap<u32, (Sender<Option<Vec<u8>>>, TcpStream)>,
+    sockets: HashMap<u32, (Bytes, TcpStream)>,
     /// WebSockets: frames to send
     websockets: HashMap<u32, Sender<WsOut>>,
     /// Tunnelled TCP: the guest's bytes (`None`: it has finished sending)
-    tunnels: HashMap<u32, Sender<Option<Vec<u8>>>>,
+    tunnels: HashMap<u32, Bytes>,
     /// Connections the guest has closed (requests in flight stop)
     closed: HashSet<u32>,
 }
@@ -626,6 +636,9 @@ fn attach(board: &Arc<Board>, conns: &Shared, id: u32, stream: TcpStream) {
 }
 
 #[cfg(test)]
+mod host_tests;
+
+#[cfg(test)]
 mod tests {
     use super::Tunnel;
 
@@ -633,7 +646,10 @@ mod tests {
     fn tunnel_specs() {
         let t = Tunnel::parse("DB.internal:5432=wss://proxy.example.com/db?x=1").unwrap();
         assert_eq!(t.host.as_deref(), Some("db.internal"));
-        assert_eq!((t.port, t.url.as_str()), (5432, "wss://proxy.example.com/db?x=1"));
+        assert_eq!(
+            (t.port, t.url.as_str()),
+            (5432, "wss://proxy.example.com/db?x=1")
+        );
         assert!(t.matches("db.INTERNAL", 5432));
         assert!(!t.matches("db.internal", 5433));
         assert!(!t.matches("other", 5432));

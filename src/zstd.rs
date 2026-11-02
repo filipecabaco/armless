@@ -67,6 +67,12 @@ mod imp {
         buf: Vec<u8>,
     }
 
+    impl Default for Stream {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl Stream {
         pub fn new() -> Stream {
             Stream {

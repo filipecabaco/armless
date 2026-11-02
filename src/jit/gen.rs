@@ -151,6 +151,9 @@ pub fn ends_block(insn: u32) -> bool {
     true
 }
 
+/// Code the generator emits later (a branch's condition).
+type Emit<'g> = Box<dyn Fn(&mut Gen<'g>)>;
+
 struct Gen<'a> {
     l: &'a Layout,
     c: Code,
@@ -1110,47 +1113,46 @@ impl Gen<'_> {
             || insn & 0xff00_0010 == 0x5400_0000
         {
             // CBZ/CBNZ, TBZ/TBNZ, B.cond: taken -> target, else fall through
-            let (target, cond_fn): (i64, Box<dyn Fn(&mut Self)>) =
-                if insn & 0x7e00_0000 == 0x3400_0000 {
-                    let sf = bit(insn, 31);
-                    let rt = insn & 31;
-                    let nz = bit(insn, 24);
-                    (
-                        off + (sext(field(insn, 5, 19) as u64, 19) << 2),
-                        Box::new(move |g: &mut Self| {
-                            g.xr(rt);
-                            g.trunc32(sf);
-                            g.c.i64_eqz();
-                            if nz {
-                                g.c.i32_eqz();
-                            }
-                        }),
-                    )
-                } else if insn & 0x7e00_0000 == 0x3600_0000 {
-                    let b = (field(insn, 31, 1) << 5) | field(insn, 19, 5);
-                    let rt = insn & 31;
-                    let nz = bit(insn, 24);
-                    (
-                        off + (sext(field(insn, 5, 14) as u64, 14) << 2),
-                        Box::new(move |g: &mut Self| {
-                            g.xr(rt);
-                            g.c.i64c(b as i64);
-                            g.c.i64_shr_u();
-                            g.c.i64c(1);
-                            g.c.i64_and();
-                            g.c.i32_wrap_i64();
-                            if !nz {
-                                g.c.i32_eqz();
-                            }
-                        }),
-                    )
-                } else {
-                    let cond = insn & 0xf;
-                    (
-                        off + (sext(field(insn, 5, 19) as u64, 19) << 2),
-                        Box::new(move |g: &mut Self| g.cond(cond)),
-                    )
-                };
+            let (target, cond_fn): (i64, Emit) = if insn & 0x7e00_0000 == 0x3400_0000 {
+                let sf = bit(insn, 31);
+                let rt = insn & 31;
+                let nz = bit(insn, 24);
+                (
+                    off + (sext(field(insn, 5, 19) as u64, 19) << 2),
+                    Box::new(move |g: &mut Self| {
+                        g.xr(rt);
+                        g.trunc32(sf);
+                        g.c.i64_eqz();
+                        if nz {
+                            g.c.i32_eqz();
+                        }
+                    }),
+                )
+            } else if insn & 0x7e00_0000 == 0x3600_0000 {
+                let b = (field(insn, 31, 1) << 5) | field(insn, 19, 5);
+                let rt = insn & 31;
+                let nz = bit(insn, 24);
+                (
+                    off + (sext(field(insn, 5, 14) as u64, 14) << 2),
+                    Box::new(move |g: &mut Self| {
+                        g.xr(rt);
+                        g.c.i64c(b as i64);
+                        g.c.i64_shr_u();
+                        g.c.i64c(1);
+                        g.c.i64_and();
+                        g.c.i32_wrap_i64();
+                        if !nz {
+                            g.c.i32_eqz();
+                        }
+                    }),
+                )
+            } else {
+                let cond = insn & 0xf;
+                (
+                    off + (sext(field(insn, 5, 19) as u64, 19) << 2),
+                    Box::new(move |g: &mut Self| g.cond(cond)),
+                )
+            };
             cond_fn(self);
             self.c.if_(EMPTY);
             self.nest += 1;
@@ -2137,7 +2139,7 @@ impl Gen<'_> {
             let size = imm5.trailing_zeros();
             let ok = match (signed, size, q) {
                 (false, 0..=2, false) | (false, 3, true) => true, // UMOV Wd (B, H, S); Xd (D)
-                (true, 0 | 1, _) | (true, 2, true) => true,      // SMOV Wd/Xd (B, H); Xd (S)
+                (true, 0 | 1, _) | (true, 2, true) => true,       // SMOV Wd/Xd (B, H); Xd (S)
                 _ => false,
             };
             if !ok {
@@ -2214,7 +2216,10 @@ impl Gen<'_> {
             return true;
         }
         if insn & 0x9f3e_0c00 == 0x0e20_0800
-            && matches!((field(insn, 12, 5), u), (0b01000, _) | (0b01001, _) | (0b01010, false))
+            && matches!(
+                (field(insn, 12, 5), u),
+                (0b01000, _) | (0b01001, _) | (0b01010, false)
+            )
             && (size != 3 || q)
         {
             // CMGT / CMGE / CMEQ / CMLE / CMLT against zero: all ones in each lane that holds
@@ -2245,8 +2250,8 @@ impl Gen<'_> {
             self.vbuild(q, rd, e, |g, k| {
                 // Which element of Vn:Vm (Vn first) lands in lane k
                 let i = match op {
-                    0b01 => 2 * k + second,                                     // UZP
-                    0b10 => (k & !1) + second + if k & 1 == 1 { lanes } else { 0 }, // TRN
+                    0b01 => 2 * k + second,                                                 // UZP
+                    0b10 => (k & !1) + second + if k & 1 == 1 { lanes } else { 0 },         // TRN
                     _ => (k / 2) + second * lanes / 2 + if k & 1 == 1 { lanes } else { 0 }, // ZIP
                 };
                 if i < lanes {

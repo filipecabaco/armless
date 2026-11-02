@@ -161,7 +161,10 @@ pub fn boot_linux<H: Host>(
 fn load<H: Host>(cpu: &Cpu<H>, addr: u64, data: &[u8]) -> Result<(), String> {
     match usize::try_from(addr) {
         Ok(a) if cpu.mem.write(a, data) => Ok(()),
-        _ => Err(format!("{} bytes at {addr:#x} do not fit in RAM", data.len())),
+        _ => Err(format!(
+            "{} bytes at {addr:#x} do not fit in RAM",
+            data.len()
+        )),
     }
 }
 

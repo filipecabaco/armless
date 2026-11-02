@@ -11,11 +11,12 @@
 use std::hint::black_box;
 
 use armless::board::Host;
+#[cfg(feature = "native-jit")]
 use armless::jit::profile::{self, Page};
 use armless::runner;
 use armless::vm::Config;
 use armless::Cpu;
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 struct NoDevices;
 impl Host for NoDevices {
@@ -51,8 +52,16 @@ const BUDGET: u64 = 1_000_000;
 ///         cmp  x1, x5
 ///         b.ne loop
 /// ```
-const LOOP: [u32; 8] =
-    [0xd280_0001, 0x8b01_0000, 0xca00_0042, 0xf940_0083, 0xf900_0482, 0x9100_0421, 0xeb05_003f, 0x54ff_ff41];
+const LOOP: [u32; 8] = [
+    0xd280_0001,
+    0x8b01_0000,
+    0xca00_0042,
+    0xf940_0083,
+    0xf900_0482,
+    0x9100_0421,
+    0xeb05_003f,
+    0x54ff_ff41,
+];
 
 fn cpu() -> Cpu<NoDevices> {
     let mut c = Cpu::new(RAM, NoDevices);
@@ -67,10 +76,16 @@ fn cpu() -> Cpu<NoDevices> {
 }
 
 /// The loop's page, compiled with its two entries (the start and the loop).
+#[cfg(feature = "native-jit")]
 fn profile(c: &Cpu<NoDevices>) -> Page {
     let mut page = [0u8; 0x1000];
     c.mem.read(CODE as usize, &mut page);
-    Page { key: (CODE << 2) | 0b11, hash: profile::hash(&page), runs: 1, entries: vec![0, 4] }
+    Page {
+        key: (CODE << 2) | 0b11,
+        hash: profile::hash(&page),
+        runs: 1,
+        entries: vec![0, 4],
+    }
 }
 
 fn execution(c: &mut Criterion) {
@@ -80,7 +95,9 @@ fn execution(c: &mut Criterion) {
     let mut interp = cpu();
     g.bench_function("interpreter", |b| b.iter(|| black_box(interp.run(BUDGET))));
 
+    #[cfg(feature = "native-jit")]
     let mut jit = cpu();
+    #[cfg(feature = "native-jit")]
     if jit.enable_native_jit() {
         let page = profile(&jit);
         jit.jit_prewarm(&[page]);
@@ -91,6 +108,11 @@ fn execution(c: &mut Criterion) {
     g.finish();
 }
 
+/// What compiling a page costs (nothing to measure without the native JIT).
+#[cfg(not(feature = "native-jit"))]
+fn compile(_: &mut Criterion) {}
+
+#[cfg(feature = "native-jit")]
 fn compile(c: &mut Criterion) {
     if !cpu().enable_native_jit() {
         return; // no Cranelift backend for this host
@@ -108,23 +130,31 @@ fn compile(c: &mut Criterion) {
                 c.wait_native_jit();
                 c
             },
-            BatchSize::PerIteration,
+            criterion::BatchSize::PerIteration,
         )
     });
 }
 
 fn snapshot(c: &mut Criterion) {
     let mut g = c.benchmark_group("snapshot");
-    let (mut vm, _clock) =
-        runner::new_vm(Config { memory_size: 64 << 20, cpus: 1, ..Default::default() }).unwrap();
+    let (mut vm, _clock) = runner::new_vm(Config {
+        memory_size: 64 << 20,
+        cpus: 1,
+        ..Default::default()
+    })
+    .unwrap();
     // 256 pages the guest wrote (1 MiB), spread over RAM
     for p in 0..256usize {
-        vm.cpus[0].mem.write(p * (64 << 20) / 256, &(p as u64 + 1).to_le_bytes());
+        vm.cpus[0]
+            .mem
+            .write(p * (64 << 20) / 256, &(p as u64 + 1).to_le_bytes());
     }
     let state = vm.save_state();
     g.throughput(Throughput::Bytes(64 << 20));
     g.bench_function("save 64 MiB", |b| b.iter(|| black_box(vm.save_state())));
-    g.bench_function("restore 64 MiB", |b| b.iter(|| vm.load_state(black_box(&state)).unwrap()));
+    g.bench_function("restore 64 MiB", |b| {
+        b.iter(|| vm.load_state(black_box(&state)).unwrap())
+    });
     g.finish();
 }
 

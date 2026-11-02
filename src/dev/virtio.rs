@@ -238,7 +238,6 @@ impl Transport {
         self.status & STATUS_DRIVER_OK != 0 && self.status & STATUS_NEEDS_RESET == 0
     }
 
-
     fn set_line(&mut self, io: &Io) {
         let level = self.isr != 0;
         if level != self.line {
@@ -432,6 +431,9 @@ impl Transport {
 }
 
 /// The device behind a transport.
+// A handful made once at start-up and never moved: boxing the network's would only add a
+// pointer chase on its hot path
+#[expect(clippy::large_enum_variant, reason = "few, long-lived, never moved")]
 pub enum Device {
     Console(Console),
     P9(P9),

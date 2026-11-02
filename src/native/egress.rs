@@ -367,7 +367,10 @@ pub struct Response {
     pub body: Box<dyn Read + Send>,
 }
 
-fn read_head(r: &mut BufReader<Conn>) -> io::Result<(u16, String, Vec<(String, String)>)> {
+/// A response's status, reason and headers.
+type Head = (u16, String, Vec<(String, String)>);
+
+fn read_head(r: &mut BufReader<Conn>) -> io::Result<Head> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -553,6 +556,9 @@ impl Egress {
         Ok((protocol, r))
     }
 }
+
+#[cfg(test)]
+mod http_tests;
 
 #[cfg(test)]
 mod tests {

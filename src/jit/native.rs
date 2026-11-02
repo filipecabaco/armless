@@ -17,9 +17,9 @@ use cranelift_codegen::{settings, settings::Configurable, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use super::wasm;
@@ -181,20 +181,20 @@ impl Native {
                     let job = match job_rx.try_recv() {
                         Ok(job) => job,
                         Err(TryRecvError::Disconnected) => return,
-                        Err(TryRecvError::Empty) => match {
+                        Err(TryRecvError::Empty) => {
                             // (not held while waiting below: `submit_later` takes it)
                             let next = thread_shared.later.lock().unwrap().pop_front();
-                            next
-                        } {
-                            Some(job) => job,
-                            None => {
-                                // Nothing queued: give back what compiling took, until the next job
-                                compiler.release_scratch();
-                                match job_rx.recv() {
-                                    Ok(job) => job,
-                                    Err(_) => return,
-                                }
-                            },
+                            match next {
+                                Some(job) => job,
+                                None => {
+                                    // Nothing queued: give back what compiling took, until the next job
+                                    compiler.release_scratch();
+                                    match job_rx.recv() {
+                                        Ok(job) => job,
+                                        Err(_) => return,
+                                    }
+                                },
+                            }
                         },
                     };
                     match job {
@@ -235,8 +235,15 @@ impl Native {
                         Job::Reset => {
                             // What waits for later is for the old module: answer it, uncompiled
                             for job in std::mem::take(&mut *thread_shared.later.lock().unwrap()) {
-                                if let Job::Compile { generation, slot, .. } = job {
-                                    let _ = done_tx.send(Done { generation, slot, function: 0 });
+                                if let Job::Compile {
+                                    generation, slot, ..
+                                } = job
+                                {
+                                    let _ = done_tx.send(Done {
+                                        generation,
+                                        slot,
+                                        function: 0,
+                                    });
                                     thread_shared.pending.fetch_add(1, Ordering::Release);
                                     thread_shared.in_flight.fetch_sub(1, Ordering::Release);
                                 }
@@ -287,7 +294,9 @@ impl Native {
     /// `submit`, for code that is not needed yet (a profile's, see `Cpu::jit_prewarm`): compiled
     /// when nothing submitted is waiting.
     pub fn submit_later(&mut self, slot: u32, body: Vec<u8>, cached: Vec<Cached>) -> bool {
-        let Some(jobs) = self.jobs.as_ref() else { return false };
+        let Some(jobs) = self.jobs.as_ref() else {
+            return false;
+        };
         self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
         self.shared.later.lock().unwrap().push_back(Job::Compile {
             generation: self.generation,
@@ -1362,24 +1371,59 @@ mod tests {
             2 => f((rng.below(1 << 20) as f64 - (1 << 19) as f64) * 1e-3),
             3 => {
                 let edges: [u64; 10] = if double {
-                    [0, 1 << 63, 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000, 0x7ff8_0000_0000_0000,
-                     0x7ff0_0000_0000_0001, 1, 0x0010_0000_0000_0000, 0x7fef_ffff_ffff_ffff, 0x000f_ffff_ffff_ffff]
+                    [
+                        0,
+                        1 << 63,
+                        0x7ff0_0000_0000_0000,
+                        0xfff0_0000_0000_0000,
+                        0x7ff8_0000_0000_0000,
+                        0x7ff0_0000_0000_0001,
+                        1,
+                        0x0010_0000_0000_0000,
+                        0x7fef_ffff_ffff_ffff,
+                        0x000f_ffff_ffff_ffff,
+                    ]
                 } else {
-                    [0, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7f80_0001, 1, 0x0080_0000, 0x7f7f_ffff, 0x007f_ffff]
+                    [
+                        0,
+                        0x8000_0000,
+                        0x7f80_0000,
+                        0xff80_0000,
+                        0x7fc0_0000,
+                        0x7f80_0001,
+                        1,
+                        0x0080_0000,
+                        0x7f7f_ffff,
+                        0x007f_ffff,
+                    ]
                 };
                 edges[rng.below(10) as usize]
             },
             4 => {
                 // near the smallest normal and the largest finite
-                let e = if rng.below(2) == 0 { 1 + rng.below(3) } else { (if double { 0x7fd } else { 0xfc }) + rng.below(3) };
-                let (shift, mant) = if double { (52, rng.next() & ((1 << 52) - 1)) } else { (23, rng.next() & 0x7f_ffff) };
+                let e = if rng.below(2) == 0 {
+                    1 + rng.below(3)
+                } else {
+                    (if double { 0x7fd } else { 0xfc }) + rng.below(3)
+                };
+                let (shift, mant) = if double {
+                    (52, rng.next() & ((1 << 52) - 1))
+                } else {
+                    (23, rng.next() & 0x7f_ffff)
+                };
                 (rng.below(2) << if double { 63 } else { 31 }) | (e << shift) | mant
             },
             _ => {
                 // any normal with a moderate exponent
                 let e = rng.below(60) as i64 - 30;
-                let (bias, shift, mant) = if double { (1023, 52, rng.next() & ((1 << 52) - 1)) } else { (127, 23, rng.next() & 0x7f_ffff) };
-                (rng.below(2) << if double { 63 } else { 31 }) | (((bias + e) as u64) << shift) | mant
+                let (bias, shift, mant) = if double {
+                    (1023, 52, rng.next() & ((1 << 52) - 1))
+                } else {
+                    (127, 23, rng.next() & 0x7f_ffff)
+                };
+                (rng.below(2) << if double { 63 } else { 31 })
+                    | (((bias + e) as u64) << shift)
+                    | mant
             },
         }
     }
@@ -1436,8 +1480,10 @@ mod tests {
                     c.mem.write(a as usize, &w.to_le_bytes());
                 }
                 // At the other page: add x0, x0, #1; ret
-                c.mem.write(target_page as usize, &0x9100_0400u32.to_le_bytes());
-                c.mem.write(target_page as usize + 4, &0xd65f_03c0u32.to_le_bytes());
+                c.mem
+                    .write(target_page as usize, &0x9100_0400u32.to_le_bytes());
+                c.mem
+                    .write(target_page as usize + 4, &0xd65f_03c0u32.to_le_bytes());
                 (c.el, c.spsel, c.daif) = (1, true, 0x3c0);
                 c.sys.vbar = VECTORS;
             };
@@ -1451,7 +1497,12 @@ mod tests {
             let key = ((CODE & !0xfff) << 2) | 0b11; // EL1, SP_EL1
             let entries = vec![0, 4, 8, 12];
             let hash = crate::jit::profile::hash(&page);
-            let prewarm = [crate::jit::profile::Page { key, hash, runs: 1, entries }];
+            let prewarm = [crate::jit::profile::Page {
+                key,
+                hash,
+                runs: 1,
+                entries,
+            }];
             assert_eq!(jit.jit_prewarm(&prewarm), 1, "{what}");
             jit.wait_native_jit();
             // First to CODE+8, so that it is an entry by the time `target` (perhaps next to it)
@@ -1465,13 +1516,18 @@ mod tests {
                     c.run(40);
                 }
                 jit.wait_native_jit();
-                let state = |c: &Cpu<NoDevices>| (c.x[0], c.x[30], c.pc, c.sys.esr, c.sys.elr, c.sys.far);
+                let state =
+                    |c: &Cpu<NoDevices>| (c.x[0], c.x[30], c.pc, c.sys.esr, c.sys.elr, c.sys.far);
                 assert_eq!(state(&jit), state(&interp), "{what}, round {round}");
             }
             assert!(jit.jit.block_runs > 0, "{what}: nothing ran compiled");
             if target & 3 != 0 {
                 // The architecture's answer, not only the interpreter's: a PC alignment fault
-                assert_eq!(interp.sys.esr >> 26, crate::cpu::ec::PC_ALIGN as u64, "{what}");
+                assert_eq!(
+                    interp.sys.esr >> 26,
+                    crate::cpu::ec::PC_ALIGN as u64,
+                    "{what}"
+                );
                 assert_eq!((interp.sys.elr, interp.sys.far), (target, target), "{what}");
             }
         }
@@ -1524,7 +1580,11 @@ mod tests {
         b.wait_native_jit();
         let runs = b.jit.block_runs;
         enter(&mut b);
-        assert_eq!(b.jit.block_runs, runs + 1, "the first run was not compiled code");
+        assert_eq!(
+            b.jit.block_runs,
+            runs + 1,
+            "the first run was not compiled code"
+        );
         assert_eq!(b.x[0], 1);
         assert_eq!(b.pc, EXIT);
 
@@ -1582,7 +1642,14 @@ mod tests {
 
     #[test]
     fn translated_groups_never_reach_the_interpreter() {
-        fuzz_with(0x6a09_e667_f3bc_c908, 4000, STRICT, false, true, STRICT_SYSTEM);
+        fuzz_with(
+            0x6a09_e667_f3bc_c908,
+            4000,
+            STRICT,
+            false,
+            true,
+            STRICT_SYSTEM,
+        );
     }
 
     /// The same, for the narrow groups.
@@ -1659,9 +1726,13 @@ mod tests {
                 let hi = (rng.next() as u128) << 64;
                 match rng.below(if fp_bias { 6 } else { 3 }) {
                     0 => hi | rng.next() as u128,
-                    3 | 4 => hi | (rng.next() as u128 & !0xffff_ffff) | fp_small(&mut rng, false) as u128,
+                    3 | 4 => {
+                        hi | (rng.next() as u128 & !0xffff_ffff) | fp_small(&mut rng, false) as u128
+                    },
                     5 => hi | fp_small(&mut rng, true) as u128,
-                    1 => hi | (rng.next() as u128 & !0xffff_ffff) | fp_value(&mut rng, false) as u128,
+                    1 => {
+                        hi | (rng.next() as u128 & !0xffff_ffff) | fp_value(&mut rng, false) as u128
+                    },
                     _ => hi | fp_value(&mut rng, true) as u128,
                 }
             });
@@ -1729,7 +1800,14 @@ mod tests {
                 "case {case}: RAM differs, block {words:08x?}"
             );
         }
-        assert!(compared > cases * 95 / 100, "only {compared} blocks ran as native code");
-        assert_eq!(jit.native_jit_failures(), 0, "blocks `gen` made that did not compile");
+        assert!(
+            compared > cases * 95 / 100,
+            "only {compared} blocks ran as native code"
+        );
+        assert_eq!(
+            jit.native_jit_failures(),
+            0,
+            "blocks `gen` made that did not compile"
+        );
     }
 }

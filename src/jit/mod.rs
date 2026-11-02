@@ -14,9 +14,9 @@
 //! slow path, which does the invalidation.
 
 pub(crate) mod gen;
-pub mod profile;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
 pub mod native;
+pub mod profile;
 pub(crate) mod wasm;
 
 use std::collections::HashMap;
@@ -174,7 +174,11 @@ impl Jit {
             sync_compile: false,
             yielded: false,
             // ARMLESS_JIT_THRESHOLD: executions of an entry before it is compiled
-            threshold: std::env::var("ARMLESS_JIT_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(1024).max(1),
+            threshold: std::env::var("ARMLESS_JIT_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024)
+                .max(1),
             prewarming: false,
             slot_used: vec![false; SLOTS as usize],
             slot_later: vec![false; SLOTS as usize],
@@ -297,7 +301,6 @@ impl Jit {
             }
         }
     }
-
 
     pub fn flush_all(&mut self) {
         self.flushes += 1;
@@ -527,8 +530,10 @@ impl<H: Host> Cpu<H> {
             return false;
         }
         let words: Vec<u32> = page
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         let layout = self.jit_layout_for(page_key);
         let code = gen::translate_page_code(&layout, &words, &entries, MAX_BLOCK);
@@ -666,7 +671,12 @@ impl<H: Host> Cpu<H> {
                     .iter()
                     .filter(|s| used(s))
                     .flat_map(|_| &info.entries)
-                    .chain(info.extra.iter().filter(|(s, _)| used(s)).flat_map(|(_, e)| e))
+                    .chain(
+                        info.extra
+                            .iter()
+                            .filter(|(s, _)| used(s))
+                            .flat_map(|(_, e)| e),
+                    )
                     .copied()
                     .collect();
                 if entries.is_empty() {
@@ -674,7 +684,12 @@ impl<H: Host> Cpu<H> {
                 }
                 entries.sort_unstable();
                 entries.dedup();
-                Some(profile::Page { key, hash: self.jit_page_hash(key)?, runs: 1, entries })
+                Some(profile::Page {
+                    key,
+                    hash: self.jit_page_hash(key)?,
+                    runs: 1,
+                    entries,
+                })
             })
             .collect();
         pages.sort_unstable_by_key(|p| (p.key, p.hash));
@@ -683,7 +698,9 @@ impl<H: Host> Cpu<H> {
 
     fn jit_page_hash(&self, page_key: u64) -> Option<u64> {
         let mut page = [0u8; 0x1000];
-        self.mem.read((page_key >> 2) as usize, &mut page).then(|| profile::hash(&page))
+        self.mem
+            .read((page_key >> 2) as usize, &mut page)
+            .then(|| profile::hash(&page))
     }
 
     /// Compile the pages of a profile now, in its order, instead of waiting for each entry to
@@ -888,7 +905,10 @@ impl<H: Host> Cpu<H> {
     pub fn jit_helper_fp3(&mut self, op: u32, x: u64, y: u64, d: u64) -> u64 {
         self.jit.helper_fp_lanes += 1;
         let mut fpsr = self.sys.fpsr;
-        let mut st = crate::fp::Fpst { fpcr: self.sys.fpcr, fpsr: &mut fpsr };
+        let mut st = crate::fp::Fpst {
+            fpcr: self.sys.fpcr,
+            fpsr: &mut fpsr,
+        };
         let r = crate::advsimd::fp3_helper(&mut st, op, x, y, d).unwrap_or(0);
         self.sys.fpsr = fpsr;
         r

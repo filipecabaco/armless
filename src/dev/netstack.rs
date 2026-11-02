@@ -111,11 +111,11 @@ pub struct Stack {
 fn checksum(parts: &[&[u8]]) -> u16 {
     let mut sum = 0u32;
     for p in parts {
-        let mut chunks = p.chunks_exact(2);
-        for c in &mut chunks {
-            sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+        let (pairs, rest) = p.as_chunks::<2>();
+        for &c in pairs {
+            sum += u16::from_be_bytes(c) as u32;
         }
-        if let [b] = chunks.remainder() {
+        if let [b] = rest {
             sum += (*b as u32) << 8;
         }
     }
@@ -940,6 +940,9 @@ fn parse_mss(opts: &[u8]) -> Option<u16> {
     }
     None
 }
+
+#[cfg(test)]
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod restore_tests {

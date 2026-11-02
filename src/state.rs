@@ -24,7 +24,6 @@ macro_rules! sys_fields {
 }
 
 impl<H: Host> Cpu<H> {
-
     /// Snapshot of the machine whose CPUs (all of them, in order, stopped) are `cpus`.
     pub fn save_machine_state(cpus: &mut [&mut Cpu<H>]) -> Vec<u8> {
         let n = cpus.len();
@@ -42,7 +41,9 @@ impl<H: Host> Cpu<H> {
         }
         for (i, slot) in m.cpus.iter().enumerate().skip(n) {
             if slot.power.load(Ordering::SeqCst) != crate::smp::POWER_OFF {
-                return Err(format!("CPU {i} is still on: take it offline in the guest first"));
+                return Err(format!(
+                    "CPU {i} is still on: take it offline in the guest first"
+                ));
             }
         }
         let mut w = W::new();
@@ -96,7 +97,6 @@ impl<H: Host> Cpu<H> {
         w.u64(self.excl_value);
         w.u64(self.excl_value2);
     }
-
 
     /// Restore the machine whose CPUs (all of them, in order, stopped) are `cpus`.
     pub fn load_machine_state(cpus: &mut [&mut Cpu<H>], data: &[u8]) -> Result<(), String> {

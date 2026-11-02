@@ -16,8 +16,8 @@ pub struct Page {
 /// FNV-1a over the page, a word at a time.
 pub fn hash(page: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for w in page.chunks_exact(8) {
-        h ^= u64::from_le_bytes(w.try_into().unwrap());
+    for &w in page.as_chunks::<8>().0 {
+        h ^= u64::from_le_bytes(w);
         h = h.wrapping_mul(0x100000001b3);
     }
     h
@@ -59,7 +59,9 @@ pub fn write(pages: &[Page]) -> Vec<u8> {
 }
 
 pub fn read(data: &[u8]) -> Result<Vec<Page>, String> {
-    let mut r = data.strip_prefix(MAGIC.as_slice()).ok_or("not a JIT profile")?;
+    let mut r = data
+        .strip_prefix(MAGIC.as_slice())
+        .ok_or("not a JIT profile")?;
     let mut take = |n: usize| -> Result<&[u8], String> {
         if r.len() < n {
             return Err("JIT profile: truncated".into());
@@ -74,8 +76,18 @@ pub fn read(data: &[u8]) -> Result<Vec<Page>, String> {
         let hash = u64::from_le_bytes(take(8)?.try_into().unwrap());
         let runs = u32::from_le_bytes(take(4)?.try_into().unwrap());
         let n = u16::from_le_bytes(take(2)?.try_into().unwrap()) as usize;
-        let entries = take(n * 2)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        pages.push(Page { key, hash, runs, entries });
+        let entries = take(n * 2)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        pages.push(Page {
+            key,
+            hash,
+            runs,
+            entries,
+        });
     }
     Ok(pages)
 }
@@ -86,11 +98,39 @@ mod tests {
 
     #[test]
     fn merge_counts_runs_and_round_trips() {
-        let a = Page { key: 0x4000, hash: 7, runs: 1, entries: vec![4, 8] };
-        let b = Page { key: 0x8000, hash: 9, runs: 1, entries: vec![0] };
+        let a = Page {
+            key: 0x4000,
+            hash: 7,
+            runs: 1,
+            entries: vec![4, 8],
+        };
+        let b = Page {
+            key: 0x8000,
+            hash: 9,
+            runs: 1,
+            entries: vec![0],
+        };
         let mut all = vec![a.clone()];
-        merge(&mut all, &[b.clone(), Page { entries: vec![12], ..a.clone() }], 16);
-        assert_eq!(all[0], Page { key: 0x4000, hash: 7, runs: 2, entries: vec![4, 8, 12] });
+        merge(
+            &mut all,
+            &[
+                b.clone(),
+                Page {
+                    entries: vec![12],
+                    ..a.clone()
+                },
+            ],
+            16,
+        );
+        assert_eq!(
+            all[0],
+            Page {
+                key: 0x4000,
+                hash: 7,
+                runs: 2,
+                entries: vec![4, 8, 12]
+            }
+        );
         assert_eq!(all[1], b);
         assert_eq!(read(&write(&all)).unwrap(), all);
         merge(&mut all, &[], 1);

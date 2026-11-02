@@ -80,7 +80,11 @@ impl Gen<'_> {
     fn special(&mut self, t: u32, double: bool) {
         // |x| bits: zero is fine; else it must lie in [smallest normal, infinity)
         let (abs, min_normal, inf) = if double {
-            (0x7fff_ffff_ffff_ffffu64 as i64, 1i64 << 52, 0x7ff0_0000_0000_0000i64)
+            (
+                0x7fff_ffff_ffff_ffffu64 as i64,
+                1i64 << 52,
+                0x7ff0_0000_0000_0000i64,
+            )
         } else {
             (0x7fff_ffff, 1 << 23, 0x7f80_0000)
         };
@@ -177,7 +181,10 @@ impl Gen<'_> {
         }
         // FMOV (immediate)
         if insn & 0xffa0_1fe0 == 0x1e20_1000 {
-            let v = crate::simd::vfp_expand_imm(field(insn, 13, 8) as u64, if double { 64 } else { 32 });
+            let v = crate::simd::vfp_expand_imm(
+                field(insn, 13, 8) as u64,
+                if double { 64 } else { 32 },
+            );
             self.c.i64c(v as i64);
             self.c.set(T0);
             self.fp_result(rd, T0, None);
@@ -221,7 +228,9 @@ impl Gen<'_> {
             self.c.i32_or();
             let l = *self.l;
             self.fp_split(insn, |g| {
-                let cmp = |g: &mut Self, f32op: fn(&mut crate::jit::wasm::Code), f64op: fn(&mut crate::jit::wasm::Code)| {
+                let cmp = |g: &mut Self,
+                           f32op: fn(&mut crate::jit::wasm::Code),
+                           f64op: fn(&mut crate::jit::wasm::Code)| {
                     g.fget(T0, double);
                     g.fget(T1, double);
                     if double {
@@ -399,7 +408,7 @@ impl Gen<'_> {
         self.fget(T0, true);
         self.c.f64_sub();
         self.fset(T2, true); // bb = s - a
-        // e = (a - (s - bb)) + (b' - bb)
+                             // e = (a - (s - bb)) + (b' - bb)
         self.fget(T0, true);
         self.fget(T3, true);
         self.fget(T2, true);
@@ -542,7 +551,7 @@ impl Gen<'_> {
         self.c.f64_ne();
         self.c.i64_extend_i32_u();
         self.c.set(T4); // e != 0
-        // r = s rounded to single
+                        // r = s rounded to single
         self.fget(T3, true);
         self.c.f32_demote_f64();
         self.fset(DATA, false);
@@ -657,7 +666,14 @@ impl Gen<'_> {
     /// The float in local T0 truncated toward zero, into local T2 (then `store`), when it is in
     /// range for the integer (`wide`: 64 bits); NaNs and anything out of range (which saturate and
     /// raise Invalid) are the interpreter's.
-    pub(super) fn fp_to_int(&mut self, insn: u32, signed: bool, wide: bool, double: bool, store: impl FnOnce(&mut Self)) {
+    pub(super) fn fp_to_int(
+        &mut self,
+        insn: u32,
+        signed: bool,
+        wide: bool,
+        double: bool,
+        store: impl FnOnce(&mut Self),
+    ) {
         // Bounds: lo <= x < hi, all exact as singles and doubles
         let (lo, hi): (f64, f64) = match (signed, wide) {
             (true, false) => (-2147483648.0, 2147483648.0),
