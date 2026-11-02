@@ -31,10 +31,17 @@ mod imp {
     /// Called by C code only.
     #[no_mangle]
     pub unsafe extern "C" fn v86_malloc(size: u32) -> u32 {
-        let layout =
-            alloc::Layout::from_size_align(size as usize + MALLOC_ALIGN, MALLOC_ALIGN).unwrap();
-        let addr = alloc::alloc(layout);
-        *(addr as *mut u32) = size;
+        let Ok(layout) = alloc::Layout::from_size_align(size as usize + MALLOC_ALIGN, MALLOC_ALIGN)
+        else {
+            return 0;
+        };
+        // SAFETY: the layout is never zero-sized (MALLOC_ALIGN bytes of header at least).
+        let addr = unsafe { alloc::alloc(layout) };
+        if addr.is_null() {
+            return 0; // as malloc: zstd checks
+        }
+        // SAFETY: the header, at the start of what was just allocated, 16-byte aligned.
+        unsafe { *(addr as *mut u32) = size };
         addr as u32 + MALLOC_ALIGN as u32
     }
 
@@ -46,10 +53,12 @@ mod imp {
             return;
         }
         let base = addr - MALLOC_ALIGN as u32;
-        let size = *(base as *mut u32);
-        let layout =
-            alloc::Layout::from_size_align(size as usize + MALLOC_ALIGN, MALLOC_ALIGN).unwrap();
-        alloc::dealloc(base as *mut u8, layout)
+        // SAFETY: `addr` came from `v86_malloc` (the caller's promise), so its header is before it.
+        let size = unsafe { *(base as *mut u32) };
+        let layout = alloc::Layout::from_size_align(size as usize + MALLOC_ALIGN, MALLOC_ALIGN)
+            .expect("the layout v86_malloc made");
+        // SAFETY: allocated by `v86_malloc` with this layout.
+        unsafe { alloc::dealloc(base as *mut u8, layout) }
     }
 
     /// Streaming decoder: compressed bytes in, decompressed chunks out.
@@ -61,6 +70,7 @@ mod imp {
     impl Stream {
         pub fn new() -> Stream {
             Stream {
+                // SAFETY: no arguments; 0 if it could not allocate, which `feed` checks.
                 ctx: unsafe { ZSTD_createDStream() },
                 buf: vec![0; 1 << 17],
             }
@@ -68,9 +78,14 @@ mod imp {
 
         /// Decompress `input`, passing output to `sink`. False on corrupt data.
         pub fn feed(&mut self, input: &[u8], sink: &mut dyn FnMut(&[u8])) -> bool {
+            if self.ctx == 0 {
+                return false;
+            }
             let mut src_pos = 0u32;
             loop {
                 let mut dst_pos = 0u32;
+                // SAFETY: a live stream; the output buffer and the input are ours, with their
+                // lengths, and the positions are this frame's own variables.
                 let r = unsafe {
                     ZSTD_decompressStream_simpleArgs(
                         self.ctx,
@@ -82,6 +97,7 @@ mod imp {
                         &mut src_pos,
                     )
                 };
+                // SAFETY: only inspects the number.
                 if unsafe { ZSTD_isError(r) } {
                     return false;
                 }
@@ -99,6 +115,7 @@ mod imp {
 
     impl Drop for Stream {
         fn drop(&mut self) {
+            // SAFETY: this stream's own context, freed once (zstd ignores 0).
             unsafe {
                 ZSTD_freeDStream(self.ctx);
             }

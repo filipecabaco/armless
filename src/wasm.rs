@@ -97,14 +97,19 @@ type JsCpu = Cpu<BoardHost<JsPlatform>>;
 
 /// The machine. Shared by every instance on the same memory.
 static mut VM: Option<Vm<JsPlatform>> = None;
-static mut BUF: Vec<u8> = Vec::new();
-static mut ERROR: String = String::new();
 static mut LOADER: Option<(StateLoader, Option<crate::zstd::Stream>)> = None;
-static mut WAKE_MS: f64 = -1.0;
 
 std::thread_local! {
     /// The CPU this instance drives (`armless_smp_attach`); CPU 0 by default.
     static CURRENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Each instance's own results, read back by the JavaScript that made the call: with several
+    // CPUs, one worker per CPU shares the memory, and a static here would be every worker's
+    /// Output of the last call that returned a length.
+    static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Last error message.
+    static ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// When `armless_run` returned 1: when to run again, in microtick() ms, or -1.
+    static WAKE_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
 }
 
 #[allow(static_mut_refs)]
@@ -118,17 +123,14 @@ fn cpu() -> &'static mut JsCpu {
 }
 
 fn set_error(e: impl Into<String>) {
-    unsafe {
-        ERROR = e.into();
-    }
+    ERROR.with_borrow_mut(|err| *err = e.into());
 }
 
-#[allow(static_mut_refs)]
 fn out(data: Vec<u8>) -> u32 {
-    unsafe {
-        BUF = data;
-        BUF.len() as u32
-    }
+    BUF.with_borrow_mut(|buf| {
+        *buf = data;
+        buf.len() as u32
+    })
 }
 
 unsafe fn slice<'a>(ptr: u32, len: u32) -> &'a [u8] {
@@ -211,22 +213,19 @@ pub extern "C" fn armless_set_fs_cache(mb: u32) {
 
 /// Last error message: pointer (length from `armless_error_len`).
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn armless_error() -> u32 {
-    unsafe { ERROR.as_ptr() as u32 }
+    ERROR.with_borrow(|e| e.as_ptr() as u32)
 }
 
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn armless_error_len() -> u32 {
-    unsafe { ERROR.len() as u32 }
+    ERROR.with_borrow(|e| e.len() as u32)
 }
 
 /// Output of the last call that returned a length.
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn armless_buf() -> u32 {
-    unsafe { BUF.as_ptr() as u32 }
+    BUF.with_borrow(|b| b.as_ptr() as u32)
 }
 
 // ------------------------------------------------------------------ SMP
@@ -400,7 +399,7 @@ pub extern "C" fn armless_run(budget: u32) -> i32 {
     match cpu().run(budget as u64) {
         Exit::Budget => 0,
         Exit::Idle { wake_ns } => {
-            unsafe { WAKE_MS = wake_ns.map_or(-1.0, |n| n as f64 / 1e6) };
+            WAKE_MS.set(wake_ns.map_or(-1.0, |n| n as f64 / 1e6));
             1
         },
         Exit::Stop(StopReason::PowerOff) => 2,
@@ -414,7 +413,7 @@ pub extern "C" fn armless_run(budget: u32) -> i32 {
 /// if only an interrupt can wake the guest.
 #[no_mangle]
 pub extern "C" fn armless_wake_ms() -> f64 {
-    unsafe { WAKE_MS }
+    WAKE_MS.get()
 }
 
 #[no_mangle]
