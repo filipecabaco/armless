@@ -288,9 +288,10 @@ fn key_share(group: u16, peer: &[u8], rng: &mut Rng) -> Option<(Vec<u8>, Vec<u8>
         SECP256R1 => {
             let peer = p256::PublicKey::from_sec1_bytes(peer).ok()?;
             let secret = p256::SecretKey::from_slice(&seed).ok()?;
-            let ours = p256::EncodedPoint::from(secret.public_key());
+            // Uncompressed (P-256 does not compress points), as TLS key shares must be
+            let ours = secret.public_key().to_sec1_bytes();
             let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
-            Some((ours.as_bytes().to_vec(), shared.raw_secret_bytes().to_vec()))
+            Some((ours.into_vec(), shared.raw_secret_bytes().to_vec()))
         },
         _ => None,
     }

@@ -1,0 +1,42 @@
+# Dependency updates as PRs: CI runs on each, so a bump that breaks the build, the difftests or
+# the guests shows up there. Security advisories are raised as soon as they are published,
+# whatever the schedule.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: chore
+    groups:
+      # Pinned to one exact version together (=x.y.z): they only move as a set
+      cranelift:
+        patterns: ["cranelift-*"]
+      # The TLS stack and its roots: one PR, one handshake test run
+      rustls:
+        patterns: ["rustls*", "webpki-roots"]
+      rustcrypto:
+        patterns: ["aes-gcm", "hmac", "p256", "sha1", "sha2", "x25519-dalek"]
+      # Everything else that stays within semver
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The arm64 Alpine image tests/js/alpine.mjs boots
+  - package-ecosystem: docker
+    directory: /tests/fs/alpine
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore
