@@ -740,6 +740,22 @@ impl<H: Host> Cpu<H> {
                 self.jit_entry = self.pc != pc.wrapping_add(4);
             }
             match r {
+                Ok(next) if next == pc.wrapping_add(4) => {
+                    // No branch: on through the straight-line code that follows, up to the next
+                    // timer poll
+                    executed += 1;
+                    let limit = budget.min(last_poll + 0x400);
+                    match self.run_straight(next, &mut executed, limit) {
+                        Ok(p) => pc = p,
+                        Err(Event::Stop(r)) => return self.leave(Exit::Stop(r)),
+                        Err(_) => unreachable!("only branches wait or stop otherwise"),
+                    }
+                    if executed - last_poll >= 0x400 {
+                        last_poll = executed;
+                        self.update_timers();
+                    }
+                    continue;
+                },
                 Ok(next) => pc = next,
                 Err(Event::Wfi) => {
                     self.update_timers();
@@ -958,6 +974,12 @@ impl<H: Host> Cpu<H> {
                 Err(x) => Err(x),
             }
         };
+        self.step_done(pc, result)
+    }
+
+    /// The end of a step: count it, and take the exception it raised, if any.
+    #[inline(always)]
+    fn step_done(&mut self, pc: u64, result: Res<u64>) -> Res<u64> {
         self.insn_count = self.insn_count.wrapping_add(1);
         match result {
             Ok(next) => {
@@ -989,6 +1011,33 @@ impl<H: Host> Cpu<H> {
             },
             Err(e) => Err(e),
         }
+    }
+
+    /// Straight-line code from `pc`: the decoded instructions of the current page that cannot
+    /// branch, one after another, until one that can (or one not decoded yet), or `limit`
+    /// instructions. Whatever needs the run loop's checks between instructions (the JIT's entry
+    /// points, requests, interrupts) only arises at a branch, so these go without them. Returns
+    /// where to go on: the next instruction, or, if one raised an exception, its vector.
+    #[inline(always)]
+    fn run_straight(&mut self, mut pc: u64, executed: &mut u64, limit: u64) -> Res<u64> {
+        while *executed < limit {
+            let e = self.fetch_decoded(pc);
+            if e == 0 || crate::predecode::may_branch(e) {
+                break;
+            }
+            let next = pc.wrapping_add(4);
+            self.next_pc = next;
+            let r = self.exec_decoded(e).map(|()| next);
+            *executed += 1;
+            let to = self.step_done(pc, r)?;
+            if to != next {
+                // An exception: on at its vector, as after a branch
+                self.jit_entry = true;
+                return Ok(to);
+            }
+            pc = to;
+        }
+        Ok(pc)
     }
 
     #[inline(always)]
@@ -1261,14 +1310,7 @@ impl<H: Host> Cpu<H> {
                 }
                 old = self.ram_load_atomic(pa, size);
             }
-            if self
-                .jit
-                .code_page
-                .get((pa >> 12) as usize)
-                .is_some_and(|&b| b != 0)
-            {
-                self.jit.invalidate_page((pa >> 12) as usize);
-            }
+            self.jit.code_written(pa, size);
             if self.excl().is_some_and(|e| e & !0x3f == pa & !0x3f) {
                 self.set_excl(None);
             }
@@ -1356,7 +1398,7 @@ impl<H: Host> Cpu<H> {
             let page = (pa & !0xfff) as usize;
             let has_code = self.jit.code_page.get(page >> 12).is_some_and(|&b| b != 0);
             if has_code {
-                self.jit.invalidate_page(page >> 12);
+                self.jit.code_written(pa, size);
             } else if !unpriv
                 && page
                     .checked_add(0x1000)

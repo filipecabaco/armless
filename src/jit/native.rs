@@ -1477,6 +1477,67 @@ mod tests {
         }
     }
 
+    /// Writes to a page with code: data next to it keeps the compiled code (and the decoded
+    /// instructions); a write to an instruction it was compiled from replaces it, interpreted and
+    /// compiled alike.
+    #[test]
+    fn writes_next_to_code_keep_it_and_writes_to_it_replace_it() {
+        const PATCH: u64 = 0x3000;
+        // PATCH: str w3, [x4]; str x0, [x2]; b EXIT
+        let patch = [0xb900_0083u32, 0xf900_0040, 0x1400_0000 | ((EXIT - PATCH - 8) / 4) as u32];
+        let setup = |c: &mut Cpu<NoDevices>| {
+            for (i, w) in patch.iter().enumerate() {
+                c.mem.write(PATCH as usize + 4 * i, &w.to_le_bytes());
+            }
+        };
+        let run = |c: &mut Cpu<NoDevices>, pc: u64, n: u64| {
+            c.pc = pc;
+            c.jit_entry = true;
+            c.run(n);
+            c.wait_native_jit();
+        };
+        let Some(mut jit) = at_block(1) else { return };
+        let mut interp = at_block(1).unwrap();
+        interp.jit.enabled = false; // the interpreter alone, with its decoded pages
+        setup(&mut jit);
+        setup(&mut interp);
+        for c in [&mut jit, &mut interp] {
+            for _ in 0..3 {
+                run(c, CODE, 2);
+            }
+            assert_eq!(c.x[0], 3);
+            // PATCH compiled too, writing elsewhere (a page without code)
+            (c.x[2], c.x[3], c.x[4]) = (0x8008, 0, 0x8000);
+            run(c, PATCH, 3);
+            run(c, PATCH, 3);
+        }
+        let compiled = jit.jit.compiled;
+        let invalidated = jit.jit.page_invalidations;
+
+        // Data next to the block, on its page: the code stays (no new compile, no invalidation)
+        for c in [&mut jit, &mut interp] {
+            (c.x[2], c.x[3], c.x[4]) = (CODE + 0x808, 0xdead_beef, CODE + 0x800);
+            run(c, PATCH, 3);
+            run(c, CODE, 2);
+            assert_eq!(c.x[0], 4);
+            assert_eq!(c.mem.load(CODE as usize + 0x808, 8), 3);
+        }
+        assert_eq!(jit.jit.compiled, compiled, "recompiled after a write next to the code");
+        assert_eq!(jit.jit.page_invalidations, invalidated);
+        assert!(jit.jit.code_writes_kept > 0);
+
+        // The block's own instruction rewritten: add x0, x0, #2 runs from now on
+        for c in [&mut jit, &mut interp] {
+            (c.x[3], c.x[4]) = (0x9100_0800, CODE);
+            run(c, PATCH, 3);
+            for _ in 0..3 {
+                run(c, CODE, 2);
+            }
+            assert_eq!(c.x[0], 10, "the new instruction ran");
+        }
+        assert!(jit.jit.page_invalidations > invalidated);
+    }
+
     /// A CPU at the start of a two-instruction block (`add x0, x0, #1; b EXIT`) at CODE.
     fn at_block(threshold: u32) -> Option<Cpu<NoDevices>> {
         let mut c = Cpu::new(RAM, NoDevices);

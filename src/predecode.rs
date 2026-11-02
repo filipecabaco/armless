@@ -225,6 +225,15 @@ impl Cache {
         slot
     }
 
+    /// Forget the decoded instructions at words `first..=last` of physical page `page` (written
+    /// since): they are decoded again when they run.
+    pub(crate) fn forget_words(&mut self, page: usize, first: usize, last: usize) {
+        let slot = self.slot(page);
+        if slot != NONE {
+            self.slots[slot as usize][first..=last].fill(0);
+        }
+    }
+
     /// Forget the decoded instructions of physical page `page`, if any.
     pub(crate) fn drop_page(&mut self, page: usize) {
         let Some(&slot) = self.page_slot.get(page) else {
