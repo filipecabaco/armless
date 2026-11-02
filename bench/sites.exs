@@ -9,6 +9,11 @@
 #   elixir bench/sites.exs ../snowglobe --save before         # keep as build/bench/sites-before.json
 #   elixir bench/sites.exs ../snowglobe --compare before
 #   elixir bench/sites.exs ../snowglobe --sites java --profile  # samply: interpreted vs compiled
+#   elixir bench/sites.exs ../snowglobe --armless ../armless-main --save main  # another checkout
+#
+# Runs start cold: snowglobe would otherwise prewarm the JIT from the profile its earlier runs
+# learned (in ~/.cache/snowglobe), which grows with every run, so runs would not compare. --warm
+# keeps snowglobe's prewarm, from a copy of the cache taken at the start (every run sees the same).
 #
 # It builds snowglobe-vm (snowglobe's native runtime) against this checkout, without changing
 # snowglobe (its Cargo.lock is put back), then for each site restores its snapshot and feeds the
@@ -26,7 +31,16 @@ defmodule Sites do
   def main(argv) do
     {opts, args} =
       OptionParser.parse!(argv,
-        strict: [sites: :string, runs: :integer, save: :string, compare: :string, profile: :boolean, build: :boolean]
+        strict: [
+          sites: :string,
+          runs: :integer,
+          save: :string,
+          compare: :string,
+          profile: :boolean,
+          build: :boolean,
+          armless: :string,
+          warm: :boolean
+        ]
       )
 
     snowglobe = Path.expand(List.first(args) || die("usage: elixir bench/sites.exs SNOWGLOBE_DIR [options]"))
@@ -34,8 +48,12 @@ defmodule Sites do
     File.dir?(dist) or die("#{dist}: no built sites (snowglobe build ... --out dist/NAME)")
     out = Path.join(@root, "build/bench")
     File.mkdir_p!(out)
-    vm = Path.join(out, "sg-target/release/snowglobe-vm")
-    if Keyword.get(opts, :build, true), do: build(snowglobe, out)
+    armless = Path.expand(Keyword.get(opts, :armless, @root))
+    # One runtime per armless checkout measured
+    target = "sg-target-" <> (armless |> :erlang.md5() |> Base.encode16(case: :lower) |> binary_part(0, 8))
+    vm = Path.join([out, target, "release/snowglobe-vm"])
+    if Keyword.get(opts, :build, true), do: build(snowglobe, armless, Path.join(out, target))
+    Process.put(:env, run_env(opts[:warm], out))
 
     sites =
       case opts[:sites] do
@@ -69,17 +87,32 @@ defmodule Sites do
 
   # ---------------------------------------------------------------- build
 
-  defp build(snowglobe, out) do
-    IO.puts(:stderr, "building snowglobe-vm against #{@root} ...")
+  # Cold (no prewarm), or warm from a fixed copy of snowglobe's learned profiles
+  defp run_env(warm, out) do
+    if warm do
+      cache = Path.join(out, "sg-cache")
+      File.rm_rf!(cache)
+      src = System.get_env("SNOWGLOBE_CACHE") || Path.join(System.user_home!(), ".cache/snowglobe")
+      if File.dir?(src), do: File.cp_r!(src, cache), else: File.mkdir_p!(cache)
+      # The copy is taken again before each run (runs add to it)
+      Process.put(:cache, {src, cache})
+      [{"SNOWGLOBE_CACHE", cache}]
+    else
+      [{"ARMLESS_JIT_PREWARM", "off"}]
+    end
+  end
+
+  defp build(snowglobe, armless, target) do
+    IO.puts(:stderr, "building snowglobe-vm against #{armless} ...")
     runtime = Path.join(snowglobe, "internal/tools/runtime")
     lock = Path.join(runtime, "Cargo.lock")
     saved = File.read!(lock)
 
     try do
       {_, status} =
-        System.cmd("cargo", ["build", "--release", "--config", ~s(#{@dep}="#{@root}")],
+        System.cmd("cargo", ["build", "--release", "--config", ~s(#{@dep}="#{armless}")],
           cd: runtime,
-          env: [{"CARGO_TARGET_DIR", Path.join(out, "sg-target")}],
+          env: [{"CARGO_TARGET_DIR", target}],
           into: IO.stream(:stderr, :line),
           stderr_to_stdout: true
         )
@@ -114,9 +147,18 @@ defmodule Sites do
     ws = Path.join(out, "ws-#{site}")
     cmd = job(dist, site, ws)
     args = ["run", Path.join(dist, site), "--blobs", Path.join(dist, "blobs"), "--workspace", ws, "--cmd", cmd, "--timeout", "600"]
-    env = [{"ARMLESS_JIT", "native"}, {"ARMLESS_JIT_HELPER_STATS", "1"}, {"SNOWGLOBE_TIMING", "1"}]
+    reset_cache()
+    env = [{"ARMLESS_JIT", "native"}, {"ARMLESS_JIT_HELPER_STATS", "1"}, {"SNOWGLOBE_TIMING", "1"}] ++ Process.get(:env)
     {output, _} = System.cmd(vm, args, env: env, stderr_to_stdout: true)
     parse(output, site)
+  end
+
+  # Warm runs all start from the same learned profiles
+  defp reset_cache do
+    with {src, cache} <- Process.get(:cache) do
+      File.rm_rf!(cache)
+      if File.dir?(src), do: File.cp_r!(src, cache), else: File.mkdir_p!(cache)
+    end
   end
 
   defp parse(output, site) do
@@ -174,7 +216,8 @@ defmodule Sites do
     args = ~w(record --rate 2000 --save-only --unstable-presymbolicate -o #{path} --) ++
       [vm, "run", Path.join(dist, site), "--blobs", Path.join(dist, "blobs"), "--workspace", ws, "--cmd", cmd, "--timeout", "600"]
 
-    {_, 0} = System.cmd("samply", args, env: [{"ARMLESS_JIT", "native"}], stderr_to_stdout: true)
+    reset_cache()
+    {_, 0} = System.cmd("samply", args, env: [{"ARMLESS_JIT", "native"} | Process.get(:env)], stderr_to_stdout: true)
     IO.puts("\n#{site}: where vcpu0's time goes (full profile: samply load #{path})")
     System.cmd("elixir", [Path.join(@root, "bench/run.exs"), "--summarize", path, "--thread", "vcpu0", "--top", "12"],
       into: IO.stream(:stdio, :line)

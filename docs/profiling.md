@@ -82,6 +82,12 @@ instructions, how much compiled code handed to the interpreter, what the JIT com
 long that took), pages dropped because the guest wrote them, and full flushes; then, over every
 site, which instructions compiled code still hands to the interpreter: what to translate next.
 
+Runs start cold (`ARMLESS_JIT_PREWARM=off`). Otherwise snowglobe would prewarm the JIT from the
+profile its earlier runs learned (`~/.cache/snowglobe`), which grows with every run, so runs of
+the same build would get faster by themselves and comparisons would mean nothing. `--warm`
+measures with prewarming, every run from the same copy of that cache. `--armless DIR` measures
+another checkout (`main`, say) against which to `--compare`.
+
 What it showed: workloads that run their own JIT (the JVM, the BEAM, V8) write code as they go,
 so armless drops what it compiled from those pages and runs the new code interpreted until it is
 hot. With `--profile`, a third to half of a vCPU's time is in the interpreter on short commands
