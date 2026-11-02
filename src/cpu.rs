@@ -195,6 +195,14 @@ pub struct Cpu<H: Host> {
 #[allow(unsafe_code)]
 unsafe impl<H: Host + Send> Send for Cpu<H> {}
 
+/// `pc` is in the page `page` (a page number) and aligned. A misaligned PC never is, so it
+/// takes the slow fetch, and its alignment fault. In one comparison: rotated, the PC's low bits
+/// land above any page number.
+#[inline(always)]
+fn same_aligned_page(pc: u64, page: u64) -> bool {
+    pc.rotate_right(2) >> 10 == page
+}
+
 const FAST_ENTRIES: usize = 256;
 /// Executable pages remembered besides the current one (`code_page`).
 const CODE_ENTRIES: usize = 64;
@@ -981,7 +989,7 @@ impl<H: Host> Cpu<H> {
     #[inline(always)]
     fn fetch(&mut self, pc: u64) -> Res<u32> {
         let f = &self.fast[self.el as usize];
-        if pc >> 12 == f.code_page {
+        if same_aligned_page(pc, f.code_page) {
             // The current code page lies in RAM (see `fetch_slow`).
             return Ok(self.ram_load(f.code_base + (pc & 0xffc) as usize, 4) as u32);
         }
@@ -993,7 +1001,7 @@ impl<H: Host> Cpu<H> {
     #[inline(always)]
     fn fetch_decoded(&self, pc: u64) -> u64 {
         let f = &self.fast[self.el as usize];
-        if pc >> 12 != f.code_page {
+        if !same_aligned_page(pc, f.code_page) {
             return 0;
         }
         self.jit

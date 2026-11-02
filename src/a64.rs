@@ -683,11 +683,11 @@ impl<H: Host> Cpu<H> {
             sr::CPACR_EL1 => self.sys.cpacr = v,
             sr::TTBR0_EL1 => {
                 self.sys.ttbr0 = v;
-                self.tlb_flush();
+                self.ttbr_changed();
             },
             sr::TTBR1_EL1 => {
                 self.sys.ttbr1 = v;
-                self.tlb_flush();
+                self.ttbr_changed();
             },
             sr::TCR_EL1 => {
                 self.sys.tcr = v;

@@ -1,8 +1,13 @@
 //! Stage-1 EL1&0 address translation: VMSAv8-64, 4 KiB granule, with a
-//! direct-mapped software TLB. TLBI by VA of a user page drops just that page
-//! when no user block mappings are cached; every other TLBI, and writes to
-//! SCTLR/TCR/TTBRx, flush everything. (Entries are not tagged with ASIDs, so
-//! invalidating more than asked is always correct.)
+//! direct-mapped software TLB.
+//!
+//! Entries are tagged as the architecture tags them: with the ASID they were made under, unless
+//! the mapping is global (nG clear: the kernel's). So a TTBR write, a context switch to another
+//! ASID, keeps them, as hardware does; the guest invalidates what it changes with TLBI. TLBI by VA
+//! of a user page drops that page (whatever its ASID) when no user block mappings are cached;
+//! every other TLBI, and writes to SCTLR and TCR, flush everything. (Invalidating more than asked
+//! is always correct.) The per-EL fast tables in front of it are not tagged, so any TTBR write
+//! drops those, and they refill from here.
 
 use crate::board::Host;
 use crate::cpu::{ec, Cpu, Event, Res};
@@ -31,6 +36,9 @@ struct Entry {
     pa_page: u64,
     perms: u8,
     level: u8,
+    /// Matches under any ASID (a global mapping), else only under `asid`.
+    global: bool,
+    asid: u16,
 }
 
 pub struct Tlb {
@@ -54,7 +62,9 @@ impl Tlb {
                     tag: u64::MAX,
                     pa_page: 0,
                     perms: 0,
-                    level: 0
+                    level: 0,
+                    global: false,
+                    asid: 0,
                 };
                 TLB_SIZE
             ],
@@ -78,6 +88,8 @@ pub struct Walk {
     pub pa: u64,
     pub perms: u8,
     pub level: u8,
+    /// nG was clear: the translation holds under every ASID.
+    pub global: bool,
 }
 
 /// Fault status codes (DFSC/IFSC).
@@ -120,7 +132,8 @@ impl<H: Host> Cpu<H> {
         let key = self.tlb_key(va, acc);
         let idx = (key as usize) & (TLB_SIZE - 1);
         let e = self.tlb.entries[idx];
-        if e.tag == key {
+        let asid = self.asid();
+        if e.tag == key && (e.global || e.asid == asid) {
             if e.perms & need != 0 {
                 return Ok((e.pa_page << 12) | (va & 0xfff));
             }
@@ -136,6 +149,8 @@ impl<H: Host> Cpu<H> {
                     pa_page: w.pa >> 12,
                     perms: w.perms,
                     level: w.level,
+                    global: w.global,
+                    asid,
                 };
                 if w.perms & need != 0 {
                     Ok(w.pa)
@@ -145,6 +160,25 @@ impl<H: Host> Cpu<H> {
             },
             Err(f) => Err(self.abort(va, acc, f)),
         }
+    }
+
+    /// The current ASID: TTBR1's if TCR.A1, else TTBR0's; 16 bits if TCR.AS, else 8.
+    pub(crate) fn asid(&self) -> u16 {
+        let tcr = self.sys.tcr;
+        let ttbr = if tcr & (1 << 22) != 0 { self.sys.ttbr1 } else { self.sys.ttbr0 };
+        let asid = (ttbr >> 48) as u16;
+        if tcr & (1 << 36) != 0 {
+            asid
+        } else {
+            asid & 0xff
+        }
+    }
+
+    /// A TTBR write: the main TLB keeps its entries, tagged with their ASIDs (the guest
+    /// invalidates what it changes); the untagged fast tables are dropped.
+    pub fn ttbr_changed(&mut self) {
+        self.fast[0].flush();
+        self.fast[1].flush();
     }
 
     /// The TLB key: the VA page, ignoring the top byte where TBI applies.
@@ -300,6 +334,8 @@ impl<H: Host> Cpu<H> {
                 pa,
                 perms,
                 level: level as u8,
+                // nG (bit 11)
+                global: desc & (1 << 11) == 0,
             });
         }
     }
@@ -356,5 +392,81 @@ impl<H: Host> Cpu<H> {
             Ok(w) => 1 | ((Fault::Permission(w.level).fsc() as u64) << 1),
             Err(f) => 1 | ((f.fsc() as u64) << 1),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Access;
+    use crate::board::Host;
+    use crate::cpu::Cpu;
+
+    struct NoDevices;
+    impl Host for NoDevices {
+        fn mmio_read(&mut self, _: u64, _: u32) -> Option<u64> {
+            None
+        }
+        fn mmio_write(&mut self, _: u64, _: u32, _: u64) -> bool {
+            false
+        }
+        fn now_ns(&mut self) -> u64 {
+            0
+        }
+        fn wall_clock_secs(&mut self) -> u64 {
+            0
+        }
+    }
+
+    const VA: u64 = 0x4000_1000;
+    // Valid, page, access flag, EL0 and EL1 read/write (AP = 01)
+    const PAGE: u64 = 3 | (1 << 10) | (1 << 6);
+    const NG: u64 = 1 << 11;
+
+    /// Tables at `base` (level 1, 2, 3 in consecutive pages) mapping VA to `pa`, and the VA one
+    /// page up (VA + 0x1000) to `global_pa`, global.
+    fn tables(c: &Cpu<NoDevices>, base: u64, pa: u64, global_pa: u64) {
+        let w = |at: u64, v: u64| c.mem.write(at as usize, &v.to_le_bytes());
+        w(base + 8 * (VA >> 30), (base + 0x1000) | 3);
+        w(base + 0x1000 + 8 * ((VA >> 21) & 0x1ff), (base + 0x2000) | 3);
+        w(base + 0x2000 + 8 * ((VA >> 12) & 0x1ff), pa | PAGE | NG);
+        w(base + 0x2000 + 8 * (((VA + 0x1000) >> 12) & 0x1ff), global_pa | PAGE);
+    }
+
+    #[test]
+    fn tlb_entries_are_tagged_with_their_asid_unless_global() {
+        let mut c = Cpu::new(16 << 20, NoDevices);
+        // 4 KiB granule, 39-bit VA for TTBR0, start at level 1; 8-bit ASIDs from TTBR0
+        c.sys.tcr = 25 | (25 << 16) | (2 << 30);
+        c.sys.sctlr = 1;
+        tables(&c, 0x10_0000, 0x20_0000, 0x30_0000);
+        tables(&c, 0x18_0000, 0x21_0000, 0x30_0000);
+        let as1 = 0x10_0000 | (1 << 48);
+        let as2 = 0x18_0000 | (2 << 48);
+        let at = |c: &mut Cpu<NoDevices>, va| c.translate(va, Access::Read, false).ok();
+        for round in 0..3 {
+            c.write_sysreg(crate::sysreg::TTBR0_EL1, as1).unwrap();
+            assert_eq!(at(&mut c, VA), Some(0x20_0000), "ASID 1, round {round}");
+            assert_eq!(at(&mut c, VA + 0x1000), Some(0x30_0000));
+            // Another process: its own mapping of VA, not ASID 1's cached one
+            c.write_sysreg(crate::sysreg::TTBR0_EL1, as2).unwrap();
+            assert_eq!(at(&mut c, VA), Some(0x21_0000), "ASID 2, round {round}");
+            assert_eq!(at(&mut c, VA + 0x1000), Some(0x30_0000));
+        }
+        // 16-bit ASIDs (TCR.AS): ASIDs that agree in their low byte are still different
+        c.sys.tcr |= 1 << 36;
+        c.write_sysreg(crate::sysreg::TCR_EL1, c.sys.tcr).unwrap();
+        c.write_sysreg(crate::sysreg::TTBR0_EL1, 0x10_0000 | (0x101 << 48)).unwrap();
+        assert_eq!(at(&mut c, VA), Some(0x20_0000));
+        c.write_sysreg(crate::sysreg::TTBR0_EL1, 0x18_0000 | (0x201 << 48)).unwrap();
+        assert_eq!(at(&mut c, VA), Some(0x21_0000));
+        // ASID from TTBR1 (TCR.A1)
+        c.sys.tcr |= 1 << 22;
+        c.write_sysreg(crate::sysreg::TCR_EL1, c.sys.tcr).unwrap();
+        c.write_sysreg(crate::sysreg::TTBR1_EL1, 7 << 48).unwrap();
+        c.write_sysreg(crate::sysreg::TTBR0_EL1, 0x10_0000).unwrap();
+        assert_eq!(at(&mut c, VA), Some(0x20_0000));
+        c.write_sysreg(crate::sysreg::TTBR1_EL1, 8 << 48).unwrap();
+        c.write_sysreg(crate::sysreg::TTBR0_EL1, 0x18_0000).unwrap();
+        assert_eq!(at(&mut c, VA), Some(0x21_0000));
     }
 }

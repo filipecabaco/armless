@@ -173,6 +173,7 @@
       jit_imports.armless_jit_read = exports.armless_jit_read;
       jit_imports.armless_jit_write = exports.armless_jit_write;
       jit_imports.armless_jit_interp = exports.armless_jit_interp;
+      jit_imports.armless_jit_fp3 = exports.armless_jit_fp3;
       exports.armless_jit_config(msg.jit ? 1 : 0, msg.jit_threshold | 0);
       const mem32 = new Int32Array(memory.buffer);
       const wake = exports.armless_smp_wake_addr(index) >>> 2;
@@ -384,6 +385,7 @@
         armless_jit_read: e.armless_jit_read,
         armless_jit_write: e.armless_jit_write,
         armless_jit_interp: e.armless_jit_interp,
+        armless_jit_fp3: e.armless_jit_fp3,
       };
 
       const flags = (o.console !== false ? DEV_CONSOLE : 0) | (o.filesystem ? DEV_FS : 0) | (o.network ? DEV_NET : 0);

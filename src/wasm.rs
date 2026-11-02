@@ -794,6 +794,12 @@ pub extern "C" fn armless_jit_write(va: i64, size: i32, value: i64) {
     cpu().jit_helper_write(va as u64, size as u32, value as u64)
 }
 
+/// One lane of a floating-point vector instruction for a JIT block (`Cpu::jit_helper_fp3`).
+#[no_mangle]
+pub extern "C" fn armless_jit_fp3(op: i32, x: i64, y: i64, d: i64) -> i64 {
+    cpu().jit_helper_fp3(op as u32, x as u64, y as u64, d as u64) as i64
+}
+
 /// Interpret one instruction on behalf of a JIT block.
 #[no_mangle]
 pub extern "C" fn armless_jit_interp(insn: i32, pc: i64) -> i32 {

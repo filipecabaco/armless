@@ -276,6 +276,8 @@ struct CpuStats {
     /// Instructions retired inside compiled code, and of those, handed back to the interpreter.
     compiled_insns: u64,
     helper_insns: u64,
+    /// Floating-point vector lanes compiled code computed through the `fp3` helper.
+    fp_lanes: u64,
     block_runs: u64,
     modules: u64,
     page_invalidations: u64,
@@ -305,6 +307,7 @@ impl CpuStats {
             instructions: c.insn_count,
             compiled_insns: j.block_insns,
             helper_insns: j.helper_interps,
+            fp_lanes: j.helper_fp_lanes,
             block_runs: j.block_runs,
             modules: j.compiled,
             page_invalidations: j.page_invalidations,
@@ -321,12 +324,14 @@ impl CpuStats {
         let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
         eprintln!(
             "armless-run: cpu{cpu}: {} instructions, {:.1}% in compiled code ({} block runs, {:.1} \
-             instructions each), {:.2}% of those handed to the interpreter",
+             instructions each), {:.2}% of those handed to the interpreter, {} vector FP lanes \
+             through fp3",
             self.instructions,
             pct(self.compiled_insns, self.instructions),
             self.block_runs,
             self.compiled_insns as f64 / self.block_runs.max(1) as f64,
             pct(self.helper_insns, self.compiled_insns),
+            self.fp_lanes,
         );
         eprintln!(
             "armless-run: cpu{cpu}: {} modules compiled ({} natively, {} failed, {:.1} ms \
@@ -351,13 +356,15 @@ impl CpuStats {
         let fallbacks: Vec<String> =
             self.fallbacks.iter().map(|(n, insn)| format!("[{insn},{n}]")).collect();
         format!(
-            "{{\"instructions\":{},\"compiled_insns\":{},\"helper_insns\":{},\"block_runs\":{},\
+            "{{\"instructions\":{},\"compiled_insns\":{},\"helper_insns\":{},\"fp_lanes\":{},\
+             \"block_runs\":{},\
              \"modules\":{},\"page_invalidations\":{},\"flushes\":{},\"native_compiles\":{},\
              \"native_failures\":{},\"native_compile_ns\":{},\"native_code_bytes\":{},\
              \"fallbacks\":[{}]}}",
             self.instructions,
             self.compiled_insns,
             self.helper_insns,
+            self.fp_lanes,
             self.block_runs,
             self.modules,
             self.page_invalidations,

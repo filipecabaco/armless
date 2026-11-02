@@ -427,60 +427,9 @@ impl<H: Host> Cpu<H> {
         if !scalar && sz && !q {
             return Err(Event::undefined());
         }
-        #[derive(Clone, Copy, PartialEq)]
-        enum Op {
-            MaxNm,
-            MinNm,
-            MaxNmP,
-            MinNmP,
-            Fmla,
-            Fmls,
-            Add,
-            Sub,
-            AddP,
-            Abd,
-            Mulx,
-            Mul,
-            Cmeq,
-            Cmge,
-            Cmgt,
-            Acge,
-            Acgt,
-            Max,
-            Min,
-            MaxP,
-            MinP,
-            Recps,
-            Rsqrts,
-            Div,
-        }
-        use Op::*;
-        let op = match (opcode, u, a_bit) {
-            (0b11000, false, false) => MaxNm,
-            (0b11000, false, true) => MinNm,
-            (0b11000, true, false) => MaxNmP,
-            (0b11000, true, true) => MinNmP,
-            (0b11001, false, false) => Fmla,
-            (0b11001, false, true) => Fmls,
-            (0b11010, false, false) => Add,
-            (0b11010, false, true) => Sub,
-            (0b11010, true, false) => AddP,
-            (0b11010, true, true) => Abd,
-            (0b11011, false, false) => Mulx,
-            (0b11011, true, false) => Mul,
-            (0b11100, false, false) => Cmeq,
-            (0b11100, true, false) => Cmge,
-            (0b11100, true, true) => Cmgt,
-            (0b11101, true, false) => Acge,
-            (0b11101, true, true) => Acgt,
-            (0b11110, false, false) => Max,
-            (0b11110, false, true) => Min,
-            (0b11110, true, false) => MaxP,
-            (0b11110, true, true) => MinP,
-            (0b11111, false, false) => Recps,
-            (0b11111, false, true) => Rsqrts,
-            (0b11111, true, false) => Div,
-            _ => return Err(Event::undefined()),
+        use Fp3::*;
+        let Some(op) = Fp3::of(opcode, u, a_bit) else {
+            return Err(Event::undefined());
         };
         if scalar
             && !matches!(
@@ -492,7 +441,7 @@ impl<H: Host> Cpu<H> {
         }
         let lanes = if scalar { 1 } else { (if q { 128 } else { 64 }) / esize };
         let (a, b, d) = (self.v(rn), self.v(rm), self.v(rd));
-        let pairwise = matches!(op, MaxNmP | MinNmP | AddP | MaxP | MinP);
+        let pairwise = op.pairwise();
         let r = self.fpst_run(|st| {
             let mut r = 0u128;
             for i in 0..lanes {
@@ -504,12 +453,7 @@ impl<H: Host> Cpu<H> {
                     (elem(a, i, esize), elem(b, i, esize))
                 };
                 let dd = elem(d, i, esize);
-                let v = if esize == 32 {
-                    fp3::<f32>(st, op as u32, x, y, dd)
-                } else {
-                    fp3::<f64>(st, op as u32, x, y, dd)
-                };
-                set_elem(&mut r, i, esize, v);
+                set_elem(&mut r, i, esize, fp3_lane(st, op, esize == 64, x, y, dd));
             }
             r
         });
@@ -1677,6 +1621,101 @@ impl<H: Host> Cpu<H> {
 
 /// Per-lane FP three-same operations, by the `Op` discriminant order used in
 /// `three_same_fp` (and 4/5/10/11 reused by the indexed forms).
+/// The three-same floating-point operations (Advanced SIMD), numbered as `fp3` takes them.
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[repr(u32)]
+pub(crate) enum Fp3 {
+    MaxNm,
+    MinNm,
+    MaxNmP,
+    MinNmP,
+    Fmla,
+    Fmls,
+    Add,
+    Sub,
+    AddP,
+    Abd,
+    Mulx,
+    Mul,
+    Cmeq,
+    Cmge,
+    Cmgt,
+    Acge,
+    Acgt,
+    Max,
+    Min,
+    MaxP,
+    MinP,
+    Recps,
+    Rsqrts,
+    Div,
+}
+
+impl Fp3 {
+    /// The operation of an opcode (bits 15:11), U and bit 23; None if unallocated.
+    pub(crate) fn of(opcode: u32, u: bool, a: bool) -> Option<Fp3> {
+        use Fp3::*;
+        Some(match (opcode, u, a) {
+            (0b11000, false, false) => MaxNm,
+            (0b11000, false, true) => MinNm,
+            (0b11000, true, false) => MaxNmP,
+            (0b11000, true, true) => MinNmP,
+            (0b11001, false, false) => Fmla,
+            (0b11001, false, true) => Fmls,
+            (0b11010, false, false) => Add,
+            (0b11010, false, true) => Sub,
+            (0b11010, true, false) => AddP,
+            (0b11010, true, true) => Abd,
+            (0b11011, false, false) => Mulx,
+            (0b11011, true, false) => Mul,
+            (0b11100, false, false) => Cmeq,
+            (0b11100, true, false) => Cmge,
+            (0b11100, true, true) => Cmgt,
+            (0b11101, true, false) => Acge,
+            (0b11101, true, true) => Acgt,
+            (0b11110, false, false) => Max,
+            (0b11110, false, true) => Min,
+            (0b11110, true, false) => MaxP,
+            (0b11110, true, true) => MinP,
+            (0b11111, false, false) => Recps,
+            (0b11111, false, true) => Rsqrts,
+            (0b11111, true, false) => Div,
+            _ => return None,
+        })
+    }
+
+    /// Takes adjacent pairs of Vm:Vn rather than lanes of each.
+    pub(crate) fn pairwise(self) -> bool {
+        matches!(self, Fp3::MaxNmP | Fp3::MinNmP | Fp3::AddP | Fp3::MaxP | Fp3::MinP)
+    }
+
+    fn from_u32(v: u32) -> Option<Fp3> {
+        use Fp3::*;
+        [
+            MaxNm, MinNm, MaxNmP, MinNmP, Fmla, Fmls, Add, Sub, AddP, Abd, Mulx, Mul, Cmeq, Cmge,
+            Cmgt, Acge, Acgt, Max, Min, MaxP, MinP, Recps, Rsqrts, Div,
+        ]
+        .get(v as usize)
+        .copied()
+    }
+}
+
+/// One lane of a three-same floating-point operation: `x` and `y` from Vn and Vm (or a pair),
+/// `d` the lane of Vd (the accumulator of FMLA and FMLS).
+pub(crate) fn fp3_lane(st: &mut Fpst, op: Fp3, double: bool, x: u64, y: u64, d: u64) -> u64 {
+    if double {
+        fp3::<f64>(st, op as u32, x, y, d)
+    } else {
+        fp3::<f32>(st, op as u32, x, y, d)
+    }
+}
+
+/// `fp3_lane` for compiled code: `op` is the operation, plus 256 for double precision.
+/// None for a number that is no operation.
+pub(crate) fn fp3_helper(st: &mut Fpst, op: u32, x: u64, y: u64, d: u64) -> Option<u64> {
+    Some(fp3_lane(st, Fp3::from_u32(op & 0xff)?, op & 0x100 != 0, x, y, d))
+}
+
 fn fp3<F: Float>(st: &mut Fpst, op: u32, x: u64, y: u64, d: u64) -> u64 {
     let (a, b, acc) = (F::from_bits64(x), F::from_bits64(y), F::from_bits64(d));
     let all = |t: bool| if t { ones(F::BITS) } else { 0 };

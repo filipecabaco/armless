@@ -87,6 +87,7 @@ pub const STATUS_WFI: i32 = 3;
 const H_READ: u32 = 0;
 const H_WRITE: u32 = 1;
 const H_INTERP: u32 = 2;
+const H_FP3: u32 = 3;
 
 pub fn imports() -> Vec<Import> {
     vec![
@@ -109,6 +110,13 @@ pub fn imports() -> Vec<Import> {
             ty: FuncType {
                 params: vec![I32, I64],
                 results: vec![I32],
+            },
+        },
+        Import {
+            name: "armless_jit_fp3",
+            ty: FuncType {
+                params: vec![I32, I64, I64, I64],
+                results: vec![I64],
             },
         },
     ]
@@ -1164,8 +1172,34 @@ impl Gen<'_> {
             if opc == 1 {
                 self.wr(30, |g| g.pc_at(off + 4));
             }
+            self.count(k);
+            // A target on this page, aligned, continues through this module's dispatch (as `goto`
+            // does for a direct branch; one that is no entry leaves through $miss), while the
+            // budget lasts and no interrupt is due. Anything else returns to the run loop.
+            let l = *self.l;
+            self.c.get(T0);
+            self.c.get(L_PC);
+            self.c.i64_xor();
+            self.c.i64c(!0xffc);
+            self.c.i64_and();
+            self.c.i64_eqz();
+            self.c.i32c(0);
+            self.c.i64_load(l.insn_count);
+            self.c.i32c(0);
+            self.c.i64_load(l.limit);
+            self.c.i64_lt_u();
+            self.c.i32_and();
+            self.c.i32c(0);
+            self.c.i32_load8_u(l.irq_dirty);
+            self.c.i32_eqz();
+            self.c.i32_and();
+            // (L_PC only matters on the way back to $top)
+            self.c.get(T0);
+            self.c.set(L_PC);
+            self.c.br_if(self.depth_top + self.nest);
             self.store_pc(|g| g.c.get(T0));
-            self.exit(STATUS_DONE, k);
+            self.c.i32c(STATUS_DONE);
+            self.c.ret();
             return true;
         }
         if insn & 0xffff_f01f == 0xd503_201f {
@@ -1752,6 +1786,28 @@ impl Gen<'_> {
                     });
                     true
                 },
+                0b11000..=0b11111 => {
+                    // Floating point (FMLA, FMLS, FADD, FMUL, FDIV, FMAX, ...): lane by lane
+                    // through the interpreter's own `fp3`, with its results and FPSR flags in
+                    // every FPCR mode, without decoding the instruction again for each one
+                    let (a, double) = (size >> 1 == 1, size & 1 == 1);
+                    let Some(op) = crate::advsimd::Fp3::of(opcode, u, a) else {
+                        return false;
+                    };
+                    if op.pairwise() || (double && !q) {
+                        return false;
+                    }
+                    let e = if double { 64 } else { 32 };
+                    let code = op as i32 | if double { 0x100 } else { 0 };
+                    self.vbuild(q, rd, e, |g, k| {
+                        g.c.i32c(code);
+                        g.lane(rn, e, k, false);
+                        g.lane(rm, e, k, false);
+                        g.lane(rd, e, k, false);
+                        g.c.call(H_FP3);
+                    });
+                    true
+                },
                 0b10111 if !u && (size != 3 || q) => {
                     // ADDP (vector): adjacent pairs of Vm:Vn added
                     let e = 8 << size;
@@ -1909,6 +1965,53 @@ impl Gen<'_> {
                 if acc {
                     g.c.i64_add();
                 }
+            });
+            return true;
+        }
+        if insn & 0xbfe0_8400 == 0x2e00_0000 {
+            // EXT: the bytes from `imm4` up of Vm:Vn (Vn at the low end)
+            let imm = field(insn, 11, 4);
+            if !q && imm >= 8 {
+                return false; // reserved
+            }
+            let words: &[(u32, u32)] =
+                if q { &[(rn, 0), (rn, 1), (rm, 0), (rm, 1)] } else { &[(rn, 0), (rm, 0)] };
+            let (base, shift) = ((imm / 8) as usize, (imm % 8) as i64 * 8);
+            self.vbuild(q, rd, 64, |g, k| {
+                let (r, h) = words[base + k as usize];
+                g.vld(r, h);
+                if shift != 0 {
+                    g.c.i64c(shift);
+                    g.c.i64_shr_u();
+                    let (r, h) = words[base + k as usize + 1];
+                    g.vld(r, h);
+                    g.c.i64c(64 - shift);
+                    g.c.i64_shl();
+                    g.c.i64_or();
+                }
+            });
+            return true;
+        }
+        if insn & 0x9f3e_0c00 == 0x0e20_0800
+            && matches!((field(insn, 12, 5), u), (0b01000, _) | (0b01001, _) | (0b01010, false))
+            && (size != 3 || q)
+        {
+            // CMGT / CMGE / CMEQ / CMLE / CMLT against zero: all ones in each lane that holds
+            let opcode = field(insn, 12, 5);
+            let e = 8 << size;
+            self.vbuild(q, rd, e, |g, k| {
+                g.c.i64c(0);
+                let lane = |g: &mut Self| g.lane(rn, e, k, true);
+                let zero = |g: &mut Self| g.c.i64c(0);
+                match (opcode, u) {
+                    (0b01000, false) => (lane(g), zero(g), g.c.i64_gt_s()), // x > 0
+                    (0b01000, true) => (lane(g), zero(g), g.c.i64_ge_s()),  // x >= 0
+                    (0b01001, false) => (lane(g), zero(g), g.c.i64_eq()),   // x == 0
+                    (0b01001, true) => (zero(g), lane(g), g.c.i64_ge_s()),  // 0 >= x
+                    _ => (zero(g), lane(g), g.c.i64_gt_s()),                // 0 > x
+                };
+                g.c.i64_extend_i32_u();
+                g.c.i64_sub();
             });
             return true;
         }
