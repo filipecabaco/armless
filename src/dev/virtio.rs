@@ -124,6 +124,10 @@ impl Queue {
         let mut table_size = self.size as u32;
         let mut i = head as u32;
         let mut steps = 0;
+        // The lengths are the driver's: a chain can't cover more than all of RAM each way, so
+        // its totals (and the buffers devices size from them) stay within what RAM can hold.
+        let (mut readable, mut writable) = (0usize, 0usize);
+        let limit = io.mem.len();
         loop {
             if i >= table_size || steps > 4096 {
                 return Some(chain); // malformed: give back what we have
@@ -140,11 +144,16 @@ impl Queue {
                 i = 0;
                 continue;
             }
-            if flags & DESC_F_WRITE != 0 {
-                chain.writable.push((addr, len));
+            let (total, list) = if flags & DESC_F_WRITE != 0 {
+                (&mut writable, &mut chain.writable)
             } else {
-                chain.readable.push((addr, len));
+                (&mut readable, &mut chain.readable)
+            };
+            match total.checked_add(len as usize) {
+                Some(t) if t <= limit => *total = t,
+                _ => return Some(chain), // malformed: give back what we have
             }
+            list.push((addr, len));
             if flags & DESC_F_NEXT == 0 {
                 return Some(chain);
             }
@@ -178,7 +187,10 @@ impl Queue {
     }
 
     fn load(&mut self, r: &mut R) -> Option<()> {
-        self.size = r.u16()?;
+        // As the driver's write of the size register: a power of two no larger than the maximum
+        // (the rings are indexed modulo it)
+        let size = r.u16()?;
+        self.size = if size.is_power_of_two() && size <= self.max { size } else { self.max };
         self.ready = r.bool()?;
         self.desc = r.u64()?;
         self.avail = r.u64()?;
@@ -511,6 +523,85 @@ impl Device {
             Device::Console(c) => c.load(r),
             Device::P9(p) => p.load(r),
             Device::Net(n) => n.load(r),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn io() -> Io {
+        Io::new(Arc::new(crate::smp::Machine::new(1 << 20, 1)), || 0)
+    }
+
+    /// A queue of 8 at 0x1000 (descriptors), 0x2000 (available) and 0x3000 (used), ready.
+    fn queue() -> Queue {
+        let mut q = Queue::new(8);
+        (q.desc, q.avail, q.used, q.ready) = (0x1000, 0x2000, 0x3000, true);
+        q
+    }
+
+    fn desc(io: &Io, i: u64, addr: u64, len: u32, flags: u16, next: u16) {
+        let mut d = [0u8; 16];
+        d[..8].copy_from_slice(&addr.to_le_bytes());
+        d[8..12].copy_from_slice(&len.to_le_bytes());
+        d[12..14].copy_from_slice(&flags.to_le_bytes());
+        d[14..].copy_from_slice(&next.to_le_bytes());
+        io.write(0x1000 + 16 * i, &d);
+    }
+
+    fn offer(io: &Io, head: u16) {
+        io.write_u16(0x2000 + 4, head);
+        io.write_u16(0x2000 + 2, 1);
+    }
+
+    #[test]
+    fn a_chain_longer_than_ram_is_cut_short() {
+        // The driver's lengths are 4 GiB each: their sum is no buffer the host can make (nor,
+        // on wasm32, a usize), so the chain stops where it would pass the size of RAM
+        let io = io();
+        let mut q = queue();
+        desc(&io, 0, 0x8000, 0x100, DESC_F_NEXT, 1);
+        desc(&io, 1, 0x8000, u32::MAX, DESC_F_NEXT, 2);
+        desc(&io, 2, 0x8000, u32::MAX, DESC_F_NEXT, 3);
+        desc(&io, 3, 0x9000, u32::MAX, DESC_F_WRITE, 0);
+        offer(&io, 0);
+        let chain = q.pop(&io).unwrap();
+        assert_eq!(chain.readable, [(0x8000, 0x100)]);
+        assert!(chain.writable.is_empty());
+        assert_eq!(chain.read_all(&io).len(), 0x100);
+    }
+
+    #[test]
+    fn a_chain_that_fits_is_whole() {
+        let io = io();
+        let mut q = queue();
+        io.write(0x8000, b"abc");
+        io.write(0x8100, b"de");
+        desc(&io, 0, 0x8000, 3, DESC_F_NEXT, 1);
+        desc(&io, 1, 0x8100, 2, DESC_F_NEXT, 2);
+        desc(&io, 2, 0x9000, 64, DESC_F_WRITE, 0);
+        offer(&io, 0);
+        let chain = q.pop(&io).unwrap();
+        assert_eq!(chain.read_all(&io), b"abcde");
+        assert_eq!(chain.write_len(), 64);
+    }
+
+    #[test]
+    fn a_snapshot_cannot_give_a_queue_a_size_its_rings_cannot_use() {
+        for (saved, loaded) in [(0, 8), (3, 8), (16, 8), (4, 4), (8, 8)] {
+            let mut q = queue();
+            q.size = saved;
+            let mut w = W::new();
+            q.save(&mut w);
+            let mut back = Queue::new(8);
+            back.load(&mut R(&w.0)).unwrap();
+            assert_eq!(back.size, loaded, "saved {saved}");
+            // Indexed modulo the size: no division by zero
+            let io = io();
+            back.push(&io, 0, 0);
         }
     }
 }

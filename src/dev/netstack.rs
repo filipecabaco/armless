@@ -83,7 +83,8 @@ impl Conn {
         self.snd_nxt.wrapping_sub(self.snd_una)
     }
     fn unsent(&self) -> usize {
-        let sent = self.in_flight() as usize - (self.fin_sent as usize);
+        // Once our FIN is acknowledged nothing is in flight, the FIN included
+        let sent = (self.in_flight() as usize).saturating_sub(self.fin_sent as usize);
         self.buf.len().saturating_sub(sent)
     }
     fn fin_acked(&self) -> bool {
@@ -929,7 +930,9 @@ fn parse_mss(opts: &[u8]) -> Option<u16> {
                     return None;
                 }
                 if kind == 2 && len == 4 {
-                    return Some(be16(opts, i + 2));
+                    // The option may claim more bytes than the header has
+                    let mss = opts.get(i + 2..i + 4)?;
+                    return Some(u16::from_be_bytes([mss[0], mss[1]]));
                 }
                 i += len;
             },
@@ -941,6 +944,39 @@ fn parse_mss(opts: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod restore_tests {
     use super::*;
+
+    #[test]
+    fn tcp_options_that_overrun_the_header_are_ignored() {
+        // A SYN's options are the guest's (any raw socket): they must never index past the end
+        assert_eq!(parse_mss(&[2, 4, 0x05, 0xb4]), Some(1460));
+        assert_eq!(parse_mss(&[1, 1, 2, 4, 0x05, 0xb4]), Some(1460));
+        for opts in [
+            &[2u8, 4][..],
+            &[2, 4, 5],
+            &[1, 1, 2, 4],
+            &[1, 2, 4, 0],
+            &[3, 3, 7, 2, 4],
+        ] {
+            assert_eq!(parse_mss(opts), None, "{opts:?}");
+        }
+        // A length that skips past the end, or loops in place
+        assert_eq!(parse_mss(&[8, 200, 2, 4, 0, 1]), None);
+        assert_eq!(parse_mss(&[8, 0, 2, 4, 0, 1]), None);
+        assert_eq!(parse_mss(&[8, 1]), None);
+        assert_eq!(parse_mss(&[8]), None);
+        assert_eq!(parse_mss(&[]), None);
+    }
+
+    #[test]
+    fn nothing_is_unsent_once_our_fin_is_acknowledged() {
+        let mut s = Stack::new([2, 0, 0, 0, 0, 1]);
+        let id = s.connect(5000);
+        let c = s.conns.get_mut(&id).unwrap();
+        c.fin_sent = true;
+        c.snd_una = c.snd_nxt;
+        assert!(c.fin_acked());
+        assert_eq!(c.unsent(), 0);
+    }
 
     #[test]
     fn connections_after_a_restore_use_ports_the_saved_machine_did_not() {

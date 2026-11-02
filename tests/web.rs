@@ -270,6 +270,80 @@ fn plain_http_chunked_and_expect() {
 }
 
 #[test]
+fn a_chunk_size_past_usize_is_a_bad_request() {
+    // Any guest process can send this: the relay must answer it, not wrap its bounds and abort
+    for size in ["ffffffffffffffff", "fffffffffffffffe", "fffffffffffffffd"] {
+        let mut web = Web::new(7, false, "a.test".into());
+        let mut rng = Rng::default();
+        let request = format!(
+            "POST /up HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n{size}\r\nabc\r\n"
+        );
+        let out = web.from_guest(request.as_bytes(), None, &mut rng);
+        let text = String::from_utf8_lossy(&out.to_guest);
+        assert!(
+            text.starts_with("HTTP/1.1 400 Bad Request"),
+            "{size}: {text}"
+        );
+        assert!(out.events.is_empty(), "{size}: {:?}", out.events);
+        assert!(out.close);
+    }
+}
+
+#[test]
+fn websocket_frame_lengths_from_the_guest_are_checked() {
+    let open = || {
+        let mut web = Web::new(4, false, "ws.test".into());
+        let mut rng = Rng::default();
+        web.from_guest(
+            b"GET /s HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            None,
+            &mut rng,
+        );
+        web.ws_accept("");
+        (web, rng)
+    };
+    // 64-bit lengths that wrap `at + len`, masked and not, and one that only fits after the mask
+    for len in [u64::MAX, u64::MAX - 3, u64::MAX - 9, u64::MAX - 13, 1 << 40] {
+        for masked in [false, true] {
+            let (mut web, mut rng) = open();
+            let mut f = vec![0x82, 127 | (masked as u8) << 7];
+            f.extend_from_slice(&len.to_be_bytes());
+            f.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            let out = web.from_guest(&f, None, &mut rng);
+            // Still waiting for the rest of a frame that can't arrive: no message, no abort
+            assert!(
+                !out.events
+                    .iter()
+                    .any(|e| matches!(e, Event::WsMessage { .. })),
+                "{len:#x} masked={masked}: {:?}",
+                out.events
+            );
+        }
+    }
+    // Short headers wait for the rest
+    for partial in [
+        &[0x81u8][..],
+        &[0x81, 126, 0],
+        &[0x81, 127, 0, 0, 0],
+        &[0x81, 0x85, 1, 2],
+    ] {
+        let (mut web, mut rng) = open();
+        let out = web.from_guest(partial, None, &mut rng);
+        assert!(out.events.is_empty() && !out.close, "{partial:?}");
+    }
+    // ...and the same bytes, completed, still make a message
+    let (mut web, mut rng) = open();
+    web.from_guest(&[0x81, 0x83, 1, 2], None, &mut rng);
+    let out = web.from_guest(&[3, 4, b'h' ^ 1, b'i' ^ 2, b'!' ^ 3], None, &mut rng);
+    assert!(
+        matches!(&out.events[..], [Event::WsMessage { text: true, data, .. }] if data == b"hi!"),
+        "{:?}",
+        out.events
+    );
+}
+
+#[test]
 fn no_sni_is_refused() {
     // An IP literal: clients send no server name, and there is no name to certify
     let mut p = Pair::new("example.com", None);
