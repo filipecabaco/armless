@@ -836,7 +836,9 @@ impl<H: Host> Cpu<H> {
             el: el as u64,
             spsel: spsel as u64,
             irq_dirty: a(self.attn_ptr()),
-            smp: (self.machine.ncpus > 1) as u64,
+            // The threaded build's memory is shared, so blocks must import a shared memory even
+            // with one CPU (the non-shared import type does not match it).
+            smp: (cfg!(target_feature = "atomics") || self.machine.ncpus > 1) as u64,
             mem: a(self.mem.as_ptr()),
             read_tag: a(f.read_tag_ptr()),
             read_base: a(f.read_base_ptr()),
