@@ -946,92 +946,88 @@ impl<H: Host> Cpu<H> {
     /// sets `jit_entry`, whether the last one went anywhere but to the next instruction.
     ///
     /// Between two instructions of the run nothing is stored but the registers the guest sees: not the
-    /// pc (the code that reads it, `needs_pc`, finds it in `self.pc`), not the count, and `attn` is not
-    /// looked at, so a run is at most `PAGE_RUN` instructions. A run ends at the end of the page, at
-    /// an instruction that is not decoded yet (`run` decodes it), after one that may change what the next
-    /// ones depend on (`ends_run`), and at a taken branch, which `jit_step` counts, except one to
-    /// an entry of the same page that it would only count. An instruction that stores into the page drops
-    /// its decoded entries (zero), which the next fetch of the run sees.
-    #[inline(always)]
+    /// pc, not the count, and `attn` is not looked at, so a run is at most `PAGE_RUN` instructions. The loop
+    /// runs the instructions that `exec_hot` runs, which call nothing (a call would make the loop keep what it
+    /// carries on the stack); a load or store that the fast tables do not serve, and every other instruction,
+    /// ends the run: `exec_slow` runs it, with `pc` and `next_pc` stored first. A run also ends at the end of
+    /// the page, at an instruction that is not decoded yet (`run` decodes it), after an indirect branch, and at
+    /// a taken branch, which `jit_step` counts, except one to an entry of the same page that it would only
+    /// count. An instruction that stores into the page drops its decoded entries (zero), which the next fetch
+    /// of the run sees.
+    #[inline(never)]
     #[allow(unsafe_code)]
     fn step_page(&mut self, start: u64, max: u64) -> (Res<u64>, u64) {
         debug_assert_eq!(start, self.pc);
-        let mut pc = start;
-        let mut last = start;
-        let mut n = 0;
-        // The entries of the page `pc` is in, if it is the current one of the cache (`Cache::current`).
+        // The entries of the page `start` is in, if it is the current one of the cache (`Cache::current`).
         let f = &self.fast[self.el as usize];
-        let mut page = if same_aligned_page(pc, f.code_page) {
+        let mut page = crate::predecode::entries_or_none(if same_aligned_page(start, f.code_page) {
             self.jit.pre.current(f.code_base)
         } else {
             std::ptr::null_mut()
-        };
+        });
+        // SAFETY: `page` is the current page's entries, which stay allocated (see `Cache::drop_page`), or the
+        // entries of no page.
+        let mut e = unsafe { crate::predecode::entry_at(page, start) };
+        if e == 0 {
+            // Not decoded yet, or dropped by a store.
+            match self.fetch_decoded_slow(start) {
+                Ok(d) => e = d,
+                Err(x) => {
+                    self.insn_count = self.insn_count.wrapping_add(1);
+                    let result = self.step_event(start, x);
+                    self.jit_entry = self.pc != start.wrapping_add(4);
+                    return (result, 1);
+                },
+            }
+            let f = &self.fast[self.el as usize];
+            if same_aligned_page(start, f.code_page) {
+                page = crate::predecode::entries_or_none(self.jit.pre.current(f.code_base));
+            }
+        }
+        let mut pc = start;
+        let mut n = 0;
         // Below which count a taken branch to the page is counted here (0: not worked out yet).
         let mut warm_at = 0;
-        let result = loop {
-            // SAFETY: `page` is the current page's entries, which stay allocated (see `Cache::drop_page`).
-            let mut e =
-                if page.is_null() { 0 } else { unsafe { crate::predecode::entry_at(page, pc) } };
-            if e == 0 {
-                if n != 0 {
-                    // Not decoded yet, or dropped by a store: `run` goes on from here.
-                    break Ok(pc);
-                }
-                e = match self.fetch_decoded_slow(pc) {
-                    Ok(e) => e,
-                    Err(x) => {
-                        n = 1;
-                        break Err(x);
-                    },
-                };
-                let f = &self.fast[self.el as usize];
-                if same_aligned_page(pc, f.code_page) {
-                    page = self.jit.pre.current(f.code_base);
-                }
-            }
-            last = pc;
-            let next = if crate::predecode::needs_pc(e) {
-                self.pc = pc;
-                self.next_pc = pc.wrapping_add(4);
-                let r = self.exec_decoded(e);
-                n += 1;
-                if let Err(x) = r {
-                    break Err(x);
-                }
-                if !crate::predecode::may_branch(e) {
-                    pc.wrapping_add(4)
-                } else if crate::predecode::ends_run(e) {
-                    break Ok(self.next_pc);
-                } else {
-                    self.next_pc
-                }
-            } else {
-                let r = self.exec_decoded(e);
-                n += 1;
-                if let Err(x) = r {
-                    break Err(x);
-                }
-                pc.wrapping_add(4)
+        let (result, last) = loop {
+            let next = match self.exec_hot(e, pc) {
+                Ok(Some(next)) => next,
+                Ok(None) => {
+                    self.pc = pc;
+                    self.next_pc = pc.wrapping_add(4);
+                    let r = self.exec_slow(e);
+                    n += 1;
+                    break (r.map(|()| self.next_pc), pc);
+                },
+                Err(x) => {
+                    n += 1;
+                    break (Err(x), pc);
+                },
             };
+            n += 1;
             if next == pc.wrapping_add(4) {
                 if next & 0xfff == 0 || n >= max {
-                    break Ok(next);
+                    break (Ok(next), pc);
                 }
-                pc = next;
-                continue;
+            } else {
+                // A taken branch. One to the same page, if it only has to be counted, goes on here.
+                if !crate::predecode::is_direct_branch(e) || next >> 12 != pc >> 12 || n >= max {
+                    break (Ok(next), pc);
+                }
+                if self.jit.enabled {
+                    if warm_at == 0 {
+                        warm_at = self.page_warm_at(self.fast[self.el as usize].code_base);
+                    }
+                    // SAFETY: as above; `next` is in the page.
+                    if !unsafe { crate::predecode::bump_below(page, next, warm_at) } {
+                        break (Ok(next), pc);
+                    }
+                }
             }
-            // A taken branch. One to the same page, if it only has to be counted, goes on here.
-            if !crate::predecode::is_direct_branch(e) || next >> 12 != pc >> 12 || n >= max {
-                break Ok(next);
-            }
-            if self.jit.enabled {
-                if warm_at == 0 {
-                    warm_at = self.page_warm_at(self.fast[self.el as usize].code_base);
-                }
-                // SAFETY: as above; `next` is in the page.
-                if !unsafe { crate::predecode::bump_below(page, next, warm_at) } {
-                    break Ok(next);
-                }
+            // SAFETY: as above.
+            e = unsafe { crate::predecode::entry_at(page, next) };
+            if e == 0 {
+                // Not decoded yet, or dropped by a store: `run` goes on from here.
+                break (Ok(next), pc);
             }
             pc = next;
         };
@@ -1375,6 +1371,39 @@ impl<H: Host> Cpu<H> {
         self.read_slow(va, size, unpriv)
     }
 
+    /// `read` if the fast tables serve it (not unprivileged, in one page, the page in them): the value. Else
+    /// None, and nothing is done.
+    #[inline(always)]
+    pub(crate) fn read_hit(&self, va: u64, size: u32) -> Option<u64> {
+        let off = va & 0xfff;
+        if off + size as u64 <= 0x1000 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.read_tag[i] == va >> 12 {
+                return Some(self.ram_load(f.read_base[i] as usize + off as usize, size));
+            }
+        }
+        None
+    }
+
+    /// Two reads of `size` bytes, at `va` and right after it, if the fast tables serve both with one page.
+    #[inline(always)]
+    pub(crate) fn read_pair_hit(&self, va: u64, size: u32) -> Option<(u64, u64)> {
+        let off = va & 0xfff;
+        if off + 2 * size as u64 <= 0x1000 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.read_tag[i] == va >> 12 {
+                let a = f.read_base[i] as usize + off as usize;
+                return Some((
+                    self.ram_load(a, size),
+                    self.ram_load(a + size as usize, size),
+                ));
+            }
+        }
+        None
+    }
+
     #[inline(never)]
     fn read_slow(&mut self, va: u64, size: u32, unpriv: bool) -> Res<u64> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
@@ -1416,6 +1445,41 @@ impl<H: Host> Cpu<H> {
             }
         }
         self.write_slow(va, size, value, unpriv)
+    }
+
+    /// `write` if the fast tables serve it (not unprivileged, in one page, the page in them, no exclusive monitor
+    /// armed): true once it is done. Else false, and nothing is done.
+    #[inline(always)]
+    pub(crate) fn write_hit(&mut self, va: u64, size: u32, value: u64) -> bool {
+        let off = va & 0xfff;
+        if off + size as u64 <= 0x1000 && self.excl_armed == 0 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.write_tag[i] == va >> 12 {
+                let a = f.write_base[i] as usize + off as usize;
+                self.ram_store(a, size, value);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Two writes of `size` bytes, at `va` and right after it, if the fast tables serve both with one page: true
+    /// once they are done. Else false, and nothing is done.
+    #[inline(always)]
+    pub(crate) fn write_pair_hit(&mut self, va: u64, size: u32, first: u64, second: u64) -> bool {
+        let off = va & 0xfff;
+        if off + 2 * size as u64 <= 0x1000 && self.excl_armed == 0 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.write_tag[i] == va >> 12 {
+                let a = f.write_base[i] as usize + off as usize;
+                self.ram_store(a, size, first);
+                self.ram_store(a + size as usize, size, second);
+                return true;
+            }
+        }
+        false
     }
 
     #[inline(never)]

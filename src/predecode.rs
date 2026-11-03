@@ -20,8 +20,6 @@ pub(crate) const COUNT_MAX: u32 = 0xffff;
 pub(crate) const NONE: u32 = u32::MAX;
 
 // Leaves dispatched to directly. 0 means the entry is not decoded yet; GENERIC runs `execute`.
-// GENERIC and the branches come first: only they may set `next_pc` (see `may_branch`); then the two
-// that read the pc as well (see `needs_pc`).
 const GENERIC: u8 = 1;
 const B_BL: u8 = 2;
 const CBZ_CBNZ: u8 = 3;
@@ -125,49 +123,6 @@ pub(crate) fn leaf_of(insn: u32) -> u8 {
     }
 }
 
-/// Whether the instruction of entry `e` may set `next_pc`: a branch, or anything `execute` runs.
-/// The others always go on to the next instruction (or raise an exception).
-#[inline(always)]
-pub(crate) fn may_branch(e: u64) -> bool {
-    (e >> 32) as u8 <= BRANCH_REG
-}
-
-/// Whether the instruction of entry `e` reads `Cpu::pc` while it runs (and may read or set `next_pc`): the
-/// branches, `adr`, a literal load, and anything `execute` runs. `step_page` stores the two only for these.
-#[inline(always)]
-pub(crate) fn needs_pc(e: u64) -> bool {
-    (e >> 32) as u8 <= LDR_LITERAL
-}
-
-/// Whether the instruction of entry `e` ends a run of instructions in `step_page` even when it goes on to the
-/// next one: it may change the exception level (an exception return), the translation regime or the interrupt
-/// mask (`msr`, `sys`: TLB and cache maintenance, address translation), or make what other CPUs invalidated
-/// apply (`isb`), so `run` must look at the CPU afresh. A hint, a barrier other than `isb` and `mrs` do not.
-#[inline(always)]
-pub(crate) fn ends_run(e: u64) -> bool {
-    let insn = e as u32;
-    match (e >> 32) as u8 {
-        BRANCH_REG => true,
-        GENERIC => {
-            if insn >> 24 != 0xd5 {
-                // Exception generation (svc, hvc, smc, brk, hlt), or not a system instruction at all.
-                return insn >> 25 == 0b110_1010;
-            }
-            let op0 = (insn >> 19) & 3;
-            let crn = (insn >> 12) & 0xf;
-            let op2 = (insn >> 5) & 7;
-            if op0 == 0 {
-                // MSR (immediate) to a PSTATE field, and ISB; the other hints and barriers go on.
-                crn == 4 || (crn == 3 && op2 == 6)
-            } else {
-                // SYS, and MSR (register).
-                op0 == 1 || insn & (1 << 21) == 0
-            }
-        },
-        _ => false,
-    }
-}
-
 /// Whether the instruction of entry `e` is a branch whose target is in its own page, when taken.
 #[inline(always)]
 pub(crate) fn is_direct_branch(e: u64) -> bool {
@@ -185,6 +140,20 @@ pub(crate) unsafe fn entry_at(page: *mut u64, pc: u64) -> u64 {
     // SAFETY: `page` has `PAGE_INSNS` entries and the index is within a page (the caller's contract). The read is
     // volatile: a store the run executes zeroes entries through the cache, which the compiler cannot see.
     unsafe { page.add(((pc & 0xfff) >> 2) as usize).read_volatile() }
+}
+
+/// The entries of a page that has none: every instruction in it is not decoded yet.
+static NO_ENTRIES: [u64; PAGE_INSNS] = [0; PAGE_INSNS];
+
+/// `current` of the cache, or `NO_ENTRIES` (never written: only an entry that is decoded is counted) for a page
+/// that is not the current one, so `step_page` does not test for it at each instruction.
+#[inline(always)]
+pub(crate) fn entries_or_none(current: *mut u64) -> *mut u64 {
+    if current.is_null() {
+        NO_ENTRIES.as_ptr() as *mut u64
+    } else {
+        current
+    }
 }
 
 /// Count one execution of the entry at `pc` in `page` as `Cache::bump` does, unless it is not decoded
@@ -373,9 +342,69 @@ impl Cache {
 }
 
 impl<H: Host> Cpu<H> {
-    /// Execute a decoded entry: the leaf `execute` would reach, directly.
+    /// Execute the decoded entry `e` of the instruction at `pc` as far as it can be done without calling
+    /// anything that is not inlined, for `step_page`: the pc after it, or None, with nothing changed (but a
+    /// store `exec_slow` repeats), for the instruction `exec_slow` has to run (a load or store the fast tables
+    /// do not serve, a prefetch, an unallocated form, a system instruction). It reads `pc`, not `Cpu::pc`, and
+    /// sets neither that nor `next_pc`.
     #[inline(always)]
-    pub(crate) fn exec_decoded(&mut self, e: u64) -> Res<()> {
+    pub(crate) fn exec_hot(&mut self, e: u64, pc: u64) -> Res<Option<u64>> {
+        let insn = e as u32;
+        let next = pc.wrapping_add(4);
+        match (e >> 32) as u8 {
+            ADD_SUB_IMM => self.add_sub_imm(insn)?,
+            LOGICAL_IMM => self.logical_imm(insn)?,
+            MOVE_WIDE => self.move_wide(insn)?,
+            BITFIELD_IMM => self.bitfield_imm(insn)?,
+            EXTR => self.extr(insn)?,
+            LOGICAL_SHIFTED => self.logical_shifted(insn)?,
+            ADD_SUB_SHIFTED => self.add_sub_shifted(insn)?,
+            ADD_SUB_EXTENDED => self.add_sub_extended(insn)?,
+            ADC_SBC => self.adc_sbc(insn)?,
+            COND_COMPARE => self.cond_compare(insn)?,
+            COND_SELECT => self.cond_select(insn)?,
+            DP_2SRC => self.dp_2src_leaf(insn)?,
+            DP_1SRC => self.dp_1src_leaf(insn)?,
+            DP_3SRC => self.dp_3src_leaf(insn)?,
+            ADR => self.adr_at(insn, pc),
+            B_BL => return Ok(Some(self.b_bl_at(insn, pc))),
+            CBZ_CBNZ => return Ok(Some(self.cbz_cbnz_at(insn, pc).unwrap_or(next))),
+            TBZ_TBNZ => return Ok(Some(self.tbz_tbnz_at(insn, pc).unwrap_or(next))),
+            B_COND => return Ok(Some(self.b_cond_at(insn, pc).unwrap_or(next))),
+            BRANCH_REG => return Ok(self.branch_reg_hot(insn, pc)),
+            LDR_LITERAL => {
+                if !self.ldr_literal_hot(insn, pc) {
+                    return Ok(None);
+                }
+            },
+            LDST_PAIR => {
+                if !self.ldst_pair_hot(insn) {
+                    return Ok(None);
+                }
+            },
+            LDST_UIMM => {
+                if !self.ldst_uimm_hot(insn) {
+                    return Ok(None);
+                }
+            },
+            LDST_IMM9 => {
+                if !self.ldst_imm9_hot(insn) {
+                    return Ok(None);
+                }
+            },
+            LDST_REGOFF => {
+                if !self.ldst_regoff_hot(insn) {
+                    return Ok(None);
+                }
+            },
+            _ => return Ok(None),
+        }
+        Ok(Some(next))
+    }
+
+    /// Execute a decoded entry: the leaf `execute` would reach, directly. `Cpu::pc` and `next_pc` are set.
+    #[inline(never)]
+    pub(crate) fn exec_slow(&mut self, e: u64) -> Res<()> {
         let insn = e as u32;
         match (e >> 32) as u8 {
             ADR => self.adr(insn),
