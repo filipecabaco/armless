@@ -148,6 +148,8 @@ pub struct BoardConfig<'a> {
     pub initrd: Option<(u64, u64)>,
     /// Number of CPUs (1..=8).
     pub ncpus: usize,
+    /// `/chosen/rng-seed`, if not empty.
+    pub rng_seed: &'a [u8],
 }
 
 const PHANDLE_GIC: u32 = 1;
@@ -173,6 +175,9 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.begin("chosen");
     f.prop_str("bootargs", cfg.cmdline);
     f.prop_str("stdout-path", &uart_path);
+    if !cfg.rng_seed.is_empty() {
+        f.prop("rng-seed", cfg.rng_seed);
+    }
     // Keep the BAR assignments the board made (dev/pci.rs).
     f.prop_u32("linux,pci-probe-only", 1);
     if let Some((start, end)) = cfg.initrd {
@@ -388,6 +393,7 @@ mod tests {
             cmdline: "console=ttyS0",
             initrd: Some((0x1000_0000, 0x1100_0000)),
             ncpus: 4,
+            rng_seed: &[7; 32],
         });
         assert_eq!(&dtb[0..4], &0xd00d_feedu32.to_be_bytes());
         let total = u32::from_be_bytes(dtb[4..8].try_into().unwrap()) as usize;

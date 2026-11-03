@@ -92,6 +92,18 @@ pub fn boot_linux<H: Host>(
     initrd: Option<&[u8]>,
     cmdline: &str,
 ) -> Result<BootLayout, String> {
+    boot_linux_seeded(cpu, image, initrd, cmdline, &[])
+}
+
+/// [`boot_linux`] with entropy for the guest: the device tree's `/chosen/rng-seed`, which Linux mixes in
+/// (and credits, with `random.trust_bootloader`) before anything draws from its random generator.
+pub fn boot_linux_seeded<H: Host>(
+    cpu: &mut Cpu<H>,
+    image: &[u8],
+    initrd: Option<&[u8]>,
+    cmdline: &str,
+    rng_seed: &[u8],
+) -> Result<BootLayout, String> {
     if image.len() >= 2 && image[0] == 0x1f && image[1] == 0x8b {
         return Err("kernel is gzip-compressed; decompress it to a raw Image first".into());
     }
@@ -136,6 +148,7 @@ pub fn boot_linux<H: Host>(
         cmdline,
         initrd: initrd_range,
         ncpus: cpu.machine.ncpus,
+        rng_seed,
     });
     if dtb.len() > 2 << 20 {
         return Err("device tree too large".into());
@@ -182,6 +195,7 @@ pub fn boot_raw<H: Host>(cpu: &mut Cpu<H>, bin: &[u8], addr: u64) -> Result<Boot
         cmdline: "",
         initrd: None,
         ncpus: cpu.machine.ncpus,
+        rng_seed: &[],
     });
     cpu.reset();
     load(cpu, addr, bin)?;
