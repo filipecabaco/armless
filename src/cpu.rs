@@ -207,6 +207,9 @@ fn same_aligned_page(pc: u64, page: u64) -> bool {
 pub(crate) const FAST_ENTRIES: usize = 256;
 /// Executable pages remembered besides the current one (`code_page`).
 const CODE_ENTRIES: usize = 64;
+/// The most instructions `step_page` runs in a row, so that `run` looks at the interrupts and at what
+/// other CPUs asked of this one at least that often.
+const PAGE_RUN: u64 = 256;
 
 /// Virtual page -> offset of the page in `mem`, for pages known to be RAM
 /// with the needed permission at one exception level.
@@ -704,7 +707,7 @@ impl<H: Host> Cpu<H> {
         let mut executed = 0;
         let mut last_poll = 0;
         // The guest pc lives here between instructions rather than being read back from `self.pc`
-        // (which `step_at` keeps up to date); whatever else may move it reloads it.
+        // (which `step_page` keeps up to date); whatever else may move it reloads it.
         let mut pc = self.pc;
         while executed < budget {
             if self.attn().load(Ordering::Relaxed) != 0 {
@@ -735,27 +738,12 @@ impl<H: Host> Cpu<H> {
                     None => {},
                 }
             }
-            let r = self.step_at(pc);
-            if self.jit.enabled {
-                self.jit_entry = self.pc != pc.wrapping_add(4);
-            }
+            // A run ends at the next timer poll too (`last_poll + 0x400`), as the straight-line runs of upstream do; a JIT
+            // dispatch may have gone past it, and a run is at least one instruction, which `budget` still allows.
+            let limit = budget.min(last_poll + 0x400);
+            let (r, n) = self.step_page(pc, limit.saturating_sub(executed).clamp(1, PAGE_RUN));
+            executed += n;
             match r {
-                Ok(next) if next == pc.wrapping_add(4) => {
-                    // No branch: on through the straight-line code that follows, up to the next
-                    // timer poll
-                    executed += 1;
-                    let limit = budget.min(last_poll + 0x400);
-                    match self.run_straight(next, &mut executed, limit) {
-                        Ok(p) => pc = p,
-                        Err(Event::Stop(r)) => return self.leave(Exit::Stop(r)),
-                        Err(_) => unreachable!("only branches wait or stop otherwise"),
-                    }
-                    if executed - last_poll >= 0x400 {
-                        last_poll = executed;
-                        self.update_timers();
-                    }
-                    continue;
-                },
                 Ok(next) => pc = next,
                 Err(Event::Wfi) => {
                     self.update_timers();
@@ -772,7 +760,6 @@ impl<H: Host> Cpu<H> {
                 Err(Event::Stop(r)) => return self.leave(Exit::Stop(r)),
                 Err(Event::Sync { .. }) => unreachable!("handled in step"),
             }
-            executed += 1;
             // Poll the timer every so often; it is cheap but not free.
             if executed - last_poll >= 0x400 {
                 last_poll = executed;
@@ -949,49 +936,129 @@ impl<H: Host> Cpu<H> {
     /// Execute exactly one instruction, taking any exception it raises.
     #[inline(always)]
     pub fn step(&mut self) -> Res<()> {
-        self.step_at(self.pc).map(|_| ())
+        self.step_page(self.pc, 1).0.map(|_| ())
     }
 
-    /// `step` for the instruction at `pc` (which is `self.pc`). Returns the new pc, also stored
-    /// in `self.pc`, unless the CPU stops or waits, so that `run` keeps the pc in a register: an
-    /// instruction that cannot branch goes on to `pc + 4` without `next_pc` making a round trip
-    /// through memory.
+    /// `step` for the instruction at `pc` (which is `self.pc`) and then, for as long as they go on in
+    /// the same decoded code page (see `predecode`), the instructions after it: at most `max` in all (and at
+    /// least one). Returns what `step` leaves for the last of them, as the new pc also stored in `self.pc`
+    /// unless the CPU stops or waits, and how many were run: all of them are counted in `insn_count`. It
+    /// sets `jit_entry`, whether the last one went anywhere but to the next instruction.
+    ///
+    /// Between two instructions of the run nothing is stored but the registers the guest sees: not the
+    /// pc (the code that reads it, `needs_pc`, finds it in `self.pc`), not the count, and `attn` is not
+    /// looked at, so a run is at most `PAGE_RUN` instructions. A run ends at the end of the page, at
+    /// an instruction that is not decoded yet (`run` decodes it), after one that may change what the next
+    /// ones depend on (`ends_run`), and at a taken branch, which `jit_step` counts, except one to
+    /// an entry of the same page that it would only count. An instruction that stores into the page drops
+    /// its decoded entries (zero), which the next fetch of the run sees.
     #[inline(always)]
-    fn step_at(&mut self, pc: u64) -> Res<u64> {
-        debug_assert_eq!(pc, self.pc);
-        self.next_pc = pc.wrapping_add(4);
-        let result = 'exec: {
-            let mut e = self.fetch_decoded(pc);
+    #[allow(unsafe_code)]
+    fn step_page(&mut self, start: u64, max: u64) -> (Res<u64>, u64) {
+        debug_assert_eq!(start, self.pc);
+        let mut pc = start;
+        let mut last = start;
+        let mut n = 0;
+        // The entries of the page `pc` is in, if it is the current one of the cache (`Cache::current`).
+        let f = &self.fast[self.el as usize];
+        let mut page = if same_aligned_page(pc, f.code_page) {
+            self.jit.pre.current(f.code_base)
+        } else {
+            std::ptr::null_mut()
+        };
+        // Below which count a taken branch to the page is counted here (0: not worked out yet).
+        let mut warm_at = 0;
+        let result = loop {
+            // SAFETY: `page` is the current page's entries, which stay allocated (see `Cache::drop_page`).
+            let mut e =
+                if page.is_null() { 0 } else { unsafe { crate::predecode::entry_at(page, pc) } };
             if e == 0 {
+                if n != 0 {
+                    // Not decoded yet, or dropped by a store: `run` goes on from here.
+                    break Ok(pc);
+                }
                 e = match self.fetch_decoded_slow(pc) {
                     Ok(e) => e,
-                    Err(x) => break 'exec Err(x),
+                    Err(x) => {
+                        n = 1;
+                        break Err(x);
+                    },
                 };
+                let f = &self.fast[self.el as usize];
+                if same_aligned_page(pc, f.code_page) {
+                    page = self.jit.pre.current(f.code_base);
+                }
             }
-            match self.exec_decoded(e) {
-                Ok(()) if crate::predecode::may_branch(e) => Ok(self.next_pc),
-                Ok(()) => Ok(pc.wrapping_add(4)),
-                Err(x) => Err(x),
+            last = pc;
+            let next = if crate::predecode::needs_pc(e) {
+                self.pc = pc;
+                self.next_pc = pc.wrapping_add(4);
+                let r = self.exec_decoded(e);
+                n += 1;
+                if let Err(x) = r {
+                    break Err(x);
+                }
+                if !crate::predecode::may_branch(e) {
+                    pc.wrapping_add(4)
+                } else if crate::predecode::ends_run(e) {
+                    break Ok(self.next_pc);
+                } else {
+                    self.next_pc
+                }
+            } else {
+                let r = self.exec_decoded(e);
+                n += 1;
+                if let Err(x) = r {
+                    break Err(x);
+                }
+                pc.wrapping_add(4)
+            };
+            if next == pc.wrapping_add(4) {
+                if next & 0xfff == 0 || n >= max {
+                    break Ok(next);
+                }
+                pc = next;
+                continue;
             }
+            // A taken branch. One to the same page, if it only has to be counted, goes on here.
+            if !crate::predecode::is_direct_branch(e) || next >> 12 != pc >> 12 || n >= max {
+                break Ok(next);
+            }
+            if self.jit.enabled {
+                if warm_at == 0 {
+                    warm_at = self.page_warm_at(self.fast[self.el as usize].code_base);
+                }
+                // SAFETY: as above; `next` is in the page.
+                if !unsafe { crate::predecode::bump_below(page, next, warm_at) } {
+                    break Ok(next);
+                }
+            }
+            pc = next;
         };
-        self.step_done(pc, result)
-    }
-
-    /// The end of a step: count it, and take the exception it raised, if any.
-    #[inline(always)]
-    fn step_done(&mut self, pc: u64, result: Res<u64>) -> Res<u64> {
-        self.insn_count = self.insn_count.wrapping_add(1);
-        match result {
+        self.insn_count = self.insn_count.wrapping_add(n);
+        let result = match result {
             Ok(next) => {
                 self.pc = next;
                 Ok(next)
             },
-            Err(Event::Sync {
+            Err(ev) => self.step_event(last, ev),
+        };
+        self.jit_entry = self.pc != last.wrapping_add(4);
+        (result, n)
+    }
+
+    /// What `step` does with the event that ended the instruction at `pc`: take the exception, or say
+    /// why the CPU stops or waits (see `step_page`).
+    #[cold]
+    #[inline(never)]
+    fn step_event(&mut self, pc: u64, ev: Event) -> Res<u64> {
+        match ev {
+            Event::Sync {
                 ec,
                 iss,
                 far,
                 ret_next,
-            }) => {
+            } => {
                 let ret = if ret_next { self.next_pc } else { pc };
                 if ec == ec::UNKNOWN {
                     if let Ok(insn) = self.fetch(pc) {
@@ -1005,39 +1072,12 @@ impl<H: Host> Cpu<H> {
                     .map_err(Event::Stop)?;
                 Ok(self.pc)
             },
-            Err(Event::Wfi) => {
+            Event::Wfi => {
                 self.pc = self.next_pc;
                 Err(Event::Wfi)
             },
-            Err(e) => Err(e),
+            e => Err(e),
         }
-    }
-
-    /// Straight-line code from `pc`: the decoded instructions of the current page that cannot
-    /// branch, one after another, until one that can (or one not decoded yet), or `limit`
-    /// instructions. Whatever needs the run loop's checks between instructions (the JIT's entry
-    /// points, requests, interrupts) only arises at a branch, so these go without them. Returns
-    /// where to go on: the next instruction, or, if one raised an exception, its vector.
-    #[inline(always)]
-    fn run_straight(&mut self, mut pc: u64, executed: &mut u64, limit: u64) -> Res<u64> {
-        while *executed < limit {
-            let e = self.fetch_decoded(pc);
-            if e == 0 || crate::predecode::may_branch(e) {
-                break;
-            }
-            let next = pc.wrapping_add(4);
-            self.next_pc = next;
-            let r = self.exec_decoded(e).map(|()| next);
-            *executed += 1;
-            let to = self.step_done(pc, r)?;
-            if to != next {
-                // An exception: on at its vector, as after a branch
-                self.jit_entry = true;
-                return Ok(to);
-            }
-            pc = to;
-        }
-        Ok(pc)
     }
 
     #[inline(always)]
@@ -1048,19 +1088,6 @@ impl<H: Host> Cpu<H> {
             return Ok(self.ram_load(f.code_base + (pc & 0xffc) as usize, 4) as u32);
         }
         self.fetch_slow(pc)
-    }
-
-    /// The pre-decoded entry of the instruction at `pc` if it is in the current decoded page
-    /// and decoded already, else 0 (see `predecode`).
-    #[inline(always)]
-    fn fetch_decoded(&self, pc: u64) -> u64 {
-        let f = &self.fast[self.el as usize];
-        if !same_aligned_page(pc, f.code_page) {
-            return 0;
-        }
-        self.jit
-            .pre
-            .current(f.code_base, ((pc & 0xfff) >> 2) as usize)
     }
 
     /// The pre-decoded entry of the instruction at `pc`, fetching and decoding it.

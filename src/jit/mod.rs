@@ -427,6 +427,24 @@ impl<H: Host> Cpu<H> {
         }
     }
 
+    /// The count of executions of an entry at which its page is compiled (see `jit_step`).
+    #[inline(always)]
+    fn hot_threshold(&self) -> u32 {
+        (self.jit.threshold.min(crate::predecode::COUNT_MAX) << (self.jit.flushes / 8).min(3))
+            .min(crate::predecode::COUNT_MAX)
+    }
+
+    /// The count of executions of an entry of the page at physical address `base` that `jit_step` reaches
+    /// with nothing more to do than to count: below it, counting the execution is all there is to do (1 when
+    /// the page has modules, which may hold the entry).
+    #[inline(always)]
+    pub(crate) fn page_warm_at(&self, base: usize) -> u32 {
+        if self.jit.code_page[base >> 12] & 1 != 0 {
+            return 1;
+        }
+        self.hot_threshold().div_ceil(4).max(1)
+    }
+
     /// Run translated code at the current PC if there is any.
     #[inline(always)]
     pub(crate) fn jit_step(&mut self, budget: u64) -> JitStep {
@@ -457,8 +475,7 @@ impl<H: Host> Cpu<H> {
         // The counts are exact, so what a workload runs a few thousand times each, in more places than the
         // modules can hold, would be compiled, flushed and compiled again. Every 8 flushes the threshold
         // doubles (at most 8 times the configured one), so that the code that is run the most stays.
-        let threshold = (self.jit.threshold.min(crate::predecode::COUNT_MAX) << (self.jit.flushes / 8).min(3))
-            .min(crate::predecode::COUNT_MAX);
+        let threshold = self.hot_threshold();
         if c >= threshold {
             if self.jit_compile(key) && self.jit.sync_compile && self.jit.enabled {
                 self.jit.yielded = true;

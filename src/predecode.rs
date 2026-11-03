@@ -20,7 +20,8 @@ pub(crate) const COUNT_MAX: u32 = 0xffff;
 pub(crate) const NONE: u32 = u32::MAX;
 
 // Leaves dispatched to directly. 0 means the entry is not decoded yet; GENERIC runs `execute`.
-// GENERIC and the branches come first: only they may set `next_pc` (see `may_branch`).
+// GENERIC and the branches come first: only they may set `next_pc` (see `may_branch`); then the two
+// that read the pc as well (see `needs_pc`).
 const GENERIC: u8 = 1;
 const B_BL: u8 = 2;
 const CBZ_CBNZ: u8 = 3;
@@ -28,12 +29,12 @@ const TBZ_TBNZ: u8 = 4;
 const B_COND: u8 = 5;
 const BRANCH_REG: u8 = 6;
 const ADR: u8 = 7;
-const ADD_SUB_IMM: u8 = 8;
-const LOGICAL_IMM: u8 = 9;
-const MOVE_WIDE: u8 = 10;
-const BITFIELD_IMM: u8 = 11;
-const EXTR: u8 = 12;
-const LDR_LITERAL: u8 = 13;
+const LDR_LITERAL: u8 = 8;
+const ADD_SUB_IMM: u8 = 9;
+const LOGICAL_IMM: u8 = 10;
+const MOVE_WIDE: u8 = 11;
+const BITFIELD_IMM: u8 = 12;
+const EXTR: u8 = 13;
 const LDST_PAIR: u8 = 14;
 const LDST_UIMM: u8 = 15;
 const LDST_IMM9: u8 = 16;
@@ -131,6 +132,81 @@ pub(crate) fn may_branch(e: u64) -> bool {
     (e >> 32) as u8 <= BRANCH_REG
 }
 
+/// Whether the instruction of entry `e` reads `Cpu::pc` while it runs (and may read or set `next_pc`): the
+/// branches, `adr`, a literal load, and anything `execute` runs. `step_page` stores the two only for these.
+#[inline(always)]
+pub(crate) fn needs_pc(e: u64) -> bool {
+    (e >> 32) as u8 <= LDR_LITERAL
+}
+
+/// Whether the instruction of entry `e` ends a run of instructions in `step_page` even when it goes on to the
+/// next one: it may change the exception level (an exception return), the translation regime or the interrupt
+/// mask (`msr`, `sys`: TLB and cache maintenance, address translation), or make what other CPUs invalidated
+/// apply (`isb`), so `run` must look at the CPU afresh. A hint, a barrier other than `isb` and `mrs` do not.
+#[inline(always)]
+pub(crate) fn ends_run(e: u64) -> bool {
+    let insn = e as u32;
+    match (e >> 32) as u8 {
+        BRANCH_REG => true,
+        GENERIC => {
+            if insn >> 24 != 0xd5 {
+                // Exception generation (svc, hvc, smc, brk, hlt), or not a system instruction at all.
+                return insn >> 25 == 0b110_1010;
+            }
+            let op0 = (insn >> 19) & 3;
+            let crn = (insn >> 12) & 0xf;
+            let op2 = (insn >> 5) & 7;
+            if op0 == 0 {
+                // MSR (immediate) to a PSTATE field, and ISB; the other hints and barriers go on.
+                crn == 4 || (crn == 3 && op2 == 6)
+            } else {
+                // SYS, and MSR (register).
+                op0 == 1 || insn & (1 << 21) == 0
+            }
+        },
+        _ => false,
+    }
+}
+
+/// Whether the instruction of entry `e` is a branch whose target is in its own page, when taken.
+#[inline(always)]
+pub(crate) fn is_direct_branch(e: u64) -> bool {
+    ((e >> 32) as u8).wrapping_sub(B_BL) <= B_COND - B_BL
+}
+
+/// The entry of the instruction at `pc` in `page`, the entries of the page `pc` is in (0: not decoded yet,
+/// or dropped).
+///
+/// # Safety
+/// `page` points at the entries of a slot of `Cache` (they stay allocated, whatever happens to the page).
+#[inline(always)]
+#[allow(unsafe_code)]
+pub(crate) unsafe fn entry_at(page: *mut u64, pc: u64) -> u64 {
+    // SAFETY: `page` has `PAGE_INSNS` entries and the index is within a page (the caller's contract). The read is
+    // volatile: a store the run executes zeroes entries through the cache, which the compiler cannot see.
+    unsafe { page.add(((pc & 0xfff) >> 2) as usize).read_volatile() }
+}
+
+/// Count one execution of the entry at `pc` in `page` as `Cache::bump` does, unless it is not decoded
+/// or its count would reach `limit`: then nothing is counted, and false is returned.
+///
+/// # Safety
+/// As for `entry_at`.
+#[inline(always)]
+#[allow(unsafe_code)]
+pub(crate) unsafe fn bump_below(page: *mut u64, pc: u64, limit: u32) -> bool {
+    // SAFETY: as in `entry_at`: `p` is an entry of the page.
+    let p = unsafe { page.add(((pc & 0xfff) >> 2) as usize) };
+    // SAFETY: as above.
+    let e = unsafe { p.read_volatile() };
+    if e == 0 || ((e >> COUNT_SHIFT) as u32 & COUNT_MAX) + 1 >= limit {
+        return false;
+    }
+    // SAFETY: as above.
+    unsafe { p.write_volatile(e + (1 << COUNT_SHIFT)) };
+    true
+}
+
 /// A decoded entry: the leaf above the instruction word. Never 0.
 #[inline(always)]
 pub(crate) fn entry(insn: u32) -> u64 {
@@ -182,17 +258,14 @@ impl Cache {
         self.cur_ptr = self.slots[slot as usize].as_mut_ptr();
     }
 
-    /// Entry `i` of the current page, if `base` is that page (0: not decoded yet).
+    /// The entries of the current page, if `base` is that page, else null (see `entry_at`).
     #[inline(always)]
-    #[allow(unsafe_code)]
-    pub(crate) fn current(&self, base: usize, i: usize) -> u64 {
-        debug_assert!(i < PAGE_INSNS);
-        if base != self.cur_base {
-            return 0;
+    pub(crate) fn current(&self, base: usize) -> *mut u64 {
+        if base == self.cur_base {
+            self.cur_ptr
+        } else {
+            std::ptr::null_mut()
         }
-        // SAFETY: `cur_ptr` points at the entries of the page at `cur_base`, a live slot (dropping
-        // any slot resets `cur_base`), and `i` is an instruction index within a page.
-        unsafe { *self.cur_ptr.add(i) }
     }
 
     /// Count one execution of entry `i` of the page at physical base `base` in the entry itself
@@ -443,5 +516,105 @@ mod tests {
             assert_eq!(c.x[0], (round * pages) as u64);
         }
         assert!(c.jit.pre.flushes > 0);
+    }
+
+    const NOP: u32 = 0xd503_201f;
+    const WFI: u32 = 0xd503_207f;
+    const SVC_0: u32 = 0xd400_0001;
+    const ADR_X1_16: u32 = 0x1000_0081; // adr x1, .+16
+    const LDR_X2_LIT: u32 = 0x5800_0102; // ldr x2, .+32
+
+    #[test]
+    fn a_run_over_decoded_pages_counts_every_instruction_and_stops_at_the_budget() {
+        let mut c = cpu();
+        // 1024 instructions fill the page at 0x1000, and the code goes on in the next page.
+        for i in 0..1124 {
+            put(&mut c, 0x1000 + 4 * i, ADD_X0_1);
+        }
+        // The second round runs from entries decoded in the first.
+        for _ in 0..2 {
+            c.pc = 0x1000;
+            c.x[0] = 0;
+            let before = c.insn_count;
+            assert!(matches!(c.run(1100), crate::cpu::Exit::Budget));
+            assert_eq!(c.x[0], 1100);
+            assert_eq!(c.insn_count - before, 1100);
+            assert_eq!(c.pc, 0x1000 + 4 * 1100);
+        }
+    }
+
+    #[test]
+    fn a_store_into_the_page_being_run_takes_effect_at_the_next_instruction() {
+        let mut c = cpu();
+        // str w2, [x3]; nop; movz x0, #1: the store rewrites the movz.
+        put(&mut c, 0x1000, STR_W2_X3);
+        put(&mut c, 0x1004, NOP);
+        put(&mut c, 0x1008, MOVZ_X0 | 1 << 5);
+        c.x[3] = 0x1008;
+        for value in 1..4u32 {
+            c.pc = 0x1000;
+            c.x[2] = (MOVZ_X0 | value << 5) as u64;
+            c.run(3);
+            assert_eq!(c.x[0], value as u64);
+        }
+        assert_eq!(c.insn_count, 9);
+    }
+
+    #[test]
+    fn instructions_that_read_the_pc_see_it_in_the_middle_of_a_run() {
+        let mut c = cpu();
+        put(&mut c, 0x1000, ADD_X0_1);
+        put(&mut c, 0x1004, ADR_X1_16);
+        put(&mut c, 0x1008, LDR_X2_LIT);
+        c.mem.write(0x1028, &0x1234_5678_9abc_def0u64.to_le_bytes());
+        for round in 1..=2u64 {
+            c.pc = 0x1000;
+            c.x[1] = 0;
+            c.x[2] = 0;
+            c.run(3);
+            assert_eq!(c.x[0], round);
+            assert_eq!(c.x[1], 0x1014);
+            assert_eq!(c.x[2], 0x1234_5678_9abc_def0);
+            assert_eq!(c.pc, 0x100c);
+        }
+    }
+
+    #[test]
+    fn an_exception_in_the_middle_of_a_run_returns_to_the_right_instruction() {
+        let mut c = cpu();
+        c.sys.vbar = 0x4000;
+        put(&mut c, 0x1000, ADD_X0_1);
+        put(&mut c, 0x1004, ADD_X0_1);
+        put(&mut c, 0x1008, SVC_0);
+        put(&mut c, 0x100c, ADD_X0_1);
+        for round in 1..=2u64 {
+            c.pc = 0x1000;
+            c.x[0] = 0;
+            c.run(3);
+            assert_eq!(c.x[0], 2);
+            assert_eq!(c.insn_count, 3 * round);
+            assert_eq!(c.sys.elr, 0x100c);
+            assert_eq!(c.sys.esr >> 26, 0x15);
+            assert!((0x4000..0x4800).contains(&c.pc));
+            // The guest returned from the handler, as far as this test goes.
+            c.el = 1;
+            c.spsel = true;
+        }
+    }
+
+    #[test]
+    fn waiting_for_an_interrupt_in_the_middle_of_a_run_stops_the_run() {
+        let mut c = cpu();
+        put(&mut c, 0x1000, ADD_X0_1);
+        put(&mut c, 0x1004, WFI);
+        put(&mut c, 0x1008, ADD_X0_1);
+        for round in 1..=2u64 {
+            c.pc = 0x1000;
+            c.x[0] = 0;
+            assert!(matches!(c.run(10), crate::cpu::Exit::Idle { .. }));
+            assert_eq!(c.x[0], 1);
+            assert_eq!(c.insn_count, 2 * round);
+            assert_eq!(c.pc, 0x1008);
+        }
     }
 }
