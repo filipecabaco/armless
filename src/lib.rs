@@ -31,6 +31,9 @@ pub mod dev;
 pub(crate) mod dtb;
 pub(crate) mod fp;
 pub(crate) mod gic;
+#[cfg(target_arch = "wasm32")]
+#[allow(unsafe_code)]
+pub(crate) mod heap;
 pub mod jit;
 pub(crate) mod kernel;
 pub(crate) mod mmu;
@@ -59,6 +62,10 @@ pub mod zstd;
 #[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
 #[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
 pub mod wasm;
+
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static HEAP: heap::Heap = heap::Heap;
 
 pub use board::{Host, Platform};
 pub use cpu::{Cpu, Exit, StopReason};
@@ -92,6 +99,18 @@ pub fn boot_linux<H: Host>(
     image: &[u8],
     initrd: Option<&[u8]>,
     cmdline: &str,
+) -> Result<BootLayout, String> {
+    boot_linux_seeded(cpu, image, initrd, cmdline, &[])
+}
+
+/// [`boot_linux`] with entropy for the guest: the device tree's `/chosen/rng-seed`, which Linux mixes in
+/// (and credits, with `random.trust_bootloader`) before anything draws from its random generator.
+pub fn boot_linux_seeded<H: Host>(
+    cpu: &mut Cpu<H>,
+    image: &[u8],
+    initrd: Option<&[u8]>,
+    cmdline: &str,
+    rng_seed: &[u8],
 ) -> Result<BootLayout, String> {
     if image.len() >= 2 && image[0] == 0x1f && image[1] == 0x8b {
         return Err("kernel is gzip-compressed; decompress it to a raw Image first".into());
@@ -137,6 +156,7 @@ pub fn boot_linux<H: Host>(
         cmdline,
         initrd: initrd_range,
         ncpus: cpu.machine.ncpus,
+        rng_seed,
     });
     if dtb.len() > 2 << 20 {
         return Err("device tree too large".into());
@@ -183,6 +203,7 @@ pub fn boot_raw<H: Host>(cpu: &mut Cpu<H>, bin: &[u8], addr: u64) -> Result<Boot
         cmdline: "",
         initrd: None,
         ncpus: cpu.machine.ncpus,
+        rng_seed: &[],
     });
     cpu.reset();
     load(cpu, addr, bin)?;

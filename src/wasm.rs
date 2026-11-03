@@ -26,7 +26,7 @@ use std::sync::atomic::Ordering;
 use crate::board::{BoardHost, Platform};
 use crate::cpu::{Cpu, Exit, StopReason};
 use crate::dev::{DeviceConfig, Event};
-use crate::vm::{BootError, Config, StateLoader, Vm};
+use crate::vm::{BootError, Config, StateLoader, StateSaver, Vm};
 
 // SAFETY: armless.js provides these, with these signatures. None has preconditions: they take
 // numbers, and `jit_compile` only reads the bytes it is given.
@@ -96,6 +96,9 @@ fn js_clock() -> u64 {
 
 type JsCpu = Cpu<BoardHost<JsPlatform>>;
 
+/// The size of a piece of `armless_save_next`
+const SAVE_PIECE: usize = 1 << 20;
+
 /// The machine. Shared by every instance on the same memory.
 static mut VM: Option<Vm<JsPlatform>> = None;
 
@@ -111,6 +114,8 @@ std::thread_local! {
     /// A snapshot being restored (on the main thread), and its decompressor.
     static LOADER: std::cell::RefCell<Option<(StateLoader, Option<crate::zstd::Stream>)>> =
         const { std::cell::RefCell::new(None) };
+    /// A snapshot being saved in pieces (on the main thread).
+    static SAVER: std::cell::RefCell<Option<StateSaver>> = const { std::cell::RefCell::new(None) };
     /// When `armless_run` returned 1: when to run again, in microtick() ms, or -1.
     static WAKE_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
 }
@@ -329,6 +334,14 @@ pub extern "C" fn armless_alloc_aligned(len: u32, align: u32) -> u32 {
     unsafe { std::alloc::alloc_zeroed(layout) as u32 }
 }
 
+/// Gives back the big blocks that the allocator keeps to hand out again (see heap.rs): the host calls it when the
+/// machine is up and its memory is about to be measured.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn armless_heap_flush() {
+    crate::heap::flush();
+}
+
 #[no_mangle]
 pub extern "C" fn armless_mem_ptr() -> u32 {
     vm().board.io.mem.as_ptr() as u32
@@ -435,6 +448,19 @@ pub extern "C" fn armless_wake_ms() -> f64 {
 #[no_mangle]
 pub extern "C" fn armless_pc() -> f64 {
     cpu().pc as f64
+}
+
+/// The exact PC (`armless_pc` is a double, which loses the low bits of an address in the kernel's half
+/// of the address space), for a host that samples where the guest is.
+#[no_mangle]
+pub extern "C" fn armless_pc64() -> i64 {
+    cpu().pc as i64
+}
+
+/// The current exception level: 0 (user) or 1 (kernel).
+#[no_mangle]
+pub extern "C" fn armless_el() -> i32 {
+    cpu().el as i32
 }
 
 #[no_mangle]
@@ -549,6 +575,51 @@ pub unsafe extern "C" fn armless_fs_load(ptr: u32, len: u32) -> i32 {
 pub unsafe extern "C" fn armless_blob(name: u32, name_len: u32, data: u32, data_len: u32) -> i32 {
     let n = string(name, name_len);
     match vm().board.provide_blob(&n, slice(data, data_len).to_vec()) {
+        Ok(()) => 0,
+        Err(e) => {
+            vm().board.blob_failed(&n);
+            set_error(e);
+            -1
+        },
+    }
+}
+
+/// Room for a blob that the host decompresses itself: `len` bytes that are not cleared, for the host to fill
+/// (up to `len`, which a frame that does not state its size makes an upper bound) and then hand to
+/// `armless_blob_raw`, which takes the block over (nothing copies it); a host that does not use it gives the block
+/// back with `armless_free`.
+#[no_mangle]
+pub extern "C" fn armless_blob_buf(len: u32) -> u32 {
+    let layout = std::alloc::Layout::from_size_align(len.max(1) as usize, 1).unwrap();
+    // SAFETY: the layout is not empty (its size is at least 1).
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    ptr as u32
+}
+
+/// Provide a blob that is already decompressed, in a block from `armless_blob_buf(data_cap)` of which the first
+/// `data_len` bytes are written. The block becomes the blob's contents, cut to `data_len` (the tail goes back to
+/// the allocator). Returns 0 or -1.
+///
+/// # Safety
+/// `data` must come from `armless_blob_buf(data_cap)`, with `data_len <= data_cap`, and must not be used or freed
+/// afterwards; `name` must reference `name_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_blob_raw(
+    name: u32,
+    name_len: u32,
+    data: u32,
+    data_len: u32,
+    data_cap: u32,
+) -> i32 {
+    let n = string(name, name_len);
+    // The block was allocated with the size max(cap, 1): a Vec of capacity 0 frees nothing, so the byte of an
+    // empty blob stays (there is no such blob in an image)
+    let mut raw = Vec::from_raw_parts(data as *mut u8, data_len as usize, data_cap as usize);
+    raw.shrink_to_fit();
+    match vm().board.provide_raw_blob(&n, raw) {
         Ok(()) => 0,
         Err(e) => {
             vm().board.blob_failed(&n);
@@ -711,6 +782,63 @@ pub extern "C" fn armless_save_state() -> u32 {
     let v = vm();
     let mut cpus: Vec<&mut JsCpu> = v.cpus.iter_mut().collect();
     out(crate::vm::save_state(&v.board, &mut cpus))
+}
+
+/// Start a snapshot that the host reads in pieces with `armless_save_next`, instead of the one
+/// buffer of `armless_save_state` (whose size is the snapshot's: the host's memory has to hold
+/// it, and a wasm heap does not shrink again). The CPUs must stay stopped until the end. 0 or -1.
+#[no_mangle]
+pub extern "C" fn armless_save_begin() -> i32 {
+    let v = vm();
+    let mut cpus: Vec<&mut JsCpu> = v.cpus.iter_mut().collect();
+    let n = cpus.len();
+    match StateSaver::new(&v.board, &mut cpus, n) {
+        Ok(saver) => {
+            SAVER.set(Some(saver));
+            0
+        },
+        Err(e) => {
+            set_error(e);
+            -1
+        },
+    }
+}
+
+/// The next piece (about 1 MiB) of the snapshot of `armless_save_begin`: its length (see
+/// `armless_buf`), or 0 when the snapshot has been given out. The bytes are those of
+/// `armless_save_state`, in order.
+#[no_mangle]
+pub extern "C" fn armless_save_next() -> u32 {
+    SAVER.with_borrow_mut(|s| {
+        let Some(saver) = s.as_mut() else {
+            return 0;
+        };
+        let more = BUF.with_borrow_mut(|buf| {
+            buf.clear();
+            buf.reserve_exact(SAVE_PIECE + 8192);
+            saver
+                .next(&vm().board, buf, SAVE_PIECE)
+                .then_some(buf.len() as u32)
+        });
+        if more.is_none() {
+            *s = None;
+        }
+        more.unwrap_or(0)
+    })
+}
+
+/// Drop the snapshot of `armless_save_begin` before it was all given out (the host could not write
+/// what it got): its header and state are freed, which only the last piece does otherwise.
+#[no_mangle]
+pub extern "C" fn armless_save_abort() {
+    SAVER.set(None);
+}
+
+/// Move the guest's clocks forward by `ms` milliseconds (call after a restore, with the time the
+/// machine was not running; see `Board::advance_clock`).
+#[no_mangle]
+pub extern "C" fn armless_clock_advance(ms: f64) {
+    vm().board.advance_clock((ms * 1e6) as u64);
 }
 
 /// Start restoring a snapshot; `compressed` = the data fed is zstd.

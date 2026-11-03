@@ -156,6 +156,8 @@
         microtick: now,
         wall_clock_ms: () => Date.now(),
         host_notify: () => post({ t: "events" }),
+        // A browser cannot give back the pages of a shared memory: the heap keeps them.
+        heap_release: () => {},
         jit_compile: (slot, ptr, len) => {
           const code = new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice();
           WebAssembly.instantiate(code, { e: jit_imports }).then((r) => {
@@ -366,6 +368,7 @@
         microtick: () => performance.now(),
         wall_clock_ms: () => Date.now(),
         host_notify: () => this._notified(),
+        heap_release: () => {},
         jit_compile: (slot, ptr, len) => this._jit_compile(slot, ptr, len),
       };
       if (smp) {
@@ -409,13 +412,15 @@
         });
       }
 
+      // Fresh randomness for the guest (a new VM generation ID) and for TLS: after a restore,
+      // whose state it replaces, and before a boot, which hands it to Linux as /chosen/rng-seed
       if (o.initial_state) {
         await this._restore(o.initial_state.url ?? o.initial_state);
-      } else if (o.boot) {
-        await this._boot(o.boot);
+        this._seed();
+      } else {
+        this._seed();
+        if (o.boot) await this._boot(o.boot);
       }
-      // Fresh randomness for the guest (a new VM generation ID) and for TLS
-      this._seed();
       if (o.network) {
         this._web_options = web_options(o.network);
         this._web = new Map();

@@ -56,6 +56,8 @@ pub struct Board {
     pub io: Io,
     pub devices: SpinLock<Devices>,
     pub config: Config,
+    /// The last entropy from `seed`: a boot hands it to Linux as the device tree's `/chosen/rng-seed`.
+    pub boot_seed: SpinLock<Vec<u8>>,
 }
 
 impl Board {
@@ -64,6 +66,7 @@ impl Board {
             io: Io::new(machine, clock),
             devices: SpinLock::new(Devices::new(&config.devices)),
             config,
+            boot_seed: SpinLock::new(Vec::new()),
         }
     }
 
@@ -123,6 +126,15 @@ impl Board {
         let mut d = self.devices.lock();
         let Some((t, p)) = d.p9() else { return Ok(()) };
         p.fs.provide_blob(name, data)?;
+        p.blob_arrived(&self.io, t, name);
+        Ok(())
+    }
+
+    /// Contents for a blob that the host has already decompressed (`provide_blob` without the zstd check).
+    pub fn provide_raw_blob(&self, name: &str, data: Vec<u8>) -> Result<(), String> {
+        let mut d = self.devices.lock();
+        let Some((t, p)) = d.p9() else { return Ok(()) };
+        p.fs.provide_raw(name, data)?;
         p.blob_arrived(&self.io, t, name);
         Ok(())
     }
@@ -295,6 +307,7 @@ impl Board {
     /// random generator at once: without it, every restore of a snapshot would draw the same
     /// "random" numbers (UUIDs, keys, nonces) as the machine that was saved.
     pub fn seed(&self, entropy: &[u8]) {
+        *self.boot_seed.lock() = entropy.to_vec();
         self.with_net(|s, _| {
             s.rng.seed(entropy);
             // Session tickets from before (another copy of this snapshot) stop working
@@ -310,6 +323,19 @@ impl Board {
         // The guest configured the line as edge-triggered: a rising edge latches it
         self.io.set_irq(crate::board::SPI_VMGENID, true);
         self.io.set_irq(crate::board::SPI_VMGENID, false);
+    }
+
+    /// Moves the guest's counter forward by `ns`: after a restore, the time the machine was not
+    /// running. CLOCK_MONOTONIC and CLOCK_REALTIME are the counter's (the RTC is read once, at
+    /// boot), so without it a restored guest's clock stays behind by the time it was asleep. Linux
+    /// takes a jump of about ten minutes at once (more overflows what it multiplies a delta by):
+    /// make long ones in steps, with the guest running between them.
+    pub fn advance_clock(&self, ns: u64) {
+        let ticks = ns / (1_000_000_000 / crate::board::TIMER_FREQ_HZ);
+        self.io
+            .machine
+            .timer_cnt_base
+            .fetch_add(ticks, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn with_web(&self, id: u32, f: impl FnOnce(&mut crate::dev::web::Web) -> crate::dev::web::Out) {
@@ -443,7 +469,8 @@ impl<P: Platform> Vm<P> {
         cmdline: &str,
     ) -> Result<crate::BootLayout, String> {
         let image = crate::kernel::prepare(kernel)?;
-        crate::boot_linux(&mut self.cpus[0], &image, initrd, cmdline)
+        let seed = self.board.boot_seed.lock().clone();
+        crate::boot_linux_seeded(&mut self.cpus[0], &image, initrd, cmdline, &seed)
     }
 
     /// Boot the kernel and initrd found under /boot in the 9p filesystem.
@@ -502,28 +529,91 @@ pub fn save_state_cpus<H: Host>(
     cpus: &mut [&mut Cpu<H>],
     n: usize,
 ) -> Result<Vec<u8>, String> {
-    let mut meta = W::new();
-    meta.bytes(&Cpu::save_machine_state_cpus(cpus, n)?);
-    board.devices.lock().save(&mut meta);
-
-    let mem = &board.io.mem;
-    let mut out = Vec::with_capacity(meta.0.len() + mem.len() / 4);
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&(mem.len() as u64).to_le_bytes());
-    out.extend_from_slice(&(n as u32).to_le_bytes());
-    out.extend_from_slice(&(meta.0.len() as u64).to_le_bytes());
-    out.extend_from_slice(&meta.0);
-    for (i, at) in (0..mem.len()).step_by(PAGE).enumerate() {
-        let n = PAGE.min(mem.len() - at);
-        if !mem.is_zero(at, n) {
-            out.extend_from_slice(&(i as u32).to_le_bytes());
-            let start = out.len();
-            out.resize(start + PAGE, 0);
-            mem.read(at, &mut out[start..start + n]);
-        }
-    }
-    out.extend_from_slice(&END.to_le_bytes());
+    let mut saver = StateSaver::new(board, cpus, n)?;
+    let mut out = Vec::with_capacity(saver.head.len() + board.io.mem.len() / 4);
+    while saver.next(board, &mut out, usize::MAX) {}
     Ok(out)
+}
+
+/// A snapshot made piece by piece, with the bytes `save_state_cpus` returns: a host that writes it
+/// out (or compresses it) as it comes never holds more than one piece of it.
+pub struct StateSaver {
+    /// The header and the machine state, which are made at once; `at` is how much was given out
+    head: Vec<u8>,
+    at: usize,
+    /// The next RAM page to look at
+    page: usize,
+    done: bool,
+}
+
+impl StateSaver {
+    /// Every CPU must be stopped and in `cpus`, in order, as for [`save_state_cpus`], and must
+    /// stay so until the last piece is out.
+    pub fn new<H: Host>(
+        board: &Board,
+        cpus: &mut [&mut Cpu<H>],
+        n: usize,
+    ) -> Result<StateSaver, String> {
+        // The header and the state in one buffer, the state written where it stays, with its length
+        // filled in once it is known: it holds the contents of the files the guest wrote
+        // (Fs::save), which a copy into a second buffer would double. Fs::save itself still
+        // builds them in memory, once; handing them out in pieces would take a sink in place of W.
+        let mem = &board.io.mem;
+        let mut head = W::new();
+        // Once, with room for the CPUs and the other devices: growing by doubling would leave the
+        // smaller buffers in the heap, which a wasm heap does not give back
+        head.0.reserve_exact(board.devices.lock().save_size_hint() + (1 << 20));
+        head.0.extend_from_slice(MAGIC);
+        head.u64(mem.len() as u64);
+        head.u32(n as u32);
+        head.u64(0);
+        let state = head.0.len();
+        head.bytes(&Cpu::save_machine_state_cpus(cpus, n)?);
+        board.devices.lock().save(&mut head);
+        let len = (head.0.len() - state) as u64;
+        head.0[state - 8..state].copy_from_slice(&len.to_le_bytes());
+        let head = head.0;
+        Ok(StateSaver {
+            head,
+            at: 0,
+            page: 0,
+            done: false,
+        })
+    }
+
+    /// Appends the next piece to `out`: the header and the state, then the RAM pages, in pieces of
+    /// about `max` bytes (at least a page and a number). False when the snapshot was all given out
+    /// and nothing was appended.
+    pub fn next(&mut self, board: &Board, out: &mut Vec<u8>, max: usize) -> bool {
+        let start = out.len();
+        if self.at < self.head.len() {
+            let n = (self.head.len() - self.at).min(max);
+            out.extend_from_slice(&self.head[self.at..self.at + n]);
+            self.at += n;
+            if self.at == self.head.len() {
+                self.head = Vec::new();
+                self.at = 0;
+            }
+            return true;
+        }
+        let mem = &board.io.mem;
+        while self.page * PAGE < mem.len() && out.len() - start + 4 + PAGE <= max {
+            let from = self.page * PAGE;
+            let n = PAGE.min(mem.len() - from);
+            if !mem.is_zero(from, n) {
+                out.extend_from_slice(&(self.page as u32).to_le_bytes());
+                let at = out.len();
+                out.resize(at + PAGE, 0);
+                mem.read(from, &mut out[at..at + n]);
+            }
+            self.page += 1;
+        }
+        if self.page * PAGE >= mem.len() && !self.done {
+            out.extend_from_slice(&END.to_le_bytes());
+            self.done = true;
+        }
+        out.len() > start
+    }
 }
 
 /// Zero the RAM pages the snapshot didn't write. Reading an untouched page doesn't commit it (the

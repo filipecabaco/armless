@@ -858,6 +858,11 @@ impl Fs {
         } else {
             data
         };
+        self.provide_raw(name, raw)
+    }
+
+    /// The host delivered a blob that is already decompressed: kept as it is, whatever its first bytes are.
+    pub fn provide_raw(&mut self, name: &str, raw: Vec<u8>) -> Result<(), String> {
         self.failed.remove(name);
         if self.blobs.contains_key(name) {
             return Ok(());
@@ -936,6 +941,34 @@ impl Fs {
     }
 
     // ------------------------------------------------------------ snapshot
+
+    /// An upper bound of the bytes `save` writes, to size its buffer once: a buffer that grows by
+    /// doubling leaves the smaller ones behind in the heap, which for the contents of the files the
+    /// guest wrote is as much again.
+    pub fn save_size_hint(&self) -> usize {
+        let mut n = 8 + self.inodes.len();
+        for i in self.inodes.iter().flatten() {
+            n += 96 + match &i.content {
+                Content::Dir { entries, .. } => {
+                    entries.keys().map(|k| k.len() + 16).sum::<usize>()
+                },
+                Content::Symlink(t) => t.len(),
+                Content::Blob(name) => name.len(),
+                Content::Mem(d) => d.len(),
+                Content::Special => 0,
+                Content::Chunks(chunks) => chunks
+                    .iter()
+                    .map(|c| {
+                        17 + match &c.data {
+                            Piece::Blob(name) => name.len(),
+                            Piece::Mem(d) => d.len(),
+                        }
+                    })
+                    .sum::<usize>(),
+            };
+        }
+        n
+    }
 
     pub fn save(&self, w: &mut W) {
         w.u64(self.inodes.len() as u64);
@@ -1093,6 +1126,16 @@ mod cache_tests {
         fs.set_cache_limit(0);
         assert_eq!(fs.blobs.keys().collect::<Vec<_>>(), ["c"]);
         assert_eq!(fs.cached, 8);
+    }
+
+    #[test]
+    fn a_blob_the_host_decompressed_is_kept_as_it_is() {
+        // The bytes of a zstd frame that are a file's content: `provide_blob` would decompress them
+        let frame = vec![0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3, 4];
+        let mut fs = Fs::empty();
+        fs.provide_raw("a", frame.clone()).unwrap();
+        assert_eq!(fs.blobs.get("a").map(|b| b.as_slice()), Some(&frame[..]));
+        assert_eq!(fs.cached, frame.len());
     }
 }
 
