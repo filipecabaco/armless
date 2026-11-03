@@ -201,6 +201,32 @@ impl Board {
         Ok(())
     }
 
+    /// Make a directory in the guest's filesystem from the host, with its parents, as `mkdir -p`
+    /// does (absolute guest path): a host saves the guest starting a process for it. As with
+    /// `fs_write_file`, make it where the guest has not looked yet.
+    pub fn fs_mkdir(&self, path: &str) -> Result<(), String> {
+        use crate::dev::fs;
+        let mut d = self.devices.lock();
+        let (_, p) = d.p9().ok_or("the machine has no filesystem")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut dir = fs::ROOT;
+        for c in path.split('/').filter(|c| !c.is_empty()) {
+            dir = match p.fs.lookup(dir, c.as_bytes()) {
+                Ok(i) => i,
+                Err(_) => {
+                    p.fs.create(dir, c.as_bytes(), fs::S_IFDIR | 0o755, 0, 0, now)
+                        .map_err(|e| match e {
+                            fs::Fail::Errno(n) => format!("{path}: errno {n}"),
+                            fs::Fail::Need(b) => format!("{path}: needs blobs {b:?}"),
+                        })?
+                },
+            };
+        }
+        Ok(())
+    }
+
     /// The regular files under a guest directory, with paths relative to it: how a host takes
     /// back what a guest wrote (after the guest's `sync`). None if there is no such directory.
     pub fn fs_read_tree(&self, path: &str) -> Result<Option<Vec<FileContents>>, String> {
@@ -572,6 +598,8 @@ pub struct StateLoader {
     meta: Vec<u8>,
     /// One bit per RAM page the snapshot wrote; the others are made zero in `finish`
     written: Vec<u64>,
+    /// RAM was all zero before the snapshot's first page: the others need no zeroing
+    fresh: bool,
 }
 
 impl StateLoader {
@@ -581,6 +609,7 @@ impl StateLoader {
             buf: Vec::new(),
             meta: Vec::new(),
             written: Vec::new(),
+            fresh: false,
         }
     }
 
@@ -629,6 +658,7 @@ impl StateLoader {
                             // touching the ones that already are: a fresh machine's RAM is never
                             // committed beyond what the snapshot holds
                             self.written = vec![0; mem.len().div_ceil(PAGE).div_ceil(64)];
+                            self.fresh = mem.take_fresh();
                             Stage::Meta(meta)
                         },
                         Stage::Meta(_) => {
@@ -678,7 +708,11 @@ impl StateLoader {
         if !matches!(self.stage, Stage::Done) {
             return Err("truncated snapshot".into());
         }
-        zero_unwritten(&board.io.mem, &self.written);
+        // RAM that nothing wrote before the snapshot is zero where the snapshot lacks pages:
+        // checking that would read (and on macOS commit) every one of them
+        if !self.fresh {
+            zero_unwritten(&board.io.mem, &self.written);
+        }
         let mut r = R(&self.meta);
         let cpu_state = r.bytes().ok_or("corrupt snapshot")?;
         Cpu::load_machine_state(cpus, cpu_state)?;
@@ -729,5 +763,100 @@ mod restore_tests {
             "a page the snapshot doesn't have is zero again"
         );
         assert!(mem.is_zero(12 * PAGE, PAGE), "untouched pages stay zero");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fresh_restore_tests {
+    use super::{Config, PAGE};
+    use crate::ram::Ram;
+
+    fn vm() -> crate::Vm<crate::platform::NativePlatform> {
+        let config = Config {
+            memory_size: 16 << 20,
+            cpus: 1,
+            ..Default::default()
+        };
+        crate::runner::new_vm(config).unwrap().0
+    }
+
+    #[test]
+    fn a_restore_zeroes_what_its_snapshot_lacks_whether_or_not_ram_was_fresh() {
+        let mut a = vm();
+        a.board.io.mem.store(3 * PAGE, 1, 0x33);
+        a.board.io.mem.store(4 * PAGE, 1, 0x44);
+        let with_3_and_4 = a.save_state();
+        let mut b = vm();
+        b.board.io.mem.store(7 * PAGE, 1, 0x77);
+        let with_7 = b.save_state();
+
+        // Into fresh RAM: nothing to zero
+        let mut c = vm();
+        let mem = c.board.io.mem.alias();
+        c.load_state(&with_3_and_4).unwrap();
+        assert_eq!(mem.load(3 * PAGE, 1), 0x33);
+        assert!(mem.is_zero(7 * PAGE, PAGE));
+        // Into RAM the last restore wrote: the pages this snapshot lacks are zeroed
+        c.load_state(&with_7).unwrap();
+        assert_eq!(mem.load(7 * PAGE, 1), 0x77);
+        assert!(mem.is_zero(3 * PAGE, PAGE) && mem.is_zero(4 * PAGE, PAGE));
+    }
+
+    #[test]
+    fn ram_is_fresh_until_a_cpu_runs_or_anything_writes_it() {
+        let v = vm();
+        assert!(v.board.io.mem.take_fresh(), "a new machine's RAM");
+        assert!(!v.board.io.mem.take_fresh(), "taken once");
+
+        let mut c = vm();
+        c.cpus[0].run(1);
+        assert!(!c.board.io.mem.take_fresh(), "a CPU ran");
+
+        let writes: [fn(&Ram); 4] = [
+            |m| assert!(m.write(0, &[1])),
+            |m| assert!(m.zero(0, 1)),
+            |m| m.store(0, 1, 1),
+            |m| assert_eq!(m.cmpxchg(0, 1, 0, 1), Some(true)),
+        ];
+        for write in writes {
+            let v = vm();
+            // Through an alias, as CPUs and devices hold it
+            write(&v.board.io.mem.alias());
+            assert!(!v.board.io.mem.take_fresh());
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod host_fs_tests {
+    use super::Config;
+    use crate::dev::DeviceConfig;
+
+    #[test]
+    fn the_host_makes_directories_with_their_parents_and_files_beside_them() {
+        let config = Config {
+            memory_size: 16 << 20,
+            cpus: 1,
+            devices: DeviceConfig {
+                fs_tag: Some("root".into()),
+                ..Default::default()
+            },
+        };
+        let (vm, _clock) = crate::runner::new_vm(config).unwrap();
+        let b = &vm.board;
+        b.load_filesystem(br#"{"version":3,"size":0,"fsroot":[]}"#)
+            .unwrap();
+        assert_eq!(b.fs_read_tree("/job/out").unwrap(), None);
+        b.fs_mkdir("/job/out").unwrap();
+        b.fs_mkdir("/job/out").unwrap(); // already there: as mkdir -p
+        b.fs_mkdir("job/in/").unwrap();
+        assert_eq!(b.fs_read_tree("/job/out").unwrap(), Some(vec![]));
+        b.fs_write_file("/job/in/a", b"a", 0o644).unwrap();
+        assert_eq!(
+            b.fs_read_tree("/job").unwrap(),
+            Some(vec![("in/a".to_string(), b"a".to_vec())])
+        );
+        // A file in the way
+        assert!(b.fs_mkdir("/job/in/a/b").is_err());
     }
 }

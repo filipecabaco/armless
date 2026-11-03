@@ -14,13 +14,18 @@
 //! through the allocator took ~0.5 ms per MiB). Grown memory cannot be given
 //! back, so dropping such a buffer leaks it; the wasm build creates one CPU.
 
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
 
 pub struct Ram {
     ptr: *mut u8,
     len: usize,
     /// What the global allocator returned, to free it with (none for memory.grow and aliases).
     alloc: Option<(*mut u8, std::alloc::Layout)>,
+    /// Nothing has written RAM since it was allocated (shared with aliases): a restore can skip
+    /// zeroing the pages its snapshot lacks. Cleared by every write here and by a CPU's `run`
+    /// (compiled code stores through `as_ptr`).
+    fresh: Arc<AtomicBool>,
 }
 
 pub const PAGE: usize = 4096;
@@ -44,6 +49,7 @@ impl Ram {
                     ptr: (old * 65536) as *mut u8,
                     len,
                     alloc: None,
+                    fresh: Arc::new(AtomicBool::new(true)),
                 };
             }
         }
@@ -62,6 +68,7 @@ impl Ram {
             ptr: unsafe { raw.add(raw.align_offset(PAGE)) },
             len,
             alloc: Some((raw, layout)),
+            fresh: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -72,7 +79,22 @@ impl Ram {
             ptr: self.ptr,
             len: self.len,
             alloc: None,
+            fresh: self.fresh.clone(),
         }
+    }
+
+    /// Note that RAM may no longer be all zero.
+    #[inline(always)]
+    pub fn mark_written(&self) {
+        if self.fresh.load(Ordering::Relaxed) {
+            self.fresh.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether RAM is still all zero as allocated (nothing has written it), and from now on
+    /// counts as written: for a restore, which then needn't zero what its snapshot lacks.
+    pub fn take_fresh(&self) -> bool {
+        self.fresh.swap(false, Ordering::SeqCst)
     }
 
     pub fn len(&self) -> usize {
@@ -109,6 +131,7 @@ impl Ram {
         if !self.holds(at, data.len()) {
             return false;
         }
+        self.mark_written();
         // SAFETY: as in `read`.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(at), data.len()) };
         true
@@ -119,6 +142,7 @@ impl Ram {
         if !self.holds(at, n) {
             return false;
         }
+        self.mark_written();
         // SAFETY: in bounds.
         unsafe { std::ptr::write_bytes(self.ptr.add(at), 0, n) };
         true
@@ -175,6 +199,7 @@ impl Ram {
             debug_assert!(false, "store of {size} at {at:#x} outside RAM");
             return;
         }
+        self.mark_written();
         // SAFETY: as in `load`.
         unsafe {
             let p = self.ptr.add(at);
@@ -217,6 +242,7 @@ impl Ram {
     /// stored. None if not aligned or not RAM.
     pub fn cmpxchg(&self, at: u64, size: u32, expected: u64, new: u64) -> Option<bool> {
         let o = Ordering::SeqCst;
+        self.mark_written();
         // SAFETY: as in `load_atomic`.
         self.atomic(at, size, |p| unsafe {
             match size {

@@ -331,6 +331,8 @@ pub extern "C" fn armless_alloc_aligned(len: u32, align: u32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn armless_mem_ptr() -> u32 {
+    // The page may write RAM through it
+    vm().board.io.mem.mark_written();
     vm().board.io.mem.as_ptr() as u32
 }
 

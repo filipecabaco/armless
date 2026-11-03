@@ -694,6 +694,8 @@ impl<H: Host> Cpu<H> {
 
     /// Execute up to `budget` instructions.
     pub fn run(&mut self, budget: u64) -> Exit {
+        // Compiled code stores into RAM through its pointer, not through `Ram`
+        self.mem.mark_written();
         self.machine.cpus[self.index]
             .run_state
             .store(smp::RUN_RUNNING, Ordering::SeqCst);
