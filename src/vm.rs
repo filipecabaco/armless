@@ -56,6 +56,8 @@ pub struct Board {
     pub io: Io,
     pub devices: SpinLock<Devices>,
     pub config: Config,
+    /// The last entropy from `seed`: a boot hands it to Linux as the device tree's `/chosen/rng-seed`.
+    pub boot_seed: SpinLock<Vec<u8>>,
 }
 
 impl Board {
@@ -64,6 +66,7 @@ impl Board {
             io: Io::new(machine, clock),
             devices: SpinLock::new(Devices::new(&config.devices)),
             config,
+            boot_seed: SpinLock::new(Vec::new()),
         }
     }
 
@@ -295,6 +298,7 @@ impl Board {
     /// random generator at once: without it, every restore of a snapshot would draw the same
     /// "random" numbers (UUIDs, keys, nonces) as the machine that was saved.
     pub fn seed(&self, entropy: &[u8]) {
+        *self.boot_seed.lock() = entropy.to_vec();
         self.with_net(|s, _| {
             s.rng.seed(entropy);
             // Session tickets from before (another copy of this snapshot) stop working
@@ -443,7 +447,8 @@ impl<P: Platform> Vm<P> {
         cmdline: &str,
     ) -> Result<crate::BootLayout, String> {
         let image = crate::kernel::prepare(kernel)?;
-        crate::boot_linux(&mut self.cpus[0], &image, initrd, cmdline)
+        let seed = self.board.boot_seed.lock().clone();
+        crate::boot_linux_seeded(&mut self.cpus[0], &image, initrd, cmdline, &seed)
     }
 
     /// Boot the kernel and initrd found under /boot in the 9p filesystem.
