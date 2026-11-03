@@ -31,6 +31,9 @@ pub mod dev;
 pub(crate) mod dtb;
 pub(crate) mod fp;
 pub(crate) mod gic;
+#[cfg(target_arch = "wasm32")]
+#[allow(unsafe_code)]
+pub(crate) mod heap;
 pub mod jit;
 pub(crate) mod kernel;
 pub(crate) mod mmu;
@@ -58,6 +61,10 @@ pub mod zstd;
 #[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
 #[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
 pub mod wasm;
+
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static HEAP: heap::Heap = heap::Heap;
 
 pub use board::{Host, Platform};
 pub use cpu::{Cpu, Exit, StopReason};

@@ -156,6 +156,8 @@
         microtick: now,
         wall_clock_ms: () => Date.now(),
         host_notify: () => post({ t: "events" }),
+        // A browser cannot give back the pages of a shared memory: the heap keeps them.
+        heap_release: () => {},
         jit_compile: (slot, ptr, len) => {
           const code = new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice();
           WebAssembly.instantiate(code, { e: jit_imports }).then((r) => {
@@ -366,6 +368,7 @@
         microtick: () => performance.now(),
         wall_clock_ms: () => Date.now(),
         host_notify: () => this._notified(),
+        heap_release: () => {},
         jit_compile: (slot, ptr, len) => this._jit_compile(slot, ptr, len),
       };
       if (smp) {
