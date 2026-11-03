@@ -26,7 +26,7 @@ use std::sync::atomic::Ordering;
 use crate::board::{BoardHost, Platform};
 use crate::cpu::{Cpu, Exit, StopReason};
 use crate::dev::{DeviceConfig, Event};
-use crate::vm::{BootError, Config, StateLoader, Vm};
+use crate::vm::{BootError, Config, StateLoader, StateSaver, Vm};
 
 // SAFETY: armless.js provides these, with these signatures. None has preconditions: they take
 // numbers, and `jit_compile` only reads the bytes it is given.
@@ -96,6 +96,9 @@ fn js_clock() -> u64 {
 
 type JsCpu = Cpu<BoardHost<JsPlatform>>;
 
+/// The size of a piece of `armless_save_next`
+const SAVE_PIECE: usize = 1 << 20;
+
 /// The machine. Shared by every instance on the same memory.
 static mut VM: Option<Vm<JsPlatform>> = None;
 
@@ -111,6 +114,8 @@ std::thread_local! {
     /// A snapshot being restored (on the main thread), and its decompressor.
     static LOADER: std::cell::RefCell<Option<(StateLoader, Option<crate::zstd::Stream>)>> =
         const { std::cell::RefCell::new(None) };
+    /// A snapshot being saved in pieces (on the main thread).
+    static SAVER: std::cell::RefCell<Option<StateSaver>> = const { std::cell::RefCell::new(None) };
     /// When `armless_run` returned 1: when to run again, in microtick() ms, or -1.
     static WAKE_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
 }
@@ -711,6 +716,63 @@ pub extern "C" fn armless_save_state() -> u32 {
     let v = vm();
     let mut cpus: Vec<&mut JsCpu> = v.cpus.iter_mut().collect();
     out(crate::vm::save_state(&v.board, &mut cpus))
+}
+
+/// Start a snapshot that the host reads in pieces with `armless_save_next`, instead of the one
+/// buffer of `armless_save_state` (whose size is the snapshot's: the host's memory has to hold
+/// it, and a wasm heap does not shrink again). The CPUs must stay stopped until the end. 0 or -1.
+#[no_mangle]
+pub extern "C" fn armless_save_begin() -> i32 {
+    let v = vm();
+    let mut cpus: Vec<&mut JsCpu> = v.cpus.iter_mut().collect();
+    let n = cpus.len();
+    match StateSaver::new(&v.board, &mut cpus, n) {
+        Ok(saver) => {
+            SAVER.set(Some(saver));
+            0
+        },
+        Err(e) => {
+            set_error(e);
+            -1
+        },
+    }
+}
+
+/// The next piece (about 1 MiB) of the snapshot of `armless_save_begin`: its length (see
+/// `armless_buf`), or 0 when the snapshot has been given out. The bytes are those of
+/// `armless_save_state`, in order.
+#[no_mangle]
+pub extern "C" fn armless_save_next() -> u32 {
+    SAVER.with_borrow_mut(|s| {
+        let Some(saver) = s.as_mut() else {
+            return 0;
+        };
+        let more = BUF.with_borrow_mut(|buf| {
+            buf.clear();
+            buf.reserve_exact(SAVE_PIECE + 8192);
+            saver
+                .next(&vm().board, buf, SAVE_PIECE)
+                .then_some(buf.len() as u32)
+        });
+        if more.is_none() {
+            *s = None;
+        }
+        more.unwrap_or(0)
+    })
+}
+
+/// Drop the snapshot of `armless_save_begin` before it was all given out (the host could not write
+/// what it got): its header and state are freed, which only the last piece does otherwise.
+#[no_mangle]
+pub extern "C" fn armless_save_abort() {
+    SAVER.set(None);
+}
+
+/// Move the guest's clocks forward by `ms` milliseconds (call after a restore, with the time the
+/// machine was not running; see `Board::advance_clock`).
+#[no_mangle]
+pub extern "C" fn armless_clock_advance(ms: f64) {
+    vm().board.advance_clock((ms * 1e6) as u64);
 }
 
 /// Start restoring a snapshot; `compressed` = the data fed is zstd.
