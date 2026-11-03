@@ -329,6 +329,14 @@ pub extern "C" fn armless_alloc_aligned(len: u32, align: u32) -> u32 {
     unsafe { std::alloc::alloc_zeroed(layout) as u32 }
 }
 
+/// Gives back the big blocks that the allocator keeps to hand out again (see heap.rs): the host calls it when the
+/// machine is up and its memory is about to be measured.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn armless_heap_flush() {
+    crate::heap::flush();
+}
+
 #[no_mangle]
 pub extern "C" fn armless_mem_ptr() -> u32 {
     vm().board.io.mem.as_ptr() as u32
