@@ -127,6 +127,15 @@ impl Board {
         Ok(())
     }
 
+    /// Contents for a blob that the host has already decompressed (`provide_blob` without the zstd check).
+    pub fn provide_raw_blob(&self, name: &str, data: Vec<u8>) -> Result<(), String> {
+        let mut d = self.devices.lock();
+        let Some((t, p)) = d.p9() else { return Ok(()) };
+        p.fs.provide_raw(name, data)?;
+        p.blob_arrived(&self.io, t, name);
+        Ok(())
+    }
+
     /// Whether a blob is already loaded.
     pub fn has_blob(&self, name: &str) -> bool {
         self.devices
