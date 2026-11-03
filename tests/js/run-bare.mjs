@@ -48,4 +48,9 @@ if (stats) {
     `jit compiled ${s(0)} invalidated ${s(1)} runs ${s(2)}`);
 }
 if (stop.reason === "fault") console.error(`stopped at pc=0x${stop.pc.toString(16)}`);
-process.stdout.write("", () => process.exit({ poweroff: 0, halt: 1 }[stop.reason] ?? 5));
+// Leave through the event loop, not through process.exit(): exit() joins the threads of V8 while the main thread
+// is not parked, and a thread that is compiling the JS of the host (Maglev) and waits for a collection that the main
+// thread no longer runs never ends, so node 24 hung at the exit of this script about once in a hundred runs. With
+// the machine destroyed nothing keeps the loop alive, and node disposes of the isolate (which parks the main thread).
+vm.destroy();
+process.exitCode = { poweroff: 0, halt: 1 }[stop.reason] ?? 5;
