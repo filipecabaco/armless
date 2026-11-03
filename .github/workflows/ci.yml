@@ -1,9 +1,17 @@
 name: ci
 
+# Branches pushed to this repository get their run from the pull request; a push to one would run
+# every job a second time. main still runs on push: its own result, and the cache pull requests restore.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# A new push to a pull request cancels the run it supersedes; every commit on main runs to the end
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   core:
@@ -16,6 +24,11 @@ jobs:
           sudo apt-get install -y clang lld llvm
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
+      # The dependencies, compiled: restored everywhere, saved by main only (build/ is the target dir)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit tests and bare-metal guest
         run: cargo test --release
       # The dev profile checks arithmetic for overflow; release wraps silently
@@ -62,6 +75,11 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
+      # The dependencies, compiled: restored everywhere, saved by main only (build/ is the target dir)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit tests and bare-metal guest
         run: cargo test --release
       - name: Unit tests with overflow checks
@@ -81,6 +99,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Cache kernel
         id: kcache
         uses: actions/cache@v6
@@ -176,6 +198,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu qemu-user
           rustup target add wasm32-unknown-unknown
+      # The classes build the same thing: one of them saves the cache they all restore
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build"
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.classes == 'int' }}
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -215,6 +242,10 @@ jobs:
           sudo pip install --break-system-packages zstandard
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build armless.wasm and armless-smp.wasm
         run: |
           sh build-wasm.sh
