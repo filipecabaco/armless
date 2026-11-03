@@ -369,8 +369,12 @@ impl Board {
         self.with_web(id, |w| w.ws_close(code));
     }
 
-    /// A file's contents by absolute path (or the blobs it waits on).
-    pub fn read_file(&self, path: &str) -> Result<Vec<u8>, BootError> {
+    /// Run `f` on the file at an absolute path; the blobs it waits on are asked for as `BootError::Need`.
+    fn with_file<T>(
+        &self,
+        path: &str,
+        f: impl FnOnce(&mut crate::dev::fs::Fs, crate::dev::fs::Ino) -> crate::dev::fs::Res<T>,
+    ) -> Result<T, BootError> {
         let mut d = self.devices.lock();
         let Some((_, p)) = d.p9() else {
             return Err(BootError::Fail("no filesystem".into()));
@@ -378,13 +382,18 @@ impl Board {
         let ino =
             p.fs.lookup_path(path)
                 .ok_or_else(|| BootError::Fail(format!("{path}: not found")))?;
-        match p.fs.read_all(ino) {
+        match f(&mut p.fs, ino) {
             Ok(v) => Ok(v),
             Err(crate::dev::fs::Fail::Need(b)) => Err(BootError::Need(b)),
             Err(crate::dev::fs::Fail::Errno(e)) => {
                 Err(BootError::Fail(format!("{path}: error {e}")))
             },
         }
+    }
+
+    /// A file's contents by absolute path (or the blobs it waits on).
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>, BootError> {
+        self.with_file(path, |fs, ino| fs.read_all(ino))
     }
 
     /// The kernel and initrd under /boot (v86's `bzimage_initrd_from_filesystem`):
@@ -424,6 +433,22 @@ pub enum BootError {
 pub struct Vm<P: Platform> {
     pub board: Arc<Board>,
     pub cpus: Vec<Cpu<BoardHost<P>>>,
+    /// A boot from the filesystem that waits for blobs (`boot_from_fs`)
+    fs_boot: Option<FsBoot>,
+}
+
+/// The most of a file `boot_from_fs` has in the heap at once, as blobs; it is the heap's high-water mark.
+const BOOT_WINDOW: u64 = 4 << 20;
+
+/// A boot from the filesystem in progress: the kernel and the initrd go from their files into RAM a window at
+/// a time, and the blobs of what is copied are dropped, so that the heap (which never gives memory back) does
+/// not grow by their size.
+struct FsBoot {
+    plan: crate::LinuxPlan,
+    /// What is copied, in order: the path, the address in RAM and the length of each file
+    files: Vec<(String, u64, u64)>,
+    /// How many bytes of those are in RAM
+    done: u64,
 }
 
 impl<P: Platform> Vm<P> {
@@ -454,7 +479,11 @@ impl<P: Platform> Vm<P> {
                 )
             })
             .collect();
-        Ok(Vm { board, cpus })
+        Ok(Vm {
+            board,
+            cpus,
+            fs_boot: None,
+        })
     }
 
     pub fn machine(&self) -> &Arc<Machine> {
@@ -473,13 +502,92 @@ impl<P: Platform> Vm<P> {
         crate::boot_linux_seeded(&mut self.cpus[0], &image, initrd, cmdline, &seed)
     }
 
-    /// Boot the kernel and initrd found under /boot in the 9p filesystem.
+    /// Boot the kernel and initrd found under /boot in the 9p filesystem. A raw `Image` goes from its blobs
+    /// into RAM in windows of a few MiB (the blobs are asked for as they are needed, and dropped once copied):
+    /// call again with them provided on `BootError::Need`, as many times as it asks.
     pub fn boot_from_fs(&mut self, cmdline: &str) -> Result<crate::BootLayout, BootError> {
+        let r = self.fs_boot_step(cmdline);
+        if !matches!(r, Err(BootError::Need(_))) {
+            self.fs_boot = None;
+        }
+        r
+    }
+
+    fn fs_boot_step(&mut self, cmdline: &str) -> Result<crate::BootLayout, BootError> {
         let (k, rd) = self.board.find_boot_files().ok_or_else(|| {
             BootError::Fail("no kernel (/boot/vmlinuz*) in the filesystem".into())
         })?;
-        let kernel = self.board.read_file(&k);
-        let initrd = rd.as_ref().map(|p| self.board.read_file(p));
+        if self.fs_boot.is_none() {
+            let size = self
+                .board
+                .with_file(&k, |fs, ino| Ok(fs.inode(ino)?.size))?;
+            let mut head = [0u8; 64];
+            if size >= 64 {
+                self.board
+                    .with_file(&k, |fs, ino| fs.read_into(ino, 0, &mut head))?;
+            }
+            if !crate::is_raw_image(&head) {
+                // Compressed: it is decompressed whole
+                return self.boot_from_fs_whole(&k, rd.as_deref(), cmdline);
+            }
+            let rd_len = match &rd {
+                Some(p) => Some(self.board.with_file(p, |fs, ino| Ok(fs.inode(ino)?.size))?),
+                None => None,
+            };
+            let seed = self.board.boot_seed.lock().clone();
+            let plan = crate::plan_linux(
+                &self.cpus[0],
+                &head,
+                size as usize,
+                rd_len.map(|l| l as usize),
+                cmdline,
+                &seed,
+            )
+            .map_err(BootError::Fail)?;
+            let mut files = vec![(k.clone(), plan.layout.kernel_addr, size)];
+            if let (Some(p), Some((at, _)), Some(len)) = (&rd, plan.layout.initrd, rd_len) {
+                files.push((p.clone(), at, len));
+            }
+            self.fs_boot = Some(FsBoot {
+                plan,
+                files,
+                done: 0,
+            });
+        }
+        let fb = self.fs_boot.as_mut().expect("set above");
+        let mut start = 0;
+        for (path, addr, len) in &fb.files {
+            while fb.done < start + len {
+                let off = fb.done - start;
+                let n = BOOT_WINDOW.min(len - off);
+                let at = (addr + off) as usize;
+                let mem = &self.cpus[0].mem;
+                self.board.with_file(path, |fs, ino| {
+                    fs.read_with(ino, off, n, |pos, d| {
+                        mem.write(at + pos, d);
+                    })
+                })?;
+                self.board.with_file(path, |fs, ino| {
+                    fs.forget_file_before(ino, off + n);
+                    Ok(())
+                })?;
+                fb.done += n;
+            }
+            start += len;
+        }
+        self.cpus[0].reset();
+        fb.plan.finish(&mut self.cpus[0]).map_err(BootError::Fail)
+    }
+
+    /// The kernel and initrd read whole, for a kernel that has to be decompressed.
+    fn boot_from_fs_whole(
+        &mut self,
+        k: &str,
+        rd: Option<&str>,
+        cmdline: &str,
+    ) -> Result<crate::BootLayout, BootError> {
+        let kernel = self.board.read_file(k);
+        let initrd = rd.map(|p| self.board.read_file(p));
         let mut need = Vec::new();
         for r in [Some(&kernel), initrd.as_ref()].into_iter().flatten() {
             match r {

@@ -926,6 +926,82 @@ impl Fs {
         Ok(self.data(ino)?.to_vec())
     }
 
+    /// `dst.len()` bytes of a file from `offset`, copied straight into `dst` (as `read`, without a buffer of
+    /// their own), or the blobs they wait on. The file must have that many bytes.
+    pub fn read_into(&mut self, ino: Ino, offset: u64, dst: &mut [u8]) -> Res<()> {
+        let len = dst.len() as u64;
+        self.read_with(ino, offset, len, |at, d| {
+            dst[at..at + d.len()].copy_from_slice(d)
+        })
+    }
+
+    /// `len` bytes of a file from `offset`, given to `sink` as they lie (the position of each piece in the range,
+    /// and the piece), or the blobs they wait on: as `read_into`, for a destination that is not a slice (RAM).
+    /// The file must have that many bytes.
+    pub fn read_with(
+        &mut self,
+        ino: Ino,
+        offset: u64,
+        len: u64,
+        mut sink: impl FnMut(usize, &[u8]),
+    ) -> Res<()> {
+        let end = offset.saturating_add(len);
+        if end > self.inode(ino)?.size {
+            return Err(EINVAL.into());
+        }
+        if let Content::Chunks(_) = self.inode(ino)?.content {
+            self.need_chunks(ino, offset, end)?;
+            let Content::Chunks(chunks) = &self.inode(ino)?.content else {
+                unreachable!()
+            };
+            for (k, pos) in Self::chunks_in(chunks, offset, end) {
+                let c = &chunks[k];
+                let d = self.piece(c)?.ok_or(Fail::Errno(EIO))?;
+                let a = offset.max(pos) - pos;
+                let b = end.min(pos + c.len) - pos;
+                let at = (pos + a - offset) as usize;
+                sink(at, &d[a as usize..b as usize]);
+            }
+            return Ok(());
+        }
+        let data = self.data(ino)?;
+        let src = data.get(offset as usize..end as usize).ok_or(EIO)?;
+        sink(0, src);
+        Ok(())
+    }
+
+    /// Forget the blobs of the part of a file that ends at or before `end` (they are fetched again if it is
+    /// read again). A host that has copied that part elsewhere does not keep it in the heap, which a wasm
+    /// module never gives back.
+    pub fn forget_file_before(&mut self, ino: Ino, end: u64) {
+        let mut names = Vec::new();
+        if let Some(i) = self.get(ino) {
+            match &i.content {
+                Content::Blob(n) if i.size <= end => names.push(n.clone()),
+                Content::Chunks(chunks) => {
+                    let mut pos = 0;
+                    for c in chunks {
+                        pos += c.len;
+                        if pos > end {
+                            break;
+                        }
+                        if let Piece::Blob(n) = &c.data {
+                            names.push(n.clone());
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
+        for n in names {
+            if let Some(b) = self.blobs.remove(&n) {
+                self.cached -= b.len();
+                self.order.retain(|o| *o != n);
+            }
+            self.pinned.remove(&n);
+        }
+    }
+
     pub fn statfs(&self) -> (u64, u64) {
         let used: u64 = self.inodes.iter().flatten().map(|i| i.size).sum();
         let files = self.inodes.iter().flatten().count() as u64;
