@@ -111,15 +111,65 @@ pub fn boot_linux_seeded<H: Host>(
     cmdline: &str,
     rng_seed: &[u8],
 ) -> Result<BootLayout, String> {
-    if image.len() >= 2 && image[0] == 0x1f && image[1] == 0x8b {
+    let plan = plan_linux(
+        cpu,
+        image,
+        image.len(),
+        initrd.map(|rd| rd.len()),
+        cmdline,
+        rng_seed,
+    )?;
+    cpu.reset();
+    load(cpu, plan.layout.kernel_addr, image)?;
+    if let (Some(rd), Some((s, _))) = (initrd, plan.layout.initrd) {
+        load(cpu, s, rd)?;
+    }
+    plan.finish(cpu)
+}
+
+/// Whether the start of a file (its first 64 bytes) is that of a raw arm64 `Image`.
+pub fn is_raw_image(head: &[u8]) -> bool {
+    head.len() >= 64
+        && u32::from_le_bytes(head[56..60].try_into().unwrap()) == IMAGE_MAGIC
+        && &head[4..8] != b"zimg"
+}
+
+/// Where a Linux boot puts the kernel, the initrd and the device tree.
+pub struct LinuxPlan {
+    pub layout: BootLayout,
+    dtb: Vec<u8>,
+}
+
+impl LinuxPlan {
+    /// Start the CPU at the kernel, once the kernel and the initrd are in RAM where `layout` says and the CPU
+    /// is reset: the device tree is put in place and x0 points to it.
+    pub fn finish<H: Host>(&self, cpu: &mut Cpu<H>) -> Result<BootLayout, String> {
+        load(cpu, self.layout.dtb_addr, &self.dtb)?;
+        cpu.x[0] = self.layout.dtb_addr;
+        cpu.pc = self.layout.kernel_addr;
+        Ok(self.layout.clone())
+    }
+}
+
+/// Check a kernel and lay a boot out, before any of it is copied: `head` is the start of the kernel image (at
+/// least its 64 bytes of header) and `image_len` its whole length.
+pub fn plan_linux<H: Host>(
+    cpu: &Cpu<H>,
+    head: &[u8],
+    image_len: usize,
+    initrd_len: Option<usize>,
+    cmdline: &str,
+    rng_seed: &[u8],
+) -> Result<LinuxPlan, String> {
+    if head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b {
         return Err("kernel is gzip-compressed; decompress it to a raw Image first".into());
     }
-    if image.len() < 64 {
+    if image_len < 64 || head.len() < 64 {
         return Err("kernel image too small".into());
     }
-    let word = |o: usize| u32::from_le_bytes(image[o..o + 4].try_into().unwrap());
-    let dword = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
-    if &image[4..8] == b"zimg" {
+    let word = |o: usize| u32::from_le_bytes(head[o..o + 4].try_into().unwrap());
+    let dword = |o: usize| u64::from_le_bytes(head[o..o + 8].try_into().unwrap());
+    if &head[4..8] == b"zimg" {
         return Err("EFI zboot images are not supported; extract the inner Image".into());
     }
     if word(56) != IMAGE_MAGIC {
@@ -129,24 +179,24 @@ pub fn boot_linux_seeded<H: Host>(
     let mut image_size = dword(16);
     if image_size == 0 {
         // Pre-3.17 kernels: unknown size, assume the file plus generous bss.
-        image_size = image.len() as u64 + (16 << 20);
+        image_size = image_len as u64 + (16 << 20);
     }
     let mem_size = cpu.mem.len() as u64;
     let kernel_addr = board::RAM_BASE + board::KERNEL_OFFSET + text_offset;
-    let kernel_end = kernel_addr + image_size.max(image.len() as u64);
+    let kernel_end = kernel_addr + image_size.max(image_len as u64);
     if kernel_end > mem_size {
         return Err(format!("kernel needs {} MiB of RAM", kernel_end >> 20));
     }
 
     // DTB in the top 2 MiB, initrd just below it.
     let dtb_addr = align_down(mem_size - (2 << 20), 2 << 20);
-    let initrd_range = match initrd {
-        Some(rd) => {
-            let start = align_down(dtb_addr - rd.len() as u64, 4096);
+    let initrd_range = match initrd_len {
+        Some(len) => {
+            let start = align_down(dtb_addr - len as u64, 4096);
             if start < align_up(kernel_end, 2 << 20) {
                 return Err("not enough RAM for kernel + initrd".into());
             }
-            Some((start, start + rd.len() as u64))
+            Some((start, start + len as u64))
         },
         None => None,
     };
@@ -160,20 +210,14 @@ pub fn boot_linux_seeded<H: Host>(
     if dtb.len() > 2 << 20 {
         return Err("device tree too large".into());
     }
-
-    cpu.reset();
-    load(cpu, kernel_addr, image)?;
-    load(cpu, dtb_addr, &dtb)?;
-    if let (Some(rd), Some((s, _))) = (initrd, initrd_range) {
-        load(cpu, s, rd)?;
-    }
-    cpu.x[0] = dtb_addr;
-    cpu.pc = kernel_addr;
-    Ok(BootLayout {
-        kernel_addr,
-        kernel_end,
-        dtb_addr,
-        initrd: initrd_range,
+    Ok(LinuxPlan {
+        layout: BootLayout {
+            kernel_addr,
+            kernel_end,
+            dtb_addr,
+            initrd: initrd_range,
+        },
+        dtb,
     })
 }
 
