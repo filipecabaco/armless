@@ -937,6 +937,34 @@ impl Fs {
 
     // ------------------------------------------------------------ snapshot
 
+    /// An upper bound of the bytes `save` writes, to size its buffer once: a buffer that grows by
+    /// doubling leaves the smaller ones behind in the heap, which for the contents of the files the
+    /// guest wrote is as much again.
+    pub fn save_size_hint(&self) -> usize {
+        let mut n = 8 + self.inodes.len();
+        for i in self.inodes.iter().flatten() {
+            n += 96 + match &i.content {
+                Content::Dir { entries, .. } => {
+                    entries.keys().map(|k| k.len() + 16).sum::<usize>()
+                },
+                Content::Symlink(t) => t.len(),
+                Content::Blob(name) => name.len(),
+                Content::Mem(d) => d.len(),
+                Content::Special => 0,
+                Content::Chunks(chunks) => chunks
+                    .iter()
+                    .map(|c| {
+                        17 + match &c.data {
+                            Piece::Blob(name) => name.len(),
+                            Piece::Mem(d) => d.len(),
+                        }
+                    })
+                    .sum::<usize>(),
+            };
+        }
+        n
+    }
+
     pub fn save(&self, w: &mut W) {
         w.u64(self.inodes.len() as u64);
         for slot in &self.inodes {

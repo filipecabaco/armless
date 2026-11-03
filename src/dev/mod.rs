@@ -361,6 +361,14 @@ impl Devices {
         }
     }
 
+    /// An upper bound of what the 9p filesystem adds to `save` (the rest is small)
+    pub fn save_size_hint(&self) -> usize {
+        match self.pci.slot(SLOT_FS) {
+            Some((_, virtio::Device::P9(p))) => p.fs.save_size_hint(),
+            _ => 0,
+        }
+    }
+
     pub fn save(&self, w: &mut W) {
         self.uart.save(w);
         self.pci.save(w);
