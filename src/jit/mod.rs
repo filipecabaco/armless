@@ -49,6 +49,17 @@ enum SlotState {
     Dead,
 }
 
+/// What `jit_compile` did with a hot entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Compile {
+    /// A compile was started.
+    Started,
+    /// Not now: a compile that has the entry, or one of its page, is in flight.
+    Waiting,
+    /// Not at all: the entry has a module, or the page has all the entries it may, or nothing can compile it.
+    Declined,
+}
+
 /// A page (with its EL and SPSel) that has, or is about to have, a module.
 #[derive(Default)]
 struct PageInfo {
@@ -485,8 +496,28 @@ impl<H: Host> Cpu<H> {
         // doubles (at most 8 times the configured one), so that the code that is run the most stays.
         let threshold = self.hot_threshold();
         if c >= threshold {
-            if self.jit_compile(key) && self.jit.sync_compile && self.jit.enabled {
-                self.jit.yielded = true;
+            match self.jit_compile(key) {
+                Compile::Started => {
+                    if self.jit.sync_compile && self.jit.enabled {
+                        self.jit.yielded = true;
+                    }
+                },
+                Compile::Waiting => {
+                    // A compile that has the entry is in flight, or one of its page, which this one waits for:
+                    // the loop of the interpreter, which exits to `jit_step` for an entry whose count is at
+                    // the threshold, would exit for each execution of it from now on, to be refused again.
+                    // Count it from just above the count that warms it, so that it is back here after the
+                    // executions in between, to be compiled when it can be. (A module that gets ready is
+                    // found by the loop itself, see `has_module`, whatever the count.)
+                    let warm = threshold.div_ceil(4).max(1);
+                    if warm + 1 < threshold {
+                        self.jit.pre.set_count(pa as usize & !0xfff, i, warm + 1);
+                    }
+                },
+                // Nothing to wait for. The count is in the predecoded slot, which every context of the
+                // physical code shares, while a page has its entries per context: one that has all the
+                // entries it may must not keep another from reaching the threshold, so the count stays.
+                Compile::Declined => {},
             }
         } else if c == threshold.div_ceil(4) {
             self.jit_warm(key);
@@ -504,9 +535,10 @@ impl<H: Host> Cpu<H> {
     }
 
     /// Compile the page of the hot entry `key`, unless a compile including
-    /// it is in flight. Returns true if a compile was started.
+    /// it is in flight. Says whether a compile was started, and if not whether
+    /// the entry can be compiled later (`Waiting`).
     #[cold]
-    fn jit_compile(&mut self, key: u64) -> bool {
+    fn jit_compile(&mut self, key: u64) -> Compile {
         #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
         if self.jit.native.as_ref().is_some_and(|n| n.full()) {
             // Start a new module: no slot may point into the old one.
@@ -524,7 +556,7 @@ impl<H: Host> Cpu<H> {
             let i = hash(key);
             self.jit.lookup_key[i] = key;
             self.jit.lookup_slot[i] = slot;
-            return false;
+            return Compile::Declined;
         }
         // An entry that got hot on a page a profile queued is needed now: it gets a module of its
         // own at once rather than waiting behind the rest of the profile
@@ -534,18 +566,18 @@ impl<H: Host> Cpu<H> {
             && info.compiling_entries.contains(&off)
             && !info.extra_compiling.iter().any(|(_, e)| e.contains(&off));
         if info.covers(off) && !waits_for_later {
-            return false;
+            return Compile::Waiting;
         }
         let busy = info.compiling.is_some();
         if busy && !additive {
             if !info.warm.contains(&off) {
                 info.warm.push(off);
             }
-            return false;
+            return Compile::Waiting;
         }
         if info.covered() >= MAX_ENTRIES {
             // The page has as many compiled entries as it may: further ones stay interpreted.
-            return false;
+            return Compile::Declined;
         }
         // A page with a module (or one on the way) gets another for this entry and the warm ones
         // no module has; else the page's module is (re)compiled with them all, and with the
@@ -576,14 +608,14 @@ impl<H: Host> Cpu<H> {
             self.jit.flush_all();
             self.jit.free.pop()
         }) else {
-            return false;
+            return Compile::Waiting;
         };
         // flush_all may have removed the page info
         let page_pa = (page_key >> 2) as usize;
         let mut page = [0u8; 0x1000];
         if !self.mem.read(page_pa, &mut page) {
             self.jit.free.push(slot);
-            return false;
+            return Compile::Declined;
         }
         let words: Vec<u32> = page
             .as_chunks::<4>()
@@ -633,9 +665,9 @@ impl<H: Host> Cpu<H> {
             // Nothing can compile it: give up on the JIT.
             self.jit.enabled = false;
             self.jit.flush_all();
-            return false;
+            return Compile::Declined;
         }
-        true
+        Compile::Started
     }
 
     /// Whether a page gets a module of its own for entries that get hot after it was compiled
@@ -789,7 +821,7 @@ impl<H: Host> Cpu<H> {
             // The rest go into the same module as warm entries
             self.jit.pages.entry(page.key).or_default().warm = offs[1..].to_vec();
             self.jit.prewarming = true;
-            if self.jit_compile(page.key | ((offs[0] as u64) << 2)) {
+            if self.jit_compile(page.key | ((offs[0] as u64) << 2)) == Compile::Started {
                 queued += 1;
             }
             self.jit.prewarming = false;
@@ -1146,11 +1178,11 @@ extern "C" fn native_interp<H: Host>(insn: i32, pc: i64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::Host;
-    use crate::cpu::Cpu;
+    use super::*;
 
-    struct NoDevices;
-    impl Host for NoDevices {
+    /// A host with a JIT that takes the compile requests.
+    struct Takes;
+    impl Host for Takes {
         fn mmio_read(&mut self, _: u64, _: u32) -> Option<u64> {
             None
         }
@@ -1163,6 +1195,55 @@ mod tests {
         fn wall_clock_secs(&mut self) -> u64 {
             0
         }
+        fn jit_compile(&mut self, _: u32, _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    const CODE: u64 = 0x10000;
+    const THRESHOLD: u32 = 64;
+
+    /// A machine whose entry at `CODE` has been counted to just below the threshold, with `info` the
+    /// page's info (what the other contexts, and the compiles in flight, made of it); `jit_step` is then
+    /// run once more, and the count the entry has after it is returned.
+    #[allow(unsafe_code)]
+    fn count_after_a_step(info: PageInfo) -> u32 {
+        let mut c = Cpu::new(4 << 20, Takes);
+        c.jit.enabled = true;
+        c.jit.threshold = THRESHOLD;
+        c.mem.write(CODE as usize, &0x1400_0000u32.to_le_bytes());
+        c.pc = CODE;
+        // The first step decodes the entry and counts it once.
+        assert!(matches!(c.jit_step(1), JitStep::NotCompiled));
+        c.jit.pre.set_count(CODE as usize & !0xfff, 0, THRESHOLD - 1);
+        c.jit.pages.insert(page_of(Jit::key(CODE, c.el, c.spsel)), info);
+        assert!(matches!(c.jit_step(1), JitStep::NotCompiled));
+        let ops = c.jit.pre.enter(CODE as usize);
+        assert!(!ops.is_null());
+        // SAFETY: `ops` is the ops of the page at CODE, a live slot of 1024 ops or more.
+        unsafe { (*ops).cnt as u32 }
+    }
+
+    /// The count of an entry is in the predecoded slot, shared by every context that runs the code, so a
+    /// refusal that does not pass (the page has all the entries it may, in one context) must not take it
+    /// from the others, while one that does (a compile in flight) counts the entry again from below.
+    #[test]
+    fn a_refusal_that_does_not_pass_leaves_the_count_and_one_that_passes_resets_it() {
+        // The page has as many entries as it may, none of them this one: declined, the count stays.
+        let full = PageInfo {
+            slot: Some(0),
+            entries: (1..=MAX_ENTRIES as u16).collect(),
+            ..PageInfo::default()
+        };
+        assert!(full.covered() >= MAX_ENTRIES && !full.covers(0));
+        assert_eq!(count_after_a_step(full), THRESHOLD);
+        // A compile that has the entry is in flight: waiting, the count is back above the warm one.
+        let flying = PageInfo {
+            compiling: Some(0),
+            compiling_entries: vec![0],
+            ..PageInfo::default()
+        };
+        assert_eq!(count_after_a_step(flying), THRESHOLD.div_ceil(4) + 1);
     }
 
     const SUBS_X1: u32 = 0xf100_0421; // subs x1, x1, #1
@@ -1176,8 +1257,8 @@ mod tests {
     /// compare that was decoded with the branch after it, whichever of the two is written), the others are kept.
     #[test]
     fn a_write_that_misses_the_compiled_words_drops_the_ops_of_the_words_it_writes() {
-        let mut c = Cpu::new(4 << 20, NoDevices);
-        let w = |c: &Cpu<NoDevices>, i: usize, insn: u32| {
+        let mut c = Cpu::new(4 << 20, Takes);
+        let w = |c: &Cpu<Takes>, i: usize, insn: u32| {
             c.mem.write(0x1000 + 4 * i, &insn.to_le_bytes());
         };
         for (i, insn) in [SUBS_X1, B_NE_BACK, MOVZ_X0_7, MOVZ_X2_9].into_iter().enumerate() {

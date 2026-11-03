@@ -155,20 +155,22 @@ impl<H: Host> Cpu<H> {
     /// least 1) in all. Returns what the last of them leaves for the pc, how many were run (a faulting one
     /// counts), and the pc of the last one. `self.pc`, `next_pc` and `insn_count` are for `step_page` to set.
     ///
-    /// The loop ends at a budget that is used up, at the end of the page, at a taken branch whose target is not
-    /// in the page or that `jit_step` counts (see `jump`), at an op that `Gen` or a load or store that the fast
-    /// tables do not serve runs, and at an exception. Nothing that is not inlined is called in the loop for
-    /// the kinds it has, so the loop keeps what it carries in registers; `Cache::drop_page` and `evict` run
-    /// in calls that end the run (a store to the page, an instruction-cache invalidation, a page decoded), so
-    /// the ops that it runs are never dropped under it.
+    /// The loop ends at a budget that is used up, at the end of the page, at a taken branch that `jit_step`
+    /// counts (see `jump`) or whose target is in another page that the fetch path does not hold or the cache
+    /// has no ops for (a taken branch to a page that it holds goes on there, see `cross`), at an op that `Gen`
+    /// or a load or store that the fast tables do not serve runs, and at an exception. Nothing that is not
+    /// inlined is called in the loop for the kinds it has, so the loop keeps what it carries in registers;
+    /// `Cache::drop_page` and `evict` run in calls that end the run (a store to a page, an instruction-cache
+    /// invalidation, a page decoded), so the ops that it runs are never dropped under it. Across pages, `ops0`
+    /// and `page_pc` are those of the page the loop is in, the current page of the fetch path and the cache.
     ///
     /// # Safety
     /// `ops` points at the `SLOT_OPS` ops of a live slot, whose page is the one `page_pc` is in; `start` is an
     /// index in it.
     pub(super) unsafe fn run_ops(
         &mut self,
-        ops0: *mut Op,
-        page_pc: u64,
+        mut ops0: *mut Op,
+        mut page_pc: u64,
         start: usize,
         max: u64,
     ) -> (Res<u64>, u64, u64) {
@@ -324,12 +326,59 @@ impl<H: Host> Cpu<H> {
                 continue;
             }};
         }
+        // The op that continues at `$next`, an aligned target in another page, after a taken branch: `jump` in that
+        // page, when the fetch path holds the page and the cache has its ops (`enter_page`), and it is the page
+        // that the loop runs from then on (`ops0` and `page_pc`, the current page of the fetch path and the
+        // cache). Else the run ends, and `step_page` does what it does for a branch out of the page: fetch and
+        // translate it (and raise the fault of that), decode it. A `jit_step` that has more to do than count the
+        // entry, as in `jump`, ends it too, before the loop leaves the page it is in. `rem` and `blk` do not
+        // depend on the page, so the budget is the same one all through.
+        macro_rules! cross {
+            ($next:expr) => {{
+                let next: u64 = $next;
+                let left = rem - (op.offset_from(blk) as u64 + 1);
+                if left == 0 {
+                    break (Ok(next), max, pc!());
+                }
+                let nops = self.enter_page(next);
+                if nops.is_null() {
+                    break (Ok(next), done!(1), pc!());
+                }
+                let idx = ((next & 0xfff) >> 2) as usize;
+                let t = nops.add(idx);
+                if self.jit.enabled {
+                    let base = self.fast[self.el as usize].code_base;
+                    let (w, h, m) = self.page_counts(base);
+                    let key = crate::jit::Jit::key(base as u64, self.el, self.spsel);
+                    let c = (*t).cnt as u32 + 1;
+                    if (*t).k == K::Miss
+                        || c == w
+                        || c >= h
+                        || (m && self.jit.has_module(key + ((idx as u64) << 4)))
+                    {
+                        break (Ok(next), done!(1), pc!());
+                    }
+                    (*t).cnt = c as u16;
+                    warm_at = w;
+                    hot_at = h;
+                    mods = m;
+                    mkey = key;
+                }
+                ops0 = nops;
+                page_pc = next & !0xfff;
+                rem = left;
+                blk = t;
+                end = t.wrapping_add(left as usize);
+                op = t;
+                continue;
+            }};
+        }
         // A taken direct branch.
         macro_rules! take {
             () => {{
                 let next = page_pc.wrapping_add(o!(imm));
                 if o!(x) == OUT {
-                    break (Ok(next), done!(1), pc!());
+                    cross!(next)
                 }
                 jump!(ops0.add(o!(x) as usize), next)
             }};
@@ -338,8 +387,11 @@ impl<H: Host> Cpu<H> {
         macro_rules! take_reg {
             ($t:expr) => {{
                 let t: u64 = $t;
-                if (t ^ page_pc) >> 12 != 0 || t & 3 != 0 {
+                if t & 3 != 0 {
                     break (Ok(t), done!(1), pc!());
+                }
+                if (t ^ page_pc) >> 12 != 0 {
+                    cross!(t)
                 }
                 jump!(ops0.add(((t & 0xfff) >> 2) as usize), t)
             }};
@@ -1623,5 +1675,533 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    // ------------------------------------------------------------ programs of several pages
+
+    /// A host with a JIT that takes the compile requests and never reports one ready, as a compile that is
+    /// slow does: the entries it was asked for stay in flight, the interpreter goes on running the code, and
+    /// `jit_step` is refused the next compile of them.
+    struct Takes;
+    impl Host for Takes {
+        fn mmio_read(&mut self, _: u64, _: u32) -> Option<u64> {
+            None
+        }
+        fn mmio_write(&mut self, _: u64, _: u32, _: u64) -> bool {
+            false
+        }
+        fn now_ns(&mut self) -> u64 {
+            0
+        }
+        fn wall_clock_secs(&mut self) -> u64 {
+            0
+        }
+        fn jit_compile(&mut self, _: u32, _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// What the machine under test has for a JIT.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Tier {
+        /// None: the loop only.
+        Off,
+        /// The one of `Takes`: it counts the entries and has compiles asked for, which never get ready.
+        Stub,
+        /// The native one, which compiles the hot entries, so that the loop finds modules to run.
+        Native,
+    }
+
+    /// The code of the programs: `PAGES` pages from `CODE`, the machine's memory being the address space.
+    const CODE: u64 = 0x10000;
+    const PAGES: usize = 4;
+
+    fn put<H: Host>(c: &mut Cpu<H>, at: u64, word: u32) {
+        c.mem.write(at as usize, &word.to_le_bytes());
+    }
+
+    /// `B to` at address `from`.
+    fn branch(from: u64, to: u64) -> u32 {
+        0x1400_0000 | (((to as i64 - from as i64) / 4) as u32 & 0x3ff_ffff)
+    }
+
+    /// The instruction at the pc of `b`, run by `execute`, which is how the loop is held to what it does: the
+    /// MMU is off in the machine, so the pc is the address in memory.
+    fn step_ref<H: Host>(b: &mut Cpu<H>) {
+        let pc = b.pc;
+        let insn = b.mem.load(pc as usize, 4) as u32;
+        b.next_pc = pc + 4;
+        match b.execute(insn).map(|()| b.next_pc) {
+            Ok(next) => b.pc = next,
+            Err(ev) => {
+                let _ = b.step_event(pc, ev);
+            },
+        }
+    }
+
+    /// What differs between two machines that ran the same instructions, if anything.
+    fn differ<H: Host, G: Host>(a: &Cpu<H>, b: &Cpu<G>) -> Option<String> {
+        if a.x[..32] != b.x[..32] {
+            let r = (0..32).find(|&r| a.x[r] != b.x[r]).unwrap();
+            Some(format!("x{r}: {:#x} against {:#x}", a.x[r], b.x[r]))
+        } else if (a.sp_el0, a.sp_el1) != (b.sp_el0, b.sp_el1) {
+            Some("sp".to_string())
+        } else if (a.n, a.z, a.c, a.v) != (b.n, b.z, b.c, b.v) {
+            Some("flags".to_string())
+        } else if a.pc != b.pc || a.el != b.el {
+            Some(format!("pc {:#x} against {:#x}", a.pc, b.pc))
+        } else if (a.sys.esr, a.sys.elr, a.sys.far) != (b.sys.esr, b.sys.elr, b.sys.far) {
+            Some(format!(
+                "esr/elr/far {:#x} {:#x} {:#x} against {:#x} {:#x} {:#x}",
+                a.sys.esr, a.sys.elr, a.sys.far, b.sys.esr, b.sys.elr, b.sys.far
+            ))
+        } else if a.vreg != b.vreg {
+            Some("vreg".to_string())
+        } else {
+            None
+        }
+    }
+
+    impl Rng {
+        /// A word of a program of `n` words for the branch at word `j` to go to: near it half of the time,
+        /// else anywhere in the program (so, mostly, in another page).
+        fn target(&mut self, j: usize, n: usize) -> usize {
+            if self.next() & 1 != 0 {
+                let t = j as i64 + (self.next() % 129) as i64 - 64;
+                t.clamp(0, n as i64 - 1) as usize
+            } else {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        /// A program of `PAGES` pages: what `flag_program` writes, with branches of every kind in the place of
+        /// some of its instructions, to words anywhere in the program, backwards too: B, BL, B.cond, CBZ and
+        /// CBNZ, TBZ and TBNZ, RET (x30), and BR, BLR and RET (x17) behind the MOVZ and MOVK that give x17 the
+        /// address of a word. The last word goes back to the first.
+        fn paged_program(&mut self) -> Vec<u32> {
+            let n = PAGES * 1024;
+            let mut code = self.flag_program(n);
+            let mut j = 0usize;
+            loop {
+                j += 1 + (self.next() % 10) as usize;
+                if j + 3 >= n - 1 {
+                    break;
+                }
+                let t = self.target(j, n);
+                let off = t as i64 - j as i64;
+                let imm26 = (off as u32) & 0x3ff_ffff;
+                let imm19 = ((off as u32) & 0x7_ffff) << 5;
+                let imm14 = ((off as u32) & 0x3fff) << 5;
+                let rt = self.small_reg();
+                match self.next() % 14 {
+                    0..=2 => code[j] = 0x1400_0000 | imm26,
+                    3 => code[j] = 0x9400_0000 | imm26,
+                    4 => code[j] = 0x5400_0000 | imm19 | (self.next() % 16) as u32,
+                    5..=6 => {
+                        let op = [0xb400_0000u32, 0xb500_0000, 0x3400_0000, 0x3500_0000];
+                        code[j] = op[(self.next() % 4) as usize] | imm19 | rt;
+                    },
+                    7 => {
+                        let bit = (self.next() % 64) as u32;
+                        let op = [0x3600_0000u32, 0x3700_0000][(self.next() % 2) as usize];
+                        code[j] = op | ((bit >> 5) << 31) | ((bit & 31) << 19) | imm14 | rt;
+                    },
+                    8 => code[j] = 0xd65f_03c0,
+                    9..=11 => {
+                        let va = CODE + 4 * t as u64;
+                        code[j] = 0xd280_0000 | (((va & 0xffff) as u32) << 5) | 17;
+                        code[j + 1] = 0xf2a0_0000 | ((((va >> 16) & 0xffff) as u32) << 5) | 17;
+                        let op = [0xd61f_0220u32, 0xd63f_0220, 0xd65f_0220];
+                        code[j + 2] = op[(self.next() % 3) as usize];
+                        j += 2;
+                    },
+                    _ => {},
+                }
+            }
+            code[n - 1] = 0x1400_0000 | ((1 - n as i64) as u32 & 0x3ff_ffff);
+            code
+        }
+    }
+
+    /// Programs of several pages, run by the loop in rounds from random words, with budgets around the length
+    /// of a run (`PAGE_RUN`) and short ones, leave what `execute` leaves, one instruction at a time: registers,
+    /// flags and pc, wherever the run ends (in the middle of a page, between a compare and its branch, in the
+    /// first instruction of a page that a branch led to), and the budget is the exact one.
+    fn paged_vs_execute(tier: Tier, seed: u64, programs: usize) {
+        const EDGES: [u64; 8] = [
+            0,
+            1,
+            2,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+        ];
+        let n = (PAGES * 1024) as u64;
+        let mut rng = Rng(seed);
+        let (mut bad, mut changes) = (Vec::new(), 0u64);
+        'programs: for prog in 0..programs {
+            let code = rng.paged_program();
+            let mut a = Cpu::new(4 << 20, Takes);
+            let mut b = Cpu::new(4 << 20, Takes);
+            a.sys.cpacr = 3 << 20;
+            b.sys.cpacr = 3 << 20;
+            match tier {
+                Tier::Off => {},
+                Tier::Stub => {
+                    a.jit.enabled = true;
+                    a.jit.threshold = 16;
+                },
+                Tier::Native => {
+                    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+                    {
+                        if !a.enable_native_jit() {
+                            return; // no Cranelift backend for this host
+                        }
+                        a.jit.threshold = 4;
+                    }
+                },
+            }
+            for (j, w) in code.iter().enumerate() {
+                put(&mut a, CODE + 4 * j as u64, *w);
+                put(&mut b, CODE + 4 * j as u64, *w);
+            }
+            for round in 0..5 {
+                let budget = match round {
+                    0 => 255,
+                    1 => 256,
+                    2 => 257,
+                    3 => 1 + rng.next() % 40,
+                    _ => 600 + rng.next() % 900,
+                };
+                let start = CODE + 4 * (rng.next() % n);
+                let (r17, r30) = (CODE + 4 * (rng.next() % n), CODE + 4 * (rng.next() % n));
+                let (s0, s1, f) = (rng.reg(), rng.reg(), rng.next());
+                for r in 0..8 {
+                    let v = match rng.next() & 1 {
+                        0 => EDGES[(rng.next() % 8) as usize],
+                        _ => rng.reg(),
+                    };
+                    a.x[r] = v;
+                    b.x[r] = v;
+                }
+                for c in [&mut a, &mut b] {
+                    c.x[17] = r17;
+                    c.x[30] = r30;
+                    c.sp_el0 = s0;
+                    c.sp_el1 = s1;
+                    c.n = f & 1 != 0;
+                    c.z = f & 2 != 0;
+                    c.c = f & 4 != 0;
+                    c.v = f & 8 != 0;
+                    c.pc = start;
+                }
+                let before = a.insn_count;
+                let exit = a.run(budget);
+                // The modules of the native JIT that the run asked for are there for the next one.
+                #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+                a.wait_native_jit();
+                let ran = a.insn_count - before;
+                for _ in 0..ran {
+                    let was = b.pc;
+                    step_ref(&mut b);
+                    changes += ((was ^ b.pc) >> 12 != 0) as u64;
+                }
+                // With no vectors installed an exception stops the machine, which leaves the pc where the
+                // run began (nothing goes on from there): what it raised is what is compared.
+                let stopped = matches!(exit, Exit::Stop(_));
+                if stopped {
+                    a.pc = b.pc;
+                }
+                // A module may end a run past the budget, by what is left of its block.
+                let diff = if tier != Tier::Native && ran != budget && !stopped {
+                    Some(format!("ran {ran} of the budget: {exit:?}, esr {:#x}", a.sys.esr))
+                } else {
+                    differ(&a, &b)
+                };
+                if let Some(d) = diff {
+                    if bad.len() < 20 {
+                        bad.push(format!(
+                            "tier {} program {prog} round {round} budget {budget} at {start:#x}: {d}",
+                            tier as u8
+                        ));
+                    }
+                    continue 'programs;
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+        assert!(changes > programs as u64 * 10, "only {changes} branches to another page");
+    }
+
+    #[test]
+    fn the_loop_agrees_with_execute_on_programs_of_several_pages() {
+        paged_vs_execute(Tier::Off, 0x2f6e_2b1c_90a3_5d47, 60);
+    }
+
+    #[test]
+    fn the_loop_agrees_with_execute_on_programs_of_several_pages_with_compiles_in_flight() {
+        paged_vs_execute(Tier::Stub, 0x51ed_270a_c4b3_91f5, 40);
+    }
+
+    #[test]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    fn the_loop_agrees_with_execute_on_programs_of_several_pages_with_the_native_jit() {
+        paged_vs_execute(Tier::Native, 0x7c3a_9e15_b2d8_4f61, 25);
+    }
+
+    /// Two pages that branch to each other, run with every budget up to a few laps: the budget is exact, and
+    /// leaves what `execute` leaves, wherever it ends in a page. With both pages held and decoded, one call of
+    /// `step_page` goes through all of them (and not out of the page that holds its first instruction).
+    #[test]
+    fn a_run_goes_on_in_the_page_a_taken_branch_leads_to() {
+        for tier in [Tier::Off, Tier::Stub] {
+            let mut a = Cpu::new(4 << 20, Takes);
+            let mut b = Cpu::new(4 << 20, Takes);
+            if tier == Tier::Stub {
+                a.jit.enabled = true;
+                a.jit.threshold = 16;
+            }
+            let (p0, p1) = (CODE, CODE + 0x1000);
+            for c in [&mut a, &mut b] {
+                for k in 0..6u64 {
+                    put(c, p0 + 4 * k, 0x9100_0400);
+                }
+                put(c, p0 + 24, branch(p0 + 24, p1));
+                for k in 0..5u64 {
+                    put(c, p1 + 4 * k, 0x9100_0c21);
+                }
+                put(c, p1 + 20, branch(p1 + 20, p0));
+                c.pc = p0;
+            }
+            for budget in 1..=40u64 {
+                let before = a.insn_count;
+                a.run(budget);
+                assert_eq!(a.insn_count - before, budget);
+                for _ in 0..budget {
+                    step_ref(&mut b);
+                }
+                assert_eq!(differ(&a, &b), None, "budget {budget}");
+            }
+            if tier == Tier::Off {
+                for c in [&mut a, &mut b] {
+                    c.pc = p0;
+                }
+                let (r, n) = a.step_page(p0, 100);
+                assert_eq!(n, 100);
+                assert!(matches!(r, Ok(pc) if pc == a.pc));
+                for _ in 0..100 {
+                    step_ref(&mut b);
+                }
+                assert_eq!(differ(&a, &b), None);
+            }
+        }
+    }
+
+    /// A store into the code of the page the run goes on in, which the run has gone through before, changes
+    /// what it runs there: the store drops the decoded page, and a run that went on with the ops it had would
+    /// run the instruction that is not there any more.
+    #[test]
+    fn a_store_into_the_next_page_changes_what_the_run_does_there() {
+        for tier in [Tier::Off, Tier::Stub] {
+            let mut a = Cpu::new(4 << 20, Takes);
+            let mut b = Cpu::new(4 << 20, Takes);
+            if tier == Tier::Stub {
+                a.jit.enabled = true;
+                a.jit.threshold = 16;
+            }
+            let (p0, p1) = (CODE, CODE + 0x1000);
+            for c in [&mut a, &mut b] {
+                // str w1, [x2]; add w1, w1, w4; add x5, x5, #1; b p1
+                put(c, p0, 0xb900_0041);
+                put(c, p0 + 4, 0x0b04_0021);
+                put(c, p0 + 8, 0x9100_04a5);
+                put(c, p0 + 12, branch(p0 + 12, p1));
+                // add x0, x0, #1 nine times, the fourth one the instruction that is stored over; b p0
+                for k in 0..9u64 {
+                    put(c, p1 + 4 * k, 0x9100_0400);
+                }
+                put(c, p1 + 36, branch(p1 + 36, p0));
+                // The stored word is add x0, x0, #imm with imm one more each time.
+                c.x[1] = 0x9100_0800;
+                c.x[2] = p1 + 12;
+                c.x[4] = 0x400;
+                c.pc = p0;
+            }
+            for round in 0..4 {
+                a.run(700);
+                for _ in 0..700 {
+                    step_ref(&mut b);
+                }
+                assert_eq!(differ(&a, &b), None, "round {round}");
+                let same = a.mem.to_vec()[0x10000..0x12000] == b.mem.to_vec()[0x10000..0x12000];
+                assert!(same, "round {round}: memory");
+                assert!(a.x[5] >= 40 * (round + 1), "round {round}: only {} laps", a.x[5]);
+            }
+        }
+    }
+
+    /// A machine with the MMU on: a space of 39 bits, 4 KiB pages, one table for each of the three levels (at
+    /// 0x80000, 0x81000, 0x82000), the first 0x20 pages mapped to themselves, EL1, the vectors in page 0 where
+    /// `b .` stands, so that a fault leaves the machine spinning.
+    fn mapped() -> Cpu<Takes> {
+        let mut c = Cpu::new(4 << 20, Takes);
+        c.sys.cpacr = 3 << 20;
+        c.sys.sctlr |= 1;
+        c.sys.tcr = 25;
+        c.sys.ttbr0 = 0x80000;
+        c.mem.write(0x80000, &(0x81000u64 | 3).to_le_bytes());
+        c.mem.write(0x81000, &(0x82000u64 | 3).to_le_bytes());
+        for page in 0..0x20u64 {
+            map(&mut c, page, (page << 12) | 0x403);
+        }
+        put(&mut c, 0x0, 0x1400_0000);
+        put(&mut c, 0x200, 0x1400_0000);
+        c
+    }
+
+    /// The descriptor of the level 3 table for virtual page `page`.
+    fn map(c: &mut Cpu<Takes>, page: u64, desc: u64) {
+        let at = 0x82000 + 8 * page as usize;
+        c.mem.write(at, &desc.to_le_bytes());
+    }
+
+    /// `a` runs `n` instructions in one call, `b` one at a time (so that no run of it goes from a page to
+    /// another): they leave the same state, and the same count.
+    fn lockstep(a: &mut Cpu<Takes>, b: &mut Cpu<Takes>, n: u64, why: &str) {
+        a.run(n);
+        for _ in 0..n {
+            let _ = b.run(1);
+        }
+        assert_eq!(a.insn_count, b.insn_count, "{why}");
+        assert_eq!(differ(a, b), None, "{why}");
+    }
+
+    /// A taken branch to a page whose fetch faults raises what that fetch raises, at the target: the page was
+    /// unmapped or not executable, or the translation of it changed, and the TLB was maintained for the page,
+    /// or all of it (when it was not, the stale translation is what the machine still uses, as it is one
+    /// instruction at a time). A target that is not aligned raises the alignment fault of the fetch.
+    #[test]
+    fn a_branch_to_a_page_that_the_fetch_faults_on_raises_that_fault() {
+        const T: u64 = 0x11000;
+        // The branch to T that follows `add x0, x0, #1` at the start of page 0x10: x1 is 7, x17 and x30 are T.
+        let kinds: [u32; 7] = [
+            0x1400_0000 | 0x3ff,                    // b
+            0x5400_0001 | (0x3ff << 5),             // b.ne
+            0xb500_0001 | (0x3ff << 5),             // cbnz x1
+            0x3700_0001 | (1 << 19) | (0x3ff << 5), // tbnz x1, #1
+            0xd61f_0220,                            // br x17
+            0xd63f_0220,                            // blr x17
+            0xd65f_03c0,                            // ret
+        ];
+        for (ki, &kind) in kinds.iter().enumerate() {
+            for mode in 0..3 {
+                for maint in 0..3 {
+                    let why = format!("branch {ki} mode {mode} maintenance {maint}");
+                    let mut a = mapped();
+                    let mut b = mapped();
+                    for c in [&mut a, &mut b] {
+                        put(c, 0x10000, 0x9100_0400);
+                        put(c, 0x10004, kind);
+                        put(c, 0x10008, branch(0x10008, 0x10000));
+                        // The page the branches lead to, and the one it is mapped to after.
+                        put(c, 0x11000, 0x9100_0442); // add x2, x2, #1
+                        put(c, 0x11004, branch(0x11004, 0x10000));
+                        put(c, 0x13000, 0x9100_0463); // add x3, x3, #1
+                        // (the page runs at 0x11000, mapped to this: its branch is the one of address 0x11004)
+                        put(c, 0x13004, branch(0x11004, 0x10000));
+                        c.x[1] = 7;
+                        c.x[17] = T;
+                        c.x[30] = T;
+                        c.pc = 0x10000;
+                    }
+                    lockstep(&mut a, &mut b, 60, &why);
+                    let laps = a.x[2];
+                    assert!(laps > 5, "{why}: the page ran {laps} times");
+                    for c in [&mut a, &mut b] {
+                        match mode {
+                            0 => map(c, 0x11, 0),
+                            1 => map(c, 0x11, 0x11000 | 0x403 | (1 << 53)),
+                            _ => map(c, 0x11, 0x13000 | 0x403),
+                        }
+                        match maint {
+                            0 => c.tlb_flush_page(0x11),
+                            1 => c.tlb_flush(),
+                            _ => {},
+                        }
+                        c.x[17] = T;
+                        c.x[30] = T;
+                        c.pc = 0x10000;
+                    }
+                    lockstep(&mut a, &mut b, 60, &why);
+                    if maint == 2 {
+                        continue;
+                    }
+                    match mode {
+                        0 | 1 => {
+                            assert_eq!(a.sys.esr >> 26, 0x21, "{why}");
+                            assert_eq!((a.sys.far, a.sys.elr), (T, T), "{why}");
+                            assert_eq!(a.x[2], laps, "{why}: ran the page that faults");
+                        },
+                        _ => {
+                            assert!(a.x[3] > 5, "{why}: the new page did not run");
+                            assert_eq!(a.x[2], laps, "{why}: ran the old page");
+                        },
+                    }
+                }
+            }
+        }
+        for (ki, &kind) in kinds[4..].iter().enumerate() {
+            let why = format!("misaligned branch {ki}");
+            let mut a = mapped();
+            let mut b = mapped();
+            for c in [&mut a, &mut b] {
+                put(c, 0x10000, 0x9100_0400);
+                put(c, 0x10004, kind);
+                put(c, 0x11000, 0x9100_0442);
+                c.x[17] = T + 2;
+                c.x[30] = T + 2;
+                c.pc = 0x10000;
+            }
+            lockstep(&mut a, &mut b, 20, &why);
+            assert_eq!(a.sys.esr >> 26, 0x22, "{why}");
+            assert_eq!((a.sys.far, a.sys.elr), (T + 2, T + 2), "{why}");
+            assert_eq!(a.x[2], 0, "{why}: ran the page");
+        }
+    }
+
+    /// The entry of a loop that the JIT refused (a compile that has it is in flight) is not sent back to
+    /// `jit_step` by each execution of it: its count is left below the threshold, from where it gets there
+    /// again after some executions. The loop is run as `execute` runs it.
+    #[test]
+    fn an_entry_that_the_jit_refused_is_counted_again_from_below_the_threshold() {
+        let mut a = Cpu::new(4 << 20, Takes);
+        let mut b = Cpu::new(4 << 20, Takes);
+        a.jit.enabled = true;
+        a.jit.threshold = 64;
+        // add x1, x1, #1; subs x0, x0, #1; b.ne the add; b .
+        let code = [0x9100_0421u32, 0xf100_0400, 0x54ff_ffc1, 0x1400_0000];
+        for c in [&mut a, &mut b] {
+            for (k, w) in code.iter().enumerate() {
+                put(c, CODE + 4 * k as u64, *w);
+            }
+            c.x[0] = 3000;
+            c.pc = CODE;
+        }
+        let steps = 3 * 3000 + 1;
+        a.run(steps);
+        for _ in 0..steps {
+            step_ref(&mut b);
+        }
+        assert_eq!(a.insn_count, steps);
+        assert_eq!(differ(&a, &b), None);
+        assert_eq!(a.x[1], 3000);
+        assert!(a.jit.compiled >= 1, "the loop was never compiled");
+        let ops = a.jit.pre.enter(CODE as usize);
+        assert!(!ops.is_null());
+        // SAFETY: `ops` is the ops of the page at CODE, a live slot of 1024 ops or more.
+        let hottest = (0..1024).map(|i| unsafe { (*ops.add(i)).cnt }).max().unwrap();
+        assert!(hottest < 64, "the count of the entry is {hottest}: each execution exits");
     }
 }

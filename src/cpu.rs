@@ -952,10 +952,13 @@ impl<H: Host> Cpu<H> {
     ///
     /// The ops of the page run in `run_ops` (see `interp`), which stores nothing but the registers the guest
     /// sees between two instructions: not the pc, not the count, and `attn` is not looked at, so a run is at
-    /// most `PAGE_RUN` instructions. It ends at the end of the page, at an instruction that is not decoded
-    /// yet (`run` decodes it), at a taken branch to another page, at one that `jit_step` has to count, and
-    /// at an instruction it does not run itself, which `exec_slow` runs with `pc` and `next_pc` stored first.
-    /// An instruction that stores into the page drops its decoded ops, which the next run decodes again.
+    /// most `PAGE_RUN` instructions, however many pages it goes through: a taken branch to a page that the
+    /// fetch path holds and the cache has ops for goes on there (`enter_page`). It ends at the end of a page,
+    /// at an instruction that is not decoded yet (`run` decodes it), at a taken branch to a page that is not
+    /// held (which the next call fetches, translates and decodes, and raises what that raises), at one that
+    /// `jit_step` has to count, and at an instruction it does not run itself, which `exec_slow` runs with `pc`
+    /// and `next_pc` stored first. An instruction that stores into a page drops its decoded ops, which the
+    /// next run decodes again.
     #[inline(never)]
     #[allow(unsafe_code)]
     fn step_page(&mut self, start: u64, max: u64) -> (Res<u64>, u64) {
@@ -998,6 +1001,29 @@ impl<H: Host> Cpu<H> {
         };
         self.jit_entry = self.pc != last.wrapping_add(4);
         (result, n)
+    }
+
+    /// The ops of the code page of `va`, for a run that goes on there: what `fetch_decoded_slow` finds when the
+    /// fetch path holds the page (a tag of `code_tag`, which what changes the translation or the permissions
+    /// clears, see `FastTlb::flush`) and the page has a slot, and then the same state: the page is the current
+    /// one of the fetch path and of the cache. Null, and nothing changed, if it holds none, or no slot: the run
+    /// ends, and `step_page` fetches, translates (and raises what the fetch raises) and decodes the page as ever.
+    #[inline(always)]
+    fn enter_page(&mut self, va: u64) -> *mut crate::predecode::Op {
+        let el = self.el as usize;
+        let f = &mut self.fast[el];
+        let page = va >> 12;
+        let i = page as usize & (CODE_ENTRIES - 1);
+        if f.code_tag[i] != page {
+            return std::ptr::null_mut();
+        }
+        let base = f.code_bases[i];
+        let ops = self.jit.pre.enter(base);
+        if !ops.is_null() {
+            f.code_page = page;
+            f.code_base = base;
+        }
+        ops
     }
 
     /// `step_page` for an instruction in a page that is not kept decoded (it ends past RAM, see `fetch_slow`):

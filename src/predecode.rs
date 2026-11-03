@@ -1150,6 +1150,21 @@ impl Cache {
         }
     }
 
+    /// The ops of the page at physical base `base`, made the current page, or null if it has no slot (the run
+    /// of a loop that goes on in another page, see `Cpu::enter_page`).
+    #[inline(always)]
+    pub(crate) fn enter(&mut self, base: usize) -> *mut Op {
+        if base == self.cur_base {
+            return self.cur_ptr;
+        }
+        let slot = self.page_slot[base >> 12];
+        if slot == NONE {
+            return std::ptr::null_mut();
+        }
+        self.set_current(base, slot);
+        self.cur_ptr
+    }
+
     /// Count one execution of op `i` of the page at physical base `base` in the op itself (saturating at
     /// `COUNT_MAX`) and return the count, or 0 when the op is not decoded yet (or its page has no slot). Makes
     /// that page the current one.
@@ -1178,6 +1193,18 @@ impl Cache {
             } else {
                 COUNT_MAX
             }
+        }
+    }
+
+    /// Set the count of op `i` of the page at physical base `base` to `v` (at most `COUNT_MAX`), if that is the
+    /// current page, as it is after `bump` unless something since dropped it.
+    #[inline(always)]
+    pub(crate) fn set_count(&mut self, base: usize, i: usize, v: u32) {
+        debug_assert!(i < PAGE_INSNS && v <= COUNT_MAX);
+        if base == self.cur_base {
+            // SAFETY: `cur_ptr` points at the ops of the page at `cur_base`, a live slot, and `i` is an
+            // instruction index within a page.
+            unsafe { (*self.cur_ptr.add(i)).cnt = v as u16 };
         }
     }
 
