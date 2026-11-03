@@ -217,6 +217,12 @@ impl Jit {
         (pa << 2) | ((el as u64) << 1) | spsel as u64
     }
 
+    /// Whether a module is ready for the entry `key`.
+    #[inline(always)]
+    pub(crate) fn has_module(&self, key: u64) -> bool {
+        self.lookup_key[hash(key)] == key
+    }
+
     #[inline(always)]
     fn ready_slot(&self, key: u64) -> Option<u32> {
         let i = hash(key);
@@ -434,15 +440,17 @@ impl<H: Host> Cpu<H> {
             .min(crate::predecode::COUNT_MAX)
     }
 
-    /// The count of executions of an entry of the page at physical address `base` that `jit_step` reaches
-    /// with nothing more to do than to count: below it, counting the execution is all there is to do (1 when
-    /// the page has modules, which may hold the entry).
+    /// What `jit_step` does with an entry of the page at physical address `base`, for the loop of the
+    /// interpreter, which counts the executions of the entries itself: the count at which `jit_step` warms an
+    /// entry, the one at which it compiles it, and whether the page has modules (one of which may hold the entry).
     #[inline(always)]
-    pub(crate) fn page_warm_at(&self, base: usize) -> u32 {
-        if self.jit.code_page[base >> 12] & 1 != 0 {
-            return 1;
-        }
-        self.hot_threshold().div_ceil(4).max(1)
+    pub(crate) fn page_counts(&self, base: usize) -> (u32, u32, bool) {
+        let hot = self.hot_threshold();
+        (
+            hot.div_ceil(4).max(1),
+            hot,
+            self.jit.code_page[base >> 12] & 1 != 0,
+        )
     }
 
     /// Run translated code at the current PC if there is any.
@@ -1134,4 +1142,94 @@ extern "C" fn native_interp<H: Host>(insn: i32, pc: i64) -> i32 {
     // (of this H) for the duration of the call.
     let cpu = unsafe { &mut *current::<H>() };
     cpu.jit_helper_interp(insn as u32, pc as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::board::Host;
+    use crate::cpu::Cpu;
+
+    struct NoDevices;
+    impl Host for NoDevices {
+        fn mmio_read(&mut self, _: u64, _: u32) -> Option<u64> {
+            None
+        }
+        fn mmio_write(&mut self, _: u64, _: u32, _: u64) -> bool {
+            false
+        }
+        fn now_ns(&mut self) -> u64 {
+            0
+        }
+        fn wall_clock_secs(&mut self) -> u64 {
+            0
+        }
+    }
+
+    const SUBS_X1: u32 = 0xf100_0421; // subs x1, x1, #1
+    const B_NE_BACK: u32 = 0x54ff_ffe1; // b.ne .-4
+    const B_EQ_BACK: u32 = 0x54ff_ffe0; // b.eq .-4
+    const MOVZ_X0_7: u32 = 0xd280_00e0;
+    const MOVZ_X0_8: u32 = 0xd280_0100;
+    const MOVZ_X2_9: u32 = 0xd280_0122;
+
+    /// A page whose compiled code covers words that a write misses: the ops decoded from the words written go (a
+    /// compare that was decoded with the branch after it, whichever of the two is written), the others are kept.
+    #[test]
+    fn a_write_that_misses_the_compiled_words_drops_the_ops_of_the_words_it_writes() {
+        let mut c = Cpu::new(4 << 20, NoDevices);
+        let w = |c: &Cpu<NoDevices>, i: usize, insn: u32| {
+            c.mem.write(0x1000 + 4 * i, &insn.to_le_bytes());
+        };
+        for (i, insn) in [SUBS_X1, B_NE_BACK, MOVZ_X0_7, MOVZ_X2_9].into_iter().enumerate() {
+            w(&c, i, insn);
+        }
+        // Two passes of the loop, then the two moves: six instructions.
+        c.pc = 0x1000;
+        c.x[1] = 2;
+        c.run(6);
+        assert_eq!((c.x[0], c.x[1], c.x[2]), (7, 0, 9));
+        assert_eq!(c.jit.code_page[1], 2, "decoded, not compiled");
+        // The page has compiled code, which covers word 40 only.
+        c.jit.code_page[1] |= 1;
+        let mut bits = Box::new([0u64; 16]);
+        bits[0] = 1 << 40;
+        c.jit.covered.insert(1, bits);
+
+        // A move is rewritten.
+        w(&c, 2, MOVZ_X0_8);
+        c.jit.code_written(0x1008, 4);
+        assert_eq!(c.jit.code_writes_kept, 1);
+        c.pc = 0x1000;
+        c.x[1] = 2;
+        c.x[0] = 0;
+        c.run(6);
+        assert_eq!((c.x[0], c.x[1]), (8, 0));
+
+        // The branch is rewritten: the compare before it was fused with the old one.
+        w(&c, 1, B_EQ_BACK);
+        c.jit.code_written(0x1004, 4);
+        assert_eq!(c.jit.code_writes_kept, 2);
+        c.pc = 0x1000;
+        c.x[1] = 2;
+        c.x[0] = 0;
+        c.run(4);
+        assert_eq!((c.x[0], c.x[1], c.pc), (8, 1, 0x1010));
+
+        // The compare is rewritten.
+        w(&c, 0, 0xf100_0821); // subs x1, x1, #2
+        c.jit.code_written(0x1000, 4);
+        assert_eq!(c.jit.code_writes_kept, 3);
+        c.pc = 0x1000;
+        c.x[1] = 5;
+        c.run(4);
+        assert_eq!((c.x[1], c.pc), (3, 0x1010));
+
+        // A write to a word the compiled code covers drops the page.
+        c.jit.covered.get_mut(&1).unwrap()[0] |= 1 << 3;
+        w(&c, 3, MOVZ_X0_7);
+        c.jit.code_written(0x100c, 4);
+        assert_eq!(c.jit.code_writes_kept, 3);
+        assert_eq!(c.jit.code_page[1], 0);
+        assert_eq!(c.jit.pre.slot(1), crate::predecode::NONE);
+    }
 }

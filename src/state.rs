@@ -70,8 +70,8 @@ impl<H: Host> Cpu<H> {
         w.u32(me.power.load(Ordering::SeqCst));
         w.u64(me.entry.load(Ordering::SeqCst));
         w.u64(me.context.load(Ordering::SeqCst));
-        for r in self.x {
-            w.u64(r);
+        for r in &self.x[..31] {
+            w.u64(*r);
         }
         for q in self.vreg {
             w.u64(q as u64);

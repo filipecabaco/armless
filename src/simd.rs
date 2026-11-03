@@ -20,15 +20,19 @@ pub fn set_elem(v: &mut u128, i: u32, esize: u32, x: u64) {
 }
 
 impl<H: Host> Cpu<H> {
+    /// Whether CPACR_EL1.FPEN lets this exception level use SIMD&FP.
+    #[inline(always)]
+    pub(crate) fn fp_enabled(&self) -> bool {
+        match (self.sys.cpacr >> 20) & 3 {
+            3 => true,
+            1 => self.el != 0,
+            _ => false,
+        }
+    }
+
     /// CPACR_EL1.FPEN check for any SIMD&FP instruction.
     pub(crate) fn check_fp_access(&self) -> Res<()> {
-        let fpen = (self.sys.cpacr >> 20) & 3;
-        let trapped = match fpen {
-            3 => false,
-            1 => self.el == 0,
-            _ => true,
-        };
-        if trapped {
+        if !self.fp_enabled() {
             return Err(Event::Sync {
                 ec: ec::FP_ACCESS,
                 iss: 0,

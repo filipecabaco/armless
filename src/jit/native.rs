@@ -1431,7 +1431,7 @@ mod tests {
     /// Everything a block can change: registers, flags, exception state and RAM.
     fn state(c: &Cpu<NoDevices>) -> impl PartialEq + std::fmt::Debug {
         (
-            c.x,
+            c.x[..31].to_vec(),
             c.pc,
             (c.sp_el0, c.sp_el1, c.el, c.spsel, c.daif),
             (c.n, c.z, c.c, c.v),
@@ -1813,7 +1813,7 @@ mod tests {
                 if drop_code {
                     c.jit.invalidate_page((CODE >> 12) as usize);
                 }
-                c.x = regs;
+                c.x[..31].copy_from_slice(&regs);
                 c.pc = start_pc;
                 (c.sp_el0, c.sp_el1) = (sp0, sp1);
                 (c.n, c.z, c.c, c.v) = (

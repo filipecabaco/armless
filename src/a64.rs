@@ -11,7 +11,12 @@ use crate::sysreg::{self as sr, id};
 
 /// AddWithCarry: returns (result, N, Z, C, V).
 #[inline(always)]
-fn add_with_carry(x: u64, y: u64, carry: bool, sf: bool) -> (u64, bool, bool, bool, bool) {
+pub(crate) fn add_with_carry(
+    x: u64,
+    y: u64,
+    carry: bool,
+    sf: bool,
+) -> (u64, bool, bool, bool, bool) {
     if sf {
         let (r1, c1) = x.overflowing_add(y);
         let (r, c2) = r1.overflowing_add(carry as u64);
@@ -28,7 +33,7 @@ fn add_with_carry(x: u64, y: u64, carry: bool, sf: bool) -> (u64, bool, bool, bo
 
 /// Shift a register operand (LSL/LSR/ASR/ROR) at the operand size.
 #[inline(always)]
-fn shift_reg(v: u64, kind: u32, amount: u32, sf: bool) -> u64 {
+pub(crate) fn shift_reg(v: u64, kind: u32, amount: u32, sf: bool) -> u64 {
     if sf {
         let a = amount & 63;
         match kind {
@@ -51,7 +56,7 @@ fn shift_reg(v: u64, kind: u32, amount: u32, sf: bool) -> u64 {
 
 /// ExtendReg: UXTB..SXTX followed by a left shift of 0..4.
 #[inline(always)]
-fn extend_reg(v: u64, option: u32, shift: u32) -> u64 {
+pub(crate) fn extend_reg(v: u64, option: u32, shift: u32) -> u64 {
     let e = match option {
         0 => v & 0xff,
         1 => v & 0xffff,
@@ -275,7 +280,15 @@ impl<H: Host> Cpu<H> {
         Ok(())
     }
 
-    fn bitfield(&self, opc: u32, src: u64, dst: u64, immr: u32, imms: u32, size: u32) -> u64 {
+    pub(crate) fn bitfield(
+        &self,
+        opc: u32,
+        src: u64,
+        dst: u64,
+        immr: u32,
+        imms: u32,
+        size: u32,
+    ) -> u64 {
         if imms >= immr {
             // Extract bits [imms:immr] to the bottom.
             let width = imms - immr + 1;
@@ -461,21 +474,6 @@ impl<H: Host> Cpu<H> {
             _ => return Err(Event::undefined()),
         }
         Ok(())
-    }
-
-    /// BR, BLR and RET of the instruction at `pc`, for `step_page`: where it goes. None, with nothing changed,
-    /// for what `branch_reg` does otherwise (ERET, the unallocated): `exec_slow` runs it.
-    #[inline(always)]
-    pub(crate) fn branch_reg_hot(&mut self, insn: u32, pc: u64) -> Option<u64> {
-        let opc = field(insn, 21, 4);
-        if opc > 2 || field(insn, 16, 5) != 31 || field(insn, 10, 6) != 0 || insn & 31 != 0 {
-            return None;
-        }
-        let target = self.xr(field(insn, 5, 5));
-        if opc == 1 {
-            self.x[30] = pc.wrapping_add(4);
-        }
-        Some(target)
     }
 
     fn system(&mut self, insn: u32) -> Res<()> {
@@ -868,157 +866,6 @@ impl<H: Host> Cpu<H> {
             _ => {}, // PRFM
         }
         Ok(())
-    }
-
-    /// LDR (literal) of the instruction at `pc`, for `step_page`: false, with nothing changed, if the
-    /// fast tables do not serve the access (`read_hit`): `exec_slow` runs it then.
-    #[inline(always)]
-    pub(crate) fn ldr_literal_hot(&mut self, insn: u32, pc: u64) -> bool {
-        let off = sext(field(insn, 5, 19) as u64, 19) << 2;
-        let addr = pc.wrapping_add(off as u64);
-        let rt = insn & 31;
-        match field(insn, 30, 2) {
-            0 => {
-                let Some(v) = self.read_hit(addr, 4) else {
-                    return false;
-                };
-                self.wr(rt, v);
-            },
-            1 => {
-                let Some(v) = self.read_hit(addr, 8) else {
-                    return false;
-                };
-                self.wr(rt, v);
-            },
-            2 => {
-                let Some(v) = self.read_hit(addr, 4) else {
-                    return false;
-                };
-                self.wr(rt, v as u32 as i32 as i64 as u64);
-            },
-            _ => {}, // PRFM
-        }
-        true
-    }
-
-    /// LDP/STP/LDPSW for `step_page`: false, with nothing changed (but a store that `exec_slow` repeats), if
-    /// the two accesses are not both served by the fast tables in one page, or the form is unallocated.
-    #[inline(always)]
-    pub(crate) fn ldst_pair_hot(&mut self, insn: u32) -> bool {
-        let opc = field(insn, 30, 2);
-        let mode = field(insn, 23, 2);
-        let load = bit(insn, 22);
-        let rt2 = field(insn, 10, 5);
-        let rn = field(insn, 5, 5);
-        let rt = insn & 31;
-        let (size, signed) = match (opc, load) {
-            (0, _) => (4u32, false),
-            (2, _) => (8, false),
-            (1, true) if mode != 0 => (4, true),
-            _ => return false,
-        };
-        let imm = sext(field(insn, 15, 7) as u64, 7) * size as i64;
-        let base = self.xs(rn);
-        let addr = if mode == 1 { base } else { base.wrapping_add(imm as u64) };
-        if load {
-            let Some((a, b)) = self.read_pair_hit(addr, size) else {
-                return false;
-            };
-            let fix = |v: u64| if signed { v as u32 as i32 as i64 as u64 } else { v };
-            self.wr(rt, fix(a));
-            self.wr(rt2, fix(b));
-        } else {
-            let (a, b) = (self.xr(rt), self.xr(rt2));
-            if !self.write_pair_hit(addr, size, a, b) {
-                return false;
-            }
-        }
-        if mode == 1 || mode == 3 {
-            self.ws(rn, base.wrapping_add(imm as u64));
-        }
-        true
-    }
-
-    /// LDR/STR (unsigned scaled 12-bit offset) for `step_page`, see `ldst_access_hot`.
-    #[inline(always)]
-    pub(crate) fn ldst_uimm_hot(&mut self, insn: u32) -> bool {
-        let size_log = field(insn, 30, 2);
-        let base = self.xs(field(insn, 5, 5));
-        let addr = base.wrapping_add((field(insn, 10, 12) as u64) << size_log);
-        self.ldst_access_hot(insn, addr, None)
-    }
-
-    /// LDUR/STUR and the post- and pre-indexed forms for `step_page`, see `ldst_access_hot` (LDTR/STTR are
-    /// left to `exec_slow`).
-    #[inline(always)]
-    pub(crate) fn ldst_imm9_hot(&mut self, insn: u32) -> bool {
-        let base = self.xs(field(insn, 5, 5));
-        let imm = sext(field(insn, 12, 9) as u64, 9) as u64;
-        match field(insn, 10, 2) {
-            0 => self.ldst_access_hot(insn, base.wrapping_add(imm), None),
-            1 => self.ldst_access_hot(insn, base, Some(base.wrapping_add(imm))),
-            2 => false,
-            _ => {
-                let a = base.wrapping_add(imm);
-                self.ldst_access_hot(insn, a, Some(a))
-            },
-        }
-    }
-
-    /// LDR/STR (register offset) for `step_page`, see `ldst_access_hot`.
-    #[inline(always)]
-    pub(crate) fn ldst_regoff_hot(&mut self, insn: u32) -> bool {
-        let size_log = field(insn, 30, 2);
-        let base = self.xs(field(insn, 5, 5));
-        let rm = field(insn, 16, 5);
-        let option = field(insn, 13, 3);
-        if option & 2 == 0 {
-            return false;
-        }
-        let shift = if bit(insn, 12) { size_log } else { 0 };
-        let addr = base.wrapping_add(extend_reg(self.xr(rm), option, shift));
-        self.ldst_access_hot(insn, addr, None)
-    }
-
-    /// `ldst_access` for `step_page`, without the rarities: false, with nothing changed, if the access is not
-    /// one the fast tables serve (`read_hit`, `write_hit`), or the form is a prefetch or unallocated:
-    /// `exec_slow` runs the instruction then, and raises what is to be raised.
-    #[inline(always)]
-    fn ldst_access_hot(&mut self, insn: u32, addr: u64, writeback: Option<u64>) -> bool {
-        let size_log = field(insn, 30, 2);
-        let bytes = 1u32 << size_log;
-        let rt = insn & 31;
-        match field(insn, 22, 2) {
-            0 => {
-                let v = self.xr(rt);
-                if !self.write_hit(addr, bytes, v) {
-                    return false;
-                }
-            },
-            1 => {
-                let Some(v) = self.read_hit(addr, bytes) else {
-                    return false;
-                };
-                self.wr(rt, v);
-            },
-            2 if size_log != 3 => {
-                let Some(v) = self.read_hit(addr, bytes) else {
-                    return false;
-                };
-                self.wr(rt, sext(v, bytes * 8) as u64);
-            },
-            3 if size_log < 2 => {
-                let Some(v) = self.read_hit(addr, bytes) else {
-                    return false;
-                };
-                self.wr(rt, sext(v, bytes * 8) as u64 & 0xffff_ffff);
-            },
-            _ => return false,
-        }
-        if let Some(wb) = writeback {
-            self.ws(field(insn, 5, 5), wb);
-        }
-        true
     }
 
     #[inline(always)]
