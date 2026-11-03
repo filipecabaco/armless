@@ -9,6 +9,9 @@ use crate::board::{self, Host};
 use crate::mmu::Tlb;
 use crate::smp::{self, Machine};
 
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+mod interp;
+
 /// Exception classes used in ESR_EL1.EC.
 pub mod ec {
     pub const UNKNOWN: u32 = 0x00;
@@ -121,8 +124,10 @@ pub struct SysRegs {
 }
 
 pub struct Cpu<H: Host> {
-    /// X0..X30. Register 31 is SP or XZR depending on the instruction.
-    pub x: [u64; 31],
+    /// X0..X30. Register 31 is SP or XZR depending on the instruction. Slot 31 is a zero that nothing
+    /// writes and slot 32 a sink that nothing reads, which the pre-decoded loop (`interp`) reads and
+    /// writes as XZR.
+    pub x: [u64; 33],
     pub pc: u64,
     pub sp_el0: u64,
     pub sp_el1: u64,
@@ -207,6 +212,9 @@ fn same_aligned_page(pc: u64, page: u64) -> bool {
 pub(crate) const FAST_ENTRIES: usize = 256;
 /// Executable pages remembered besides the current one (`code_page`).
 const CODE_ENTRIES: usize = 64;
+/// The most instructions `step_page` runs in a row, so that `run` looks at the interrupts and at what
+/// other CPUs asked of this one at least that often.
+const PAGE_RUN: u64 = 256;
 
 /// Virtual page -> offset of the page in `mem`, for pages known to be RAM
 /// with the needed permission at one exception level.
@@ -322,7 +330,7 @@ impl<H: Host> Cpu<H> {
         let memory_size = machine.mem.len();
         let attn = &machine.cpus[index].attn as *const AtomicU8;
         let mut cpu = Cpu {
-            x: [0; 31],
+            x: [0; 33],
             pc: 0,
             sp_el0: 0,
             sp_el1: 0,
@@ -418,7 +426,7 @@ impl<H: Host> Cpu<H> {
 
     /// Reset this CPU's own state only.
     fn reset_local(&mut self) {
-        self.x = [0; 31];
+        self.x = [0; 33];
         self.vreg = [0; 32];
         self.pc = board::RAM_BASE;
         self.sp_el0 = 0;
@@ -704,7 +712,7 @@ impl<H: Host> Cpu<H> {
         let mut executed = 0;
         let mut last_poll = 0;
         // The guest pc lives here between instructions rather than being read back from `self.pc`
-        // (which `step_at` keeps up to date); whatever else may move it reloads it.
+        // (which `step_page` keeps up to date); whatever else may move it reloads it.
         let mut pc = self.pc;
         while executed < budget {
             if self.attn().load(Ordering::Relaxed) != 0 {
@@ -735,27 +743,12 @@ impl<H: Host> Cpu<H> {
                     None => {},
                 }
             }
-            let r = self.step_at(pc);
-            if self.jit.enabled {
-                self.jit_entry = self.pc != pc.wrapping_add(4);
-            }
+            // A run ends at the next timer poll too (`last_poll + 0x400`), as the straight-line runs of upstream do; a JIT
+            // dispatch may have gone past it, and a run is at least one instruction, which `budget` still allows.
+            let limit = budget.min(last_poll + 0x400);
+            let (r, n) = self.step_page(pc, limit.saturating_sub(executed).clamp(1, PAGE_RUN));
+            executed += n;
             match r {
-                Ok(next) if next == pc.wrapping_add(4) => {
-                    // No branch: on through the straight-line code that follows, up to the next
-                    // timer poll
-                    executed += 1;
-                    let limit = budget.min(last_poll + 0x400);
-                    match self.run_straight(next, &mut executed, limit) {
-                        Ok(p) => pc = p,
-                        Err(Event::Stop(r)) => return self.leave(Exit::Stop(r)),
-                        Err(_) => unreachable!("only branches wait or stop otherwise"),
-                    }
-                    if executed - last_poll >= 0x400 {
-                        last_poll = executed;
-                        self.update_timers();
-                    }
-                    continue;
-                },
                 Ok(next) => pc = next,
                 Err(Event::Wfi) => {
                     self.update_timers();
@@ -772,7 +765,6 @@ impl<H: Host> Cpu<H> {
                 Err(Event::Stop(r)) => return self.leave(Exit::Stop(r)),
                 Err(Event::Sync { .. }) => unreachable!("handled in step"),
             }
-            executed += 1;
             // Poll the timer every so often; it is cheap but not free.
             if executed - last_poll >= 0x400 {
                 last_poll = executed;
@@ -949,49 +941,128 @@ impl<H: Host> Cpu<H> {
     /// Execute exactly one instruction, taking any exception it raises.
     #[inline(always)]
     pub fn step(&mut self) -> Res<()> {
-        self.step_at(self.pc).map(|_| ())
+        self.step_page(self.pc, 1).0.map(|_| ())
     }
 
-    /// `step` for the instruction at `pc` (which is `self.pc`). Returns the new pc, also stored
-    /// in `self.pc`, unless the CPU stops or waits, so that `run` keeps the pc in a register: an
-    /// instruction that cannot branch goes on to `pc + 4` without `next_pc` making a round trip
-    /// through memory.
-    #[inline(always)]
-    fn step_at(&mut self, pc: u64) -> Res<u64> {
-        debug_assert_eq!(pc, self.pc);
-        self.next_pc = pc.wrapping_add(4);
-        let result = 'exec: {
-            let mut e = self.fetch_decoded(pc);
-            if e == 0 {
-                e = match self.fetch_decoded_slow(pc) {
-                    Ok(e) => e,
-                    Err(x) => break 'exec Err(x),
-                };
-            }
-            match self.exec_decoded(e) {
-                Ok(()) if crate::predecode::may_branch(e) => Ok(self.next_pc),
-                Ok(()) => Ok(pc.wrapping_add(4)),
-                Err(x) => Err(x),
-            }
+    /// `step` for the instruction at `pc` (which is `self.pc`) and then, for as long as they go on in
+    /// the same decoded code page (see `predecode`), the instructions after it: at most `max` in all (and at
+    /// least one). Returns what `step` leaves for the last of them, as the new pc also stored in `self.pc`
+    /// unless the CPU stops or waits, and how many were run: all of them are counted in `insn_count`. It
+    /// sets `jit_entry`, whether the last one went anywhere but to the next instruction.
+    ///
+    /// The ops of the page run in `run_ops` (see `interp`), which stores nothing but the registers the guest
+    /// sees between two instructions: not the pc, not the count, and `attn` is not looked at, so a run is at
+    /// most `PAGE_RUN` instructions, however many pages it goes through: a taken branch to a page that the
+    /// fetch path holds and the cache has ops for goes on there (`enter_page`). It ends at the end of a page,
+    /// at an instruction that is not decoded yet (`run` decodes it), at a taken branch to a page that is not
+    /// held (which the next call fetches, translates and decodes, and raises what that raises), at one that
+    /// `jit_step` has to count, and at an instruction it does not run itself, which `exec_slow` runs with `pc`
+    /// and `next_pc` stored first. An instruction that stores into a page drops its decoded ops, which the
+    /// next run decodes again.
+    #[inline(never)]
+    #[allow(unsafe_code)]
+    fn step_page(&mut self, start: u64, max: u64) -> (Res<u64>, u64) {
+        debug_assert_eq!(start, self.pc);
+        let idx = ((start & 0xfff) >> 2) as usize;
+        // The ops of the page `start` is in, if it is the current one of the cache (`Cache::current`).
+        let f = &self.fast[self.el as usize];
+        let mut ops = if same_aligned_page(start, f.code_page) {
+            self.jit.pre.current(f.code_base)
+        } else {
+            std::ptr::null_mut()
         };
-        self.step_done(pc, result)
-    }
-
-    /// The end of a step: count it, and take the exception it raised, if any.
-    #[inline(always)]
-    fn step_done(&mut self, pc: u64, result: Res<u64>) -> Res<u64> {
-        self.insn_count = self.insn_count.wrapping_add(1);
-        match result {
+        // SAFETY: `ops` is the current page's ops, which stay allocated (see `Cache::drop_page`), and `idx`
+        // is an index in the page.
+        if ops.is_null() || unsafe { (*ops.add(idx)).k } == crate::predecode::K::Miss {
+            // Not decoded yet, dropped by a store, or not the page of the last fetch.
+            match self.fetch_decoded_slow(start) {
+                Ok(p) => ops = p,
+                Err(x) => {
+                    self.insn_count = self.insn_count.wrapping_add(1);
+                    let result = self.step_event(start, x);
+                    self.jit_entry = self.pc != start.wrapping_add(4);
+                    return (result, 1);
+                },
+            }
+            if ops.is_null() {
+                return self.step_undecoded(start);
+            }
+        }
+        // SAFETY: `ops` is the ops of the current page of the cache, the one `start` is in, and `idx` is an
+        // index in it.
+        let (result, n, last) = unsafe { self.run_ops(ops, start & !0xfff, idx, max) };
+        self.insn_count = self.insn_count.wrapping_add(n);
+        let result = match result {
             Ok(next) => {
                 self.pc = next;
                 Ok(next)
             },
-            Err(Event::Sync {
+            Err(ev) => self.step_event(last, ev),
+        };
+        self.jit_entry = self.pc != last.wrapping_add(4);
+        (result, n)
+    }
+
+    /// The ops of the code page of `va`, for a run that goes on there: what `fetch_decoded_slow` finds when the
+    /// fetch path holds the page (a tag of `code_tag`, which what changes the translation or the permissions
+    /// clears, see `FastTlb::flush`) and the page has a slot, and then the same state: the page is the current
+    /// one of the fetch path and of the cache. Null, and nothing changed, if it holds none, or no slot: the run
+    /// ends, and `step_page` fetches, translates (and raises what the fetch raises) and decodes the page as ever.
+    #[inline(always)]
+    fn enter_page(&mut self, va: u64) -> *mut crate::predecode::Op {
+        let el = self.el as usize;
+        let f = &mut self.fast[el];
+        let page = va >> 12;
+        let i = page as usize & (CODE_ENTRIES - 1);
+        if f.code_tag[i] != page {
+            return std::ptr::null_mut();
+        }
+        let base = f.code_bases[i];
+        let ops = self.jit.pre.enter(base);
+        if !ops.is_null() {
+            f.code_page = page;
+            f.code_base = base;
+        }
+        ops
+    }
+
+    /// `step_page` for an instruction in a page that is not kept decoded (it ends past RAM, see `fetch_slow`):
+    /// that instruction only.
+    #[cold]
+    #[inline(never)]
+    fn step_undecoded(&mut self, pc: u64) -> (Res<u64>, u64) {
+        let result = match self.fetch(pc) {
+            Ok(insn) => {
+                self.next_pc = pc.wrapping_add(4);
+                self.exec_slow(crate::predecode::entry(insn))
+                    .map(|()| self.next_pc)
+            },
+            Err(x) => Err(x),
+        };
+        self.insn_count = self.insn_count.wrapping_add(1);
+        let result = match result {
+            Ok(next) => {
+                self.pc = next;
+                Ok(next)
+            },
+            Err(ev) => self.step_event(pc, ev),
+        };
+        self.jit_entry = self.pc != pc.wrapping_add(4);
+        (result, 1)
+    }
+
+    /// What `step` does with the event that ended the instruction at `pc`: take the exception, or say
+    /// why the CPU stops or waits (see `step_page`).
+    #[cold]
+    #[inline(never)]
+    fn step_event(&mut self, pc: u64, ev: Event) -> Res<u64> {
+        match ev {
+            Event::Sync {
                 ec,
                 iss,
                 far,
                 ret_next,
-            }) => {
+            } => {
                 let ret = if ret_next { self.next_pc } else { pc };
                 if ec == ec::UNKNOWN {
                     if let Ok(insn) = self.fetch(pc) {
@@ -1005,39 +1076,12 @@ impl<H: Host> Cpu<H> {
                     .map_err(Event::Stop)?;
                 Ok(self.pc)
             },
-            Err(Event::Wfi) => {
+            Event::Wfi => {
                 self.pc = self.next_pc;
                 Err(Event::Wfi)
             },
-            Err(e) => Err(e),
+            e => Err(e),
         }
-    }
-
-    /// Straight-line code from `pc`: the decoded instructions of the current page that cannot
-    /// branch, one after another, until one that can (or one not decoded yet), or `limit`
-    /// instructions. Whatever needs the run loop's checks between instructions (the JIT's entry
-    /// points, requests, interrupts) only arises at a branch, so these go without them. Returns
-    /// where to go on: the next instruction, or, if one raised an exception, its vector.
-    #[inline(always)]
-    fn run_straight(&mut self, mut pc: u64, executed: &mut u64, limit: u64) -> Res<u64> {
-        while *executed < limit {
-            let e = self.fetch_decoded(pc);
-            if e == 0 || crate::predecode::may_branch(e) {
-                break;
-            }
-            let next = pc.wrapping_add(4);
-            self.next_pc = next;
-            let r = self.exec_decoded(e).map(|()| next);
-            *executed += 1;
-            let to = self.step_done(pc, r)?;
-            if to != next {
-                // An exception: on at its vector, as after a branch
-                self.jit_entry = true;
-                return Ok(to);
-            }
-            pc = to;
-        }
-        Ok(pc)
     }
 
     #[inline(always)]
@@ -1050,27 +1094,16 @@ impl<H: Host> Cpu<H> {
         self.fetch_slow(pc)
     }
 
-    /// The pre-decoded entry of the instruction at `pc` if it is in the current decoded page
-    /// and decoded already, else 0 (see `predecode`).
-    #[inline(always)]
-    fn fetch_decoded(&self, pc: u64) -> u64 {
-        let f = &self.fast[self.el as usize];
-        if !same_aligned_page(pc, f.code_page) {
-            return 0;
-        }
-        self.jit
-            .pre
-            .current(f.code_base, ((pc & 0xfff) >> 2) as usize)
-    }
-
-    /// The pre-decoded entry of the instruction at `pc`, fetching and decoding it.
+    /// The ops of the code page of the instruction at `pc`, decoded at least from there to the end of its
+    /// block (see `predecode`), fetching and decoding them; null if the page is not one the fetch path keeps
+    /// (it ends past RAM, see `fetch_slow`).
     #[inline(never)]
-    fn fetch_decoded_slow(&mut self, pc: u64) -> Res<u64> {
-        let insn = self.fetch(pc)?;
+    #[allow(unsafe_code)]
+    pub(crate) fn fetch_decoded_slow(&mut self, pc: u64) -> Res<*mut crate::predecode::Op> {
+        self.fetch(pc)?;
         let f = &self.fast[self.el as usize];
         if pc >> 12 != f.code_page {
-            // Not a page the fetch path keeps (it ends past RAM): run it undecoded.
-            return Ok(crate::predecode::entry(insn));
+            return Ok(std::ptr::null_mut());
         }
         let base = f.code_base;
         let page = base >> 12;
@@ -1085,14 +1118,16 @@ impl<H: Host> Cpu<H> {
             }
         }
         self.jit.pre.set_current(base, slot);
+        let ops = self.jit.pre.cur_ptr;
         let i = ((pc & 0xfff) >> 2) as usize;
-        let e = self.jit.pre.get(slot, i);
-        if e != 0 {
-            return Ok(e);
+        // SAFETY: `ops` is the ops of the page at `base`, which `set_current` just made the current one, and
+        // `i` is an index in the page.
+        unsafe {
+            if (*ops.add(i)).k == crate::predecode::K::Miss {
+                self.fill_ops(ops, i);
+            }
         }
-        let e = crate::predecode::entry(insn);
-        self.jit.pre.set_current_entry(i, e);
-        Ok(e)
+        Ok(ops)
     }
 
     pub(crate) fn fetch_slow_pub(&mut self, pc: u64) -> Res<u32> {
@@ -1348,6 +1383,39 @@ impl<H: Host> Cpu<H> {
         self.read_slow(va, size, unpriv)
     }
 
+    /// `read` if the fast tables serve it (not unprivileged, in one page, the page in them): the value. Else
+    /// None, and nothing is done.
+    #[inline(always)]
+    pub(crate) fn read_hit(&self, va: u64, size: u32) -> Option<u64> {
+        let off = va & 0xfff;
+        if off + size as u64 <= 0x1000 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.read_tag[i] == va >> 12 {
+                return Some(self.ram_load(f.read_base[i] as usize + off as usize, size));
+            }
+        }
+        None
+    }
+
+    /// Two reads of `size` bytes, at `va` and right after it, if the fast tables serve both with one page.
+    #[inline(always)]
+    pub(crate) fn read_pair_hit(&self, va: u64, size: u32) -> Option<(u64, u64)> {
+        let off = va & 0xfff;
+        if off + 2 * size as u64 <= 0x1000 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.read_tag[i] == va >> 12 {
+                let a = f.read_base[i] as usize + off as usize;
+                return Some((
+                    self.ram_load(a, size),
+                    self.ram_load(a + size as usize, size),
+                ));
+            }
+        }
+        None
+    }
+
     #[inline(never)]
     fn read_slow(&mut self, va: u64, size: u32, unpriv: bool) -> Res<u64> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
@@ -1389,6 +1457,41 @@ impl<H: Host> Cpu<H> {
             }
         }
         self.write_slow(va, size, value, unpriv)
+    }
+
+    /// `write` if the fast tables serve it (not unprivileged, in one page, the page in them, no exclusive monitor
+    /// armed): true once it is done. Else false, and nothing is done.
+    #[inline(always)]
+    pub(crate) fn write_hit(&mut self, va: u64, size: u32, value: u64) -> bool {
+        let off = va & 0xfff;
+        if off + size as u64 <= 0x1000 && self.excl_armed == 0 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.write_tag[i] == va >> 12 {
+                let a = f.write_base[i] as usize + off as usize;
+                self.ram_store(a, size, value);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Two writes of `size` bytes, at `va` and right after it, if the fast tables serve both with one page: true
+    /// once they are done. Else false, and nothing is done.
+    #[inline(always)]
+    pub(crate) fn write_pair_hit(&mut self, va: u64, size: u32, first: u64, second: u64) -> bool {
+        let off = va & 0xfff;
+        if off + 2 * size as u64 <= 0x1000 && self.excl_armed == 0 {
+            let f = &self.fast[self.el as usize];
+            let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
+            if f.write_tag[i] == va >> 12 {
+                let a = f.write_base[i] as usize + off as usize;
+                self.ram_store(a, size, first);
+                self.ram_store(a + size as usize, size, second);
+                return true;
+            }
+        }
+        false
     }
 
     #[inline(never)]

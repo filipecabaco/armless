@@ -41,6 +41,7 @@ pub(crate) mod mmu;
 pub mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod platform;
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
 pub(crate) mod predecode;
 #[allow(unsafe_code)]
 pub(crate) mod ram;

@@ -11,7 +11,12 @@ use crate::sysreg::{self as sr, id};
 
 /// AddWithCarry: returns (result, N, Z, C, V).
 #[inline(always)]
-fn add_with_carry(x: u64, y: u64, carry: bool, sf: bool) -> (u64, bool, bool, bool, bool) {
+pub(crate) fn add_with_carry(
+    x: u64,
+    y: u64,
+    carry: bool,
+    sf: bool,
+) -> (u64, bool, bool, bool, bool) {
     if sf {
         let (r1, c1) = x.overflowing_add(y);
         let (r, c2) = r1.overflowing_add(carry as u64);
@@ -28,7 +33,7 @@ fn add_with_carry(x: u64, y: u64, carry: bool, sf: bool) -> (u64, bool, bool, bo
 
 /// Shift a register operand (LSL/LSR/ASR/ROR) at the operand size.
 #[inline(always)]
-fn shift_reg(v: u64, kind: u32, amount: u32, sf: bool) -> u64 {
+pub(crate) fn shift_reg(v: u64, kind: u32, amount: u32, sf: bool) -> u64 {
     if sf {
         let a = amount & 63;
         match kind {
@@ -51,7 +56,7 @@ fn shift_reg(v: u64, kind: u32, amount: u32, sf: bool) -> u64 {
 
 /// ExtendReg: UXTB..SXTX followed by a left shift of 0..4.
 #[inline(always)]
-fn extend_reg(v: u64, option: u32, shift: u32) -> u64 {
+pub(crate) fn extend_reg(v: u64, option: u32, shift: u32) -> u64 {
     let e = match option {
         0 => v & 0xff,
         1 => v & 0xffff,
@@ -126,17 +131,23 @@ impl<H: Host> Cpu<H> {
     /// ADR / ADRP
     #[inline(always)]
     pub(crate) fn adr(&mut self, insn: u32) -> Res<()> {
+        self.adr_at(insn, self.pc);
+        Ok(())
+    }
+
+    /// ADR / ADRP of the instruction at `pc`.
+    #[inline(always)]
+    pub(crate) fn adr_at(&mut self, insn: u32, pc: u64) {
         let rd = insn & 31;
         let immlo = field(insn, 29, 2) as u64;
         let immhi = field(insn, 5, 19) as u64;
         let imm = sext((immhi << 2) | immlo, 21);
         let v = if bit(insn, 31) {
-            (self.pc & !0xfff).wrapping_add((imm << 12) as u64)
+            (pc & !0xfff).wrapping_add((imm << 12) as u64)
         } else {
-            self.pc.wrapping_add(imm as u64)
+            pc.wrapping_add(imm as u64)
         };
         self.wr(rd, v);
-        Ok(())
     }
 
     /// ADD/ADDS/SUB/SUBS (immediate)
@@ -269,7 +280,15 @@ impl<H: Host> Cpu<H> {
         Ok(())
     }
 
-    fn bitfield(&self, opc: u32, src: u64, dst: u64, immr: u32, imms: u32, size: u32) -> u64 {
+    pub(crate) fn bitfield(
+        &self,
+        opc: u32,
+        src: u64,
+        dst: u64,
+        immr: u32,
+        imms: u32,
+        size: u32,
+    ) -> u64 {
         if imms >= immr {
             // Extract bits [imms:immr] to the bottom.
             let width = imms - immr + 1;
@@ -320,46 +339,82 @@ impl<H: Host> Cpu<H> {
     /// B / BL
     #[inline(always)]
     pub(crate) fn b_bl(&mut self, insn: u32) -> Res<()> {
+        self.next_pc = self.b_bl_at(insn, self.pc);
+        Ok(())
+    }
+
+    /// B / BL of the instruction at `pc`: where it goes.
+    #[inline(always)]
+    pub(crate) fn b_bl_at(&mut self, insn: u32, pc: u64) -> u64 {
         let off = sext((insn & 0x3ff_ffff) as u64, 26) << 2;
         if bit(insn, 31) {
-            self.x[30] = self.pc.wrapping_add(4);
+            self.x[30] = pc.wrapping_add(4);
         }
-        self.next_pc = self.pc.wrapping_add(off as u64);
-        Ok(())
+        pc.wrapping_add(off as u64)
     }
 
     /// CBZ / CBNZ
     #[inline(always)]
     pub(crate) fn cbz_cbnz(&mut self, insn: u32) -> Res<()> {
+        if let Some(target) = self.cbz_cbnz_at(insn, self.pc) {
+            self.next_pc = target;
+        }
+        Ok(())
+    }
+
+    /// CBZ / CBNZ of the instruction at `pc`: where it goes if it is taken.
+    #[inline(always)]
+    pub(crate) fn cbz_cbnz_at(&self, insn: u32, pc: u64) -> Option<u64> {
         let sf = bit(insn, 31);
         let t = trunc(self.xr(insn & 31), sf);
         if (t == 0) != bit(insn, 24) {
             let off = sext(field(insn, 5, 19) as u64, 19) << 2;
-            self.next_pc = self.pc.wrapping_add(off as u64);
+            Some(pc.wrapping_add(off as u64))
+        } else {
+            None
         }
-        Ok(())
     }
 
     /// TBZ / TBNZ
     #[inline(always)]
     pub(crate) fn tbz_tbnz(&mut self, insn: u32) -> Res<()> {
+        if let Some(target) = self.tbz_tbnz_at(insn, self.pc) {
+            self.next_pc = target;
+        }
+        Ok(())
+    }
+
+    /// TBZ / TBNZ of the instruction at `pc`: where it goes if it is taken.
+    #[inline(always)]
+    pub(crate) fn tbz_tbnz_at(&self, insn: u32, pc: u64) -> Option<u64> {
         let b = (field(insn, 31, 1) << 5) | field(insn, 19, 5);
         let set = (self.xr(insn & 31) >> b) & 1 != 0;
         if set == bit(insn, 24) {
             let off = sext(field(insn, 5, 14) as u64, 14) << 2;
-            self.next_pc = self.pc.wrapping_add(off as u64);
+            Some(pc.wrapping_add(off as u64))
+        } else {
+            None
         }
-        Ok(())
     }
 
     /// B.cond
     #[inline(always)]
     pub(crate) fn b_cond(&mut self, insn: u32) -> Res<()> {
-        if self.cond_holds(insn & 0xf) {
-            let off = sext(field(insn, 5, 19) as u64, 19) << 2;
-            self.next_pc = self.pc.wrapping_add(off as u64);
+        if let Some(target) = self.b_cond_at(insn, self.pc) {
+            self.next_pc = target;
         }
         Ok(())
+    }
+
+    /// B.cond of the instruction at `pc`: where it goes if it is taken.
+    #[inline(always)]
+    pub(crate) fn b_cond_at(&self, insn: u32, pc: u64) -> Option<u64> {
+        if self.cond_holds(insn & 0xf) {
+            let off = sext(field(insn, 5, 19) as u64, 19) << 2;
+            Some(pc.wrapping_add(off as u64))
+        } else {
+            None
+        }
     }
 
     fn exception_gen(&mut self, insn: u32) -> Res<()> {
