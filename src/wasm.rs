@@ -437,6 +437,19 @@ pub extern "C" fn armless_pc() -> f64 {
     cpu().pc as f64
 }
 
+/// The exact PC (`armless_pc` is a double, which loses the low bits of an address in the kernel's half
+/// of the address space), for a host that samples where the guest is.
+#[no_mangle]
+pub extern "C" fn armless_pc64() -> i64 {
+    cpu().pc as i64
+}
+
+/// The current exception level: 0 (user) or 1 (kernel).
+#[no_mangle]
+pub extern "C" fn armless_el() -> i32 {
+    cpu().el as i32
+}
+
 #[no_mangle]
 pub extern "C" fn armless_insn_count() -> f64 {
     vm().cpus.iter().map(|c| c.insn_count).sum::<u64>() as f64
