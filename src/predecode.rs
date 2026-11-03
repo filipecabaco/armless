@@ -13,6 +13,9 @@ use crate::cpu::{Cpu, Res};
 pub(crate) const PAGE_INSNS: usize = 1024;
 /// Pages kept decoded (8 KiB each); past that every page is dropped and decoded afresh.
 const MAX_PAGES: usize = 1024;
+/// Executions of an entry are counted in its bits `COUNT_SHIFT..COUNT_SHIFT + 16` (`bump`).
+const COUNT_SHIFT: u32 = 40;
+pub(crate) const COUNT_MAX: u32 = 0xffff;
 /// No slot.
 pub(crate) const NONE: u32 = u32::MAX;
 
@@ -190,6 +193,38 @@ impl Cache {
         // SAFETY: `cur_ptr` points at the entries of the page at `cur_base`, a live slot (dropping
         // any slot resets `cur_base`), and `i` is an instruction index within a page.
         unsafe { *self.cur_ptr.add(i) }
+    }
+
+    /// Count one execution of entry `i` of the page at physical base `base` in the entry itself
+    /// (bits 40..56, saturating at `COUNT_MAX`) and return the count, or 0 when the entry is not
+    /// decoded yet (or its page has no slot). Makes that page the current one.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    pub(crate) fn bump(&mut self, base: usize, i: usize) -> u32 {
+        debug_assert!(i < PAGE_INSNS);
+        if base != self.cur_base {
+            let slot = self.page_slot[base >> 12];
+            if slot == NONE {
+                return 0;
+            }
+            self.set_current(base, slot);
+        }
+        // SAFETY: `cur_ptr` points at the entries of the page at `cur_base`, a live slot, and `i`
+        // is an instruction index within a page.
+        let p = unsafe { self.cur_ptr.add(i) };
+        // SAFETY: `p` is that same entry.
+        let e = unsafe { *p };
+        if e == 0 {
+            return 0;
+        }
+        let c = ((e >> COUNT_SHIFT) as u32 & COUNT_MAX) + 1;
+        if c <= COUNT_MAX {
+            // SAFETY: `p` is that same entry.
+            unsafe { *p = e + (1 << COUNT_SHIFT) };
+            c
+        } else {
+            COUNT_MAX
+        }
     }
 
     /// Record entry `i` of the current page.

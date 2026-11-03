@@ -1065,7 +1065,7 @@ impl<H: Host> Cpu<H> {
 
     /// The pre-decoded entry of the instruction at `pc`, fetching and decoding it.
     #[inline(never)]
-    fn fetch_decoded_slow(&mut self, pc: u64) -> Res<u64> {
+    pub(crate) fn fetch_decoded_slow(&mut self, pc: u64) -> Res<u64> {
         let insn = self.fetch(pc)?;
         let f = &self.fast[self.el as usize];
         if pc >> 12 != f.code_page {

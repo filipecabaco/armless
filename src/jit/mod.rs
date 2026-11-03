@@ -119,8 +119,6 @@ pub struct Jit {
     slot_later: Vec<bool>,
     lookup_key: Vec<u64>,
     lookup_slot: Vec<u32>,
-    hot_key: Vec<u64>,
-    hot_count: Vec<u32>,
     pages: HashMap<u64, PageInfo>,
     slot_page: Vec<u64>,
     slot_state: Vec<SlotState>,
@@ -189,8 +187,6 @@ impl Jit {
             slot_later: vec![false; SLOTS as usize],
             lookup_key: vec![u64::MAX; LOOKUP],
             lookup_slot: vec![0; LOOKUP],
-            hot_key: vec![u64::MAX; LOOKUP],
-            hot_count: vec![0; LOOKUP],
             pages: HashMap::new(),
             slot_page: vec![u64::MAX; SLOTS as usize],
             slot_state: vec![SlotState::Free; SLOTS as usize],
@@ -228,27 +224,6 @@ impl Jit {
             Some(self.lookup_slot[i])
         } else {
             None
-        }
-    }
-
-    /// Count an execution of the entry at `key`. Returns 1 when it became
-    /// warm (worth including in its page's next module) and 2 when it is hot
-    /// (its page should be compiled now).
-    #[inline(always)]
-    fn touch(&mut self, key: u64) -> u32 {
-        let i = hash(key);
-        if self.hot_key[i] != key {
-            self.hot_key[i] = key;
-            self.hot_count[i] = 0;
-        }
-        self.hot_count[i] += 1;
-        let c = self.hot_count[i];
-        if c >= self.threshold {
-            2
-        } else if c == self.threshold.div_ceil(4) {
-            1
-        } else {
-            0
         }
     }
 
@@ -352,7 +327,6 @@ impl Jit {
         self.covered.clear();
         self.code_page.fill(0);
         self.pre.clear();
-        self.hot_key.fill(u64::MAX);
         self.lookup_key.fill(u64::MAX);
     }
 
@@ -464,17 +438,33 @@ impl<H: Host> Cpu<H> {
             return JitStep::NotCompiled;
         };
         let key = Jit::key(pa, self.el, self.spsel);
-        if let Some(slot) = self.jit.ready_slot(key) {
-            return self.jit_run(slot, budget);
+        // Only a page that was ever compiled (or is compiling) can have a module to run: the
+        // lookup table is not touched for the cold ones.
+        if self.jit.code_page[(pa >> 12) as usize] & 1 != 0 {
+            if let Some(slot) = self.jit.ready_slot(key) {
+                return self.jit_run(slot, budget);
+            }
         }
-        match self.jit.touch(key) {
-            0 => {},
-            1 => self.jit_warm(key),
-            _ => {
-                if self.jit_compile(key) && self.jit.sync_compile && self.jit.enabled {
-                    self.jit.yielded = true;
-                }
-            },
+        // Count this execution of the entry in its predecoded slot (`Cache::bump`): the line is
+        // the one the interpreter reads next.
+        let i = ((pa & 0xfff) >> 2) as usize;
+        let mut c = self.jit.pre.bump(pa as usize & !0xfff, i);
+        if c == 0 {
+            // Not decoded yet: decode it now (the interpreter would next), and count it.
+            let _ = self.fetch_decoded_slow(self.pc);
+            c = self.jit.pre.bump(pa as usize & !0xfff, i);
+        }
+        // The counts are exact, so what a workload runs a few thousand times each, in more places than the
+        // modules can hold, would be compiled, flushed and compiled again. Every 8 flushes the threshold
+        // doubles (at most 8 times the configured one), so that the code that is run the most stays.
+        let threshold = (self.jit.threshold.min(crate::predecode::COUNT_MAX) << (self.jit.flushes / 8).min(3))
+            .min(crate::predecode::COUNT_MAX);
+        if c >= threshold {
+            if self.jit_compile(key) && self.jit.sync_compile && self.jit.enabled {
+                self.jit.yielded = true;
+            }
+        } else if c == threshold.div_ceil(4) {
+            self.jit_warm(key);
         }
         JitStep::NotCompiled
     }
