@@ -584,6 +584,51 @@ pub unsafe extern "C" fn armless_blob(name: u32, name_len: u32, data: u32, data_
     }
 }
 
+/// Room for a blob that the host decompresses itself: `len` bytes that are not cleared, for the host to fill
+/// (up to `len`, which a frame that does not state its size makes an upper bound) and then hand to
+/// `armless_blob_raw`, which takes the block over (nothing copies it); a host that does not use it gives the block
+/// back with `armless_free`.
+#[no_mangle]
+pub extern "C" fn armless_blob_buf(len: u32) -> u32 {
+    let layout = std::alloc::Layout::from_size_align(len.max(1) as usize, 1).unwrap();
+    // SAFETY: the layout is not empty (its size is at least 1).
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    ptr as u32
+}
+
+/// Provide a blob that is already decompressed, in a block from `armless_blob_buf(data_cap)` of which the first
+/// `data_len` bytes are written. The block becomes the blob's contents, cut to `data_len` (the tail goes back to
+/// the allocator). Returns 0 or -1.
+///
+/// # Safety
+/// `data` must come from `armless_blob_buf(data_cap)`, with `data_len <= data_cap`, and must not be used or freed
+/// afterwards; `name` must reference `name_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_blob_raw(
+    name: u32,
+    name_len: u32,
+    data: u32,
+    data_len: u32,
+    data_cap: u32,
+) -> i32 {
+    let n = string(name, name_len);
+    // The block was allocated with the size max(cap, 1): a Vec of capacity 0 frees nothing, so the byte of an
+    // empty blob stays (there is no such blob in an image)
+    let mut raw = Vec::from_raw_parts(data as *mut u8, data_len as usize, data_cap as usize);
+    raw.shrink_to_fit();
+    match vm().board.provide_raw_blob(&n, raw) {
+        Ok(()) => 0,
+        Err(e) => {
+            vm().board.blob_failed(&n);
+            set_error(e);
+            -1
+        },
+    }
+}
+
 /// # Safety
 /// `name` must reference `name_len` readable bytes.
 #[no_mangle]

@@ -858,6 +858,11 @@ impl Fs {
         } else {
             data
         };
+        self.provide_raw(name, raw)
+    }
+
+    /// The host delivered a blob that is already decompressed: kept as it is, whatever its first bytes are.
+    pub fn provide_raw(&mut self, name: &str, raw: Vec<u8>) -> Result<(), String> {
         self.failed.remove(name);
         if self.blobs.contains_key(name) {
             return Ok(());
@@ -1121,6 +1126,16 @@ mod cache_tests {
         fs.set_cache_limit(0);
         assert_eq!(fs.blobs.keys().collect::<Vec<_>>(), ["c"]);
         assert_eq!(fs.cached, 8);
+    }
+
+    #[test]
+    fn a_blob_the_host_decompressed_is_kept_as_it_is() {
+        // The bytes of a zstd frame that are a file's content: `provide_blob` would decompress them
+        let frame = vec![0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3, 4];
+        let mut fs = Fs::empty();
+        fs.provide_raw("a", frame.clone()).unwrap();
+        assert_eq!(fs.blobs.get("a").map(|b| b.as_slice()), Some(&frame[..]));
+        assert_eq!(fs.cached, frame.len());
     }
 }
 
