@@ -255,23 +255,35 @@ fn smp_atomics_native_jit() {
     smp_atomics(true);
 }
 
-/// The benchmark guest (guest/bench.c, what bench/run.exs times) under the native JIT, checked by
-/// what the JIT did rather than by time: almost everything runs compiled, almost nothing goes back
-/// to the interpreter, and every compile works. A change that quietly sends code back to the
-/// interpreter fails here, not later as a slowdown.
+/// What one boot of the benchmark guest did under the native JIT.
 #[cfg(feature = "native-jit")]
-#[test]
-fn benchmark_guest_stays_compiled() {
-    let Some(image) = bench_image() else {
-        return skip("could not build the benchmark guest");
-    };
+struct Boot {
+    insns: u64,
+    compiled: u64,
+    helped: u64,
+    failed: u64,
+    /// The code the boot compiled and ran (`Runner::jit_profile`).
+    profile: Vec<armless::jit::profile::Page>,
+    /// The modules of `prewarm` that were queued before the guest started.
+    queued: usize,
+}
+
+/// Boots the benchmark guest to power off under the native JIT. With a `prewarm` profile, its pages
+/// are compiled, and the compiler waited for, before the guest runs its first instruction.
+#[cfg(feature = "native-jit")]
+fn boot_benchmark(image: &[u8], prewarm: Option<&[armless::jit::profile::Page]>) -> Option<Boot> {
     let (mut vm, clock) = runner::new_vm(Config::default()).unwrap();
     if !vm.cpus[0].enable_native_jit() {
-        return eprintln!("skipping: no native JIT backend for this host");
+        return None;
     }
-    armless::boot_raw(&mut vm.cpus[0], &image, armless::board::KERNEL_OFFSET).unwrap();
+    armless::boot_raw(&mut vm.cpus[0], image, armless::board::KERNEL_OFFSET).unwrap();
     let _host = NativeHost::spawn(vm.board.clone(), HostOptions::default(), Box::new(|_| {}));
     let mut runner = Runner::new(vm, clock, true);
+    let queued = prewarm.map_or(0, |pages| {
+        let queued = runner.jit_prewarm(pages);
+        runner.with_cpu(0, |c| c.wait_native_jit());
+        queued
+    });
     runner.start();
     assert_eq!(
         runner.wait(Some(Duration::from_secs(300))),
@@ -285,6 +297,81 @@ fn benchmark_guest_stays_compiled() {
             c.native_jit_failures(),
         )
     });
+    Some(Boot {
+        insns,
+        compiled,
+        helped,
+        failed,
+        profile: runner.jit_profile(),
+        queued,
+    })
+}
+
+/// Whether everything `boot` compiled and ran is in `profile`: its pages, and each page's entry points.
+#[cfg(feature = "native-jit")]
+fn knows(profile: &[armless::jit::profile::Page], boot: &Boot) -> bool {
+    boot.profile.iter().all(|p| {
+        profile
+            .iter()
+            .find(|q| q.key == p.key && q.hash == p.hash)
+            .is_some_and(|q| p.entries.iter().all(|e| q.entries.contains(e)))
+    })
+}
+
+/// The benchmark guest (guest/bench.c, what bench/run.exs times) under the native JIT, checked by
+/// what the JIT did rather than by time: almost everything runs compiled, almost nothing goes back
+/// to the interpreter, and every compile works. A change that quietly sends code back to the
+/// interpreter fails here, not later as a slowdown.
+///
+/// What runs compiled must not depend on how far the interpreter gets while the compiler is still
+/// at work on code the guest has just reached: that is a race of the compiler's time against the
+/// interpreter's speed (about a dozen modules at about half a millisecond each, and the share of
+/// 98% leaves less than 2% of the guest's instructions, so a faster interpreter alone can fail
+/// it). So the measured boot is one that starts with everything it will run compiled. A boot
+/// learns what it runs (`Runner::jit_profile`) and the next one starts with what has been learned
+/// compiled, and the compiler idle. The measured boot is the first that learns nothing new and
+/// leaves no more than a thousandth of its instructions interpreted (normally the second): a
+/// compiler that is late for a short phase of the guest (a busy machine) makes one more boot learn
+/// it, or leaves it in the measurement, which the share of 98% allows for. The boots are at most six.
+#[cfg(feature = "native-jit")]
+#[test]
+fn benchmark_guest_stays_compiled() {
+    let Some(image) = bench_image() else {
+        return skip("could not build the benchmark guest");
+    };
+    let mut profile = Vec::new();
+    let mut boots = 0;
+    let (boot, started_with) = loop {
+        boots += 1;
+        let started_with = profile.len();
+        let Some(boot) = boot_benchmark(&image, (boots > 1).then_some(profile.as_slice())) else {
+            return eprintln!("skipping: no native JIT backend for this host");
+        };
+        assert_eq!(boot.failed, 0, "blocks that did not compile");
+        let learned = boots == 1 || !knows(&profile, &boot);
+        armless::jit::profile::merge(&mut profile, &boot.profile, usize::MAX);
+        if (!learned && boot.compiled * 1000 >= boot.insns * 999) || boots == 6 {
+            break (boot, started_with);
+        }
+    };
+    let Boot {
+        insns,
+        compiled,
+        helped,
+        failed,
+        queued,
+        ..
+    } = boot;
+    eprintln!(
+        "benchmark guest: {compiled} of {insns} instructions ran compiled ({:.3}%), {helped} interpreted by helpers, {} pages in the profile, {queued} queued, boot {boots}",
+        compiled as f64 * 100.0 / insns as f64,
+        profile.len(),
+    );
+    assert!(!profile.is_empty(), "the guest compiled nothing");
+    assert_eq!(
+        queued, started_with,
+        "pages of the profile not compiled ahead"
+    );
     assert_eq!(failed, 0, "blocks that did not compile");
     assert!(
         compiled * 100 >= insns * 98,
