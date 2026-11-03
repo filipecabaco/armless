@@ -783,18 +783,43 @@ impl<H: Host> Cpu<H> {
     }
 
     /// Turn the JIT on with the native compiler (false where the host has no Cranelift backend).
+    /// One turned on with `enable_native_jit_here` compiles on a thread from now on, keeping what
+    /// it compiled; one already compiling on a thread is left as it is.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
     pub fn enable_native_jit(&mut self) -> bool {
-        let helpers = native::Helpers {
+        if let Some(n) = self.jit.native.as_mut() {
+            if n.compiles_here() {
+                self.jit.enabled = n.start_thread();
+            }
+            return self.jit.enabled;
+        }
+        self.jit.native = native::Native::new(gen::LOCALS, self.native_helpers());
+        self.jit.enabled = self.jit.native.is_some();
+        self.jit_entry = true;
+        self.jit.enabled
+    }
+
+    /// Turn the JIT on with the native compiler working on this thread: a page compiles before
+    /// the call that asked for it returns (`jit_prewarm`), and no thread starts. For a process
+    /// that compiles a profile and then forks: every child starts with that code, sharing it, and
+    /// `enable_native_jit` in the child moves compiling to a thread (and a module) of its own.
+    /// False where the host has no Cranelift backend.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    pub fn enable_native_jit_here(&mut self) -> bool {
+        self.jit.native = native::Native::new_here(gen::LOCALS, self.native_helpers());
+        self.jit.enabled = self.jit.native.is_some();
+        self.jit_entry = true;
+        self.jit.enabled
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    fn native_helpers(&self) -> native::Helpers {
+        native::Helpers {
             read: native_read::<H> as *const () as usize,
             write: native_write::<H> as *const () as usize,
             interp: native_interp::<H> as *const () as usize,
             fp3: native_fp3::<H> as *const () as usize,
-        };
-        self.jit.native = native::Native::new(gen::LOCALS, helpers);
-        self.jit.enabled = self.jit.native.is_some();
-        self.jit_entry = true;
-        self.jit.enabled
+        }
     }
 
     /// Layout for code of the page key (its EL and SPSel select the TLB and SP).

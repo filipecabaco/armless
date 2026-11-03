@@ -131,6 +131,12 @@ struct Shared {
 /// One CPU's native JIT: a compiler thread of its own owns the generated code, so the CPU goes on
 /// interpreting while a page compiles, and takes the result when it is there (as in the browser,
 /// where the host compiles asynchronously too).
+///
+/// Or, made with `new_here`, it compiles on the caller's thread before `submit` returns, and
+/// starts no thread until `start_thread`: for a process that compiles and then forks, whose
+/// children all run what it compiled. A child never writes into that module (on Linux its memory
+/// is shared with the parent and every other child): `start_thread` keeps it, unwritten, for the
+/// code already pointing into it, and compiles into a new module of its own.
 pub struct Native {
     jobs: Option<Sender<Job>>,
     done: Receiver<Done>,
@@ -138,6 +144,13 @@ pub struct Native {
     /// Results of an older generation point into a module that has been freed.
     pub generation: u64,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Compiling on the caller's thread (`new_here`): the compiler, and where its results go
+    here: Option<(Compiler, Sender<Done>)>,
+    /// The module compiled into on the caller's thread before `start_thread`: written no more,
+    /// kept until the next reset for the code that points into it
+    kept: Option<Compiler>,
+    locals: &'static [(u32, u8)],
+    helpers: Helpers,
 }
 
 /// Whether code in Cranelift's own memory can be made visible to every core. On Linux arm64
@@ -164,117 +177,85 @@ impl Native {
     /// None where Cranelift does not support the host. `locals` and the helpers are those of the
     /// functions `gen` writes for this CPU.
     pub fn new(locals: &'static [(u32, u8)], helpers: Helpers) -> Option<Native> {
-        let (jobs, job_rx) = channel::<Job>();
         let (done_tx, done) = channel::<Done>();
-        let (ready_tx, ready_rx) = channel::<bool>();
         let shared = Arc::new(Shared::default());
-        let thread_shared = shared.clone();
-        let thread = std::thread::Builder::new()
-            .name("armless-jit".into())
-            .spawn(move || {
-                let Some(mut compiler) = Compiler::new() else {
-                    let _ = ready_tx.send(false);
-                    return;
-                };
-                let _ = ready_tx.send(true);
-                loop {
-                    let job = match job_rx.try_recv() {
-                        Ok(job) => job,
-                        Err(TryRecvError::Disconnected) => return,
-                        Err(TryRecvError::Empty) => {
-                            // (not held while waiting below: `submit_later` takes it)
-                            let next = thread_shared.later.lock().unwrap().pop_front();
-                            match next {
-                                Some(job) => job,
-                                None => {
-                                    // Nothing queued: give back what compiling took, until the next job
-                                    compiler.release_scratch();
-                                    match job_rx.recv() {
-                                        Ok(job) => job,
-                                        Err(_) => return,
-                                    }
-                                },
-                            }
-                        },
-                    };
-                    match job {
-                        Job::Wake => {},
-                        Job::Compile {
-                            generation,
-                            slot,
-                            body,
-                            cached,
-                        } => {
-                            let started = std::time::Instant::now();
-                            let function = compiler
-                                .compile(&body, locals, &helpers, &cached)
-                                .map_or(0, |f| f as usize);
-                            thread_shared.compiles.fetch_add(1, Ordering::Relaxed);
-                            if function == 0 {
-                                thread_shared.failures.fetch_add(1, Ordering::Relaxed);
-                            }
-                            thread_shared
-                                .compile_ns
-                                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            thread_shared
-                                .code_bytes
-                                .store(compiler.code_bytes, Ordering::Relaxed);
-                            if done_tx
-                                .send(Done {
-                                    generation,
-                                    slot,
-                                    function,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                            thread_shared.pending.fetch_add(1, Ordering::Release);
-                            thread_shared.in_flight.fetch_sub(1, Ordering::Release);
-                        },
-                        Job::Reset => {
-                            // What waits for later is for the old module: answer it, uncompiled
-                            for job in std::mem::take(&mut *thread_shared.later.lock().unwrap()) {
-                                if let Job::Compile {
-                                    generation, slot, ..
-                                } = job
-                                {
-                                    let _ = done_tx.send(Done {
-                                        generation,
-                                        slot,
-                                        function: 0,
-                                    });
-                                    thread_shared.pending.fetch_add(1, Ordering::Release);
-                                    thread_shared.in_flight.fetch_sub(1, Ordering::Release);
-                                }
-                            }
-                            let Some(fresh) = Compiler::new() else {
-                                return;
-                            };
-                            compiler = fresh;
-                            thread_shared.code_bytes.store(0, Ordering::Relaxed);
-                        },
-                    }
-                }
-            })
-            .ok()?;
-        if !ready_rx.recv().unwrap_or(false) {
-            let _ = thread.join();
-            return None;
-        }
+        let (jobs, thread) = spawn(locals, helpers, shared.clone(), done_tx)?;
         Some(Native {
             jobs: Some(jobs),
             done,
             shared,
             generation: 0,
             thread: Some(thread),
+            here: None,
+            kept: None,
+            locals,
+            helpers,
         })
+    }
+
+    /// A native JIT that compiles on the caller's thread, and starts none, until `start_thread`
+    /// (see `Native`). None where Cranelift does not support the host.
+    pub fn new_here(locals: &'static [(u32, u8)], helpers: Helpers) -> Option<Native> {
+        let compiler = Compiler::new()?;
+        let (done_tx, done) = channel::<Done>();
+        Some(Native {
+            jobs: None,
+            done,
+            shared: Arc::new(Shared::default()),
+            generation: 0,
+            thread: None,
+            here: Some((compiler, done_tx)),
+            kept: None,
+            locals,
+            helpers,
+        })
+    }
+
+    /// Compile on a thread of its own from now on, into a module of its own: what was compiled on
+    /// the caller's thread stays where it is, unwritten. False if no thread could be started (the
+    /// JIT then compiles nothing more).
+    pub fn start_thread(&mut self) -> bool {
+        let Some((compiler, done_tx)) = self.here.take() else {
+            return self.jobs.is_some();
+        };
+        self.kept = Some(compiler);
+        self.shared.code_bytes.store(0, Ordering::Relaxed);
+        match spawn(self.locals, self.helpers, self.shared.clone(), done_tx) {
+            Some((jobs, thread)) => {
+                self.jobs = Some(jobs);
+                self.thread = Some(thread);
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// Whether this compiles on the caller's thread (`new_here`, before `start_thread`).
+    pub fn compiles_here(&self) -> bool {
+        self.here.is_some()
     }
 
     /// Compile `body` (a `gen` function) for `slot`, remembering the `cached` fields' values; the
     /// result comes back through `take_done`.
     pub fn submit(&mut self, slot: u32, body: Vec<u8>, cached: Vec<Cached>) -> bool {
         let generation = self.generation;
+        if let Some((compiler, done_tx)) = self.here.as_mut() {
+            let function = compile_one(
+                compiler,
+                &self.shared,
+                self.locals,
+                &self.helpers,
+                &body,
+                &cached,
+            );
+            let _ = done_tx.send(Done {
+                generation,
+                slot,
+                function,
+            });
+            self.shared.pending.fetch_add(1, Ordering::Release);
+            return true;
+        }
         self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
         let sent = self.jobs.as_ref().is_some_and(|j| {
             j.send(Job::Compile {
@@ -294,6 +275,9 @@ impl Native {
     /// `submit`, for code that is not needed yet (a profile's, see `Cpu::jit_prewarm`): compiled
     /// when nothing submitted is waiting.
     pub fn submit_later(&mut self, slot: u32, body: Vec<u8>, cached: Vec<Cached>) -> bool {
+        if self.here.is_some() {
+            return self.submit(slot, body, cached);
+        }
         let Some(jobs) = self.jobs.as_ref() else {
             return false;
         };
@@ -345,6 +329,13 @@ impl Native {
     pub fn reset(&mut self) {
         self.generation += 1;
         self.shared.code_bytes.store(0, Ordering::Relaxed);
+        // Every slot is flushed: nothing points into a kept module any more
+        self.kept = None;
+        if let Some((compiler, _)) = self.here.as_mut() {
+            if let Some(fresh) = Compiler::new() {
+                *compiler = fresh;
+            }
+        }
         if let Some(j) = &self.jobs {
             let _ = j.send(Job::Reset);
         }
@@ -377,6 +368,132 @@ impl Drop for Native {
             let _ = t.join();
         }
     }
+}
+
+/// Start a compiler thread: it makes its module, then compiles the jobs sent to it, answering on
+/// `done_tx`. None if it could not start or Cranelift does not support the host.
+fn spawn(
+    locals: &'static [(u32, u8)],
+    helpers: Helpers,
+    thread_shared: Arc<Shared>,
+    done_tx: Sender<Done>,
+) -> Option<(Sender<Job>, std::thread::JoinHandle<()>)> {
+    let (jobs, job_rx) = channel::<Job>();
+    let (ready_tx, ready_rx) = channel::<bool>();
+    let thread = std::thread::Builder::new()
+        .name("armless-jit".into())
+        .spawn(move || {
+            let Some(mut compiler) = Compiler::new() else {
+                let _ = ready_tx.send(false);
+                return;
+            };
+            let _ = ready_tx.send(true);
+            loop {
+                let job = match job_rx.try_recv() {
+                    Ok(job) => job,
+                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Empty) => {
+                        // (not held while waiting below: `submit_later` takes it)
+                        let next = thread_shared.later.lock().unwrap().pop_front();
+                        match next {
+                            Some(job) => job,
+                            None => {
+                                // Nothing queued: give back what compiling took, until the next job
+                                compiler.release_scratch();
+                                match job_rx.recv() {
+                                    Ok(job) => job,
+                                    Err(_) => return,
+                                }
+                            },
+                        }
+                    },
+                };
+                match job {
+                    Job::Wake => {},
+                    Job::Compile {
+                        generation,
+                        slot,
+                        body,
+                        cached,
+                    } => {
+                        let function = compile_one(
+                            &mut compiler,
+                            &thread_shared,
+                            locals,
+                            &helpers,
+                            &body,
+                            &cached,
+                        );
+                        if done_tx
+                            .send(Done {
+                                generation,
+                                slot,
+                                function,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        thread_shared.pending.fetch_add(1, Ordering::Release);
+                        thread_shared.in_flight.fetch_sub(1, Ordering::Release);
+                    },
+                    Job::Reset => {
+                        // What waits for later is for the old module: answer it, uncompiled
+                        for job in std::mem::take(&mut *thread_shared.later.lock().unwrap()) {
+                            if let Job::Compile {
+                                generation, slot, ..
+                            } = job
+                            {
+                                let _ = done_tx.send(Done {
+                                    generation,
+                                    slot,
+                                    function: 0,
+                                });
+                                thread_shared.pending.fetch_add(1, Ordering::Release);
+                                thread_shared.in_flight.fetch_sub(1, Ordering::Release);
+                            }
+                        }
+                        let Some(fresh) = Compiler::new() else {
+                            return;
+                        };
+                        compiler = fresh;
+                        thread_shared.code_bytes.store(0, Ordering::Relaxed);
+                    },
+                }
+            }
+        })
+        .ok()?;
+    if !ready_rx.recv().unwrap_or(false) {
+        let _ = thread.join();
+        return None;
+    }
+    Some((jobs, thread))
+}
+
+/// Compile one function, counting it: its address, or 0 if it could not be compiled.
+fn compile_one(
+    compiler: &mut Compiler,
+    shared: &Shared,
+    locals: &'static [(u32, u8)],
+    helpers: &Helpers,
+    body: &[u8],
+    cached: &[Cached],
+) -> usize {
+    let started = std::time::Instant::now();
+    let function = compiler
+        .compile(body, locals, helpers, cached)
+        .map_or(0, |f| f as usize);
+    shared.compiles.fetch_add(1, Ordering::Relaxed);
+    if function == 0 {
+        shared.failures.fetch_add(1, Ordering::Relaxed);
+    }
+    shared
+        .compile_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    shared
+        .code_bytes
+        .store(compiler.code_bytes, Ordering::Relaxed);
+    function
 }
 
 /// The compiler thread's state: the module the generated code lives in.
@@ -1665,6 +1782,66 @@ mod tests {
         enter(&mut c);
         assert_eq!(c.jit.block_runs, runs);
         assert_eq!(c.x[0], 2);
+    }
+
+    /// Compiling on the caller's thread: a profile is compiled before `jit_prewarm` returns, with
+    /// no thread; once compiling moves to a thread, that code still runs and new code goes into a
+    /// module of the thread's own.
+    #[test]
+    fn a_jit_that_compiles_here_has_its_code_at_once_and_keeps_it_on_a_thread() {
+        let Some(mut a) = at_block(1) else { return };
+        for _ in 0..3 {
+            enter(&mut a);
+            a.wait_native_jit();
+        }
+        let profile = a.jit_profile();
+
+        let mut b = at_block(u32::MAX).unwrap();
+        assert!(b.enable_native_jit_here());
+        b.jit.threshold = u32::MAX;
+        let n = b.jit.native.as_ref().unwrap();
+        assert!(n.compiles_here() && n.thread.is_none());
+        assert_eq!(b.jit_prewarm(&profile), profile.len());
+        // No waiting: the code is there
+        assert!(b.jit.native.as_ref().unwrap().has_done());
+        let here_bytes = b.native_jit_code_bytes();
+        assert!(here_bytes > 0);
+        let runs = b.jit.block_runs;
+        enter(&mut b);
+        assert_eq!(b.jit.block_runs, runs + 1, "the profile's code did not run");
+        assert_eq!(b.x[0], 1);
+
+        // On a thread now: the code compiled here still runs
+        assert!(b.enable_native_jit());
+        let n = b.jit.native.as_ref().unwrap();
+        assert!(!n.compiles_here() && n.thread.is_some() && n.kept.is_some());
+        assert_eq!(b.native_jit_code_bytes(), 0, "a module of its own");
+        enter(&mut b);
+        assert_eq!(b.jit.block_runs, runs + 2);
+        assert_eq!(b.x[0], 2);
+        // and new code compiles into the thread's module
+        const OTHER: u64 = 0x8000;
+        let back = ((EXIT as i64 - (OTHER + 4) as i64) / 4) as u32 & 0x3ff_ffff;
+        let words = [0x9100_0c00u32, 0x1400_0000 | back];
+        for (i, w) in words.iter().enumerate() {
+            b.mem.write(OTHER as usize + 4 * i, &w.to_le_bytes());
+        }
+        b.jit.threshold = 1;
+        for _ in 0..3 {
+            b.pc = OTHER;
+            b.jit_entry = true;
+            b.run(2);
+            b.wait_native_jit();
+        }
+        let runs = b.jit.block_runs;
+        b.pc = OTHER;
+        b.jit_entry = true;
+        b.run(2);
+        assert_eq!(b.jit.block_runs, runs + 1, "new code was not compiled");
+        assert_eq!(b.x[0], 2 + 4 * 3);
+        assert!(b.native_jit_code_bytes() > 0);
+        enter(&mut b);
+        assert_eq!(b.jit.block_runs, runs + 2, "the kept code went");
     }
 
     /// Groups that are translated in full: what real workloads (bench/sites.exs) used to hand to
