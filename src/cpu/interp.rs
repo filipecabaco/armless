@@ -1350,6 +1350,12 @@ mod tests {
     fn the_loop_agrees_with_execute_on_random_instructions() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let (mut bad, mut seen) = (Vec::new(), Vec::new());
+        // The data pages only: a copy of all of RAM after each of the 400 000 instructions took minutes
+        let data = |c: &Cpu<NoDevices>| {
+            let mut v = vec![0; DATA.len()];
+            c.mem.read(DATA.start, &mut v);
+            v
+        };
         for _ in 0..400 {
             let mut a = Cpu::new(4 << 20, NoDevices);
             let mut b = Cpu::new(4 << 20, NoDevices);
@@ -1411,7 +1417,7 @@ mod tests {
                         "esr/elr/far {:#x} {:#x} {:#x} against {:#x} {:#x} {:#x}",
                         a.sys.esr, a.sys.elr, a.sys.far, b.sys.esr, b.sys.elr, b.sys.far
                     ))
-                } else if a.mem.to_vec()[DATA] != b.mem.to_vec()[DATA] {
+                } else if data(&a) != data(&b) {
                     Some("memory".to_string())
                 } else {
                     None
