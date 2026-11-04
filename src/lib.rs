@@ -70,6 +70,7 @@ static HEAP: heap::Heap = heap::Heap;
 pub use board::{Host, Platform};
 pub use cpu::{Cpu, Exit, StopReason};
 pub use dev::Event;
+pub use ram::Ram;
 pub use vm::{Board, Config, Vm};
 
 /// Where the boot loader placed things, for logging and tests.

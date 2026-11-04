@@ -1,6 +1,6 @@
 [package]
 name = "armless"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # Cranelift (the native-jit feature) needs 1.96
 rust-version = "1.96"
@@ -37,16 +37,16 @@ cranelift-jit = { version = "=0.136.2", optional = true }
 cranelift-module = { version = "=0.136.2", optional = true }
 cranelift-native = { version = "=0.136.2", optional = true }
 
-# The native JIT checks the kernel lets it make new code visible to other cores (membarrier), and
-# maps its code memory itself (src/jit/native/code.rs)
-[target.'cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
-libc = { version = "0.2", optional = true }
+# RAM mapped from an image (Ram::from_image); the native JIT checks the kernel lets it make new
+# code visible to other cores (membarrier), and maps its code memory itself (src/jit/native/code.rs)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["native-jit"]
 # Compile hot guest code to host code on native hosts (opt-in at run time: ARMLESS_JIT=native, or
 # Cpu::enable_native_jit).
-native-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:libc"]
+native-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 # Compile the wasm export layer natively, to type-check it without a wasm target.
 wasm-api = []
 

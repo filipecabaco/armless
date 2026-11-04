@@ -30,6 +30,8 @@ pub use crate::dev::Event as VmEvent;
 const MAGIC: &[u8; 8] = b"ARMLESS\x03";
 const PAGE: usize = 4096;
 const END: u32 = u32::MAX;
+/// In a snapshot's CPU count: the snapshot has no pages, its RAM is an image (`split_state`).
+const ON_IMAGE: u32 = 1 << 31;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -483,15 +485,39 @@ impl<P: Platform> Vm<P> {
     pub fn new(
         config: Config,
         clock: fn() -> u64,
-        mut platform: impl FnMut(usize) -> P,
+        platform: impl FnMut(usize) -> P,
     ) -> Result<Vm<P>, String> {
+        Self::check(&config)?;
+        let ram = crate::ram::Ram::zeroed(config.memory_size);
+        Self::with_ram(config, ram, clock, platform)
+    }
+
+    fn check(config: &Config) -> Result<(), String> {
         if config.memory_size as u64 > crate::board::RAM_MAX || config.memory_size < 16 << 20 {
             return Err("memory size must be between 16 MiB and 3.5 GiB".into());
         }
         if !(1..=MAX_CPUS).contains(&config.cpus) {
             return Err(format!("1 to {MAX_CPUS} CPUs"));
         }
-        let machine = Arc::new(Machine::new(config.memory_size, config.cpus));
+        Ok(())
+    }
+
+    /// `new`, on `ram` (`Ram::from_image`, say), which must be `config.memory_size` long.
+    pub fn with_ram(
+        config: Config,
+        ram: crate::ram::Ram,
+        clock: fn() -> u64,
+        mut platform: impl FnMut(usize) -> P,
+    ) -> Result<Vm<P>, String> {
+        Self::check(&config)?;
+        if ram.len() != config.memory_size {
+            return Err(format!(
+                "RAM is {} MiB, the machine {} MiB",
+                ram.len() >> 20,
+                config.memory_size >> 20
+            ));
+        }
+        let machine = Arc::new(Machine::with_ram(ram, config.cpus));
         let board = Arc::new(Board::new(machine.clone(), config.clone(), clock));
         let cpus = (0..config.cpus)
             .map(|i| {
@@ -696,7 +722,8 @@ impl StateSaver {
         let mut head = W::new();
         // Once, with room for the CPUs and the other devices: growing by doubling would leave the
         // smaller buffers in the heap, which a wasm heap does not give back
-        head.0.reserve_exact(board.devices.lock().save_size_hint() + (1 << 20));
+        head.0
+            .reserve_exact(board.devices.lock().save_size_hint() + (1 << 20));
         head.0.extend_from_slice(MAGIC);
         head.u64(mem.len() as u64);
         head.u32(n as u32);
@@ -780,6 +807,67 @@ pub fn load_state<H: Host>(
     loader.finish(board, cpus)
 }
 
+/// Splits a snapshot (decompressed, read from `data`) into its RAM and the rest: RAM goes into
+/// `image`, each page at its offset and the zero ones left as holes, so that `Ram::from_image` maps
+/// it; what is returned is the snapshot without its pages, marked as such: it restores only onto
+/// RAM from an image, whose pages it keeps. (Restore it onto its own image: another's would be
+/// another machine's memory.) Any other snapshot restored onto RAM from an image zeroes the pages
+/// it lacks, as onto any RAM.
+#[cfg(unix)]
+pub fn split_state(data: &mut dyn std::io::Read, image: &std::fs::File) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::FileExt;
+    let e = |e: std::io::Error| e.to_string();
+    let mut head = [0u8; 28];
+    data.read_exact(&mut head)
+        .map_err(|_| "truncated snapshot")?;
+    if &head[..8] != MAGIC {
+        return Err("not an armless snapshot (or one from an older version)".into());
+    }
+    let ram = u64::from_le_bytes(head[8..16].try_into().unwrap());
+    let meta = u64::from_le_bytes(head[20..28].try_into().unwrap());
+    if ram > crate::board::RAM_MAX {
+        return Err("corrupt snapshot".into());
+    }
+    let mut out = head.to_vec();
+    let cpus = u32::from_le_bytes(head[16..20].try_into().unwrap()) | ON_IMAGE;
+    out[16..20].copy_from_slice(&cpus.to_le_bytes());
+    let at = out.len();
+    out.resize(at + meta as usize, 0);
+    data.read_exact(&mut out[at..])
+        .map_err(|_| "truncated snapshot")?;
+    image.set_len(0).map_err(e)?;
+    let mut page = vec![0u8; PAGE];
+    loop {
+        let mut n = [0u8; 4];
+        data.read_exact(&mut n).map_err(|_| "truncated snapshot")?;
+        let p = u32::from_le_bytes(n);
+        if p == END {
+            break;
+        }
+        let from = p as u64 * PAGE as u64;
+        if from >= ram {
+            return Err("snapshot page outside RAM".into());
+        }
+        data.read_exact(&mut page)
+            .map_err(|_| "truncated snapshot")?;
+        let fit = (PAGE as u64).min(ram - from) as usize;
+        image.write_all_at(&page[..fit], from).map_err(e)?;
+    }
+    if data.read(&mut [0u8; 1]).map_err(e)? != 0 {
+        return Err("data after the end of the snapshot".into());
+    }
+    image.set_len(ram).map_err(e)?;
+    out.extend_from_slice(&END.to_le_bytes());
+    Ok(out)
+}
+
+/// Whether `data` is a snapshot `split_state` made: one without pages, for RAM from its image.
+pub fn is_split_state(data: &[u8]) -> bool {
+    data.len() >= 28
+        && &data[..8] == MAGIC
+        && u32::from_le_bytes(data[16..20].try_into().unwrap()) & ON_IMAGE != 0
+}
+
 enum Stage {
     Header,
     Meta(usize),
@@ -837,7 +925,9 @@ impl StateLoader {
                                 );
                             }
                             let ram = u64::from_le_bytes(b[8..16].try_into().unwrap());
-                            let ncpus = u32::from_le_bytes(b[16..20].try_into().unwrap()) as usize;
+                            let cpus = u32::from_le_bytes(b[16..20].try_into().unwrap());
+                            let on_image = cpus & ON_IMAGE != 0;
+                            let ncpus = (cpus & !ON_IMAGE) as usize;
                             let meta = u64::from_le_bytes(b[20..28].try_into().unwrap()) as usize;
                             if ram != mem.len() as u64 {
                                 return Err(format!(
@@ -856,7 +946,13 @@ impl StateLoader {
                             // touching the ones that already are: a fresh machine's RAM is never
                             // committed beyond what the snapshot holds
                             self.written = vec![0; mem.len().div_ceil(PAGE).div_ceil(64)];
-                            self.fresh = mem.take_fresh();
+                            // A snapshot split from its RAM (`split_state`) restores onto that
+                            // RAM's image, keeping its pages; any other zeroes the pages it lacks,
+                            // the image's too (they would be another machine's memory)
+                            if on_image && !mem.is_image() {
+                                return Err("this snapshot's RAM is in an image: restore it onto RAM from that image".into());
+                            }
+                            self.fresh = mem.take_fresh() || on_image;
                             Stage::Meta(meta)
                         },
                         Stage::Meta(_) => {
@@ -961,6 +1057,140 @@ mod restore_tests {
             "a page the snapshot doesn't have is zero again"
         );
         assert!(mem.is_zero(12 * PAGE, PAGE), "untouched pages stay zero");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod image_tests {
+    use super::{Config, PAGE};
+    use crate::ram::Ram;
+
+    const MB16: usize = 16 << 20;
+
+    fn config() -> Config {
+        Config {
+            memory_size: MB16,
+            cpus: 1,
+            ..Default::default()
+        }
+    }
+
+    fn temp(name: &str) -> std::fs::File {
+        let path = std::env::temp_dir().join(format!("armless-{name}-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        f
+    }
+
+    fn on_image(image: &std::fs::File) -> crate::Vm<crate::platform::NativePlatform> {
+        let clock = crate::platform::Clock::new();
+        let ram = Ram::from_image(image, MB16).unwrap();
+        crate::Vm::with_ram(config(), ram, crate::platform::unix_secs, move |_| {
+            crate::platform::NativePlatform::new(clock.clone())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_split_snapshot_restores_onto_its_image() {
+        let (mut a, _clock) = crate::runner::new_vm(config()).unwrap();
+        a.board.io.mem.store(3 * PAGE + 1, 1, 0x33);
+        a.board.io.mem.store(200 * PAGE, 8, 0x0102_0304_0506_0708);
+        let whole = a.save_state();
+
+        let image = temp("split");
+        let rest = super::split_state(&mut &whole[..], &image).unwrap();
+        assert!(rest.len() < 64 << 10, "no pages left in it: {}", rest.len());
+        assert!(super::is_split_state(&rest) && !super::is_split_state(&whole));
+        assert_eq!(image.metadata().unwrap().len(), MB16 as u64);
+
+        // Two machines on the image: the snapshot's RAM, each writing its own
+        let mut b = on_image(&image);
+        let mut c = on_image(&image);
+        b.load_state(&rest).unwrap();
+        c.load_state(&rest).unwrap();
+        let (mb, mc) = (b.board.io.mem.alias(), c.board.io.mem.alias());
+        assert_eq!(
+            mb.load(3 * PAGE + 1, 1),
+            0x33,
+            "an image page kept, not zeroed"
+        );
+        assert_eq!(mb.load(200 * PAGE, 8), 0x0102_0304_0506_0708);
+        assert!(mb.is_zero(4 * PAGE, PAGE));
+        mb.store(3 * PAGE + 1, 1, 0xbb);
+        assert_eq!(mc.load(3 * PAGE + 1, 1), 0x33, "b's write is b's");
+
+        // The same snapshot whole restores onto an image too
+        let mut d = on_image(&image);
+        d.load_state(&whole).unwrap();
+        assert_eq!(d.board.io.mem.load(200 * PAGE, 8), 0x0102_0304_0506_0708);
+
+        // The split one needs its image
+        let (mut e, _clock) = crate::runner::new_vm(config()).unwrap();
+        let err = e.load_state(&rest).unwrap_err();
+        assert!(err.contains("image"), "{err}");
+    }
+
+    #[test]
+    fn another_snapshot_onto_an_image_doesnt_show_the_images_pages() {
+        let (mut a, _clock) = crate::runner::new_vm(config()).unwrap();
+        a.board.io.mem.store(3 * PAGE, 1, 0x33);
+        let image = temp("other");
+        super::split_state(&mut &a.save_state()[..], &image).unwrap();
+
+        // A machine saved with page 3 zero (and page 9 not), restored onto a's image
+        let (mut b, _clock) = crate::runner::new_vm(config()).unwrap();
+        b.board.io.mem.store(9 * PAGE, 1, 0x99);
+        let other = b.save_state();
+        let mut c = on_image(&image);
+        c.load_state(&other).unwrap();
+        let mem = &c.board.io.mem;
+        assert_eq!(
+            mem.load(3 * PAGE, 1),
+            0,
+            "the image's page is not the snapshot's"
+        );
+        assert_eq!(mem.load(9 * PAGE, 1), 0x99);
+        // Its own pages stay in the image, for the next machine on it
+        let d = on_image(&image);
+        assert_eq!(d.board.io.mem.load(3 * PAGE, 1), 0x33);
+    }
+
+    #[test]
+    fn a_split_refuses_what_isnt_a_whole_snapshot() {
+        let (mut a, _clock) = crate::runner::new_vm(config()).unwrap();
+        a.board.io.mem.store(PAGE, 1, 1);
+        let whole = a.save_state();
+        let image = temp("refuse");
+        assert!(super::split_state(&mut &whole[..whole.len() - 10], &image).is_err());
+        let mut more = whole.clone();
+        more.push(0);
+        assert!(super::split_state(&mut &more[..], &image).is_err());
+        assert!(super::split_state(&mut &b"not one"[..], &image).is_err());
+    }
+
+    #[test]
+    fn a_machine_takes_ram_of_its_size_only() {
+        let image = temp("size");
+        image.set_len(MB16 as u64).unwrap();
+        let clock = crate::platform::Clock::new();
+        let ram = Ram::from_image(&image, MB16).unwrap();
+        let bigger = Config {
+            memory_size: 32 << 20,
+            ..config()
+        };
+        assert!(
+            crate::Vm::with_ram(bigger, ram, crate::platform::unix_secs, move |_| {
+                crate::platform::NativePlatform::new(clock.clone())
+            })
+            .is_err()
+        );
     }
 }
 
