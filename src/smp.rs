@@ -188,10 +188,16 @@ pub struct Machine {
 
 impl Machine {
     pub fn new(memory_size: usize, ncpus: usize) -> Machine {
+        Machine::with_ram(Ram::zeroed(memory_size), ncpus)
+    }
+
+    /// A machine on `mem` (`Ram::from_image`, say) rather than on zeroed RAM.
+    pub fn with_ram(mem: Ram, ncpus: usize) -> Machine {
         assert!((1..=MAX_CPUS).contains(&ncpus), "1..={MAX_CPUS} CPUs");
+        let memory_size = mem.len();
         let m = Machine {
             ncpus,
-            mem: Ram::zeroed(memory_size),
+            mem,
             gic: SpinLock::new(Gic::new(ncpus)),
             rtc: SpinLock::new(Rtc::default()),
             cpus: Default::default(),

@@ -66,11 +66,21 @@ pub fn os_entropy() -> [u8; 32] {
 
 /// Creates a machine for the native runner, seeded with the host's randomness.
 pub fn new_vm(config: crate::vm::Config) -> Result<(Vm<NativePlatform>, Arc<Clock>), String> {
+    new_vm_on(config, None)
+}
+
+/// `new_vm`, on `ram` when there is one (`Ram::from_image`, say).
+pub fn new_vm_on(
+    config: crate::vm::Config,
+    ram: Option<crate::ram::Ram>,
+) -> Result<(Vm<NativePlatform>, Arc<Clock>), String> {
     let clock = Clock::new();
     let c = clock.clone();
-    let vm = Vm::new(config, crate::platform::unix_secs, move |_| {
-        NativePlatform::new(c.clone())
-    })?;
+    let platform = move |_| NativePlatform::new(c.clone());
+    let vm = match ram {
+        Some(ram) => Vm::with_ram(config, ram, crate::platform::unix_secs, platform)?,
+        None => Vm::new(config, crate::platform::unix_secs, platform)?,
+    };
     vm.board.seed(&os_entropy());
     vm.machine().host_cores.store(
         std::thread::available_parallelism().map_or(1, |n| n.get()) as u32,

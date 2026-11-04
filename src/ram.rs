@@ -22,6 +22,12 @@ pub struct Ram {
     len: usize,
     /// What the global allocator returned, to free it with (none for memory.grow and aliases).
     alloc: Option<(*mut u8, std::alloc::Layout)>,
+    /// A mapping of `len` bytes to unmap when this is dropped (`from_image`; aliases have none).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    mapped: bool,
+    /// The pages came from an image (`from_image`): a restore keeps those its snapshot lacks,
+    /// rather than zeroing them.
+    image: bool,
     /// Nothing has written RAM since it was allocated (shared with aliases): a restore can skip
     /// zeroing the pages its snapshot lacks. Cleared by every write here and by a CPU's `run`
     /// (compiled code stores through `as_ptr`).
@@ -49,6 +55,8 @@ impl Ram {
                     ptr: (old * 65536) as *mut u8,
                     len,
                     alloc: None,
+                    mapped: false,
+                    image: false,
                     fresh: Arc::new(AtomicBool::new(true)),
                 };
             }
@@ -68,8 +76,63 @@ impl Ram {
             ptr: unsafe { raw.add(raw.align_offset(PAGE)) },
             len,
             alloc: Some((raw, layout)),
+            mapped: false,
+            image: false,
             fresh: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// RAM whose pages are an image's: `file` holds RAM as it is, `len` bytes, with holes where it
+    /// is zero (`split_state` writes one). It is mapped copy-on-write, private to this RAM:
+    /// machines made from one image share the pages none of them writes (the host's page cache),
+    /// a page a machine writes becomes its own, and nothing is ever written to the file.
+    ///
+    /// A snapshot split from the image (`split_state`) restores onto it keeping its pages; any
+    /// other snapshot zeroes those it lacks, as on any RAM. Pair a split snapshot with its own
+    /// image: on another it would run on another machine's memory.
+    ///
+    /// A page no machine has written yet is still the file's, so the file must not change while
+    /// it is mapped: make it read-only, where only its owner can reach it, and replace it rather
+    /// than write to it. A file cut shorter than RAM would crash the machine at the first touch of
+    /// a page past its end.
+    #[cfg(unix)]
+    pub fn from_image(file: &std::fs::File, len: usize) -> std::io::Result<Ram> {
+        use std::os::fd::AsRawFd;
+        let size = file.metadata()?.len();
+        if size != len as u64 || len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the RAM image is {size} bytes, RAM {len}"),
+            ));
+        }
+        // SAFETY: a new mapping, at an address the kernel picks, of the whole file (it is `len`
+        // long); nothing else owns that range, and `drop` unmaps it once.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Ram {
+            ptr: ptr.cast(),
+            len,
+            alloc: None,
+            mapped: true,
+            image: true,
+            fresh: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Whether the pages came from an image (`from_image`).
+    pub fn is_image(&self) -> bool {
+        self.image
     }
 
     /// Another handle on the same memory; it does not free it when dropped. Whoever holds one
@@ -79,6 +142,8 @@ impl Ram {
             ptr: self.ptr,
             len: self.len,
             alloc: None,
+            mapped: false,
+            image: self.image,
             fresh: self.fresh.clone(),
         }
     }
@@ -269,6 +334,11 @@ impl Drop for Ram {
             // SAFETY: what `alloc_zeroed` returned for this layout, freed once (aliases have none).
             unsafe { std::alloc::dealloc(raw, layout) }
         }
+        #[cfg(unix)]
+        if self.mapped {
+            // SAFETY: the mapping `from_image` made, unmapped once (aliases have none).
+            unsafe { libc::munmap(self.ptr.cast(), self.len) };
+        }
     }
 }
 
@@ -323,5 +393,82 @@ mod tests {
         assert_eq!(ram.cmpxchg(4, 4, 0x0504_0302, 9), Some(true));
         assert_eq!(ram.cmpxchg(4, 4, 0x0504_0302, 10), Some(false));
         assert_eq!(ram.load(4, 4), 9);
+    }
+
+    #[cfg(unix)]
+    fn image(len: usize, pages: &[(usize, u8)]) -> std::fs::File {
+        use std::os::unix::fs::FileExt;
+        let path = std::env::temp_dir().join(format!("armless-image-{}-{len}", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        f.set_len(len as u64).unwrap();
+        for &(page, b) in pages {
+            f.write_all_at(&[b; PAGE], (page * PAGE) as u64).unwrap();
+        }
+        f
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ram_from_an_image_is_its_pages_and_writes_stay_private() {
+        let f = image(8 * PAGE, &[(2, 0x22), (5, 0x55)]);
+        let a = Ram::from_image(&f, 8 * PAGE).unwrap();
+        let b = Ram::from_image(&f, 8 * PAGE).unwrap();
+        assert!(a.is_image() && a.alias().is_image() && !Ram::zeroed(PAGE).is_image());
+        assert!(!a.take_fresh(), "an image's RAM isn't all zero");
+        assert_eq!((a.load(2 * PAGE + 9, 1), a.load(5 * PAGE, 1)), (0x22, 0x55));
+        assert!(a.is_zero(3 * PAGE, PAGE), "a hole is zero");
+
+        // A write is a's own: b and the file still have the image's page
+        a.store(2 * PAGE, 1, 0xaa);
+        a.store(7 * PAGE, 1, 0x77);
+        assert_eq!((a.load(2 * PAGE, 1), a.load(7 * PAGE, 1)), (0xaa, 0x77));
+        assert_eq!((b.load(2 * PAGE, 1), b.load(7 * PAGE, 1)), (0x22, 0));
+        let mut on_disk = [0u8; 1];
+        std::os::unix::fs::FileExt::read_exact_at(&f, &mut on_disk, (2 * PAGE) as u64).unwrap();
+        assert_eq!(on_disk, [0x22]);
+        assert_eq!(a.cmpxchg((5 * PAGE) as u64, 4, 0x5555_5555, 1), Some(true));
+        assert_eq!(b.load(5 * PAGE, 4), 0x5555_5555);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fork_has_the_parents_ram_from_an_image() {
+        let f = image(8 * PAGE, &[(2, 0x22), (5, 0x55)]);
+        let a = Ram::from_image(&f, 8 * PAGE).unwrap();
+        a.store(2 * PAGE, 1, 0xaa);
+        // SAFETY: the child only reads and writes this RAM, then exits without unwinding.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let ok = a.load(2 * PAGE, 1) == 0xaa
+                && a.load(2 * PAGE + 1, 1) == 0x22
+                && a.load(5 * PAGE, 1) == 0x55
+                && a.is_zero(3 * PAGE, PAGE);
+            a.store(5 * PAGE, 1, 0x11);
+            let ok = ok && a.load(5 * PAGE, 1) == 0x11;
+            // SAFETY: ends the child at once.
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child just forked.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the child saw other memory: {status}");
+        assert_eq!(a.load(5 * PAGE, 1), 0x55, "the child's write is its own");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_image_of_another_size_is_refused() {
+        let f = image(4 * PAGE, &[]);
+        assert!(Ram::from_image(&f, 8 * PAGE).is_err());
+        assert!(Ram::from_image(&f, 2 * PAGE).is_err());
+        assert!(Ram::from_image(&f, 4 * PAGE).is_ok());
     }
 }
