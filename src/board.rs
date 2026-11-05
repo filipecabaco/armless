@@ -26,6 +26,9 @@ pub const GICD_BASE: u64 = 0xF000_0000;
 pub const GICD_SIZE: u64 = 0x1_0000;
 pub const GICC_BASE: u64 = 0xF001_0000;
 pub const GICC_SIZE: u64 = 0x1_0000;
+/// A GICv3's redistributors (`Machine::gic_v3`): one frame pair per CPU, from here.
+pub const GICR_BASE: u64 = 0xF040_0000;
+pub const GICR_STRIDE: u64 = 0x2_0000;
 pub const UART_BASE: u64 = 0xF010_0000;
 pub const UART_SIZE: u64 = 0x1000;
 pub const RTC_BASE: u64 = 0xF011_0000;

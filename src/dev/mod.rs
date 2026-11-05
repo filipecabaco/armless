@@ -155,6 +155,11 @@ impl Io {
     }
 
     pub fn set_irq(&self, intid: u32, level: bool) {
+        if self.machine.gic_v3.load(Ordering::Relaxed) {
+            if let Some(sink) = self.machine.irq_sink.get() {
+                return sink(intid, level);
+            }
+        }
         let mask = self.machine.gic.lock().set_line(0, intid, level);
         if mask != 0 {
             self.machine.kick_mask(mask, usize::MAX);

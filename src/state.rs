@@ -2,7 +2,8 @@
 //! snapshot's metadata (see `vm.rs` for the whole format).
 //!
 //! Layout (version 2): magic, version, RAM size, CPU count, counter, GIC,
-//! RTC, then one block per CPU.
+//! RTC, then one block per CPU. Version 3 has the timer's frequency after the counter: a
+//! machine at the default one (62.5 MHz) still writes version 2, which older readers take.
 
 use std::sync::atomic::Ordering;
 
@@ -12,6 +13,8 @@ use crate::smp;
 
 const MAGIC: &[u8; 4] = b"ARML";
 const VERSION: u32 = 2;
+/// With the timer's frequency, for machines not at `board::TIMER_FREQ_HZ`.
+const VERSION_FREQ: u32 = 3;
 
 use crate::ser::{R, W};
 
@@ -47,11 +50,16 @@ impl<H: Host> Cpu<H> {
             }
         }
         let mut w = W::new();
+        let freq = m.timer_freq.load(Ordering::Relaxed);
+        let default_freq = freq == crate::board::TIMER_FREQ_HZ;
         w.0.extend_from_slice(MAGIC);
-        w.u32(VERSION);
+        w.u32(if default_freq { VERSION } else { VERSION_FREQ });
         w.u64(m.mem.len() as u64);
         w.u32(n as u32);
         w.u64(counter);
+        if !default_freq {
+            w.u64(freq);
+        }
         m.gic.lock().save_cpus(&mut w.0, n);
         {
             let rtc = m.rtc.lock();
@@ -110,7 +118,7 @@ impl<H: Host> Cpu<H> {
             return Some(Err("not an armless CPU state".into()));
         }
         let version = r.u32()?;
-        if version != VERSION {
+        if version != VERSION && version != VERSION_FREQ {
             return Some(Err(format!("unsupported CPU state version {version}")));
         }
         let mem = r.u64()?;
@@ -129,8 +137,15 @@ impl<H: Host> Cpu<H> {
             )));
         }
         let counter = r.u64()?;
+        let freq = if version == VERSION_FREQ { r.u64()? } else { crate::board::TIMER_FREQ_HZ };
+        if freq == 0 {
+            return None;
+        }
+        m.timer_freq.store(freq, Ordering::SeqCst);
+        m.restored.store(true, Ordering::SeqCst);
         let mut rest = r.0;
         m.gic.lock().load(&mut rest)?;
+        m.started.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut r = R(rest);
         {
             let mut rtc = m.rtc.lock();

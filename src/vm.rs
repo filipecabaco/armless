@@ -348,9 +348,13 @@ impl Board {
             id[i % 16] ^= b.rotate_left((i / 16) as u32);
         }
         self.devices.lock().vmgenid = id;
-        // The guest configured the line as edge-triggered: a rising edge latches it
-        self.io.set_irq(crate::board::SPI_VMGENID, true);
-        self.io.set_irq(crate::board::SPI_VMGENID, false);
+        // The guest configured the line as edge-triggered: a rising edge latches it. Not before the
+        // guest has state: an edge latched before it booted reaches a driver that is not ready for
+        // it (Linux's takes it as soon as it asks for the line, with KVM's GIC, and crashes).
+        if self.io.machine.started.load(std::sync::atomic::Ordering::Relaxed) {
+            self.io.set_irq(crate::board::SPI_VMGENID, true);
+            self.io.set_irq(crate::board::SPI_VMGENID, false);
+        }
     }
 
     /// Moves the guest's counter forward by `ns`: after a restore, the time the machine was not
@@ -359,7 +363,7 @@ impl Board {
     /// takes a jump of about ten minutes at once (more overflows what it multiplies a delta by):
     /// make long ones in steps, with the guest running between them.
     pub fn advance_clock(&self, ns: u64) {
-        let ticks = ns / (1_000_000_000 / crate::board::TIMER_FREQ_HZ);
+        let ticks = self.io.machine.ticks_in_ns(ns);
         self.io
             .machine
             .timer_cnt_base
@@ -678,7 +682,7 @@ impl<P: Platform> Vm<P> {
 /// Snapshot of the machine; every CPU must be stopped and in `cpus`, in order.
 pub fn save_state<H: Host>(board: &Board, cpus: &mut [&mut Cpu<H>]) -> Vec<u8> {
     let n = cpus.len();
-    save_state_cpus(board, cpus, n).expect("every CPU is kept")
+    save_state_cpus(board, cpus, n).expect("every CPU is kept, and the GIC is armless's")
 }
 
 /// Snapshot for a machine of the first `n` CPUs: the rest must be powered off, taken offline
@@ -714,6 +718,11 @@ impl StateSaver {
         cpus: &mut [&mut Cpu<H>],
         n: usize,
     ) -> Result<StateSaver, String> {
+        if board.io.machine.gic_v3.load(std::sync::atomic::Ordering::Relaxed) {
+            // Its interrupt controller's state is in the host's kernel (KVM's GICv3), which a
+            // snapshot does not hold yet
+            return Err("a machine with the hypervisor's GICv3 can't be saved yet".into());
+        }
         // The header and the state in one buffer, the state written where it stays, with its length
         // filled in once it is known: it holds the contents of the files the guest wrote
         // (Fs::save), which a copy into a second buffer would double. Fs::save itself still

@@ -11,6 +11,18 @@ use crate::smp::{self, Machine};
 
 #[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
 mod interp;
+#[cfg(armless_hvf)]
+mod hv;
+#[cfg(armless_hw)]
+mod hw;
+#[cfg(armless_hw)]
+pub use hw::hypervisor_probe;
+#[cfg(armless_kvm)]
+mod kvm;
+#[cfg(armless_hvf)]
+pub(crate) use hv::exit_vcpu as hv_exit;
+#[cfg(armless_kvm)]
+pub(crate) use kvm::exit_vcpu as hv_exit;
 
 /// Exception classes used in ESR_EL1.EC.
 pub mod ec {
@@ -191,6 +203,9 @@ pub struct Cpu<H: Host> {
     pub(crate) jit_pending_flag: u8,
     /// Stop instead of raising an exception on undefined instructions.
     pub trap_undefined: bool,
+    /// Whether the CPU runs in hardware (`hv`).
+    #[cfg(armless_hw)]
+    pub(crate) hv: hw::Backend,
     /// Last undefined instruction seen (for diagnostics), as (pc, insn).
     pub last_undefined: Option<(u64, u32)>,
 }
@@ -378,6 +393,8 @@ impl<H: Host> Cpu<H> {
             next_pc: 0,
             insn_count: 0,
             trap_undefined: false,
+            #[cfg(armless_hw)]
+            hv: hw::Backend::Off,
             last_undefined: None,
             jit: crate::jit::Jit::new(memory_size),
             jit_pending: None,
@@ -634,7 +651,7 @@ impl<H: Host> Cpu<H> {
         let ns = now.wrapping_sub(m.timer_ns_base.load(Ordering::Relaxed));
         m.timer_cnt_base
             .load(Ordering::Relaxed)
-            .wrapping_add(ns / (1_000_000_000 / board::TIMER_FREQ_HZ))
+            .wrapping_add(m.ticks_in_ns(ns))
     }
 
     /// Recompute timer ISTATUS bits and the PPI lines into the GIC.
@@ -667,7 +684,6 @@ impl<H: Host> Cpu<H> {
     pub fn next_timer_deadline_ns(&mut self) -> Option<u64> {
         let cnt = self.counter();
         let now = self.host.now_ns();
-        let tick_ns = 1_000_000_000 / board::TIMER_FREQ_HZ;
         let mut best: Option<u64> = None;
         for (ctl, cval) in [
             (self.sys.cntv_ctl, self.sys.cntv_cval),
@@ -677,7 +693,7 @@ impl<H: Host> Cpu<H> {
                 let ns = if cval <= cnt {
                     now
                 } else {
-                    now.saturating_add((cval - cnt).saturating_mul(tick_ns))
+                    now.saturating_add(self.machine.ns_for_ticks(cval - cnt))
                 };
                 best = Some(best.map_or(ns, |b: u64| b.min(ns)));
             }
@@ -717,6 +733,13 @@ impl<H: Host> Cpu<H> {
 
     /// Execute up to `budget` instructions.
     pub fn run(&mut self, budget: u64) -> Exit {
+        if !self.machine.started.load(Ordering::Relaxed) {
+            self.machine.started.store(true, Ordering::Relaxed);
+        }
+        #[cfg(armless_hw)]
+        if self.runs_in_hardware() {
+            return self.run_hw(budget);
+        }
         // Compiled code stores into RAM through its pointer, not through `Ram`
         self.mem.mark_written();
         self.machine.cpus[self.index]

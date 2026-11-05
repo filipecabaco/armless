@@ -123,6 +123,9 @@ pub struct PerCpu {
     /// Last TLB-invalidation generation this CPU has applied.
     pub tlb_seen: AtomicU64,
     pub run_state: AtomicU32,
+    /// The CPU's hardware vCPU plus one, when it runs in hardware (`cpu::hv`): a kick makes it leave the
+    /// guest. 0: none.
+    pub hv_vcpu: AtomicU64,
 }
 
 /// Instruction-cache invalidations kept for CPUs that have not applied them yet. A CPU further
@@ -157,6 +160,20 @@ pub struct Machine {
     /// Guest RAM; CPUs hold aliases of it.
     pub mem: Ram,
     pub gic: SpinLock<Gic>,
+    /// The guest has a GICv3 that the host's KVM keeps (`cpu::kvm`), not `gic`: set before a boot,
+    /// which describes it in the device tree.
+    pub gic_v3: AtomicBool,
+    /// Where device lines go instead of `gic` (the in-kernel GICv3 of `cpu::kvm`), once set.
+    pub irq_sink: std::sync::OnceLock<Box<dyn Fn(u32, bool) + Send + Sync>>,
+    /// The guest has state: a CPU ran, or a snapshot was restored (`Board::seed` tells it of a new
+    /// generation only then).
+    pub started: AtomicBool,
+    /// A snapshot was restored into the machine (its guest booted elsewhere: `cpu::hw` checks it can
+    /// go on in hardware).
+    pub restored: AtomicBool,
+    /// The generic timer's frequency, which the guest reads in CNTFRQ_EL0 at boot and keeps: a
+    /// snapshot carries it, and a machine in hardware has the host counter's.
+    pub timer_freq: AtomicU64,
     pub rtc: SpinLock<Rtc>,
     pub cpus: [PerCpu; MAX_CPUS],
     /// Generic timer: the counter was `timer_cnt_base` at host time `timer_ns_base`.
@@ -189,6 +206,17 @@ pub struct Machine {
 }
 
 impl Machine {
+    /// Counter ticks in `ns` nanoseconds, at `timer_freq`.
+    pub fn ticks_in_ns(&self, ns: u64) -> u64 {
+        (ns as u128 * self.timer_freq.load(Ordering::Relaxed) as u128 / 1_000_000_000) as u64
+    }
+
+    /// Nanoseconds until `ticks` counter ticks have passed (rounded up), at `timer_freq`.
+    pub fn ns_for_ticks(&self, ticks: u64) -> u64 {
+        let f = self.timer_freq.load(Ordering::Relaxed).max(1) as u128;
+        (ticks as u128 * 1_000_000_000).div_ceil(f).min(u64::MAX as u128) as u64
+    }
+
     pub fn new(memory_size: usize, ncpus: usize) -> Machine {
         Machine::with_ram(Ram::zeroed(memory_size), ncpus)
     }
@@ -201,6 +229,11 @@ impl Machine {
             ncpus,
             mem,
             gic: SpinLock::new(Gic::new(ncpus)),
+            gic_v3: AtomicBool::new(false),
+            irq_sink: std::sync::OnceLock::new(),
+            started: AtomicBool::new(false),
+            restored: AtomicBool::new(false),
+            timer_freq: AtomicU64::new(crate::board::TIMER_FREQ_HZ),
             rtc: SpinLock::new(Rtc::default()),
             cpus: Default::default(),
             timer_cnt_base: AtomicU64::new(0),
@@ -238,6 +271,8 @@ impl Machine {
         let c = &self.cpus[cpu];
         c.attn.store(1, Ordering::SeqCst);
         c.wake.fetch_add(1, Ordering::SeqCst);
+        #[cfg(armless_hw)]
+        crate::cpu::hv_exit(c.hv_vcpu.load(Ordering::SeqCst));
         if let Some(w) = self.waker.lock().as_ref() {
             w(cpu);
         }

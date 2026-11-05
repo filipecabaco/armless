@@ -5,7 +5,7 @@
 //! which is also what real hardware does for unallocated encodings.
 
 use crate::bits::{bit, decode_bit_masks, field, ones, sext, trunc};
-use crate::board::{self, Host};
+use crate::board::Host;
 use crate::cpu::{ec, Cpu, Event, Res, StopReason};
 use crate::sysreg::{self as sr, id};
 
@@ -709,7 +709,7 @@ impl<H: Host> Cpu<H> {
             sr::TPIDR_EL0 => s.tpidr_el0,
             sr::TPIDRRO_EL0 => s.tpidrro_el0,
             sr::CNTKCTL_EL1 => s.cntkctl,
-            sr::CNTFRQ_EL0 => board::TIMER_FREQ_HZ,
+            sr::CNTFRQ_EL0 => self.machine.timer_freq.load(std::sync::atomic::Ordering::Relaxed),
             sr::CNTPCT_EL0 | sr::CNTVCT_EL0 | sr::CNTPCTSS_EL0 | sr::CNTVCTSS_EL0 => self.counter(),
             sr::CNTV_CTL_EL0 | sr::CNTP_CTL_EL0 => {
                 self.update_timers();
