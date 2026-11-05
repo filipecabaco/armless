@@ -56,15 +56,18 @@ pub struct HostOptions {
     pub tunnels: Vec<Tunnel>,
 }
 
-/// A guest TCP destination reached through a WebSocket: each connection the guest opens to it
-/// becomes one WebSocket to `url`, its bytes sent and received as binary messages (what
-/// websockify, websocat and Neon's wsproxy speak). The browser host does the same.
+/// A guest TCP destination reached elsewhere: each connection the guest opens to it becomes one
+/// WebSocket to a ws:// or wss:// `url`, its bytes sent and received as binary messages (what
+/// websockify, websocat and Neon's wsproxy speak; the browser host does the same), or, natively,
+/// one TCP connection to a tcp://HOST:PORT `url` (another machine's forwarded port, say). Either
+/// endpoint is reached as the guest's own connections are: a loopback or private one only with
+/// `Egress::allow_private`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tunnel {
     /// The name the guest connected to; `None` for any
     pub host: Option<String>,
     pub port: u16,
-    /// A ws:// or wss:// URL
+    /// A ws://, wss:// or tcp:// URL
     pub url: String,
 }
 
@@ -72,7 +75,11 @@ impl Tunnel {
     /// `[HOST:]PORT=URL`, e.g. `db.internal:5432=wss://proxy.example.com/db`.
     pub fn parse(spec: &str) -> Option<Tunnel> {
         let (dest, url) = spec.split_once('=')?;
-        if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+        let tcp_ok = url
+            .strip_prefix("tcp://")
+            .and_then(|a| a.rsplit_once(':'))
+            .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|p| p != 0));
+        if !(url.starts_with("ws://") || url.starts_with("wss://") || tcp_ok) {
             return None;
         }
         let (host, port) = match dest.rsplit_once(':') {
@@ -85,6 +92,12 @@ impl Tunnel {
             port: port.parse().ok().filter(|p| *p != 0)?,
             url: url.to_string(),
         })
+    }
+
+    /// The host and port of a tcp:// tunnel.
+    pub fn tcp_address(&self) -> Option<(String, u16)> {
+        let (h, p) = self.url.strip_prefix("tcp://")?.rsplit_once(':')?;
+        Some((h.to_string(), p.parse().ok()?))
     }
 
     pub fn matches(&self, host: &str, port: u16) -> bool {
@@ -297,7 +310,13 @@ fn event_loop(
                         board.tcp_refuse(id);
                         continue;
                     }
-                    if let Some(t) = options.tunnels.iter().find(|t| t.matches(&host, port)) {
+                    let target = options.tunnels.iter().find(|t| t.matches(&host, port));
+                    // A tcp:// tunnel: a connection to its address in place of the guest's
+                    let (host, port) = match target.and_then(|t| t.tcp_address()) {
+                        Some((h, p)) => (h, p),
+                        None => (host, port),
+                    };
+                    if let Some(t) = target.filter(|t| t.tcp_address().is_none()) {
                         let (ttx, trx) = channel();
                         conns.lock().unwrap().tunnels.insert(id, ttx);
                         let url = t.url.clone();
@@ -658,9 +677,17 @@ mod tests {
         assert_eq!(any.host, None);
         assert!(any.matches("anything", 6379));
 
+        let tcp = Tunnel::parse("db.internal:5432=tcp://127.0.0.1:15432").unwrap();
+        assert_eq!(tcp.tcp_address(), Some(("127.0.0.1".to_string(), 15432)));
+        assert!(tcp.matches("db.internal", 5432));
+        assert_eq!(t.tcp_address(), None);
+
         for bad in [
             "5432",
             "db:5432=tcp://x",
+            "db:5432=tcp://x:0",
+            "db:5432=tcp://:5432",
+            "db:5432=udp://x:5432",
             ":5432=ws://x",
             "db:0=ws://x",
             "db:nope=ws://x",

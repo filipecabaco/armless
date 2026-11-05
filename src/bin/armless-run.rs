@@ -22,7 +22,8 @@ fn usage() -> ! {
   --boot-fs            boot the kernel and initrd found under /boot in --fs
   --net                virtio-net, with the guest's TCP connections made from here
   --tunnel [H:]P=URL   carry the guest's TCP to H:P (any host if H is left out) over a
-                       WebSocket to URL instead (repeatable; needs --net)
+                       WebSocket to URL (ws://, wss://) or a TCP connection to it
+                       (tcp://HOST:PORT) instead (repeatable; needs --net)
   --allow-private      let the guest reach loopback and private addresses (a local
                        tunnel endpoint, say)
   -m MB                RAM size in MiB (default 512)
