@@ -64,6 +64,20 @@ instructions handed to the interpreter, and `native_read`/`native_write` are mem
 missed the fast TLB. `samply load build/bench/profile-MODE.json` opens the whole profile in the
 Firefox profiler.
 
+With `ARMLESS_JIT_PERF_MAP=1` set (for any command, `bench/sites.exs --profile` included), the
+native JIT writes `/tmp/perf-<pid>.map`, one line per compiled function: `armless EL0 va
+0x0000ffff885b6000 pa 0x6bb6000 [cpu1, 5 entries]`, the exception level, the virtual page it got
+hot at (the same physical page can be mapped at others) and the physical page. samply takes the
+file for a library, and `--summarize` names compiled code by it, then adds compiled guest code by
+exception level and by virtual page. It says how much of the compiled code it could name: on a
+java run, 77%. The rest is in host code the map has no line for, mostly late in the run, after
+the JIT's flushes, although every compile has its line.
+
+`ARMLESS_JIT_INVAL_STATS=1` prints, for each CPU when it stops, why pages' code was dropped (a
+store of its own, its IC IVAU, another CPU's or a device's, a store-exclusive), split into pages
+with compiled code and pages with decoded instructions only, and how often the same pages with
+compiled code were dropped again. Most drops are of decoded instructions only, which are cheap.
+
 ## `bench/sites.exs`: real workloads
 
 ```sh

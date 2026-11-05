@@ -78,6 +78,16 @@ pub struct Cached {
     pub byte: bool,
 }
 
+/// What `BASES` functions take after the PC: the host regions their code reaches at fixed
+/// addresses, as (start, length) — the CPU itself, guest RAM and the fast TLB's four tables for the
+/// code's EL. An address in one of them is compiled as the parameter plus an offset, one
+/// instruction where its 64-bit constant took four or five; the caller passes the same starts, so
+/// the addresses are the ones compiled in (the code was always for this CPU's addresses).
+pub const BASES: usize = 6;
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Bases(pub [(u64, u64); BASES]);
+
 /// The helpers blocks call, as host function addresses (see `gen::imports`).
 #[derive(Clone, Copy)]
 pub struct Helpers {
@@ -98,6 +108,7 @@ enum Job {
         slot: u32,
         body: Vec<u8>,
         cached: Vec<Cached>,
+        bases: Bases,
     },
     /// Free the module and compile into a new one: nothing compiled before is reachable any more.
     Reset,
@@ -105,11 +116,50 @@ enum Job {
     Wake,
 }
 
-/// A compiled slot: the address of its function, or 0 if it could not be compiled.
+/// A compiled slot: the address of its function, or 0 if it could not be compiled, and the size
+/// of its code.
 pub struct Done {
     pub generation: u64,
     pub slot: u32,
     pub function: usize,
+    pub size: usize,
+}
+
+/// ARMLESS_JIT_CODE_DUMP=DIR: the code of every compiled function, appended to
+/// `DIR/code-<pid>.bin`, and `DIR/code-<pid>.idx` with a line per function: its address, size and
+/// offset in the `.bin`, for disassembling what a profile found hot.
+pub(crate) fn code_dump() -> Option<&'static std::sync::Mutex<(std::fs::File, std::fs::File, u64)>>
+{
+    static DUMP: std::sync::OnceLock<
+        Option<std::sync::Mutex<(std::fs::File, std::fs::File, u64)>>,
+    > = std::sync::OnceLock::new();
+    DUMP.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("ARMLESS_JIT_CODE_DUMP")?);
+        let pid = std::process::id();
+        let open = |name: String| std::fs::File::create(dir.join(name)).ok();
+        Some(std::sync::Mutex::new((
+            open(format!("code-{pid}.bin"))?,
+            open(format!("code-{pid}.idx"))?,
+            0,
+        )))
+    })
+    .as_ref()
+}
+
+/// ARMLESS_JIT_PERF_MAP: `/tmp/perf-<pid>.map`, which profilers (samply, perf) read to name the
+/// host code the JIT made, one line per compiled function (`Cpu::jit_take_compiled` writes them).
+pub(crate) fn perf_map() -> Option<&'static std::fs::File> {
+    static MAP: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        std::env::var_os("ARMLESS_JIT_PERF_MAP")?;
+        // Appended to, a whole line per write, from every CPU
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("/tmp/perf-{}.map", std::process::id()))
+            .ok()
+    })
+    .as_ref()
 }
 
 #[derive(Default)]
@@ -237,21 +287,23 @@ impl Native {
 
     /// Compile `body` (a `gen` function) for `slot`, remembering the `cached` fields' values; the
     /// result comes back through `take_done`.
-    pub fn submit(&mut self, slot: u32, body: Vec<u8>, cached: Vec<Cached>) -> bool {
+    pub fn submit(&mut self, slot: u32, body: Vec<u8>, cached: Vec<Cached>, bases: Bases) -> bool {
         let generation = self.generation;
         if let Some((compiler, done_tx)) = self.here.as_mut() {
-            let function = compile_one(
+            let (function, size) = compile_one(
                 compiler,
                 &self.shared,
                 self.locals,
                 &self.helpers,
                 &body,
                 &cached,
+                &bases,
             );
             let _ = done_tx.send(Done {
                 generation,
                 slot,
                 function,
+                size,
             });
             self.shared.pending.fetch_add(1, Ordering::Release);
             return true;
@@ -263,6 +315,7 @@ impl Native {
                 slot,
                 body,
                 cached,
+                bases,
             })
             .is_ok()
         });
@@ -274,9 +327,15 @@ impl Native {
 
     /// `submit`, for code that is not needed yet (a profile's, see `Cpu::jit_prewarm`): compiled
     /// when nothing submitted is waiting.
-    pub fn submit_later(&mut self, slot: u32, body: Vec<u8>, cached: Vec<Cached>) -> bool {
+    pub fn submit_later(
+        &mut self,
+        slot: u32,
+        body: Vec<u8>,
+        cached: Vec<Cached>,
+        bases: Bases,
+    ) -> bool {
         if self.here.is_some() {
-            return self.submit(slot, body, cached);
+            return self.submit(slot, body, cached, bases);
         }
         let Some(jobs) = self.jobs.as_ref() else {
             return false;
@@ -287,6 +346,7 @@ impl Native {
             slot,
             body,
             cached,
+            bases,
         });
         let _ = jobs.send(Job::Wake);
         true
@@ -415,20 +475,23 @@ fn spawn(
                         slot,
                         body,
                         cached,
+                        bases,
                     } => {
-                        let function = compile_one(
+                        let (function, size) = compile_one(
                             &mut compiler,
                             &thread_shared,
                             locals,
                             &helpers,
                             &body,
                             &cached,
+                            &bases,
                         );
                         if done_tx
                             .send(Done {
                                 generation,
                                 slot,
                                 function,
+                                size,
                             })
                             .is_err()
                         {
@@ -448,6 +511,7 @@ fn spawn(
                                     generation,
                                     slot,
                                     function: 0,
+                                    size: 0,
                                 });
                                 thread_shared.pending.fetch_add(1, Ordering::Release);
                                 thread_shared.in_flight.fetch_sub(1, Ordering::Release);
@@ -470,7 +534,8 @@ fn spawn(
     Some((jobs, thread))
 }
 
-/// Compile one function, counting it: its address, or 0 if it could not be compiled.
+/// Compile one function, counting it: its address, or 0 if it could not be compiled, and the size
+/// of its code.
 fn compile_one(
     compiler: &mut Compiler,
     shared: &Shared,
@@ -478,11 +543,12 @@ fn compile_one(
     helpers: &Helpers,
     body: &[u8],
     cached: &[Cached],
-) -> usize {
+    bases: &Bases,
+) -> (usize, usize) {
     let started = std::time::Instant::now();
-    let function = compiler
-        .compile(body, locals, helpers, cached)
-        .map_or(0, |f| f as usize);
+    let (function, size) = compiler
+        .compile(body, locals, helpers, cached, bases)
+        .map_or((0, 0), |(f, size)| (f as usize, size));
     shared.compiles.fetch_add(1, Ordering::Relaxed);
     if function == 0 {
         shared.failures.fetch_add(1, Ordering::Relaxed);
@@ -493,7 +559,7 @@ fn compile_one(
     shared
         .code_bytes
         .store(compiler.code_bytes, Ordering::Relaxed);
-    function
+    (function, size)
 }
 
 /// The compiler thread's state: the module the generated code lives in.
@@ -545,17 +611,22 @@ impl Compiler {
     }
 
     /// Compile the body of a `gen` function, `(pc: i64) -> i32` with `locals` after the
-    /// parameter. None if it uses something this does not translate.
+    /// parameter: its address and the size of its code. None if it uses something this does not
+    /// translate.
     fn compile(
         &mut self,
         body: &[u8],
         locals: &[(u32, u8)],
         h: &Helpers,
         cached: &[Cached],
-    ) -> Option<*const u8> {
+        bases: &Bases,
+    ) -> Option<(*const u8, usize)> {
         self.scratch = true;
         let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(I64));
+        // (pc, the BASES starts) -> status
+        for _ in 0..=BASES {
+            sig.params.push(AbiParam::new(I64));
+        }
         sig.returns.push(AbiParam::new(I32));
         let name = format!("page{}", self.functions);
         self.functions += 1;
@@ -567,7 +638,7 @@ impl Compiler {
         let target = self.module.target_config();
         let translated = {
             let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-            let ok = Translator::new(&mut b, locals, h, cached)
+            let ok = Translator::new(&mut b, locals, h, cached, bases)
                 .run(body)
                 .is_some();
             if ok {
@@ -590,16 +661,21 @@ impl Compiler {
                 .ctx
                 .compiled_code()
                 .is_some_and(|c| c.buffer.relocs().is_empty());
-        if let Some(code) = self.ctx.compiled_code() {
-            self.code_bytes += code.code_buffer().len();
-        }
+        let size = self
+            .ctx
+            .compiled_code()
+            .map_or(0, |code| code.code_buffer().len());
+        self.code_bytes += size;
         self.module.clear_context(&mut self.ctx);
         let finalized = defined.is_ok() && movable && self.module.finalize_definitions().is_ok();
         code_writable(false);
         finalized.then(|| {
-            self.module
-                .get_finalized_function(id)
-                .wrapping_offset(self.exec_offset)
+            (
+                self.module
+                    .get_finalized_function(id)
+                    .wrapping_offset(self.exec_offset),
+                size,
+            )
         })
     }
 }
@@ -696,6 +772,8 @@ struct Translator<'a, 'b> {
     known: Known,
     /// i32 constants by value, to tell accesses with a constant (zero) base from others.
     consts: std::collections::HashMap<Value, i64>,
+    /// The `Bases` regions with the parameters that hold their starts.
+    bases: [(u64, u64, Value); BASES],
 }
 
 fn val_type(t: u8) -> Option<Type> {
@@ -767,11 +845,14 @@ impl<'a, 'b> Translator<'a, 'b> {
         locals: &[(u32, u8)],
         h: &'a Helpers,
         cached: &'a [Cached],
+        regions: &Bases,
     ) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let pc = b.block_params(entry)[0];
+        let params = b.block_params(entry)[1..=BASES].to_vec();
+        let bases = std::array::from_fn(|i| (regions.0[i].0, regions.0[i].1, params[i]));
         let mut vars = Vec::new();
         let v = b.declare_var(I64);
         b.def_var(v, pc);
@@ -807,6 +888,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             cached,
             known: Known::new(),
             consts: std::collections::HashMap::new(),
+            bases,
         }
     }
 
@@ -1056,6 +1138,21 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// The host address of an access: the dynamic i32 on the stack, zero-extended, plus `offset`.
     fn address(&mut self, offset: u64) -> Option<Value> {
         let dynamic = self.pop()?;
+        // In one of the regions: its parameter plus the offset into it (the same address), which
+        // a load or store takes as its immediate
+        if let Some(&(start, _, base)) = self
+            .bases
+            .iter()
+            .find(|&&(start, len, _)| offset.wrapping_sub(start) < len)
+        {
+            let at = if self.consts.get(&dynamic) == Some(&0) {
+                base
+            } else {
+                let wide = self.b.ins().uextend(I64, dynamic);
+                self.b.ins().iadd(base, wide)
+            };
+            return Some(self.b.ins().iadd_imm_u(at, (offset - start) as i64));
+        }
         let wide = self.b.ins().uextend(I64, dynamic);
         Some(self.b.ins().iadd_imm_u(wide, offset as i64))
     }

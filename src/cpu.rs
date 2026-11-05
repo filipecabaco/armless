@@ -291,6 +291,21 @@ impl FastTlb {
     pub(crate) fn write_base_ptr(&self) -> *const u8 {
         self.write_base.as_ptr() as *const u8
     }
+
+    /// The four tables compiled code reads, as (start, bytes): read tags, read bases, write tags,
+    /// write bases. They are allocated once and never move.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    pub(crate) fn tables(&self) -> [(u64, u64); 4] {
+        fn span<T>(v: &[T]) -> (u64, u64) {
+            (v.as_ptr() as u64, std::mem::size_of_val(v) as u64)
+        }
+        [
+            span(&self.read_tag),
+            span(&self.read_base),
+            span(&self.write_tag),
+            span(&self.write_base),
+        ]
+    }
 }
 
 const DAIF_ALL: u32 = 0xf << 6;
@@ -748,6 +763,7 @@ impl<H: Host> Cpu<H> {
             // A run ends at the next timer poll too (`last_poll + 0x400`), as the straight-line runs of upstream do; a JIT
             // dispatch may have gone past it, and a run is at least one instruction, which `budget` still allows.
             let limit = budget.min(last_poll + 0x400);
+            self.jit.last_ran_block = false;
             let (r, n) = self.step_page(pc, limit.saturating_sub(executed).clamp(1, PAGE_RUN));
             executed += n;
             match r {
@@ -831,7 +847,9 @@ impl<H: Host> Cpu<H> {
             for n in self.code_seen..c.gen {
                 match c.ring[n as usize % smp::CODE_RING] {
                     smp::CODE_ALL => self.jit.flush_all(),
-                    page => self.jit.invalidate_page(page as usize),
+                    page => self
+                        .jit
+                        .invalidate_page_by(page as usize, crate::jit::Inval::Remote),
                 }
             }
         }

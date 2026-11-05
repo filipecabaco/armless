@@ -2048,6 +2048,57 @@ mod tests {
         }
     }
 
+    /// Compiled loads and stores that cross from a page into the next, where the next virtual page is mapped
+    /// elsewhere (0x11 to 0x15): the fast table holds the first page, and an access whose last byte is in the
+    /// next one must take the slow path, which translates each page; served from the first page's host memory
+    /// it would read and write the physical page after it (0x11) instead.
+    #[test]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    fn compiled_accesses_that_cross_into_a_page_mapped_elsewhere_reach_it() {
+        let mut a = mapped();
+        let mut b = mapped();
+        if !a.enable_native_jit() {
+            return; // no Cranelift backend for this host
+        }
+        a.jit.threshold = 2;
+        let code = 0x5000u64;
+        for c in [&mut a, &mut b] {
+            map(c, 0x11, (0x15 << 12) | 0x403);
+            for (base, fill) in [(0x10000usize, 0x10u8), (0x11000, 0x77), (0x15000, 0x55)] {
+                let bytes: Vec<u8> = (0..0x1000).map(|i| fill ^ (i as u8)).collect();
+                c.mem.write(base, &bytes);
+            }
+            // ldr x5, [x1]; ldrh w7, [x3]; str x6, [x2]; strh w6, [x4]; add x6, x6, #1; b code
+            for (k, w) in [0xf940_0025u32, 0x7940_0067, 0xf900_0046, 0x7900_0086, 0x9100_04c6].iter().enumerate() {
+                put(c, code + 4 * k as u64, *w);
+            }
+            put(c, code + 20, branch(code + 20, code));
+            c.pc = code;
+            c.x[6] = 0x0123_4567_89ab_cdef;
+        }
+        // Inside the page first: compiled, and the page in the fast table; then across into the next
+        for (round, back) in [0x20u64, 0x18, 1, 2, 3, 4, 5, 6, 7].into_iter().enumerate() {
+            for c in [&mut a, &mut b] {
+                c.x[1] = 0x11000 - back;
+                c.x[2] = 0x11000 - back.min(7);
+                c.x[3] = 0x11000 - back.min(1);
+                c.x[4] = 0x11000 - 1;
+            }
+            let before = a.insn_count;
+            a.run(120);
+            a.wait_native_jit();
+            for _ in 0..a.insn_count - before {
+                step_ref(&mut b);
+            }
+            assert_eq!(differ(&a, &b), None, "round {round}");
+            for page in [0x10000usize, 0x11000, 0x15000] {
+                let same = a.mem.to_vec()[page..page + 0x1000] == b.mem.to_vec()[page..page + 0x1000];
+                assert!(same, "round {round}: memory at {page:#x}");
+            }
+        }
+        assert!(a.jit.block_runs > 0, "nothing ran compiled");
+    }
+
     /// A machine with the MMU on: a space of 39 bits, 4 KiB pages, one table for each of the three levels (at
     /// 0x80000, 0x81000, 0x82000), the first 0x20 pages mapped to themselves, EL1, the vectors in page 0 where
     /// `b .` stands, so that a fault leaves the machine spinning.

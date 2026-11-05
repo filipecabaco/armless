@@ -180,6 +180,8 @@ pub struct Machine {
     /// Statistics: broadcast TLBIs, DSB waits that had to spin, IC
     /// invalidations, kicks.
     pub stats: [AtomicU64; 4],
+    /// Of the IC invalidations, those of a device's DMA write (not a CPU's IC IVAU).
+    pub dma_code_invals: AtomicU64,
     /// One flag per RAM page: some CPU's JIT holds code translated from it
     /// (device DMA into such a page invalidates that code).
     pub code_pages: Vec<AtomicU8>,
@@ -209,6 +211,7 @@ impl Machine {
             pair_lock: SpinLock::new(()),
             code_inval: SpinLock::new(CodeInval::default()),
             stats: Default::default(),
+            dma_code_invals: AtomicU64::new(0),
             sev: AtomicU32::new(0),
             host_cores: AtomicU32::new(0),
             code_pages: (0..memory_size.div_ceil(4096))
@@ -244,6 +247,9 @@ impl Machine {
     /// the other CPUs (`page` = physical page number, or CODE_ALL).
     pub fn invalidate_code(&self, page: u32, from: usize) {
         self.stats[2].fetch_add(1, Ordering::Relaxed);
+        if from >= self.ncpus {
+            self.dma_code_invals.fetch_add(1, Ordering::Relaxed);
+        }
         {
             let mut c = self.code_inval.lock();
             // Every invalidation is recorded, even of the page recorded last: CPUs that applied

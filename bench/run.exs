@@ -378,6 +378,7 @@ defmodule Profile do
 
         {d["debug_name"], t}
       end)
+      |> Map.merge(perf_maps(p["libs"]))
 
     libs = p["libs"] |> Enum.map(& &1["debugName"]) |> List.to_tuple()
     th = Enum.find(p["threads"], &(&1["name"] == thread_name)) || Bench.die("no thread #{thread_name}")
@@ -395,7 +396,7 @@ defmodule Profile do
 
       case lib && Map.get(tables, lib) do
         nil -> "(JIT-compiled guest code)"
-        t -> lookup(t, elem(addr, f)) || "#{lib}+0x#{Integer.to_string(elem(addr, f), 16)}"
+        t -> lookup(t, elem(addr, f)) || if(perf_map?(lib), do: "(JIT code not in the perf map)", else: "#{lib}+0x#{Integer.to_string(elem(addr, f), 16)}")
       end
     end
 
@@ -415,6 +416,57 @@ defmodule Profile do
     print(self, total, top)
     IO.puts("\ninclusive (with what it calls):")
     print(incl, total, top)
+    guest_code(self, total, top)
+  end
+
+  # Compiled guest code by exception level and by the virtual page it was compiled for, from the
+  # names the perf map gives it (ARMLESS_JIT_PERF_MAP)
+  defp guest_code(self, total, top) do
+    jit = for {"armless EL" <> _ = name, n} <- self, do: {name, n}
+
+    if jit != [] do
+      in_map = jit |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+      missing = Map.get(self, "(JIT code not in the perf map)", 0)
+      IO.puts("\ncompiled guest code: #{pct(in_map + missing, total)} of the samples, #{pct(in_map, in_map + missing)} of them named by the perf map")
+
+      by = fn key -> Enum.reduce(jit, %{}, fn {name, n}, acc -> Map.update(acc, key.(name), n, &(&1 + n)) end) end
+      IO.puts("\nby exception level (share of all samples):")
+      print(by.(fn name -> name |> String.split(" ") |> Enum.at(1) end), total, 4)
+      IO.puts("\nby virtual page compiled for (share of all samples):")
+      print(by.(fn name -> name |> String.split(" pa ") |> hd() end), total, top)
+    end
+  end
+
+  defp pct(n, of), do: "#{:io_lib.format("~.1f", [100 * n / max(of, 1)])}%"
+
+  defp perf_map?(lib), do: is_binary(lib) and lib =~ ~r/^perf-\d+\.map$/
+
+  # A perf map that samply took for a library: its functions, at offsets from the lowest address
+  # in it (where samply puts the library). A later line for the same address wins (its code was
+  # freed and the address used again).
+  defp perf_maps(libs) do
+    for %{"debugName" => name, "path" => path} <- libs, perf_map?(name), File.exists?(path), into: %{} do
+      entries =
+        path
+        |> File.stream!()
+        |> Enum.flat_map(fn line ->
+          case String.split(String.trim_trailing(line), " ", parts: 3) do
+            [a, s, sym] -> [{String.to_integer(a, 16), String.to_integer(s, 16), sym}]
+            _ -> []
+          end
+        end)
+
+      base = entries |> Enum.map(&elem(&1, 0)) |> Enum.min(fn -> 0 end)
+
+      table =
+        entries
+        |> Enum.reduce(%{}, fn {a, s, sym}, acc -> Map.put(acc, a, {a - base, s, sym}) end)
+        |> Map.values()
+        |> Enum.sort()
+        |> List.to_tuple()
+
+      {name, table}
+    end
   end
 
   defp walk(nil, _, _, acc), do: acc
