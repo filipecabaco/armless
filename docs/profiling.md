@@ -64,6 +64,20 @@ instructions handed to the interpreter, and `native_read`/`native_write` are mem
 missed the fast TLB. `samply load build/bench/profile-MODE.json` opens the whole profile in the
 Firefox profiler.
 
+With `ARMLESS_JIT_PERF_MAP=1` set (for any command, `bench/sites.exs --profile` included), the
+native JIT writes `/tmp/perf-<pid>.map`, one line per compiled function: `armless EL0 va
+0x0000ffff885b6000 pa 0x6bb6000 [cpu1, 5 entries]`, the exception level, the virtual page it got
+hot at (the same physical page can be mapped at others) and the physical page. samply takes the
+file for a library, and `--summarize` names compiled code by it, then adds compiled guest code by
+exception level and by virtual page. It says how much of the compiled code it could name: on a
+java run, 77%. The rest is in host code the map has no line for, mostly late in the run, after
+the JIT's flushes, although every compile has its line.
+
+`ARMLESS_JIT_INVAL_STATS=1` prints, for each CPU when it stops, why pages' code was dropped (a
+store of its own, its IC IVAU, another CPU's or a device's, a store-exclusive), split into pages
+with compiled code and pages with decoded instructions only, and how often the same pages with
+compiled code were dropped again. Most drops are of decoded instructions only, which are cheap.
+
 ## `bench/sites.exs`: real workloads
 
 ```sh
@@ -92,8 +106,12 @@ What it showed: workloads that run their own JIT (the JVM, the BEAM, V8) write c
 so armless drops what it compiled from those pages and runs the new code interpreted until it is
 hot. With `--profile`, a third to half of a vCPU's time is in the interpreter on short commands
 (Java, Python, iex): code that runs fewer than `ARMLESS_JIT_THRESHOLD` times never compiles.
-Lowering the threshold or compiling with cheaper Cranelift settings made every site slower, so
-that time is the interpreter's to win.
+Lowering the threshold made every site slower, so that time is the interpreter's to win.
+
+`ARMLESS_JIT_OPT` (Cranelift's `opt_level`, `speed` by default) and `ARMLESS_JIT_REGALLOC`
+(`regalloc_algorithm`) change how the native JIT compiles. With `none`, compiles take about 30%
+less time and java, elixir and python were 1–4% faster, but the benchmark guest's tight loops ran
+7–23% slower; even then a lower threshold did not pay. `single_pass` made every site 21–31% slower.
 
 ## `cargo bench --bench machine`
 

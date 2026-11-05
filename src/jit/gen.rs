@@ -485,11 +485,7 @@ impl Gen<'_> {
     /// Store the i64 in local DATA (low `size` bytes) at VA.
     fn store(&mut self, size: u32) {
         let l = *self.l;
-        self.tlb_probe(l.write_tag, size);
-        self.c.i32c(0);
-        self.c.i32_load8_u(l.excl_armed);
-        self.c.i32_eqz();
-        self.c.i32_and();
+        self.tlb_probe_unarmed(l.write_tag, size);
         self.c.if_(EMPTY);
         {
             self.host_addr(l.write_base);
@@ -520,12 +516,35 @@ impl Gen<'_> {
         self.c.set(VA);
     }
 
-    /// Push (tag[idx] == VA >> 12) && ((VA & 0xfff) + size <= 0x1000); sets IDX and PAGE.
+    /// Push whether the fast table serves the access: (tag[idx] == VA >> 12) && ((VA & 0xfff) + size <= 0x1000),
+    /// as the one comparison tag[idx] == (VA + size - 1) >> 12, which a branch takes at once (two conditions and
+    /// their `and` made 0/1 values first). The access's last byte is in VA's page then, and in the next one
+    /// (VA >> 12) + 1 when it crosses, which no tag at idx is: a slot holds pages whose low bits are its index,
+    /// and those of the next page are the next index. Sets IDX.
     fn tlb_probe(&mut self, tags: u64, size: u32) {
+        self.tlb_compare(tags, size);
+        self.c.i64_eq();
+    }
+
+    /// `tlb_probe` for a plain store: also false while an exclusive monitor is armed (the store must clear it,
+    /// on the slow path), as the flag's byte at bit 56 of the page compared: no tag is that large.
+    fn tlb_probe_unarmed(&mut self, tags: u64, size: u32) {
+        let l = *self.l;
+        self.tlb_compare(tags, size);
+        self.c.i32c(0);
+        self.c.i32_load8_u(l.excl_armed);
+        self.c.i64_extend_i32_u();
+        self.c.i64c(56);
+        self.c.i64_shl();
+        self.c.i64_or();
+        self.c.i64_eq();
+    }
+
+    /// Push tag[idx] (sets IDX, idx = (VA >> 12) % FAST_ENTRIES) and the page of the access's last byte.
+    fn tlb_compare(&mut self, tags: u64, size: u32) {
         self.c.get(VA);
         self.c.i64c(12);
         self.c.i64_shr_u();
-        self.c.tee(PAGE);
         self.c.i32_wrap_i64();
         self.c.i32c(crate::cpu::FAST_ENTRIES as i32 - 1);
         self.c.i32_and();
@@ -533,15 +552,13 @@ impl Gen<'_> {
         self.c.i32c(3);
         self.c.i32_shl();
         self.c.i64_load(tags);
-        self.c.get(PAGE);
-        self.c.i64_eq();
         self.c.get(VA);
-        self.c.i32_wrap_i64();
-        self.c.i32c(0xfff);
-        self.c.i32_and();
-        self.c.i32c(0x1000 - size as i32);
-        self.c.i32_le_u();
-        self.c.i32_and();
+        if size > 1 {
+            self.c.i64c(size as i64 - 1);
+            self.c.i64_add();
+        }
+        self.c.i64c(12);
+        self.c.i64_shr_u();
     }
 
     /// Push the i32 host offset (page base + VA & 0xfff), relative to `mem`.

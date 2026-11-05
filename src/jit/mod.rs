@@ -60,6 +60,65 @@ enum Compile {
     Declined,
 }
 
+/// Why a page's code was dropped (ARMLESS_JIT_INVAL_STATS).
+#[derive(Clone, Copy)]
+pub(crate) enum Inval {
+    /// A store of this CPU to a word its compiled code covers (or to a page with decoded
+    /// instructions only).
+    Store = 0,
+    /// An IC IVAU of this CPU (several CPUs).
+    IcLocal = 1,
+    /// Another CPU's IC IVAU, or a device's DMA write, from the shared ring.
+    Remote = 2,
+    /// A store-exclusive of this CPU (several CPUs).
+    Excl = 3,
+}
+
+const INVAL_NAMES: [&str; 4] = [
+    "store",
+    "ic ivau (own)",
+    "remote (other cpu / dma)",
+    "store-exclusive",
+];
+
+/// Pages dropped by why, split into those with compiled code and those with decoded
+/// instructions only, and how often each page with compiled code was dropped.
+#[derive(Default)]
+pub struct InvalStats {
+    by: [[u64; 2]; 4],
+    compiled_pages: HashMap<u32, u32>,
+}
+
+impl InvalStats {
+    fn record(&mut self, page: usize, why: Inval, compiled: bool) {
+        self.by[why as usize][compiled as usize] += 1;
+        if compiled {
+            *self.compiled_pages.entry(page as u32).or_default() += 1;
+        }
+    }
+
+    /// One line per reason, then how concentrated the drops of compiled code are.
+    pub fn report(&self, cpu: usize) -> String {
+        let mut out = String::new();
+        for (name, [decoded, compiled]) in INVAL_NAMES.iter().zip(self.by) {
+            if decoded + compiled > 0 {
+                out += &format!("jit-inval: cpu{cpu} {name:<26} compiled {compiled:>7}  decoded only {decoded:>7}\n");
+            }
+        }
+        let mut counts: Vec<u32> = self.compiled_pages.values().copied().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let total: u64 = counts.iter().map(|&c| c as u64).sum();
+        let top10: u64 = counts.iter().take(10).map(|&c| c as u64).sum();
+        let once = counts.iter().filter(|&&c| c == 1).count();
+        out += &format!(
+            "jit-inval: cpu{cpu} compiled drops {total} over {} pages ({once} dropped once); the 10 most dropped pages: {top10} ({:?})\n",
+            counts.len(),
+            &counts[..counts.len().min(10)]
+        );
+        out
+    }
+}
+
 /// A page (with its EL and SPSel) that has, or is about to have, a module.
 #[derive(Default)]
 struct PageInfo {
@@ -144,10 +203,21 @@ pub struct Jit {
     /// Physical page -> the instruction words its compiled blocks cover (1024 bits). A write to
     /// the page drops its compiled code only if it touches one of them.
     covered: HashMap<u32, Box<[u64; 16]>>,
+    /// ARMLESS_JIT_DECODED_WRITES (experiment, 0: off): writes a page with decoded instructions
+    /// only takes before it is dropped (each forgets the words written), and the count per page.
+    decoded_writes_limit: u32,
+    decoded_writes: HashMap<u32, u32>,
     /// Statistics
     pub compiled: u64,
     pub invalidated: u64,
     pub block_runs: u64,
+    /// Block runs right after a block run (no instruction interpreted in between): the exits a
+    /// jump from compiled code into the next module would keep out of the run loop.
+    pub block_to_block: u64,
+    /// Whether the last thing the run loop did was a block run.
+    pub(crate) last_ran_block: bool,
+    /// Block runs by how they ended: done, redirected by a helper, exception pending, WFI.
+    pub exits: [u64; 4],
     /// Full flushes (slots exhausted, reset, configuration).
     pub flushes: u64,
     /// Pages dropped because they were written.
@@ -162,12 +232,18 @@ pub struct Jit {
     /// ARMLESS_JIT_HELPER_STATS: instructions compiled code hands to the interpreter, by opcode
     /// (registers masked out) with how many and one of them: what the JIT should translate next.
     pub helper_hist: Option<HashMap<u32, (u64, u32)>>,
+    /// ARMLESS_JIT_INVAL_STATS: why pages' code was dropped (`InvalStats::report`).
+    pub inval_stats: Option<Box<InvalStats>>,
     /// The native JIT's compiled code (None: pages go to the host, i.e. the browser) and the
     /// address of each slot's function in it.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
     pub(crate) native: Option<native::Native>,
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
     native_fns: Vec<usize>,
+    /// For the perf map (`native::perf_map`): the virtual page each slot was compiled for (the
+    /// PC's when it got hot; u64::MAX for a profile's), and its entries.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    slot_va: Vec<(u64, u16)>,
 }
 
 #[inline(always)]
@@ -206,9 +282,17 @@ impl Jit {
             code_page: vec![0; memory_size.div_ceil(4096)],
             pre: crate::predecode::Cache::new(memory_size),
             covered: HashMap::new(),
+            decoded_writes_limit: std::env::var("ARMLESS_JIT_DECODED_WRITES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            decoded_writes: HashMap::new(),
             compiled: 0,
             invalidated: 0,
             block_runs: 0,
+            block_to_block: 0,
+            last_ran_block: false,
+            exits: [0; 4],
             flushes: 0,
             page_invalidations: 0,
             code_writes_kept: 0,
@@ -216,10 +300,13 @@ impl Jit {
             helper_interps: 0,
             helper_fp_lanes: 0,
             helper_hist: std::env::var_os("ARMLESS_JIT_HELPER_STATS").map(|_| HashMap::new()),
+            inval_stats: std::env::var_os("ARMLESS_JIT_INVAL_STATS").map(|_| Box::default()),
             #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
             native: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
             native_fns: vec![0; SLOTS as usize],
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+            slot_va: vec![(u64::MAX, 0); SLOTS as usize],
         }
     }
 
@@ -286,6 +373,16 @@ impl Jit {
         }
     }
 
+    /// Drop all modules of a physical page, recording why (ARMLESS_JIT_INVAL_STATS).
+    pub(crate) fn invalidate_page_by(&mut self, page: usize, why: Inval) {
+        if let (Some(s), Some(&flags)) = (self.inval_stats.as_mut(), self.code_page.get(page)) {
+            if flags != 0 {
+                s.record(page, why, flags & 1 != 0);
+            }
+        }
+        self.invalidate_page(page);
+    }
+
     /// Drop all modules of a physical page.
     pub fn invalidate_page(&mut self, page: usize) {
         if page >= self.code_page.len() || self.code_page[page] == 0 {
@@ -295,6 +392,7 @@ impl Jit {
         self.page_invalidations += 1;
         self.pre.drop_page(page);
         self.covered.remove(&(page as u32));
+        self.decoded_writes.remove(&(page as u32));
         if let Some(keys) = self.page_keys.remove(&(page as u32)) {
             for k in keys {
                 self.remove_page(k);
@@ -317,18 +415,29 @@ impl Jit {
         }
         // Decoded instructions alone are cheap to decode again, and dropping them lets writes to
         // the page take the fast path again: only compiled code is worth keeping
-        if flags & 1 == 0 {
-            self.invalidate_page(page);
-            return;
-        }
         let first = ((pa & 0xfff) >> 2) as usize;
         let last = (((pa & 0xfff) + size as u64 - 1).min(0xfff) >> 2) as usize;
+        if flags & 1 == 0 {
+            // ARMLESS_JIT_DECODED_WRITES (experiment): the first N writes to such a page forget
+            // only the words written, keeping the rest decoded and their counts towards compiling
+            if self.decoded_writes_limit > 0 {
+                let n = self.decoded_writes.entry(page as u32).or_default();
+                if *n < self.decoded_writes_limit {
+                    *n += 1;
+                    self.pre.forget_words(page, first, last);
+                    self.code_writes_kept += 1;
+                    return;
+                }
+            }
+            self.invalidate_page_by(page, Inval::Store);
+            return;
+        }
         let hit = match self.covered.get(&(page as u32)) {
             Some(c) => (first..=last).any(|w| c[w / 64] & (1 << (w % 64)) != 0),
             None => true, // compiled code with no record of what it covers: drop it
         };
         if hit {
-            self.invalidate_page(page);
+            self.invalidate_page_by(page, Inval::Store);
         } else {
             self.pre.forget_words(page, first, last);
             self.code_writes_kept += 1;
@@ -342,6 +451,7 @@ impl Jit {
         }
         self.page_keys.clear();
         self.covered.clear();
+        self.decoded_writes.clear();
         self.code_page.fill(0);
         self.pre.clear();
         self.lookup_key.fill(u64::MAX);
@@ -472,6 +582,7 @@ impl<H: Host> Cpu<H> {
             self.jit_take_compiled();
         }
         let Some(pa) = self.jit_pc_pa() else {
+            self.jit.last_ran_block = false;
             return JitStep::NotCompiled;
         };
         let key = Jit::key(pa, self.el, self.spsel);
@@ -482,6 +593,7 @@ impl<H: Host> Cpu<H> {
                 return self.jit_run(slot, budget);
             }
         }
+        self.jit.last_ran_block = false;
         // Count this execution of the entry in its predecoded slot (`Cache::bump`): the line is
         // the one the interpreter reads next.
         let i = ((pa & 0xfff) >> 2) as usize;
@@ -645,6 +757,12 @@ impl<H: Host> Cpu<H> {
         if !keys.contains(&page_key) {
             keys.push(page_key);
         }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+        {
+            // The PC is the hot entry's, unless a profile is being compiled
+            let va = if self.jit.prewarming { u64::MAX } else { self.pc & !0xfff };
+            self.jit.slot_va[slot as usize] = (va, entries.len() as u16);
+        }
         let info = self.jit.pages.entry(page_key).or_default();
         if extra {
             info.extra_compiling.push((slot, entries));
@@ -684,6 +802,8 @@ impl<H: Host> Cpu<H> {
     /// ready when it is.
     fn jit_compile_code(&mut self, slot: u32, code: &wasm::Code, layout: &gen::Layout) -> bool {
         #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+        let bases = self.jit_bases(layout.el as usize);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
         if let Some(n) = self.jit.native.as_mut() {
             // On a thread of its own: `jit_take_compiled` marks the slot ready when it is. Until
             // then the slot must not keep a function from its previous page.
@@ -699,13 +819,32 @@ impl<H: Host> Cpu<H> {
                 .map(|addr| native::Cached { addr, byte: true });
             let cached = wide.chain(flags).collect();
             return if self.jit.prewarming {
-                n.submit_later(slot, code.b.clone(), cached)
+                n.submit_later(slot, code.b.clone(), cached, bases)
             } else {
-                n.submit(slot, code.b.clone(), cached)
+                n.submit(slot, code.b.clone(), cached, bases)
             };
         }
         let wasm = wasm::module(&gen::imports(), gen::LOCALS, code, layout.smp != 0);
         self.host.jit_compile(SLOT_BASE + slot, &wasm)
+    }
+
+    /// The regions native code for EL `el` reaches at fixed addresses (`native::Bases`): this CPU,
+    /// guest RAM and that EL's fast TLB tables. `jit_run` passes their starts to every function.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    #[inline(always)]
+    fn jit_bases(&self, el: usize) -> native::Bases {
+        let [rt, rb, wt, wb] = self.fast[el].tables();
+        native::Bases([
+            (
+                self as *const Self as u64,
+                std::mem::size_of::<Self>() as u64,
+            ),
+            (self.mem.as_ptr() as u64, self.mem.len() as u64),
+            rt,
+            rb,
+            wt,
+            wb,
+        ])
     }
 
     /// The native compiler's statistics: (functions compiled, nanoseconds spent compiling).
@@ -750,7 +889,47 @@ impl<H: Host> Cpu<H> {
             // only frees it.
             self.jit.native_fns[done.slot as usize] =
                 if done.generation == generation { done.function } else { 0 };
+            if done.generation == generation && done.function != 0 {
+                self.jit_perf_map_line(done.slot, done.function, done.size);
+            }
             self.jit.ready(SLOT_BASE + done.slot);
+        }
+    }
+
+    /// Name the function compiled for `slot` in the perf map (ARMLESS_JIT_PERF_MAP), after the
+    /// guest code it was translated from: its exception level, virtual page (the one it got hot
+    /// at; the same physical page can be mapped at others) and physical page, as in
+    /// `armless EL0 va 0x0000aaaab2c41000 pa 0x41a3f000 [cpu1, 12 entries]`.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+    #[cold]
+    #[allow(unsafe_code)]
+    fn jit_perf_map_line(&self, slot: u32, function: usize, size: usize) {
+        use std::io::Write;
+        if let Some(dump) = native::code_dump() {
+            let mut d = dump.lock().unwrap();
+            // SAFETY: the function's code, just compiled and readable, `size` bytes from `function`
+            let code = unsafe { std::slice::from_raw_parts(function as *const u8, size) };
+            let offset = d.2;
+            if d.0.write_all(code).is_ok() {
+                let _ = writeln!(d.1, "{function:x} {size:x} {offset:x}");
+                d.2 += size as u64;
+            }
+        }
+        let Some(mut map) = native::perf_map() else {
+            return;
+        };
+        let key = self.jit.slot_page[slot as usize];
+        let (va, entries) = self.jit.slot_va[slot as usize];
+        let el = (key >> 1) & 1;
+        let pa = (key >> 2) & !0xfff;
+        let va = if va == u64::MAX { "?".to_string() } else { format!("{va:#018x}") };
+        // One write per line: the file is appended to by every CPU
+        let line = format!(
+            "{function:x} {size:x} armless EL{el} va {va} pa {pa:#x} [cpu{}, {entries} entries]\n",
+            self.index
+        );
+        if let Err(e) = map.write_all(line.as_bytes()) {
+            eprintln!("armless: perf map: {e}");
         }
     }
 
@@ -943,18 +1122,38 @@ impl<H: Host> Cpu<H> {
                 return JitStep::NotCompiled;
             }
             self.jit.slot_used[slot as usize] = true;
+            // The regions the function was compiled with: its page's EL is this one (the slot was
+            // found by a key with it)
+            let b = self.jit_bases(self.el as usize).0;
             let previous = CURRENT.replace(self as *mut Self as *mut ());
             // SAFETY: `f` is the function compiled for this slot, in the module the JIT holds; the
-            // block reaches this CPU through the addresses in its layout, and its helpers through
-            // CURRENT, while nothing else uses the CPU.
+            // block reaches this CPU through the addresses in its layout and the region starts it
+            // is passed (the same ones), and its helpers through CURRENT, while nothing else uses
+            // the CPU.
             let status = unsafe {
-                let f: extern "C" fn(i64) -> i32 = std::mem::transmute(f);
-                f(pc as i64)
+                type Block = extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i32;
+                let f: Block = std::mem::transmute(f);
+                f(
+                    pc as i64,
+                    b[0].0 as i64,
+                    b[1].0 as i64,
+                    b[2].0 as i64,
+                    b[3].0 as i64,
+                    b[4].0 as i64,
+                    b[5].0 as i64,
+                )
             };
             CURRENT.set(previous);
             status
         };
         self.jit.block_runs += 1;
+        if self.jit.last_ran_block {
+            self.jit.block_to_block += 1;
+        }
+        self.jit.last_ran_block = true;
+        if let Some(e) = self.jit.exits.get_mut(status as usize) {
+            *e += 1;
+        }
         let ran = self.insn_count.wrapping_sub(before);
         self.jit.block_insns += ran;
         match status {
@@ -1242,8 +1441,12 @@ mod tests {
         c.pc = CODE;
         // The first step decodes the entry and counts it once.
         assert!(matches!(c.jit_step(1), JitStep::NotCompiled));
-        c.jit.pre.set_count(CODE as usize & !0xfff, 0, THRESHOLD - 1);
-        c.jit.pages.insert(page_of(Jit::key(CODE, c.el, c.spsel)), info);
+        c.jit
+            .pre
+            .set_count(CODE as usize & !0xfff, 0, THRESHOLD - 1);
+        c.jit
+            .pages
+            .insert(page_of(Jit::key(CODE, c.el, c.spsel)), info);
         assert!(matches!(c.jit_step(1), JitStep::NotCompiled));
         let ops = c.jit.pre.enter(CODE as usize);
         assert!(!ops.is_null());
@@ -1288,7 +1491,10 @@ mod tests {
         let w = |c: &Cpu<Takes>, i: usize, insn: u32| {
             c.mem.write(0x1000 + 4 * i, &insn.to_le_bytes());
         };
-        for (i, insn) in [SUBS_X1, B_NE_BACK, MOVZ_X0_7, MOVZ_X2_9].into_iter().enumerate() {
+        for (i, insn) in [SUBS_X1, B_NE_BACK, MOVZ_X0_7, MOVZ_X2_9]
+            .into_iter()
+            .enumerate()
+        {
             w(&c, i, insn);
         }
         // Two passes of the loop, then the two moves: six instructions.

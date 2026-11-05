@@ -198,9 +198,6 @@ impl Code {
     pub fn i32_eq(&mut self) {
         self.op(0x46)
     }
-    pub fn i32_le_u(&mut self) {
-        self.op(0x4d)
-    }
     pub fn i32_add(&mut self) {
         self.op(0x6a)
     }

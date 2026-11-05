@@ -336,6 +336,36 @@ fn vcpu_thread(
     };
     loop {
         if ctl.quit.load(Ordering::SeqCst) {
+            // A CPU waiting in `tlb_sync` for this one's acknowledgement would wait forever (and
+            // `shutdown` for it): it waits only for CPUs that are running.
+            me.run_state.store(smp::RUN_IDLE, Ordering::SeqCst);
+            let c = cpu.lock().unwrap();
+            if let Some(s) = c.jit.inval_stats.as_ref() {
+                eprint!("{}", s.report(i));
+                let (all, compiled) = (c.insn_count, c.jit.block_insns);
+                eprintln!(
+                    "jit-inval: cpu{i} instructions {:.0}M, compiled {:.0}M ({:.1}%), of them handed to the interpreter {:.1}M; {} block runs ({:.1} instructions each)",
+                    all as f64 / 1e6,
+                    compiled as f64 / 1e6,
+                    100.0 * compiled as f64 / all.max(1) as f64,
+                    c.jit.helper_interps as f64 / 1e6,
+                    c.jit.block_runs,
+                    compiled as f64 / c.jit.block_runs.max(1) as f64
+                );
+                let e = c.jit.exits;
+                eprintln!(
+                    "jit-inval: cpu{i} block runs right after a block run {:.1}%; ended done {}, redirected {}, exception {}, wfi {}",
+                    100.0 * c.jit.block_to_block as f64 / c.jit.block_runs.max(1) as f64,
+                    e[0], e[1], e[2], e[3]
+                );
+                if i == 0 {
+                    eprintln!(
+                        "jit-inval: machine IC invalidations recorded {}, of them DMA {}",
+                        machine.stats[2].load(Ordering::Relaxed),
+                        machine.dma_code_invals.load(Ordering::Relaxed)
+                    );
+                }
+            }
             return;
         }
         if ctl.paused.load(Ordering::SeqCst) {

@@ -628,7 +628,8 @@ impl<H: Host> Cpu<H> {
                 sr::IC_IVAU if self.machine.ncpus > 1 => {
                     if let Ok(pa) = self.translate(self.xr(rt), crate::mmu::Access::Read, false) {
                         let page = (pa >> 12) as u32;
-                        self.jit.invalidate_page(page as usize);
+                        self.jit
+                            .invalidate_page_by(page as usize, crate::jit::Inval::IcLocal);
                         self.machine.invalidate_code(page, self.index);
                     }
                 },
@@ -1201,7 +1202,8 @@ impl<H: Host> Cpu<H> {
                             .get((pa >> 12) as usize)
                             .is_some_and(|&b| b != 0)
                     {
-                        self.jit.invalidate_page((pa >> 12) as usize);
+                        self.jit
+                            .invalidate_page_by((pa >> 12) as usize, crate::jit::Inval::Excl);
                     }
                     Ok(ok)
                 },

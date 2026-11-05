@@ -398,7 +398,12 @@ mod tests {
     #[cfg(unix)]
     fn image(len: usize, pages: &[(usize, u8)]) -> std::fs::File {
         use std::os::unix::fs::FileExt;
-        let path = std::env::temp_dir().join(format!("armless-image-{}-{len}", std::process::id()));
+        // Tests run in parallel, several with the same length: a path of its own for each call,
+        // or one would remove the file another just made
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("armless-image-{}-{len}-{n}", std::process::id()));
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -459,7 +464,10 @@ mod tests {
         let mut status = 0;
         // SAFETY: waits for the child just forked.
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the child saw other memory: {status}");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the child saw other memory: {status}"
+        );
         assert_eq!(a.load(5 * PAGE, 1), 0x55, "the child's write is its own");
     }
 
