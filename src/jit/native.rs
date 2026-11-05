@@ -148,6 +148,13 @@ pub(crate) fn code_dump() -> Option<&'static std::sync::Mutex<(std::fs::File, st
 
 /// ARMLESS_JIT_PERF_MAP: `/tmp/perf-<pid>.map`, which profilers (samply, perf) read to name the
 /// host code the JIT made, one line per compiled function (`Cpu::jit_take_compiled` writes them).
+/// Whether stores of the cached fields wait until something could see them (`Translator::flush`),
+/// so that one a later store replaces is never made. `ARMLESS_JIT_DEFER_STORES=0` makes each.
+fn defer_stores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ARMLESS_JIT_DEFER_STORES").map_or(true, |v| v != "0"))
+}
+
 pub(crate) fn perf_map() -> Option<&'static std::fs::File> {
     static MAP: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
     MAP.get_or_init(|| {
@@ -778,6 +785,11 @@ struct Translator<'a, 'b> {
     consts: std::collections::HashMap<Value, i64>,
     /// The `Bases` regions with the parameters that hold their starts.
     bases: [(u64, u64, Value); BASES],
+    /// Stores of cached fields not made yet, in order (`ARMLESS_JIT_DEFER_STORES`): a later store
+    /// to the field replaces one, and they are all made before anything could see the field
+    /// (`flush`).
+    deferred: Vec<((u64, bool), Value)>,
+    defer: bool,
 }
 
 fn val_type(t: u8) -> Option<Type> {
@@ -893,6 +905,8 @@ impl<'a, 'b> Translator<'a, 'b> {
             known: Known::new(),
             consts: std::collections::HashMap::new(),
             bases,
+            deferred: Vec::new(),
+            defer: defer_stores(),
         }
     }
 
@@ -984,6 +998,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         *saw_else = true;
         let before = f.before.clone().unwrap_or_default();
         if !self.unreachable {
+            self.flush();
             let args: Vec<BlockArg> = match result {
                 Some(_) => vec![BlockArg::Value(self.pop()?)],
                 None => Vec::new(),
@@ -1001,6 +1016,7 @@ impl<'a, 'b> Translator<'a, 'b> {
     fn end(&mut self) -> Option<()> {
         let mut f = self.frames.pop()?;
         if !self.unreachable {
+            self.flush();
             let args: Vec<BlockArg> = match f.result {
                 Some(_) => vec![BlockArg::Value(self.pop()?)],
                 None => Vec::new(),
@@ -1039,6 +1055,10 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     fn open(&mut self, kind: u8, ty: u8) -> Option<()> {
         let result = block_type(ty)?;
+        if kind != 0x02 {
+            // A loop's header and an `if`'s arms begin new blocks: what is deferred is made here
+            self.flush();
+        }
         let end = self.b.create_block();
         if let Some(t) = result {
             self.b.append_block_param(end, t);
@@ -1116,6 +1136,8 @@ impl<'a, 'b> Translator<'a, 'b> {
     }
 
     fn call(&mut self, f: u64) -> Option<()> {
+        // Helpers see the CPU in memory
+        self.flush();
         let (i, addr, nargs) = match f {
             0 => (0, self.h.read, 2),
             1 => (1, self.h.write, 3),
@@ -1137,6 +1159,57 @@ impl<'a, 'b> Translator<'a, 'b> {
             self.known.clear();
         }
         Some(())
+    }
+
+    /// The host address of the field at `offset` (a constant address).
+    fn field_address(&mut self, offset: u64) -> Value {
+        match self.bases.iter().find(|&&(start, len, _)| offset.wrapping_sub(start) < len) {
+            Some(&(start, _, base)) => self.b.ins().iadd_imm_u(base, (offset - start) as i64),
+            None => self.b.ins().iconst(I64, offset as i64),
+        }
+    }
+
+    /// Make the deferred stores that `hit` selects (by field address and width), in order.
+    fn flush_where(&mut self, hit: impl Fn(u64, u64) -> bool) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.deferred)
+            .into_iter()
+            .partition(|&((addr, byte), _)| hit(addr, if byte { 1 } else { 8 }));
+        self.deferred = later;
+        let flags = MemFlagsData::new().with_notrap();
+        for ((addr, byte), v) in now {
+            let p = self.field_address(addr);
+            if byte {
+                self.b.ins().istore8(flags, v, p, 0);
+            } else {
+                self.b.ins().store(flags, v, p, 0);
+            }
+        }
+    }
+
+    /// Make every deferred store: before control leaves this point of the function or a helper
+    /// runs.
+    fn flush(&mut self) {
+        self.flush_where(|_, _| true);
+    }
+
+    /// Before an access other than a cached field's own: make the deferred stores it may see or
+    /// overwrite (with a dynamic address into the CPU, any of them).
+    fn flush_for(&mut self, dynamic: Value, offset: u64, width: u64) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        if self.consts.get(&dynamic) == Some(&0) {
+            self.flush_where(|addr, len| addr < offset + width && offset < addr + len);
+        } else if !self.bases[1..]
+            .iter()
+            .any(|&(start, len, _)| offset.wrapping_sub(start) < len)
+        {
+            // Not into guest RAM nor a TLB table (`Bases`, after the CPU): it may be the CPU
+            self.flush();
+        }
     }
 
     /// The host address of an access: the dynamic i32 on the stack, zero-extended, plus `offset`.
@@ -1174,6 +1247,13 @@ impl<'a, 'b> Translator<'a, 'b> {
             self.push(v);
             return Some(());
         }
+        let width = match op {
+            0x29 => 8,
+            0x28 | 0x35 => 4,
+            0x33 => 2,
+            _ => 1,
+        };
+        self.flush_for(*self.stack.last()?, offset, width);
         let p = self.address(offset)?;
         let flags = MemFlagsData::new().with_notrap();
         let ins = self.b.ins();
@@ -1209,6 +1289,20 @@ impl<'a, 'b> Translator<'a, 'b> {
             0x3a => self.cached_key(dynamic, offset, true),
             _ => None,
         };
+        if let Some(k) = key.filter(|_| self.defer) {
+            // Replaces a deferred store to the field (which nothing saw); made later
+            self.deferred.retain(|&(d, _)| d != k);
+            self.pop()?;
+            self.known.retain(|&(addr, byte), _| {
+                let len = if byte { 1 } else { 8 };
+                addr + len <= offset || offset + width <= addr
+            });
+            let known = if k.1 { self.b.ins().band_imm_u(v, 0xff) } else { v };
+            self.known.insert(k, known);
+            self.deferred.push((k, v));
+            return Some(());
+        }
+        self.flush_for(dynamic, offset, width);
         if self.consts.get(&dynamic) == Some(&0) {
             // Forget the fields this store overwrites, in part or in whole.
             self.known.retain(|&(addr, byte), _| {
@@ -1288,6 +1382,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             0x0d => {
                 let depth = r.leb_u()? as usize;
                 let c = self.pop()?;
+                self.flush();
                 let args = self.branch_args(depth)?;
                 let target = self.target(depth)?;
                 let next = self.b.create_block();
@@ -1303,6 +1398,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 }
                 let default = r.leb_u()? as usize;
                 let index = self.pop()?;
+                self.flush();
                 let call = |t: &mut Self, depth: usize| -> Option<_> {
                     // `gen` only branches to blocks without results through a table.
                     if !t.branch_args(depth)?.is_empty() {
@@ -1324,6 +1420,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             },
             0x0f => {
                 let v = self.pop()?;
+                self.flush();
                 self.b.ins().return_(&[v]);
                 self.unreachable = true;
             },
