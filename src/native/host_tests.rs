@@ -323,3 +323,38 @@ fn tunnelled_destinations_are_carried_over_a_websocket() {
     g.syn(ip, 40002, 5432);
     seg(&mut g, "a reset", |s| s.has(RST));
 }
+
+#[test]
+fn tcp_tunnels_carry_a_connection_to_their_address() {
+    // A server on the host's loopback, which the guest knows as db.internal:5432
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    let (got, got_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut s, _) = server.accept().unwrap();
+        s.write_all(b"server says hi").unwrap();
+        let mut buf = [0u8; 8];
+        s.read_exact(&mut buf).unwrap();
+        got.send(buf.to_vec()).unwrap();
+    });
+    let b = board(true);
+    let (obs, _) = observer();
+    let opts = HostOptions {
+        tunnels: vec![Tunnel::parse(&format!("db.internal:5432=tcp://127.0.0.1:{port}")).unwrap()],
+        ..options(true)
+    };
+    let _host = NativeHost::spawn(b.clone(), opts, obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("db.internal", 1).unwrap();
+    g.syn(ip, 40010, 5432);
+    let sa = seg(&mut g, "the SYN-ACK once the tunnel's address answers", |s| {
+        s.has(SYN | ACK)
+    });
+    let theirs = sa.seq.wrapping_add(1);
+    g.ack(ip, 40010, 5432, theirs);
+    let d = seg(&mut g, "the server's bytes", |s| !s.payload.is_empty());
+    assert_eq!(d.payload, b"server says hi");
+    let theirs = theirs.wrapping_add(d.payload.len() as u32);
+    g.data(ip, 40010, 5432, theirs, b"SELECT 1");
+    assert_eq!(got_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"SELECT 1");
+}

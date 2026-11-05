@@ -2,7 +2,10 @@
 //! snapshot's metadata (see `vm.rs` for the whole format).
 //!
 //! Layout (version 2): magic, version, RAM size, CPU count, counter, GIC,
-//! RTC, then one block per CPU.
+//! RTC, then one block per CPU. Version 3 has the timer's frequency after the counter, version 4
+//! the frequency and then the feature ID registers a guest booted in hardware saw where they
+//! aren't armless's (a count, then key and value each). A machine writes the oldest version that
+//! holds it: one at the default frequency (62.5 MHz) that saw armless's features, version 2.
 
 use std::sync::atomic::Ordering;
 
@@ -12,6 +15,10 @@ use crate::smp;
 
 const MAGIC: &[u8; 4] = b"ARML";
 const VERSION: u32 = 2;
+/// With the timer's frequency, for machines not at `board::TIMER_FREQ_HZ`.
+const VERSION_FREQ: u32 = 3;
+/// With the frequency and the features a guest booted in hardware saw (`Machine::features`).
+const VERSION_FEATURES: u32 = 4;
 
 use crate::ser::{R, W};
 
@@ -47,11 +54,30 @@ impl<H: Host> Cpu<H> {
             }
         }
         let mut w = W::new();
+        let freq = m.timer_freq.load(Ordering::Relaxed);
+        let features = m.features.lock().clone();
+        let version = if !features.is_empty() {
+            VERSION_FEATURES
+        } else if freq != crate::board::TIMER_FREQ_HZ {
+            VERSION_FREQ
+        } else {
+            VERSION
+        };
         w.0.extend_from_slice(MAGIC);
-        w.u32(VERSION);
+        w.u32(version);
         w.u64(m.mem.len() as u64);
         w.u32(n as u32);
         w.u64(counter);
+        if version >= VERSION_FREQ {
+            w.u64(freq);
+        }
+        if version >= VERSION_FEATURES {
+            w.u32(features.len() as u32);
+            for (key, value) in features {
+                w.u32(key);
+                w.u64(value);
+            }
+        }
         m.gic.lock().save_cpus(&mut w.0, n);
         {
             let rtc = m.rtc.lock();
@@ -110,7 +136,7 @@ impl<H: Host> Cpu<H> {
             return Some(Err("not an armless CPU state".into()));
         }
         let version = r.u32()?;
-        if version != VERSION {
+        if !(VERSION..=VERSION_FEATURES).contains(&version) {
             return Some(Err(format!("unsupported CPU state version {version}")));
         }
         let mem = r.u64()?;
@@ -129,8 +155,30 @@ impl<H: Host> Cpu<H> {
             )));
         }
         let counter = r.u64()?;
+        let freq = if version >= VERSION_FREQ { r.u64()? } else { crate::board::TIMER_FREQ_HZ };
+        if freq == 0 {
+            return None;
+        }
+        let mut features = Vec::new();
+        if version >= VERSION_FEATURES {
+            for _ in 0..r.u32()?.min(64) {
+                features.push((r.u32()?, r.u64()?));
+            }
+        }
+        // A guest that saw features armless doesn't emulate goes on only in hardware
+        if !features.is_empty() && !m.hw_backend.load(Ordering::SeqCst) {
+            return Some(Err(
+                "the snapshot's guest saw CPU features armless doesn't emulate (it booted under a \
+                 hypervisor that couldn't hide them): restore it where it runs in hardware"
+                    .into(),
+            ));
+        }
+        *m.features.lock() = features;
+        m.timer_freq.store(freq, Ordering::SeqCst);
+        m.restored.store(true, Ordering::SeqCst);
         let mut rest = r.0;
         m.gic.lock().load(&mut rest)?;
+        m.started.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut r = R(rest);
         {
             let mut rtc = m.rtc.lock();

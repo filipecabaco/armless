@@ -1,6 +1,6 @@
 [package]
 name = "armless"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 # Cranelift (the native-jit feature) needs 1.96
 rust-version = "1.96"
@@ -49,6 +49,10 @@ default = ["native-jit"]
 native-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 # Compile the wasm export layer natively, to type-check it without a wasm target.
 wasm-api = []
+# Run guests in hardware: Hypervisor.framework on macOS with Apple silicon (the binary needs the
+# com.apple.security.hypervisor entitlement), KVM on Linux arm64 (/dev/kvm). Opt-in at run time:
+# ARMLESS_HV=1, or Cpu::enable_hypervisor. Elsewhere it does nothing (see build.rs).
+hypervisor = []
 
 [[bench]]
 name = "machine"

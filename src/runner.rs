@@ -86,6 +86,27 @@ pub fn new_vm_on(
         std::thread::available_parallelism().map_or(1, |n| n.get()) as u32,
         Ordering::Relaxed,
     );
+    // ARMLESS_HV=1 runs the CPUs in hardware (Hypervisor.framework, KVM), where the process can;
+    // where it can't, they run as ARMLESS_JIT says.
+    #[cfg(armless_hw)]
+    let vm = {
+        let mut vm = vm;
+        if std::env::var("ARMLESS_HV").is_ok_and(|v| v == "1") {
+            // Which GIC the guest gets (the boot, after this, describes it)
+            let all = crate::cpu::hypervisor_probe().and_then(|gic_v3| {
+                vm.machine().gic_v3.store(gic_v3, Ordering::Relaxed);
+                vm.cpus.iter_mut().try_for_each(|cpu| cpu.enable_hypervisor())
+            });
+            match all {
+                Ok(()) => return Ok((vm, clock)),
+                Err(e) => {
+                    vm.machine().gic_v3.store(false, Ordering::Relaxed);
+                    eprintln!("armless: {e}; not running in hardware");
+                },
+            }
+        }
+        vm
+    };
     // ARMLESS_JIT=native compiles hot guest code to host code (where the host supports it).
     #[cfg(feature = "native-jit")]
     if std::env::var("ARMLESS_JIT").is_ok_and(|v| v == "native") {

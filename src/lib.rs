@@ -208,6 +208,7 @@ pub fn plan_linux<H: Host>(
         initrd: initrd_range,
         ncpus: cpu.machine.ncpus,
         rng_seed,
+        gic_v3: cpu.machine.gic_v3.load(std::sync::atomic::Ordering::Relaxed),
     });
     if dtb.len() > 2 << 20 {
         return Err("device tree too large".into());
@@ -249,6 +250,7 @@ pub fn boot_raw<H: Host>(cpu: &mut Cpu<H>, bin: &[u8], addr: u64) -> Result<Boot
         initrd: None,
         ncpus: cpu.machine.ncpus,
         rng_seed: &[],
+        gic_v3: cpu.machine.gic_v3.load(std::sync::atomic::Ordering::Relaxed),
     });
     cpu.reset();
     load(cpu, addr, bin)?;

@@ -150,6 +150,8 @@ pub struct BoardConfig<'a> {
     pub ncpus: usize,
     /// `/chosen/rng-seed`, if not empty.
     pub rng_seed: &'a [u8],
+    /// A GICv3 (distributor and redistributors) in place of the GICv2.
+    pub gic_v3: bool,
 }
 
 const PHANDLE_GIC: u32 = 1;
@@ -221,8 +223,8 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.prop_str("method", "hvc");
     f.end();
 
-    // GIC binding: PPI flags carry the CPU mask in bits 15:8 (level-high = 4).
-    let ppi_flags = (((1u32 << cfg.ncpus) - 1) << 8) | 4;
+    // GIC binding: PPI flags are level-high (4); a GICv2's carry the CPU mask in bits 15:8 too.
+    let ppi_flags = if cfg.gic_v3 { 4 } else { (((1u32 << cfg.ncpus) - 1) << 8) | 4 };
     f.begin("timer");
     f.prop_str("compatible", "arm,armv8-timer");
     // secure phys, non-secure phys, virtual, hypervisor (PPI = INTID - 16)
@@ -247,23 +249,43 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
     f.end();
 
     f.begin(&format!("intc@{:x}", board::GICD_BASE));
-    f.prop_str("compatible", "arm,cortex-a15-gic");
     f.prop_u32("#interrupt-cells", 3);
     f.prop_u32("#address-cells", 0);
     f.prop_empty("interrupt-controller");
-    f.prop_cells(
-        "reg",
-        &[
-            hi(board::GICD_BASE),
-            lo(board::GICD_BASE),
-            0,
-            lo(board::GICD_SIZE),
-            hi(board::GICC_BASE),
-            lo(board::GICC_BASE),
-            0,
-            lo(board::GICC_SIZE),
-        ],
-    );
+    if cfg.gic_v3 {
+        // The distributor, and the redistributors of every CPU in one region
+        let gicr_size = board::GICR_STRIDE * cfg.ncpus as u64;
+        f.prop_str("compatible", "arm,gic-v3");
+        f.prop_u32("#redistributor-regions", 1);
+        f.prop_cells(
+            "reg",
+            &[
+                hi(board::GICD_BASE),
+                lo(board::GICD_BASE),
+                0,
+                lo(board::GICD_SIZE),
+                hi(board::GICR_BASE),
+                lo(board::GICR_BASE),
+                hi(gicr_size),
+                lo(gicr_size),
+            ],
+        );
+    } else {
+        f.prop_str("compatible", "arm,cortex-a15-gic");
+        f.prop_cells(
+            "reg",
+            &[
+                hi(board::GICD_BASE),
+                lo(board::GICD_BASE),
+                0,
+                lo(board::GICD_SIZE),
+                hi(board::GICC_BASE),
+                lo(board::GICC_BASE),
+                0,
+                lo(board::GICC_SIZE),
+            ],
+        );
+    }
     f.prop_u32("phandle", PHANDLE_GIC);
     f.end();
 
@@ -394,6 +416,7 @@ mod tests {
             initrd: Some((0x1000_0000, 0x1100_0000)),
             ncpus: 4,
             rng_seed: &[7; 32],
+            gic_v3: false,
         });
         assert_eq!(&dtb[0..4], &0xd00d_feedu32.to_be_bytes());
         let total = u32::from_be_bytes(dtb[4..8].try_into().unwrap()) as usize;

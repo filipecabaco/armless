@@ -348,9 +348,13 @@ impl Board {
             id[i % 16] ^= b.rotate_left((i / 16) as u32);
         }
         self.devices.lock().vmgenid = id;
-        // The guest configured the line as edge-triggered: a rising edge latches it
-        self.io.set_irq(crate::board::SPI_VMGENID, true);
-        self.io.set_irq(crate::board::SPI_VMGENID, false);
+        // The guest configured the line as edge-triggered: a rising edge latches it. Not before the
+        // guest has state: an edge latched before it booted reaches a driver that is not ready for
+        // it (Linux's takes it as soon as it asks for the line, with KVM's GIC, and crashes).
+        if self.io.machine.started.load(std::sync::atomic::Ordering::Relaxed) {
+            self.io.set_irq(crate::board::SPI_VMGENID, true);
+            self.io.set_irq(crate::board::SPI_VMGENID, false);
+        }
     }
 
     /// Moves the guest's counter forward by `ns`: after a restore, the time the machine was not
@@ -359,7 +363,7 @@ impl Board {
     /// takes a jump of about ten minutes at once (more overflows what it multiplies a delta by):
     /// make long ones in steps, with the guest running between them.
     pub fn advance_clock(&self, ns: u64) {
-        let ticks = ns / (1_000_000_000 / crate::board::TIMER_FREQ_HZ);
+        let ticks = self.io.machine.ticks_in_ns(ns);
         self.io
             .machine
             .timer_cnt_base
@@ -678,7 +682,7 @@ impl<P: Platform> Vm<P> {
 /// Snapshot of the machine; every CPU must be stopped and in `cpus`, in order.
 pub fn save_state<H: Host>(board: &Board, cpus: &mut [&mut Cpu<H>]) -> Vec<u8> {
     let n = cpus.len();
-    save_state_cpus(board, cpus, n).expect("every CPU is kept")
+    save_state_cpus(board, cpus, n).expect("every CPU is kept, and the GIC is armless's")
 }
 
 /// Snapshot for a machine of the first `n` CPUs: the rest must be powered off, taken offline
@@ -714,6 +718,11 @@ impl StateSaver {
         cpus: &mut [&mut Cpu<H>],
         n: usize,
     ) -> Result<StateSaver, String> {
+        if board.io.machine.gic_v3.load(std::sync::atomic::Ordering::Relaxed) {
+            // Its interrupt controller's state is in the host's kernel (KVM's GICv3), which a
+            // snapshot does not hold yet
+            return Err("a machine with the hypervisor's GICv3 can't be saved yet".into());
+        }
         // The header and the state in one buffer, the state written where it stays, with its length
         // filled in once it is known: it holds the contents of the files the guest wrote
         // (Fs::save), which a copy into a second buffer would double. Fs::save itself still
@@ -1095,6 +1104,45 @@ mod image_tests {
             crate::platform::NativePlatform::new(clock.clone())
         })
         .unwrap()
+    }
+
+    /// The version a snapshot's CPU state is written in: 2 at the default frequency with armless's
+    /// features, 3 with another frequency, 4 with features a guest in hardware saw.
+    fn cpu_state_version(snapshot: &[u8]) -> u32 {
+        // Its "ARML", not the snapshot's own "ARMLESS"
+        let at = (0..snapshot.len() - 8)
+            .find(|&i| &snapshot[i..i + 4] == b"ARML" && &snapshot[i + 4..i + 7] != b"ESS")
+            .expect("the CPU state");
+        u32::from_le_bytes(snapshot[at + 4..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_snapshot_carries_its_frequency_and_the_features_its_guest_saw() {
+        use std::sync::atomic::Ordering;
+        let (mut a, _clock) = crate::runner::new_vm(config()).unwrap();
+        assert_eq!(cpu_state_version(&a.save_state()), 2, "armless's own: older readers take it");
+
+        a.machine().timer_freq.store(24_000_000, Ordering::SeqCst);
+        let snap = a.save_state();
+        assert_eq!(cpu_state_version(&snap), 3);
+        let (mut b, _clock) = crate::runner::new_vm(config()).unwrap();
+        b.load_state(&snap).unwrap();
+        assert_eq!(b.machine().timer_freq.load(Ordering::SeqCst), 24_000_000);
+
+        // A guest that saw FP16 (ID_AA64PFR0_EL1 with FP and AdvSIMD at 1), as under KVM on 6.8
+        let saw = vec![(crate::sysreg::ID_AA64PFR0_EL1, 0x0011_0011u64)];
+        *a.machine().features.lock() = saw.clone();
+        let snap = a.save_state();
+        assert_eq!(cpu_state_version(&snap), 4);
+        let (mut c, _clock) = crate::runner::new_vm(config()).unwrap();
+        let err = c.load_state(&snap).unwrap_err();
+        assert!(err.contains("features armless doesn't emulate"), "{err}");
+        // Where it can run in hardware it restores, and goes on seeing what it saw
+        let (mut d, _clock) = crate::runner::new_vm(config()).unwrap();
+        d.machine().hw_backend.store(true, Ordering::SeqCst);
+        d.load_state(&snap).unwrap();
+        assert_eq!(*d.machine().features.lock(), saw);
+        assert_eq!(d.machine().timer_freq.load(Ordering::SeqCst), 24_000_000);
     }
 
     #[test]
