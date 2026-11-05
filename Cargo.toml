@@ -35,7 +35,7 @@ cranelift-codegen = { version = "=0.136.2", optional = true }
 cranelift-frontend = { version = "=0.136.2", optional = true }
 cranelift-jit = { version = "=0.136.2", optional = true }
 cranelift-module = { version = "=0.136.2", optional = true }
-cranelift-native = { version = "=0.136.2", optional = true }
+cranelift-native = { version = "=0.137.1", optional = true }
 
 # RAM mapped from an image (Ram::from_image); the native JIT checks the kernel lets it make new
 # code visible to other cores (membarrier), and maps its code memory itself (src/jit/native/code.rs)
