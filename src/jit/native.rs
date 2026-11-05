@@ -579,7 +579,11 @@ struct Compiler {
 impl Compiler {
     fn new() -> Option<Compiler> {
         let mut flags = settings::builder();
-        flags.set("opt_level", "speed").ok()?;
+        let opt = std::env::var("ARMLESS_JIT_OPT").unwrap_or_else(|_| "speed".into());
+        flags.set("opt_level", &opt).ok()?;
+        if let Ok(regalloc) = std::env::var("ARMLESS_JIT_REGALLOC") {
+            flags.set("regalloc_algorithm", &regalloc).ok()?;
+        }
         // Checking the IR of every function takes about a third of the compile time; the block
         // tests and fuzzers keep the translation honest.
         flags.set("enable_verifier", "false").ok()?;

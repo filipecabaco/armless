@@ -106,8 +106,12 @@ What it showed: workloads that run their own JIT (the JVM, the BEAM, V8) write c
 so armless drops what it compiled from those pages and runs the new code interpreted until it is
 hot. With `--profile`, a third to half of a vCPU's time is in the interpreter on short commands
 (Java, Python, iex): code that runs fewer than `ARMLESS_JIT_THRESHOLD` times never compiles.
-Lowering the threshold or compiling with cheaper Cranelift settings made every site slower, so
-that time is the interpreter's to win.
+Lowering the threshold made every site slower, so that time is the interpreter's to win.
+
+`ARMLESS_JIT_OPT` (Cranelift's `opt_level`, `speed` by default) and `ARMLESS_JIT_REGALLOC`
+(`regalloc_algorithm`) change how the native JIT compiles. With `none`, compiles take about 30%
+less time and java, elixir and python were 1–4% faster, but the benchmark guest's tight loops ran
+7–23% slower; even then a lower threshold did not pay. `single_pass` made every site 21–31% slower.
 
 ## `cargo bench --bench machine`
 
