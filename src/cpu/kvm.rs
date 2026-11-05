@@ -502,12 +502,15 @@ impl<H: Host> Cpu<H> {
                     // The features armless has, no others (`hw::MASKED_ID_REGS`): before the
                     // vCPU first runs, as KVM wants
                     let mut kept = Vec::new();
+                    let mut seen = Vec::new();
                     for (key, want) in self.guest_id_regs() {
                         let got = v.set_id_reg(key, want);
                         if got != want {
                             kept.push(format!("{key:#x} {got:#x} (armless {want:#x})"));
                         }
+                        seen.push((key, got));
                     }
+                    self.record_features(&seen);
                     if self.index == 0 && !kept.is_empty() {
                         eprintln!("armless: KVM keeps some of the host's features: {}", kept.join(", "));
                     }

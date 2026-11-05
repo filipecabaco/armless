@@ -84,6 +84,12 @@ jobs:
         run: cargo test --release
       - name: Unit tests with overflow checks
         run: cargo test
+      # The KVM backend (src/cpu/kvm.rs) is built only with the hypervisor feature on Linux arm64:
+      # checked here, where it compiles (running it needs /dev/kvm, which the runner hasn't)
+      - name: The hypervisor feature (KVM backend)
+        run: |
+          rustup component add clippy
+          cargo clippy --release --all-targets --features hypervisor
 
   linux:
     runs-on: ubuntu-24.04

@@ -171,6 +171,14 @@ pub struct Machine {
     /// A snapshot was restored into the machine (its guest booted elsewhere: `cpu::hw` checks it can
     /// go on in hardware).
     pub restored: AtomicBool,
+    /// The feature ID registers (`sr` key, value) a guest booted in hardware was shown, where they
+    /// aren't armless's own (a hypervisor that can't hide all of the host's, as KVM on Linux 6.8
+    /// with FP16): empty for a guest that saw armless's. A snapshot carries them; a guest that saw
+    /// more than armless emulates goes on only in hardware.
+    pub features: SpinLock<Vec<(u32, u64)>>,
+    /// The CPUs may run in hardware (`Cpu::enable_hypervisor`): a snapshot whose guest saw
+    /// features armless doesn't emulate can be restored.
+    pub hw_backend: AtomicBool,
     /// The generic timer's frequency, which the guest reads in CNTFRQ_EL0 at boot and keeps: a
     /// snapshot carries it, and a machine in hardware has the host counter's.
     pub timer_freq: AtomicU64,
@@ -233,6 +241,8 @@ impl Machine {
             irq_sink: std::sync::OnceLock::new(),
             started: AtomicBool::new(false),
             restored: AtomicBool::new(false),
+            features: SpinLock::new(Vec::new()),
+            hw_backend: AtomicBool::new(false),
             timer_freq: AtomicU64::new(crate::board::TIMER_FREQ_HZ),
             rtc: SpinLock::new(Rtc::default()),
             cpus: Default::default(),

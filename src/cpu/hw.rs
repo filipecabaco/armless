@@ -177,6 +177,7 @@ impl<H: Host> Cpu<H> {
                 .timer_freq
                 .store(host_counter_hz(), Ordering::SeqCst);
         }
+        self.machine.hw_backend.store(true, Ordering::SeqCst);
         self.hv = Backend::Wanted;
         Ok(())
     }
@@ -229,6 +230,13 @@ impl<H: Host> Cpu<H> {
             return self.leave(exit);
         }
         if let Some(why) = self.hw_cannot_resume() {
+            // A guest that saw features armless doesn't emulate can't go on without hardware
+            if !self.machine.features.lock().is_empty() {
+                if self.index == 0 {
+                    eprintln!("armless: {why}, and its guest saw CPU features armless doesn't emulate: it can't run here");
+                }
+                return self.leave(Exit::Stop(StopReason::PowerOff));
+            }
             // Every CPU of the machine comes here: they all go on interpreted and compiled, with
             // armless's GIC
             if self.index == 0 {
@@ -246,6 +254,11 @@ impl<H: Host> Cpu<H> {
 
     /// The ID registers to show a guest in hardware (`MASKED_ID_REGS`): `sr` key and value.
     pub(super) fn guest_id_regs(&mut self) -> Vec<(u32, u64)> {
+        // A restored guest is shown what it saw when it booted
+        let saw = self.machine.features.lock().clone();
+        if !saw.is_empty() {
+            return saw;
+        }
         let gic_v3 = self.machine.gic_v3.load(Ordering::Relaxed);
         MASKED_ID_REGS
             .iter()
@@ -257,6 +270,20 @@ impl<H: Host> Cpu<H> {
                 (key, v)
             })
             .collect()
+    }
+
+    /// After a fresh guest's vCPU was shown `wanted` (`guest_id_regs`) and actually shows `seen`:
+    /// what differs from armless's own is kept with the machine (`Machine::features`), for its
+    /// snapshots. CPU 0's, before the guest has run.
+    pub(super) fn record_features(&mut self, seen: &[(u32, u64)]) {
+        if self.index != 0 || self.machine.restored.load(Ordering::Relaxed) {
+            return;
+        }
+        let own: Vec<(u32, u64)> = MASKED_ID_REGS
+            .iter()
+            .map(|&key| (key, self.read_sysreg(key).unwrap_or(0)))
+            .collect();
+        *self.machine.features.lock() = if seen == own.as_slice() { Vec::new() } else { seen.to_vec() };
     }
 
     /// The architectural state into the vCPU.

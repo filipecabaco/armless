@@ -219,14 +219,25 @@ impl<H: Host> Cpu<H> {
                 // Aff0 is the CPU number, as `psci_call` and the GIC take it
                 let mpidr = self.read_sysreg(sr::MPIDR_EL1).unwrap_or(0);
                 v.set_sys(sr::MPIDR_EL1, mpidr);
-                // The features armless has, no others (`hw::MASKED_ID_REGS`)
-                for (key, value) in self.guest_id_regs() {
+                // The features armless has, no others (`hw::MASKED_ID_REGS`), and what the vCPU
+                // then shows: a register Hypervisor.framework doesn't model (ID_AA64ISAR2_EL1
+                // before macOS 27) neither sets nor reads, and reads as zero in the guest
+                let mut seen = Vec::new();
+                for (key, want) in self.guest_id_regs() {
+                    let mut got = 0;
                     // SAFETY: this thread's vCPU
-                    let r = unsafe { ffi::hv_vcpu_set_sys_reg(v.id, key as u16, value) };
-                    if r != ffi::HV_SUCCESS && self.index == 0 {
-                        eprintln!("armless: ID register {key:#x} can't be set ({r:#x}): the guest sees the host's");
+                    let read = unsafe {
+                        ffi::hv_vcpu_set_sys_reg(v.id, key as u16, want);
+                        ffi::hv_vcpu_get_sys_reg(v.id, key as u16, &mut got)
+                    };
+                    if read != ffi::HV_SUCCESS {
+                        got = 0;
+                    } else if got != want && self.index == 0 {
+                        eprintln!("armless: ID register {key:#x} shows {got:#x}, not {want:#x}: the guest sees the host's");
                     }
+                    seen.push((key, got));
                 }
+                self.record_features(&seen);
                 v
             },
         };

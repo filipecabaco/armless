@@ -104,9 +104,16 @@ addresses with keys a snapshot doesn't hold, and dies wherever it is restored.) 
 registers (CTR_EL0, CLIDR_EL1, DCZID_EL0) stay the host's: they say what maintenance the hardware
 needs.
 
-Hypervisor.framework sets all of them but ID_AA64ISAR2_EL1 (macOS 27). KVM refuses fields it
-doesn't let change: armless lowers them one at a time, and says which stay the host's. Linux 6.8
-keeps FP16 and BTI: a guest started there may use half-precision instructions armless can't run.
+Hypervisor.framework sets all of them but ID_AA64ISAR2_EL1, which it doesn't model before macOS 27
+(the guest reads it as zero). KVM refuses fields it doesn't let change: armless lowers them one at
+a time, and says which stay the host's. Linux 6.8 keeps FP16 and BTI, so a guest started there may
+use half-precision instructions armless can't run.
+
+What a guest started in hardware was shown, where it isn't armless's own, stays with the machine
+(`Machine::features`) and its snapshots (version 4). Such a snapshot restores only where its
+machine may run in hardware (`StateSaver`'s reader refuses it otherwise), its vCPUs are shown what
+the guest saw before, and it doesn't fall back to the JIT: a host that can't run it says why and
+stops. A snapshot made on an Apple silicon Mac shows armless's own, and goes on anywhere.
 
 ## Not yet
 
