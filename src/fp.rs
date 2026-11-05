@@ -96,7 +96,7 @@ pub trait Float: Copy + PartialOrd + std::fmt::Debug {
 }
 
 macro_rules! impl_float {
-    ($t:ty, $ut:ty, $bits:expr, $mant:expr, $dn:expr) => {
+    ($t:ty, $ut:ty, $bits:expr, $mant:expr, $dn:expr, $fma:ident) => {
         impl Float for $t {
             const BITS: u32 = $bits;
             const MANT: u32 = $mant;
@@ -131,7 +131,7 @@ macro_rules! impl_float {
             }
             #[inline]
             fn fma(self, b: Self, c: Self) -> Self {
-                self.mul_add(b, c)
+                $fma(self, b, c)
             }
             #[inline]
             fn sqrt(self) -> Self {
@@ -189,8 +189,8 @@ macro_rules! impl_float {
     };
 }
 
-impl_float!(f32, u32, 32, 23, 0x7fc0_0000);
-impl_float!(f64, u64, 64, 52, 0x7ff8_0000_0000_0000);
+impl_float!(f32, u32, 32, 23, 0x7fc0_0000, fma32);
+impl_float!(f64, u64, 64, 52, 0x7ff8_0000_0000_0000, fma64);
 
 #[inline]
 pub fn is_snan<F: Float>(x: F) -> bool {
@@ -414,6 +414,112 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
     (s, (a - (s - bb)) + (b - bb))
 }
 
+// Fused multiply-add. A host with an FMA instruction uses it. WebAssembly has none, and Rust's
+// `mul_add` there is libm's integer emulation, which the benchmark guest's floating point spent
+// most of its time in; so the browser builds compute it from plain double operations instead
+// (`two_prod_split`, `fma32_odd`, `fma64_odd`: exact, checked against the host's FMA in the
+// tests), and use `mul_add` only for what those leave out.
+
+/// Below this magnitude an f64 operand may be split (`two_prod_split`) without overflowing.
+const SPLIT_MAX: f64 = 6.0e299; // < 2^996
+/// What the error-free transformations need to stay exact: no partial product nor error term
+/// falls below the normal range (a product at least this big keeps 2^-106 of itself normal).
+const EFT_MIN: f64 = 1e-280;
+
+/// a*b == p + e exactly, with p = a*b rounded to nearest.
+#[inline]
+fn two_prod(a: f64, b: f64) -> (f64, f64) {
+    let p = a * b;
+    #[cfg(target_arch = "wasm32")]
+    if let Some(e) = two_prod_split(a, b, p) {
+        return (p, e);
+    }
+    (p, a.mul_add(b, -p))
+}
+
+/// Dekker's product error a*b - p for p = a*b rounded to nearest, without an FMA: exact for
+/// operands and products below `SPLIT_MAX`, products at least `EFT_MIN` (else None).
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+#[inline]
+fn two_prod_split(a: f64, b: f64, p: f64) -> Option<f64> {
+    if !(a.abs() < SPLIT_MAX && b.abs() < SPLIT_MAX && p.abs() >= EFT_MIN && p.abs() < SPLIT_MAX) {
+        return None;
+    }
+    let split = |x: f64| {
+        let t = 134_217_729.0 * x; // 2^27 + 1
+        let hi = t - (t - x);
+        (hi, x - hi)
+    };
+    let (ah, al) = split(a);
+    let (bh, bl) = split(b);
+    Some(((ah * bh - p) + ah * bl + al * bh) + al * bl)
+}
+
+/// The f64 next to `s` toward `s + e` when that is odd and `e` (the error of rounding to `s`)
+/// is not zero: rounding to odd, which a later rounding to nearest cannot round twice.
+#[inline]
+fn round_odd(s: f64, e: f64) -> f64 {
+    let b = s.to_bits();
+    if e == 0.0 || b & 1 != 0 {
+        return s;
+    }
+    // s is not zero (a sum rounds to zero only when it is zero)
+    f64::from_bits(if (e > 0.0) == (s > 0.0) { b + 1 } else { b - 1 })
+}
+
+/// a*b + c for f32, correctly rounded: the product is exact in f64, the sum is rounded to odd
+/// there and then to nearest in f32 (53 >= 2*24 + 2 bits: Boldo and Melquiond). Finite operands.
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+#[inline]
+fn fma32_odd(a: f32, b: f32, c: f32) -> Option<f32> {
+    if !(a.is_finite() && b.is_finite() && c.is_finite()) {
+        return None;
+    }
+    let (s, e) = two_sum(a as f64 * b as f64, c as f64);
+    Some(round_odd(s, e) as f32)
+}
+
+/// a*b + c for f64, correctly rounded with Boldo and Melquiond's emulation of an FMA by rounding
+/// to odd ("Emulation of FMA and correctly rounded sums: proved algorithms using rounding to
+/// odd", 2008): uh + ul = a*b, th + tl = c + uh, RN(th + RO(tl + ul)). Proved without underflow
+/// or overflow, so for operands and partial results within the bounds checked (else None).
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+#[inline]
+fn fma64_odd(a: f64, b: f64, c: f64) -> Option<f64> {
+    let p = a * b;
+    if p == 0.0 || !(c == 0.0 || (c.abs() >= EFT_MIN && c.abs() < SPLIT_MAX)) {
+        // Products of zero (exactly c, or a signed zero) and the extremes stay with `mul_add`
+        return None;
+    }
+    let ul = two_prod_split(a, b, p)?;
+    let (th, tl) = two_sum(c, p);
+    let (v, ve) = two_sum(tl, ul);
+    let tiny = |x: f64| x != 0.0 && x.abs() < EFT_MIN;
+    if tiny(th) || tiny(v) || !th.is_finite() {
+        return None;
+    }
+    let r = th + round_odd(v, ve);
+    (r.is_finite() && !tiny(r)).then_some(r)
+}
+
+#[inline]
+fn fma32(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(r) = fma32_odd(a, b, c) {
+        return r;
+    }
+    a.mul_add(b, c)
+}
+
+#[inline]
+fn fma64(a: f64, b: f64, c: f64) -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(r) = fma64_odd(a, b, c) {
+        return r;
+    }
+    a.mul_add(b, c)
+}
+
 /// Decompose a finite f64 into (negative, mantissa, exponent) with
 /// value = mantissa * 2^exponent.
 fn decompose(x: f64) -> (bool, u128, i32) {
@@ -491,7 +597,8 @@ fn safe(x: f64) -> bool {
 /// sign(a*b - r) for f64 operands.
 fn err_mul64(a: f64, b: f64, r: f64) -> i32 {
     if safe(a * b) && safe(r) && a * b != 0.0 {
-        return cmp_exact_f64(a.mul_add(b, -r));
+        let (p, e) = two_prod(a, b);
+        return cmp_exact_f64((p - r) + e);
     }
     exact_sign(&[product_term(false, a, b), term(true, r)])
 }
@@ -499,7 +606,9 @@ fn err_mul64(a: f64, b: f64, r: f64) -> i32 {
 /// sign(a/b - r) for f64 operands.
 fn err_div64(a: f64, b: f64, r: f64) -> i32 {
     let s = if safe(r * b) && safe(r) && safe(a) && r * b != 0.0 {
-        cmp_exact_f64(-(r.mul_add(b, -a)))
+        // r*b is within a factor of 2 of a: p - a is exact (Sterbenz)
+        let (p, e) = two_prod(r, b);
+        cmp_exact_f64(-((p - a) + e))
     } else {
         exact_sign(&[term(false, a), product_term(true, r, b)])
     };
@@ -513,7 +622,8 @@ fn err_div64(a: f64, b: f64, r: f64) -> i32 {
 /// sign(sqrt(a) - r) for f64.
 fn err_sqrt64(a: f64, r: f64) -> i32 {
     if safe(r * r) && safe(a) && r * r != 0.0 {
-        return cmp_exact_f64(-(r.mul_add(r, -a)));
+        let (p, e) = two_prod(r, r);
+        return cmp_exact_f64(-((p - a) + e));
     }
     exact_sign(&[term(false, a), product_term(true, r, r)])
 }
@@ -522,7 +632,7 @@ fn err_sqrt64(a: f64, r: f64) -> i32 {
 fn err_fma64(a: f64, b: f64, c: f64, r: f64) -> i32 {
     let p = b * c;
     if safe(p) && safe(a) && safe(r) && (p != 0.0 || b == 0.0 || c == 0.0) {
-        let p_lo = b.mul_add(c, -p);
+        let p_lo = two_prod(b, c).1;
         let (s, e1) = two_sum(p, a);
         let t = s - r;
         let low = e1 + p_lo;
@@ -1345,6 +1455,123 @@ mod tests {
 
     fn st(fpsr: &mut u64) -> Fpst<'_> {
         Fpst { fpcr: 0, fpsr }
+    }
+
+    /// Operands for the FMA emulations: random magnitudes across the range, and the cases where
+    /// rounding is hard (an addend that cancels the product, or sits half an ulp from it).
+    fn fma_cases(n: usize, mut f: impl FnMut(f64, f64, f64)) {
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let val = |next: &mut dyn FnMut() -> u64, exp_span: u64| {
+            let r = next();
+            let exp = 1023 - exp_span / 2 + (r >> 11) % exp_span;
+            f64::from_bits((r & (1 << 63)) | (exp << 52) | (next() & ((1 << 52) - 1)))
+        };
+        for i in 0..n {
+            let span = [8, 64, 600, 2000][i % 4];
+            let a = val(&mut next, span);
+            let b = val(&mut next, span);
+            let p = a * b;
+            let lo = a.mul_add(b, -p);
+            let ulp = f64::from_bits(p.abs().to_bits() + 1) - p.abs();
+            let c = match i % 6 {
+                0 => val(&mut next, span),
+                1 => -p,
+                2 => -p + lo * (next() % 5) as f64,
+                3 => -(p + ulp * 0.5),
+                4 => ulp * 0.5 * if next() & 1 == 0 { 1.0 } else { -1.0 },
+                _ => val(&mut next, 40) * p,
+            };
+            f(a, b, c);
+        }
+    }
+
+    #[test]
+    fn product_error_without_an_fma_is_exact() {
+        let mut checked = 0;
+        fma_cases(400_000, |a, b, _| {
+            let p = a * b;
+            if let Some(e) = two_prod_split(a, b, p) {
+                assert_eq!(e.to_bits(), a.mul_add(b, -p).to_bits(), "{a:e} * {b:e}");
+                checked += 1;
+            }
+        });
+        assert!(checked > 300_000, "{checked}");
+    }
+
+    #[test]
+    fn f64_fma_by_rounding_to_odd_is_the_fma() {
+        let mut checked = 0;
+        fma_cases(600_000, |a, b, c| {
+            if let Some(r) = fma64_odd(a, b, c) {
+                let want = a.mul_add(b, c);
+                assert_eq!(r.to_bits(), want.to_bits(), "{a:e} * {b:e} + {c:e}: {r:e}, not {want:e}");
+                checked += 1;
+            }
+        });
+        assert!(checked > 400_000, "{checked}");
+
+        // Operands with few significant bits and exponents near each other, where p + c often
+        // lands next to a midpoint that only the product's low part decides: rounding tl + ul
+        // to nearest there (not to odd) gets about 1 in 20000 of these wrong, which this checks
+        // the cases still catch.
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (mut ties, mut double_rounding_wrong) = (0, 0);
+        for _ in 0..2_000_000 {
+            let (ka, kb, kc) = (27 + next() % 26, 27 + next() % 26, 1 + next() % 53);
+            let (xa, xb, xc, sc) = (next(), next(), next(), next());
+            let ea = (next() % 40) as i32 - 20;
+            let eb = (next() % 40) as i32 - 20;
+            let ec = (next() % 120) as i32 - 60;
+            let a = ((xa % (1 << ka)) | 1) as f64 * 2f64.powi(ea);
+            let b = ((xb % (1 << kb)) | 1) as f64 * 2f64.powi(eb);
+            let c = ((xc % (1 << kc)) | 1) as f64 * 2f64.powi(ec) * if sc & 1 == 0 { 1.0 } else { -1.0 };
+            let want = a.mul_add(b, c);
+            if let Some(r) = fma64_odd(a, b, c) {
+                assert_eq!(r.to_bits(), want.to_bits(), "{a:e} * {b:e} + {c:e}: {r:e}, not {want:e}");
+                ties += 1;
+                let p = a * b;
+                let (th, tl) = two_sum(c, p);
+                if (th + (tl + a.mul_add(b, -p))).to_bits() != want.to_bits() {
+                    double_rounding_wrong += 1;
+                }
+            }
+        }
+        assert!(ties > 1_900_000, "{ties}");
+        assert!(double_rounding_wrong > 20, "{double_rounding_wrong}");
+    }
+
+    #[test]
+    fn f32_fma_by_rounding_to_odd_is_the_fma() {
+        let mut checked = 0;
+        fma_cases(600_000, |a, b, c| {
+            // The same shapes in f32, subnormals and overflow included
+            let (a, b) = (a as f32, b as f32);
+            let p = a as f64 * b as f64;
+            let c = if c.abs() > 1e30 || c.abs() < 1e-30 { c as f32 } else { (c * (p / (a * b) as f64)) as f32 };
+            for c in [c, -(p as f32), -(p as f32) * (1.0 + f32::EPSILON)] {
+                if let Some(r) = fma32_odd(a, b, c) {
+                    let want = a.mul_add(b, c);
+                    assert!(
+                        r.to_bits() == want.to_bits() || (r.is_nan() && want.is_nan()),
+                        "{a:e} * {b:e} + {c:e}: {r:e}, not {want:e}"
+                    );
+                    checked += 1;
+                }
+            }
+        });
+        assert!(checked > 1_000_000, "{checked}");
     }
 
     #[test]
