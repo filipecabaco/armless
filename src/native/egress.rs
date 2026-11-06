@@ -63,6 +63,10 @@ pub struct Egress {
     /// Allow connections to loopback, private and link-local addresses (off: the guest can't
     /// reach the host's own services or its network).
     pub allow_private: bool,
+    /// Nothing leaves at all: no connection, request or WebSocket of the guest's reaches the
+    /// outside (links, which the host's program sets, still do). A machine whose network is only
+    /// for what it is linked to and what forwards in.
+    pub deny_all: bool,
 }
 
 fn env(names: &[&str]) -> Option<String> {
@@ -90,7 +94,15 @@ impl Egress {
                 })
                 .unwrap_or_default(),
             allow_private: false,
+            deny_all: false,
         }
+    }
+
+    fn refused(&self, what: &str) -> io::Result<()> {
+        if self.deny_all {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{what}: this machine has no way out (egress none)")));
+        }
+        Ok(())
     }
 
     fn bypass(&self, host: &str) -> bool {
@@ -139,6 +151,7 @@ impl Egress {
 
     /// A TCP stream to host:port: direct, or tunnelled through the proxy with CONNECT.
     pub fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+        self.refused(host)?;
         let Some(p) = self.proxy_for(host, true) else {
             return self.direct(host, port);
         };
@@ -331,6 +344,7 @@ impl Egress {
     /// Open the stream for a request to `t`, and the request target to put in it (absolute
     /// for plain HTTP through a proxy).
     pub fn open(&self, t: &Target) -> io::Result<(Conn, String)> {
+        self.refused(&t.host)?;
         if !t.secure {
             if let Some(p) = self.proxy_for(&t.host, false) {
                 let s = self.proxy(p)?;

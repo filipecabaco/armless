@@ -358,3 +358,70 @@ fn tcp_tunnels_carry_a_connection_to_their_address() {
     g.data(ip, 40010, 5432, theirs, b"SELECT 1");
     assert_eq!(got_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"SELECT 1");
 }
+
+#[test]
+fn links_set_while_it_runs_reach_their_address_even_a_private_one() {
+    // A server on the host's loopback, which the guest knows as db:5432 once the link is set
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut s, _) = server.accept().unwrap();
+        s.write_all(b"linked").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+    });
+    let b = board(true);
+    let (obs, _) = observer();
+    // Private addresses off limits: a link is the host's own and goes anyway
+    let mut opts = options(true);
+    opts.egress.allow_private = false;
+    let host = NativeHost::spawn(b.clone(), opts, obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("db", 1).unwrap();
+    // Before the link: nothing there (refused, as a private address)
+    g.syn(ip, 40020, 5432);
+    seg(&mut g, "a reset before the link", |s| s.has(RST));
+    host.set_links(vec![Tunnel::parse(&format!("db:5432=tcp://127.0.0.1:{port}")).unwrap()]);
+    g.syn(ip, 40021, 5432);
+    let sa = seg(&mut g, "the SYN-ACK once the link's address answers", |s| s.has(SYN | ACK));
+    g.ack(ip, 40021, 5432, sa.seq.wrapping_add(1));
+    let d = seg(&mut g, "the server's bytes", |s| !s.payload.is_empty());
+    assert_eq!(d.payload, b"linked");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_unix_link_reaches_its_socket_and_nothing_else_leaves_with_egress_denied() {
+    use std::os::unix::net::UnixListener;
+    let dir = std::env::temp_dir().join(format!("armless-link-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("l.sock");
+    let _ = std::fs::remove_file(&sock);
+    let server = UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        let (mut s, _) = server.accept().unwrap();
+        s.write_all(b"over unix").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+    });
+    // Something on the loopback that only a guest allowed out could reach
+    let open = TcpListener::bind("127.0.0.1:0").unwrap();
+    let open_port = open.local_addr().unwrap().port();
+    let b = board(true);
+    let (obs, _) = observer();
+    let mut opts = options(true);
+    opts.egress.deny_all = true;
+    let host = NativeHost::spawn(b.clone(), opts, obs);
+    host.set_links(vec![Tunnel { host: Some("db".into()), port: 5432, url: format!("unix://{}", sock.display()) }]);
+    let mut g = Guest::on_board(b.clone());
+    let out = g.resolve("localhost.example", 1).unwrap();
+    let ip = g.resolve("db", 1).unwrap();
+    // Out: refused, even to an allowed private address
+    g.syn(out, 40030, open_port);
+    seg(&mut g, "a reset: nothing leaves", |s| s.has(RST));
+    // The link: through
+    g.syn(ip, 40031, 5432);
+    let sa = seg(&mut g, "the SYN-ACK once the socket answers", |s| s.has(SYN | ACK));
+    g.ack(ip, 40031, 5432, sa.seq.wrapping_add(1));
+    let d = seg(&mut g, "the server's bytes", |s| !s.payload.is_empty());
+    assert_eq!(d.payload, b"over unix");
+    std::fs::remove_dir_all(&dir).ok();
+}
