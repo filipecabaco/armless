@@ -105,6 +105,7 @@ fn no_proxy_names_go_direct() {
         http_proxy: Some(Proxy { port: 2, ..proxy }),
         no_proxy: vec!["internal.corp".into(), ".svc".into(), "*.local".into()],
         allow_private: false,
+        deny_all: false,
     };
     for host in ["internal.corp", "a.internal.corp", "db.svc", "X.Local"] {
         assert!(e.proxy_for(host, true).is_none(), "{host}");

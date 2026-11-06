@@ -3,7 +3,8 @@
 //! * blobs from a directory (`<dir>/<name>`)
 //! * the web relay's requests (`HttpRequest`, `WsOpen`) made with a built-in HTTP client
 //! * other TCP connections the guest opens, as real connections, or through a WebSocket
-//!   tunnel for the destinations [`HostOptions::tunnels`] names
+//!   tunnel for the destinations [`HostOptions::tunnels`] names, or to the address a link the
+//!   host's program set ([`NativeHost::set_links`]) names
 //! * connections into the guest (port forwarding) from host sockets
 //! * the network's retransmit timer
 //!
@@ -94,6 +95,11 @@ impl Tunnel {
         })
     }
 
+    /// A unix:///PATH url's socket: a link's, to a socket the host's program listens on.
+    pub fn unix_path(&self) -> Option<&str> {
+        self.url.strip_prefix("unix://").filter(|p| p.starts_with('/'))
+    }
+
     /// The host and port of a tcp:// tunnel.
     pub fn tcp_address(&self) -> Option<(String, u16)> {
         let (h, p) = self.url.strip_prefix("tcp://")?.rsplit_once(':')?;
@@ -111,8 +117,41 @@ impl Tunnel {
 
 pub type Observer = Box<dyn FnMut(&Event) + Send>;
 
+/// A link's connection: straight to its address, whatever it is. A Unix socket's is carried as a
+/// TcpStream (the host pumps it the same way; only TCP options fail, and are ignored).
+fn link(l: &Tunnel) -> std::io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    if let Some(path) = l.unix_path() {
+        #[cfg(unix)]
+        {
+            let s = std::os::unix::net::UnixStream::connect(path)?;
+            return Ok(TcpStream::from(std::os::fd::OwnedFd::from(s)));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unix:// links need a Unix host"));
+        }
+    }
+    let (host, port) = l.tcp_address().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a link's url: tcp:// or unix://"))?;
+    let host = host.as_str();
+    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no address");
+    for a in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&a, Duration::from_secs(10)) {
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            },
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 enum Msg {
     Wake,
+    /// The links, replaced.
+    Links(Vec<Tunnel>),
     /// A host socket to connect to the guest's port.
     Forward(TcpStream, u16),
     Quit,
@@ -195,6 +234,15 @@ impl NativeHost {
         let _ = self.tx.send(Msg::Forward(stream, port));
     }
 
+    /// Replace the links: destinations whose connections go to a unix:///PATH socket or a
+    /// tcp:// address the host's program chose (another machine's port, say), checked before the
+    /// tunnels. Unlike a tunnel, which comes with the site, a link is the host's own: it goes
+    /// whatever the egress allows (a private address, `Egress::deny_all`). New connections
+    /// follow the new links; open ones stay as they are.
+    pub fn set_links(&self, links: Vec<Tunnel>) {
+        let _ = self.tx.send(Msg::Links(links));
+    }
+
     /// Look at the events again (after something was delivered elsewhere).
     pub fn wake(&self) {
         let _ = self.tx.send(Msg::Wake);
@@ -223,9 +271,11 @@ fn event_loop(
     let mut forwarding: HashMap<u32, TcpStream> = HashMap::new();
     let start = Instant::now();
     let mut last_tick = Instant::now();
+    let mut links: Vec<Tunnel> = Vec::new();
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Msg::Quit) => break,
+            Ok(Msg::Links(l)) => links = l,
             Ok(Msg::Forward(stream, port)) => match board.tcp_connect(port) {
                 Some(id) => {
                     forwarding.insert(id, stream);
@@ -310,7 +360,29 @@ fn event_loop(
                         board.tcp_refuse(id);
                         continue;
                     }
+                    // A link: a direct connection to its address (a Unix socket or a TCP
+                    // one), the host's own choice
+                    if let Some(l) = links
+                        .iter()
+                        .find(|t| t.matches(&host, port))
+                        .filter(|t| t.unix_path().is_some() || t.tcp_address().is_some())
+                        .cloned()
+                    {
+                        let (board, conns, tx) = (board.clone(), conns.clone(), tx.clone());
+                        std::thread::spawn(move || {
+                            match link(&l) {
+                                Ok(s) => {
+                                    board.tcp_accept(id);
+                                    attach(&board, &conns, id, s);
+                                },
+                                Err(_) => board.tcp_refuse(id),
+                            }
+                            let _ = tx.send(Msg::Wake);
+                        });
+                        continue;
+                    }
                     let target = options.tunnels.iter().find(|t| t.matches(&host, port));
+
                     // A tcp:// tunnel: a connection to its address in place of the guest's
                     let (host, port) = match target.and_then(|t| t.tcp_address()) {
                         Some((h, p)) => (h, p),
