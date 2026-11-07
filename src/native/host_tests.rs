@@ -81,7 +81,8 @@ fn blobs_come_from_the_directory_or_the_source_and_names_outside_it_fail() {
         },
         obs,
     );
-    for name in ["good", "../armless-outside", "missing"] {
+    // The host answers in order, so once "good" is in, the two before it were failed
+    for name in ["../armless-outside", "missing", "good"] {
         b.io.out.push(Event::Blob(name.into()));
     }
     until("the blobs", || {
@@ -91,12 +92,13 @@ fn blobs_come_from_the_directory_or_the_source_and_names_outside_it_fail() {
         .eq(b"abc")
         .then_some(())
         .unwrap();
-    for path in ["/b", "/c"] {
-        let e = until("a failure", || match b.read_file(path) {
-            Err(crate::vm::BootError::Fail(e)) => Some(e),
-            _ => None,
-        });
-        assert!(e.contains("error 5"), "{path}: {e}");
+    // A failed blob is not kept as failed: the next read asks for it again (and never gets the file outside)
+    for (path, name) in [("/b", "../armless-outside"), ("/c", "missing")] {
+        assert!(!b.has_blob(name), "{path}");
+        match b.read_file(path) {
+            Err(crate::vm::BootError::Need(n)) => assert_eq!(n, vec![name.to_string()], "{path}"),
+            other => panic!("{path}: {:?}", other.map(|_| ())),
+        }
     }
     drop(host);
     std::fs::remove_dir_all(&dir).unwrap();

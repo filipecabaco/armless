@@ -152,8 +152,10 @@ impl Board {
     pub fn blob_failed(&self, name: &str) {
         let mut d = self.devices.lock();
         if let Some((t, p)) = d.p9() {
+            // The reads that waited on it get EIO; the next read asks the host for it again
             p.fs.blob_failed(name);
             p.blob_arrived(&self.io, t, name);
+            p.fs.forget_failure(name);
         }
     }
 

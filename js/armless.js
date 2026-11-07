@@ -65,6 +65,9 @@
 
   function is_url(s) { return /^(https?|blob|data):/i.test(s); }
 
+  // Milliseconds to wait before each new try of a blob fetch that failed
+  const BLOB_RETRIES = [500, 2000, 5000];
+
   /** Bytes of a URL (or, in Node, a path), reporting progress. */
   async function load(src, on_progress) {
     if (src instanceof ArrayBuffer) return new Uint8Array(src);
@@ -1042,7 +1045,18 @@
         const base = fsopt.baseurl || "";
         const url = IS_NODE && !is_url(base) ? base + name :
           String(new URL(name, typeof location !== "undefined" ? new URL(base, location.href) : base));
-        const data = fsopt.fetch_blob ? await fsopt.fetch_blob(name) : await load(url);
+        // A burst of first reads can be throttled or dropped by the server: try again, waiting longer
+        // each time, before the guest's read is failed
+        let data;
+        for (let attempt = 0; ; attempt++) {
+          try {
+            data = fsopt.fetch_blob ? await fsopt.fetch_blob(name) : await load(url);
+            break;
+          } catch (err) {
+            if (attempt >= BLOB_RETRIES.length) throw err;
+            await new Promise((resolve) => setTimeout(resolve, BLOB_RETRIES[attempt]));
+          }
+        }
         this.provide_blob(name, data);
       } catch (err) {
         console.warn(`armless: could not load ${name}: ${err}`);

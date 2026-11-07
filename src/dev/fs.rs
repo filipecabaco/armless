@@ -901,6 +901,12 @@ impl Fs {
         self.failed.insert(name.to_string());
     }
 
+    /// Ask for a failed blob again on the next read, instead of failing every read from now on: a fetch
+    /// that failed once (a dropped connection, a throttled request) can work the next time.
+    pub fn forget_failure(&mut self, name: &str) {
+        self.failed.remove(name);
+    }
+
     /// Drop every fetched blob (they are fetched again when needed).
     pub fn forget_blobs(&mut self) {
         self.blobs.clear();
@@ -1282,6 +1288,16 @@ mod chunk_tests {
         assert_eq!(fs.read(big, 0, 1), Err(Fail::Errno(EIO)));
         fs.provide_blob("b", b"45".to_vec()).unwrap();
         assert_eq!(fs.read(big, 4, 1), Err(Fail::Errno(EIO)));
+    }
+
+    #[test]
+    fn a_forgotten_failure_is_asked_for_again() {
+        let mut fs = image();
+        let big = fs.lookup_path("/big").unwrap();
+        fs.blob_failed("a");
+        assert_eq!(fs.read(big, 0, 1), Err(Fail::Errno(EIO)));
+        fs.forget_failure("a");
+        assert_eq!(fs.read(big, 0, 1), Err(need(&["a"])));
     }
 
     #[test]
