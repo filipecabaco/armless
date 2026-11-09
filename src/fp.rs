@@ -809,6 +809,16 @@ pub fn muladd<F: Float>(st: &mut Fpst, addend: F, b: F, c: F) -> F {
             return F::from_bits64(if s { F::SIGN } else { 0 });
         }
     }
+    // Round to nearest with Inexact already raised, and a result well inside the normal range:
+    // what the error term would decide (Inexact, Underflow, a directed adjustment, the sign of
+    // an exact zero) is already settled, so the exact error is not worth computing.
+    if !r.is_inf()
+        && st.rmode() == Round::Nearest
+        && *st.fpsr & IXC != 0
+        && r.absf().bits() > F::MIN_NORMAL.bits()
+    {
+        return r;
+    }
     let err = if r.is_inf() {
         0
     } else if F::BITS == 32 {

@@ -3,7 +3,7 @@ name = "armless"
 version = "0.9.3"
 edition = "2021"
 # Cranelift (the native-jit feature) needs 1.96
-rust-version = "1.96"
+rust-version = "1.97"
 publish = false
 description = "An AArch64 virtual machine (CPU, JIT, devices) for the browser and native hosts"
 license = "BSD-2-Clause"

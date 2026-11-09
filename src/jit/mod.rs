@@ -70,22 +70,19 @@ pub(crate) enum Inval {
     IcLocal = 1,
     /// Another CPU's IC IVAU, or a device's DMA write, from the shared ring.
     Remote = 2,
-    /// A store-exclusive of this CPU (several CPUs).
-    Excl = 3,
 }
 
-const INVAL_NAMES: [&str; 4] = [
+const INVAL_NAMES: [&str; 3] = [
     "store",
     "ic ivau (own)",
     "remote (other cpu / dma)",
-    "store-exclusive",
 ];
 
 /// Pages dropped by why, split into those with compiled code and those with decoded
 /// instructions only, and how often each page with compiled code was dropped.
 #[derive(Default)]
 pub struct InvalStats {
-    by: [[u64; 2]; 4],
+    by: [[u64; 2]; 3],
     compiled_pages: HashMap<u32, u32>,
 }
 
