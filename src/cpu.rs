@@ -224,9 +224,12 @@ fn same_aligned_page(pc: u64, page: u64) -> bool {
 }
 
 /// Entries of each fast table (a power of two; compiled code indexes them with this, too).
-pub(crate) const FAST_ENTRIES: usize = 256;
+pub(crate) const FAST_ENTRIES: usize = 4096;
 /// Executable pages remembered besides the current one (`code_page`).
 const CODE_ENTRIES: usize = 64;
+/// Read and write slots a fast table remembers filling, so that a flush clears only those; past
+/// this many it clears every slot.
+const FILLED_MAX: usize = 512;
 /// The most instructions `step_page` runs in a row, so that `run` looks at the interrupts and at what
 /// other CPUs asked of this one at least that often.
 const PAGE_RUN: u64 = 256;
@@ -243,6 +246,9 @@ pub(crate) struct FastTlb {
     pub(crate) code_base: usize,
     code_tag: Vec<u64>,
     code_bases: Vec<usize>,
+    /// Read and write slots filled since the last flush (repeats possible), unless `filled_all`.
+    filled: Vec<u16>,
+    filled_all: bool,
 }
 
 impl FastTlb {
@@ -256,12 +262,54 @@ impl FastTlb {
             code_base: 0,
             code_tag: vec![u64::MAX; CODE_ENTRIES],
             code_bases: vec![0; CODE_ENTRIES],
+            filled: Vec::with_capacity(FILLED_MAX),
+            filled_all: false,
+        }
+    }
+
+    /// Serve reads of virtual page `page` from the RAM page at `base`.
+    #[inline]
+    fn fill_read(&mut self, page: u64, base: usize) {
+        let i = page as usize & (FAST_ENTRIES - 1);
+        self.read_tag[i] = page;
+        self.read_base[i] = base as u32;
+        self.filled(i);
+    }
+
+    /// Serve writes to virtual page `page` from the RAM page at `base`.
+    #[inline]
+    fn fill_write(&mut self, page: u64, base: usize) {
+        let i = page as usize & (FAST_ENTRIES - 1);
+        self.write_tag[i] = page;
+        self.write_base[i] = base as u32;
+        self.filled(i);
+    }
+
+    #[inline]
+    fn filled(&mut self, i: usize) {
+        if self.filled_all {
+            return;
+        }
+        if self.filled.len() < FILLED_MAX {
+            self.filled.push(i as u16);
+        } else {
+            self.filled_all = true;
         }
     }
 
     pub(crate) fn flush(&mut self) {
-        self.read_tag.fill(u64::MAX);
-        self.write_tag.fill(u64::MAX);
+        // A context switch fills a few dozen slots before the next one: clear those, not all
+        if self.filled_all {
+            self.read_tag.fill(u64::MAX);
+            self.write_tag.fill(u64::MAX);
+        } else {
+            for &i in &self.filled {
+                self.read_tag[i as usize] = u64::MAX;
+                self.write_tag[i as usize] = u64::MAX;
+            }
+        }
+        self.filled.clear();
+        self.filled_all = false;
         self.code_page = u64::MAX;
         self.code_tag.fill(u64::MAX);
     }
@@ -287,10 +335,17 @@ impl FastTlb {
 
     /// Remove write entries mapping to the physical page at `base`.
     pub(crate) fn forget_write_page(&mut self, base: usize) {
-        for i in 0..FAST_ENTRIES {
-            if self.write_tag[i] != u64::MAX && self.write_base[i] as usize == base {
-                self.write_tag[i] = u64::MAX;
+        let (tags, bases) = (&mut self.write_tag, &self.write_base);
+        let mut forget = |i: usize| {
+            if tags[i] != u64::MAX && bases[i] as usize == base {
+                tags[i] = u64::MAX;
             }
+        };
+        // Only filled slots can hold an entry
+        if self.filled_all {
+            (0..FAST_ENTRIES).for_each(forget);
+        } else {
+            self.filled.iter().for_each(|&i| forget(i as usize));
         }
     }
 
@@ -1469,10 +1524,7 @@ impl<H: Host> Cpu<H> {
                     .checked_add(0x1000)
                     .is_some_and(|end| end <= self.mem.len())
             {
-                let f = &mut self.fast[self.el as usize];
-                let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-                f.read_tag[i] = va >> 12;
-                f.read_base[i] = page as u32;
+                self.fast[self.el as usize].fill_read(va >> 12, page);
             }
             return self
                 .phys_read(pa, size)
@@ -1550,10 +1602,7 @@ impl<H: Host> Cpu<H> {
                     .checked_add(0x1000)
                     .is_some_and(|end| end <= self.mem.len())
             {
-                let f = &mut self.fast[self.el as usize];
-                let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-                f.write_tag[i] = va >> 12;
-                f.write_base[i] = page as u32;
+                self.fast[self.el as usize].fill_write(va >> 12, page);
             }
             if let Some(e) = self.excl() {
                 if e & !0x3f == pa & !0x3f {
