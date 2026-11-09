@@ -360,7 +360,7 @@ impl Gen<'_> {
             if insn & 0xffe0_ec00 == 0x1e60_2800 {
                 return self.fp_add_double(insn, rd, rn, rm);
             }
-            return false;
+            return self.fp_double_sticky(insn, rd, rn, rm);
         }
         match insn & 0xffff_fc00 {
             0x1e21_c000 => return self.fp_sqrt(insn, rd, rn),
@@ -546,6 +546,71 @@ impl Gen<'_> {
         self.c.i32_and();
         self.c.i32_or();
         self.fp_split(insn, |g| g.fp_result(rd, T3, Some(T4)));
+        true
+    }
+
+    /// FMUL / FNMUL / FDIV (double), and FMADD / FMSUB / FNMADD / FNMSUB (double) where the
+    /// backend has a fused multiply-add: inline once FPSR.IXC is set, on the terms of `fp_2d`
+    /// (the host's result is Arm's and Inexact, sticky, is already raised). False for the rest.
+    fn fp_double_sticky(&mut self, insn: u32, rd: u32, rn: u32, rm: u32) -> bool {
+        let fused = insn & 0xffc0_0000 == 0x1f40_0000;
+        let op = field(insn, 12, 4);
+        if fused {
+            if !self.fma {
+                return false;
+            }
+        } else if insn & 0xffe0_0c00 != 0x1e60_0800 || !matches!(op, 0 | 1 | 8) {
+            return false;
+        }
+        self.fload(rn, true, T0);
+        self.fload(rm, true, T1);
+        self.fget(T0, true);
+        if fused {
+            // Rd = (-)Ra + (-)Rn * Rm, rounded once: FMADD +,+; FMSUB +,-; FNMADD -,-; FNMSUB -,+
+            let (o1, o0) = (bit(insn, 21), bit(insn, 15));
+            if o0 != o1 {
+                self.c.f64_neg();
+            }
+            self.fget(T1, true);
+            self.fload(field(insn, 10, 5), true, T2);
+            self.fget(T2, true);
+            if o1 {
+                self.c.f64_neg();
+            }
+            self.c.f64_fma();
+        } else {
+            self.fget(T1, true);
+            if op == 1 {
+                self.c.f64_div();
+            } else {
+                self.c.f64_mul();
+                if op == 8 {
+                    self.c.f64_neg(); // FNMUL: the rounded product, negated
+                }
+            }
+        }
+        self.fset(T3, true);
+        self.fpcr_unusual();
+        self.ixc_clear();
+        self.c.i32_or();
+        let operands: &[u32] = if fused { &[T0, T1, T2] } else { &[T0, T1] };
+        for &t in operands.iter().chain(&[T3]) {
+            self.special(t, true);
+            self.c.i32_or();
+        }
+        // A zero result is exact only from a product with a zero factor or a quotient of zero
+        self.zero_or_least(T3, true);
+        self.is_zero64(T3);
+        self.is_zero64(T0);
+        if op != 1 || fused {
+            self.is_zero64(T1);
+            self.c.i32_or();
+        }
+        self.c.i32_and();
+        self.c.i32_eqz();
+        self.c.i32_and();
+        self.c.i32_or();
+        self.fp_split(insn, |g| g.fp_result(rd, T3, None));
         true
     }
 

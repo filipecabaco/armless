@@ -1772,6 +1772,13 @@ mod tests {
         fuzz(0x9e37_79b9_7f4a_7c15, 6000, &[(0xdf60_c400, 0x4e60_c400)], true);
     }
 
+    /// Scalar double FMUL, FNMUL, FDIV (with the rest of that encoding group) and FMADD,
+    /// FMSUB, FNMADD, FNMSUB, inline once FPSR.IXC is set (`Gen::fp_double_sticky`).
+    #[test]
+    fn double_scalar_fp_does_what_the_interpreter_does() {
+        let body = [(0xffe0_0c00, 0x1e60_0800), (0xffc0_0000, 0x1f40_0000)];
+        fuzz(0x6a09_e667_f3bc_c908, 6000, &body, true);
+    }
     #[test]
     fn compiled_blocks_do_what_the_interpreter_does() {
         fuzz(0x2545_f491_4f6c_dd1d, 6000, BODY, false);
