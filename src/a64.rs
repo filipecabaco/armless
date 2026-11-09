@@ -1195,15 +1195,9 @@ impl<H: Host> Cpu<H> {
             let new = self.xr(rt);
             return match self.ram_cmpxchg(pa, bytes, self.excl_value, new) {
                 Some(ok) => {
-                    if ok
-                        && self
-                            .jit
-                            .code_page
-                            .get((pa >> 12) as usize)
-                            .is_some_and(|&b| b != 0)
-                    {
-                        self.jit
-                            .invalidate_page_by((pa >> 12) as usize, crate::jit::Inval::Excl);
+                    if ok {
+                        // Only the words written: code next to the lock word stays compiled
+                        self.jit.code_written(pa, bytes);
                     }
                     Ok(ok)
                 },
