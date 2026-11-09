@@ -227,12 +227,29 @@ fn same_aligned_page(pc: u64, page: u64) -> bool {
 pub(crate) const FAST_ENTRIES: usize = 4096;
 /// Executable pages remembered besides the current one (`code_page`).
 const CODE_ENTRIES: usize = 64;
-/// Read and write slots a fast table remembers filling, so that a flush clears only those; past
-/// this many it clears every slot.
-const FILLED_MAX: usize = 512;
+/// Read and write slots a fast table remembers filling exactly, so that a flush clears only those;
+/// past this many it clears the chunks of slots filled since (`FastTlb::chunks`).
+const FILLED_MAX: usize = 64;
+/// Slots per chunk: the table in 64 chunks, one bit each of a u64.
+const CHUNK: usize = FAST_ENTRIES / 64;
 /// The most instructions `step_page` runs in a row, so that `run` looks at the interrupts and at what
 /// other CPUs asked of this one at least that often.
 const PAGE_RUN: u64 = 256;
+
+/// The fast-table slots that may hold an entry: the `filled` ones while there are at most
+/// FILLED_MAX, else every slot of the `chunks` filled since the last flush.
+fn each_filled(filled: &[u16], chunks: u64, mut f: impl FnMut(usize)) {
+    if filled.len() <= FILLED_MAX {
+        filled.iter().for_each(|&i| f(i as usize));
+        return;
+    }
+    let mut chunks = chunks;
+    while chunks != 0 {
+        let c = chunks.trailing_zeros() as usize;
+        chunks &= chunks - 1;
+        (c * CHUNK..(c + 1) * CHUNK).for_each(&mut f);
+    }
+}
 
 /// Virtual page -> offset of the page in `mem`, for pages known to be RAM
 /// with the needed permission at one exception level.
@@ -246,9 +263,13 @@ pub(crate) struct FastTlb {
     pub(crate) code_base: usize,
     code_tag: Vec<u64>,
     code_bases: Vec<usize>,
-    /// Read and write slots filled since the last flush (repeats possible), unless `filled_all`.
+    /// Read and write slots filled since the last flush (repeats possible), while there are at
+    /// most FILLED_MAX of them.
     filled: Vec<u16>,
-    filled_all: bool,
+    /// Chunks with a slot filled since the last flush, one bit per CHUNK slots. Addresses a
+    /// process uses cluster (text, heap, stack, libraries), so a flush after many fills still
+    /// clears a few chunks, not the whole table.
+    chunks: u64,
 }
 
 impl FastTlb {
@@ -262,8 +283,8 @@ impl FastTlb {
             code_base: 0,
             code_tag: vec![u64::MAX; CODE_ENTRIES],
             code_bases: vec![0; CODE_ENTRIES],
-            filled: Vec::with_capacity(FILLED_MAX),
-            filled_all: false,
+            filled: Vec::with_capacity(FILLED_MAX + 1),
+            chunks: 0,
         }
     }
 
@@ -287,29 +308,20 @@ impl FastTlb {
 
     #[inline]
     fn filled(&mut self, i: usize) {
-        if self.filled_all {
-            return;
-        }
-        if self.filled.len() < FILLED_MAX {
-            self.filled.push(i as u16);
-        } else {
-            self.filled_all = true;
+        self.chunks |= 1 << (i / CHUNK);
+        if self.filled.len() <= FILLED_MAX {
+            self.filled.push(i as u16); // one past FILLED_MAX marks the list as overflowed
         }
     }
 
     pub(crate) fn flush(&mut self) {
-        // A context switch fills a few dozen slots before the next one: clear those, not all
-        if self.filled_all {
-            self.read_tag.fill(u64::MAX);
-            self.write_tag.fill(u64::MAX);
-        } else {
-            for &i in &self.filled {
-                self.read_tag[i as usize] = u64::MAX;
-                self.write_tag[i as usize] = u64::MAX;
-            }
-        }
+        // Only filled slots hold entries: a context switch clears what it filled, not the table
+        each_filled(&self.filled, self.chunks, |i| {
+            self.read_tag[i] = u64::MAX;
+            self.write_tag[i] = u64::MAX;
+        });
         self.filled.clear();
-        self.filled_all = false;
+        self.chunks = 0;
         self.code_page = u64::MAX;
         self.code_tag.fill(u64::MAX);
     }
@@ -335,18 +347,12 @@ impl FastTlb {
 
     /// Remove write entries mapping to the physical page at `base`.
     pub(crate) fn forget_write_page(&mut self, base: usize) {
-        let (tags, bases) = (&mut self.write_tag, &self.write_base);
-        let mut forget = |i: usize| {
-            if tags[i] != u64::MAX && bases[i] as usize == base {
-                tags[i] = u64::MAX;
-            }
-        };
         // Only filled slots can hold an entry
-        if self.filled_all {
-            (0..FAST_ENTRIES).for_each(forget);
-        } else {
-            self.filled.iter().for_each(|&i| forget(i as usize));
-        }
+        each_filled(&self.filled, self.chunks, |i| {
+            if self.write_tag[i] != u64::MAX && self.write_base[i] as usize == base {
+                self.write_tag[i] = u64::MAX;
+            }
+        });
     }
 
     pub(crate) fn read_tag_ptr(&self) -> *const u8 {
@@ -1711,5 +1717,52 @@ impl<H: Host> Cpu<H> {
         };
         self.x[0] = ret;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fast_tlb_tests {
+    use super::*;
+
+    /// Fill `pages` (read and write) at `base`; every slot must hold its entry.
+    fn fill(f: &mut FastTlb, pages: impl Iterator<Item = u64>, base: usize) -> Vec<u64> {
+        let pages: Vec<u64> = pages.collect();
+        for &p in &pages {
+            f.fill_read(p, base);
+            f.fill_write(p, base);
+        }
+        pages
+    }
+
+    fn empty(f: &FastTlb) -> bool {
+        f.read_tag.iter().chain(&f.write_tag).all(|&t| t == u64::MAX)
+    }
+
+    /// A flush leaves no entry whether the fills were few (the exact list), many and clustered,
+    /// or spread over every chunk, and the next flush starts the bookkeeping afresh.
+    #[test]
+    fn a_flush_clears_every_filled_slot() {
+        let mut f = FastTlb::new();
+        let few = (0x4_0000u64..).step_by(7).take(FILLED_MAX);
+        let cluster = 0x8_0000u64..0x8_0000 + 3 * CHUNK as u64;
+        let spread = (0u64..).map(|k| 0x10_0000 + k * 977).take(FAST_ENTRIES);
+        for pages in [few.collect::<Vec<_>>(), cluster.collect(), spread.collect()] {
+            fill(&mut f, pages.into_iter(), 0x1000);
+            assert!(!empty(&f));
+            f.flush();
+            assert!(empty(&f));
+        }
+    }
+
+    /// forget_write_page drops only the write entries of that physical page, past the exact list.
+    #[test]
+    fn forget_write_page_finds_entries_past_the_list() {
+        let mut f = FastTlb::new();
+        let a = fill(&mut f, 0x2_0000u64..0x2_0000 + 2 * FILLED_MAX as u64, 0x5000);
+        let b = fill(&mut f, 0x9_0800u64..0x9_0808, 0x6000); // slots apart from a's
+        f.forget_write_page(0x5000);
+        let slot = |p: u64| p as usize & (FAST_ENTRIES - 1);
+        assert!(a.iter().all(|&p| f.write_tag[slot(p)] == u64::MAX && f.read_tag[slot(p)] == p));
+        assert!(b.iter().all(|&p| f.write_tag[slot(p)] == p));
     }
 }
