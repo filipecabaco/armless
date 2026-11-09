@@ -45,7 +45,7 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
 }
 
 fn hmac(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
-    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
+    let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(key).unwrap();
     for d in data {
         m.update(d);
     }
@@ -595,7 +595,7 @@ impl Tls {
         let finished_key = expand_label(&binder_key, "finished", &[], 32);
         // The ClientHello up to its binders (header included: it carries the full length)
         let truncated = &hello[..4 + psk.binders_at];
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&finished_key).unwrap();
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&finished_key).unwrap();
         mac.update(&sha256(&[truncated]));
         mac.verify_slice(&psk.binders[index])
             .map_err(|_| Some(51u8))?; // decrypt_error
