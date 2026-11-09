@@ -148,6 +148,109 @@ impl Gen<'_> {
         }
     }
 
+    /// Push i32: local `t` (a double's bits) is zero.
+    fn is_zero64(&mut self, t: u32) {
+        self.c.get(t);
+        self.c.i64c(0x7fff_ffff_ffff_ffffu64 as i64);
+        self.c.i64_and();
+        self.c.i64_eqz();
+    }
+
+    /// Push i32: FPSR.IXC is clear.
+    fn ixc_clear(&mut self) {
+        self.c.i32c(0);
+        self.c.i64_load(self.l.fpsr);
+        self.c.i64c(IXC);
+        self.c.i64_and();
+        self.c.i64_eqz();
+    }
+
+    /// FADD / FSUB / FMUL / FDIV (.2D), and FMLA / FMLS (.2D) where the backend has a fused
+    /// multiply-add, inline once FPSR.IXC is set: Inexact is sticky, so with FPCR asking for
+    /// nothing unusual and every operand and result an ordinary number outside the smallest
+    /// normal binade (no NaN, infinity, subnormal or zero result, so no underflow, overflow,
+    /// division by zero or sign of an exact zero to work out), the host's arithmetic is the
+    /// Arm result bit for bit and there is no flag left to set. Anything else runs `slow`, the
+    /// lane-by-lane `fp3` helper. False (nothing emitted) for the other operations.
+    pub(super) fn fp_2d(
+        &mut self,
+        op: crate::advsimd::Fp3,
+        rd: u32,
+        rn: u32,
+        rm: u32,
+        slow: impl FnOnce(&mut Self),
+    ) -> bool {
+        use crate::advsimd::Fp3;
+        let fused = matches!(op, Fp3::Fmla | Fp3::Fmls);
+        if !matches!(op, Fp3::Add | Fp3::Sub | Fp3::Mul | Fp3::Div) && !(fused && self.fma) {
+            return false;
+        }
+        self.fpcr_unusual();
+        self.ixc_clear();
+        self.c.i32_or();
+        // Lane k: Vn in T2, Vm in T3, Vd (the addend) in T4, the result in T0 / T1
+        for (k, r) in [(0, T0), (1, T1)] {
+            self.vld(rn, k);
+            self.c.set(T2);
+            self.vld(rm, k);
+            self.c.set(T3);
+            self.special(T2, true);
+            self.c.i32_or();
+            self.special(T3, true);
+            self.c.i32_or();
+            if fused {
+                self.vld(rd, k);
+                self.c.set(T4);
+                self.special(T4, true);
+                self.c.i32_or();
+                self.fget(T2, true);
+                if op == Fp3::Fmls {
+                    self.c.f64_neg();
+                }
+                self.fget(T3, true);
+                self.fget(T4, true);
+                self.c.f64_fma();
+            } else {
+                self.fget(T2, true);
+                self.fget(T3, true);
+                match op {
+                    Fp3::Add => self.c.f64_add(),
+                    Fp3::Sub => self.c.f64_sub(),
+                    Fp3::Mul => self.c.f64_mul(),
+                    _ => self.c.f64_div(),
+                }
+            }
+            self.fset(r, true);
+            self.special(r, true);
+            self.c.i32_or();
+            // A zero result is exact (so the host's sign of it is Arm's) from a sum or difference
+            // of normals (x - y = 0 only when x = y), from a product with a zero factor and from
+            // a quotient of zero; any other may have underflowed
+            self.zero_or_least(r, true);
+            self.is_zero64(r);
+            match op {
+                Fp3::Add | Fp3::Sub => self.c.i32c(1),
+                Fp3::Div => self.is_zero64(T2),
+                _ => {
+                    self.is_zero64(T2);
+                    self.is_zero64(T3);
+                    self.c.i32_or();
+                },
+            }
+            self.c.i32_and();
+            self.c.i32_eqz();
+            self.c.i32_and();
+            self.c.i32_or();
+        }
+        self.c.if_(EMPTY);
+        slow(self);
+        self.c.else_();
+        self.vst(rd, 0, |g| g.c.get(T0));
+        self.vst(rd, 1, |g| g.c.get(T1));
+        self.c.end();
+        true
+    }
+
     /// The scalar floating-point instructions translated inline; false for the rest.
     pub(super) fn fp_scalar(&mut self, insn: u32) -> bool {
         let rd = insn & 31;

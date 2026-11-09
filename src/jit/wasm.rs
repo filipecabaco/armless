@@ -10,6 +10,9 @@ pub const I64: u8 = 0x7e;
 /// Block types.
 pub const EMPTY: u8 = 0x40;
 
+/// 0xfc-prefixed opcode of `Code::f64_fma`: past every one WebAssembly defines.
+pub const FMA_F64: u64 = 0x7f;
+
 pub fn leb_u(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let b = (v & 0x7f) as u8;
@@ -464,6 +467,15 @@ impl Code {
     }
     pub fn f64_mul(&mut self) {
         self.op(0xa2)
+    }
+    pub fn f64_div(&mut self) {
+        self.op(0xa3)
+    }
+    /// x * y + z rounded once (x, y, z pushed in that order). Not WebAssembly: an extension only
+    /// the native JIT reads, so `gen` emits it only for code compiled there (`Gen::fma`).
+    pub fn f64_fma(&mut self) {
+        self.op(0xfc);
+        leb_u(&mut self.b, FMA_F64);
     }
     pub fn f32_convert_i64_s(&mut self) {
         self.op(0xb4)

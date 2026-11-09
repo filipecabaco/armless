@@ -169,6 +169,8 @@ struct Gen<'a> {
     depth_top: u32,
     /// Extra structured-control nesting at the current emission point.
     nest: u32,
+    /// The code is for the native JIT, which has a fused multiply-add (`Code::f64_fma`).
+    fma: bool,
 }
 
 impl Gen<'_> {
@@ -1935,13 +1937,18 @@ impl Gen<'_> {
                     }
                     let e = if double { 64 } else { 32 };
                     let code = op as i32 | if double { 0x100 } else { 0 };
-                    self.vbuild(q, rd, e, |g, k| {
-                        g.c.i32c(code);
-                        g.lane(rn, e, k, false);
-                        g.lane(rm, e, k, false);
-                        g.lane(rd, e, k, false);
-                        g.c.call(H_FP3);
-                    });
+                    let lanes = |g: &mut Self| {
+                        g.vbuild(q, rd, e, |g, k| {
+                            g.c.i32c(code);
+                            g.lane(rn, e, k, false);
+                            g.lane(rm, e, k, false);
+                            g.lane(rd, e, k, false);
+                            g.c.call(H_FP3);
+                        })
+                    };
+                    if !(double && self.fp_2d(op, rd, rn, rm, lanes)) {
+                        lanes(self);
+                    }
                     true
                 },
                 0b01100 | 0b01101 | 0b10100 | 0b10101 if size != 3 => {
@@ -2879,6 +2886,7 @@ pub fn translate_page_code(
     words: &[u32],
     entries: &[u16],
     max_block: usize,
+    fma: bool,
 ) -> Code {
     let n_entries = entries.len() as u32;
     let mut g = Gen {
@@ -2890,6 +2898,7 @@ pub fn translate_page_code(
         entry_off: 0,
         depth_top: 0,
         nest: 0,
+        fma,
     };
     // loop $top { block $miss { block $e[N-1] ... { block $e0 { br_table } e0 } ... } miss }
     g.c.loop_(EMPTY);

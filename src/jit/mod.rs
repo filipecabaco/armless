@@ -733,7 +733,9 @@ impl<H: Host> Cpu<H> {
             .map(|&c| u32::from_le_bytes(c))
             .collect();
         let layout = self.jit_layout_for(page_key);
-        let code = gen::translate_page_code(&layout, &words, &entries, MAX_BLOCK);
+        // Only the native JIT takes the fused multiply-add WebAssembly lacks
+        let code =
+            gen::translate_page_code(&layout, &words, &entries, MAX_BLOCK, self.jit_additive());
 
         let page = page_pa >> 12;
         // The words these blocks were translated from: writes to them drop the page's code

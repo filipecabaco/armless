@@ -1511,7 +1511,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             0x92 | 0xa0 => self.binary(|b, x, y| b.ins().fadd(x, y))?,
             0x93 | 0xa1 => self.binary(|b, x, y| b.ins().fsub(x, y))?,
             0xa2 => self.binary(|b, x, y| b.ins().fmul(x, y))?,
-            0x95 => self.binary(|b, x, y| b.ins().fdiv(x, y))?,
+            0x95 | 0xa3 => self.binary(|b, x, y| b.ins().fdiv(x, y))?,
             0xb4 => self.unary(|b, x| b.ins().fcvt_from_sint(F32, x))?,
             0xb5 => self.unary(|b, x| b.ins().fcvt_from_uint(F32, x))?,
             0xb6 => self.unary(|b, x| b.ins().fdemote(F32, x))?,
@@ -1530,6 +1530,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                 match r.leb_u()? {
                     4 | 6 => self.unary(|b, x| b.ins().fcvt_to_sint_sat(I64, x))?,
                     5 | 7 => self.unary(|b, x| b.ins().fcvt_to_uint_sat(I64, x))?,
+                    super::wasm::FMA_F64 => {
+                        let z = self.pop()?;
+                        let y = self.pop()?;
+                        let x = self.pop()?;
+                        let v = self.b.ins().fma(x, y, z);
+                        self.push(v);
+                    },
                     _ => return None,
                 }
             },
@@ -1758,6 +1765,13 @@ mod tests {
 
     /// Random blocks of random instructions from random states, run by the interpreter and as
     /// native code: registers, flags, exception state and RAM must match.
+    /// Three-same floating point on .2D only, where FADD, FSUB, FMUL, FDIV, FMLA and FMLS run
+    /// inline once FPSR.IXC is set (`Gen::fp_2d`): results and flags must still match.
+    #[test]
+    fn double_vector_fp_does_what_the_interpreter_does() {
+        fuzz(0x9e37_79b9_7f4a_7c15, 6000, &[(0xdf60_c400, 0x4e60_c400)], true);
+    }
+
     #[test]
     fn compiled_blocks_do_what_the_interpreter_does() {
         fuzz(0x2545_f491_4f6c_dd1d, 6000, BODY, false);
