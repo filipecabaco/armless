@@ -37,6 +37,9 @@
   const TCP_BACKLOG = 1 << 20;
 
   const utf8 = new TextEncoder();
+  // With the `debug` option: how often the memory is sampled, and how many samples are kept
+  const DEBUG_SAMPLE_MS = 5000;
+  const DEBUG_SAMPLES = 400;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   class Emitter {
@@ -399,6 +402,12 @@
       if (o.mac) mac = this._copy_in(Uint8Array.from(o.mac.split(":").map((x) => parseInt(x, 16))));
       if (e.armless_create(o.memory_mb, this.cpus, flags, mac) !== 0) throw new Error("armless: " + this._error());
       e.armless_jit_config(o.jit ? 1 : 0, o.jit_threshold | 0);
+      if (o.debug) {
+        // Off by default: samples of the memory, every few seconds and where it moves (see memory_report)
+        this.debug = { samples: [] };
+        this._debug_sample("created");
+        this._debug_timer = setInterval(() => this._debug_sample("tick"), DEBUG_SAMPLE_MS);
+      }
       // Decompressed file contents kept in this page (the guest caches what it uses itself)
       if (o.fs_cache_mb != null) e.armless_set_fs_cache(o.fs_cache_mb >>> 0);
       // Testing aid: every block is compiled before it first runs
@@ -444,6 +453,61 @@
       return this;
     }
 
+    /**
+     * What this page's memory holds, as far as armless can tell it apart. The linear memory of a machine never shrinks
+     * and the browser reports one number for the page, so a host that wants to know why it is big needs the pieces:
+     *
+     *   memory      bytes of the whole linear memory (what `memory.buffer.byteLength` says)
+     *   guest_ram   the guest's RAM, and `guest_ram_at` where it starts in the memory
+     *   heap        what the host side of the machine allocated: `live` bytes now, the `peak`, how much of `live` is in
+     *               big blocks (`large`) and how much of it is freed blocks kept to be handed out again (`kept`)
+     *   fs          what the 9p file system holds: the blobs it fetched (`cached_bytes` of at most `cache_limit`) and
+     *               the files the guest wrote (`written_bytes`, in buffers made at `written_capacity` bytes)
+     *   jit         blocks compiled and how many times the cache was flushed
+     *   pages       with `scan` (the default), the 4 KiB pages of the memory that hold a non-zero byte, for the parts
+     *               before the RAM, the RAM and after it. A page that was never written, or was given back (the big
+     *               blocks that are freed are discarded to zeros), is zero, so this is the memory the machine really
+     *               uses, as opposed to `memory`, which is only as far as it has grown. It reads the memory (a few ms
+     *               for 100 MB).
+     */
+    memory_report({ scan = true } = {}) {
+      const e = this.exports;
+      if (!e.armless_mem_report) throw new Error("armless: this build has no memory report");
+      const n = e.armless_mem_report();
+      const r = JSON.parse(new TextDecoder().decode(new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice()));
+      // The memory may have grown since the report was made: its size now
+      r.memory = this.memory.buffer.byteLength;
+      if (scan) {
+        const buf = this.memory.buffer;
+        const words = new Uint32Array(buf);
+        const count = (from, to) => {
+          let pages = 0, used = 0;
+          for (let w = from >>> 2, end = to >>> 2; w < end; w += 1024, pages++) {
+            const stop = Math.min(w + 1024, end);
+            for (let i = w; i < stop; i++) {
+              if (words[i] !== 0) { used++; break; }
+            }
+          }
+          return { bytes: pages * 4096, used: used * 4096 };
+        };
+        const at = Math.min(r.guest_ram_at, r.memory), end = Math.min(r.guest_ram_at + r.guest_ram, r.memory);
+        r.pages = { before_ram: count(0, at), guest_ram: count(at, end), after_ram: count(end, r.memory) };
+      }
+      return r;
+    }
+
+    /** A sample of the memory without the scan (cheap), when `debug` is on: kept in `this.debug.samples`, the last 400. */
+    _debug_sample(label) {
+      if (!this.debug) return;
+      let r;
+      try { r = this.memory_report({ scan: false }); } catch { return; }
+      const s = { t: Math.round(performance.now()), label, memory: r.memory, heap: r.heap, fs: r.fs };
+      const samples = this.debug.samples;
+      samples.push(s);
+      if (samples.length > DEBUG_SAMPLES) samples.splice(0, samples.length - DEBUG_SAMPLES);
+      this.emit("memory", s);
+    }
+
     async _restore(src) {
       const e = this.exports;
       let begun = false;
@@ -462,6 +526,7 @@
         this.emit("download-progress", { file_name: file, loaded, total, lengthComputable: total > 0 });
       });
       if (e.armless_state_finish() !== 0) throw new Error("armless: snapshot: " + this._error());
+      this._debug_sample("restored");
     }
 
     async _boot(boot) {
@@ -708,6 +773,7 @@
           const n = e.armless_save_state();
           return [new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice()];
         }
+        this._debug_sample("save begins");
         if (e.armless_save_begin() !== 0) throw new Error("armless: snapshot: " + this._error());
         // No await until the last piece: nothing runs the machine in between
         const pieces = [];
@@ -719,6 +785,7 @@
           e.armless_save_abort();
           throw err;
         }
+        this._debug_sample("save ends");
         return pieces;
       } finally {
         if (this.cpus > 1 && was_running) {
@@ -759,6 +826,7 @@
       this._cancel();
       this._channel?.port1.close();
       clearInterval(this._interval);
+      clearInterval(this._debug_timer);
       if (this._ctrl) {
         Atomics.store(this._ctrl, CTRL_QUIT, 1);
         Atomics.notify(this._ctrl, CTRL_PAUSE);

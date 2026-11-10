@@ -93,6 +93,7 @@ More than one CPU needs `SharedArrayBuffer`, so the page must be cross-origin is
 | `mac` | the NIC's MAC address, `"aa:bb:cc:dd:ee:ff"` |
 | `jit`, `jit_threshold` | the wasm JIT on or off (default on) and how often a block runs before it is compiled |
 | `autostart` | run as soon as it is set up (default true); otherwise call `run()` |
+| `debug` | off by default. On, the machine samples its memory every few seconds and where it moves (loaded, restored, a save), keeps the last 400 in `vm.debug.samples` and emits them as `memory` events; see `memory_report()` |
 
 `network` options:
 
@@ -114,6 +115,7 @@ Subscribe with `vm.on(name, fn)` (`off` removes).
 - `console` and `serial`: output bytes.
 - `ready`: set up. `progress` (`{ file, loaded, total }`): a snapshot or file loading.
 - `blob`: a file being fetched. `stop` (`{ reason }`) and `error`.
+- `memory`: a sample of the memory (with the `debug` option).
 - `tcp-connection`: a `Connection` from the guest to a port nothing else handles.
 
 A `Connection` has `host` (the name the guest resolved) and `port`, and supports
@@ -129,6 +131,12 @@ connections nobody accepts, and no tunnel takes, are refused.
 - Snapshots: `save_state()` returns the snapshot as one buffer; `save_state_pieces()`
   returns it in pieces of about 1 MiB, to write or compress as they come;
   `restore_state(src)` replaces the machine's state.
+- `memory_report({ scan })`: what the page's memory holds, split into the pieces armless can tell
+  apart: the whole linear memory (which never shrinks), the guest's RAM, the host's heap (live,
+  peak, big blocks, freed blocks kept to be reused), the file system (blobs fetched, files the
+  guest wrote) and the JIT. With `scan` (the default) it also counts the 4 KiB pages that hold a
+  non-zero byte before, in and after the RAM: the memory in use, as opposed to how far it has
+  grown. It is what to read when a page is bigger than the guest's RAM explains.
 - Lifecycle: `run()`, `stop()` and `destroy()`; `vm.ready` is a promise for the setup.
 
 ## Native API

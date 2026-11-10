@@ -115,7 +115,12 @@ impl Board {
         let fs = crate::dev::fs::Fs::from_json(json)?;
         match self.devices.lock().p9() {
             Some((_, p)) => {
+                // The budget the host set (set_fs_cache, or DeviceConfig::fs_cache) before the tree came is
+                // the new tree's too: a page sets it right after the machine is made, and the tree is read
+                // after that
+                let limit = p.fs.cache_limit();
                 p.fs = fs;
+                p.fs.set_cache_limit(limit);
                 Ok(())
             },
             None => Err("this machine has no 9p filesystem".into()),
@@ -1389,6 +1394,31 @@ mod host_fs_tests {
         );
         // A file in the way
         assert!(b.fs_mkdir("/job/in/a/b").is_err());
+    }
+
+    #[test]
+    fn the_cache_budget_a_host_sets_stays_when_the_tree_is_loaded() {
+        let config = Config {
+            memory_size: 16 << 20,
+            cpus: 1,
+            devices: DeviceConfig {
+                fs_tag: Some("root".into()),
+                ..Default::default()
+            },
+        };
+        let (vm, _clock) = crate::runner::new_vm(config).unwrap();
+        let b = &vm.board;
+        let limit = || b.devices.lock().fs_stats().cache_limit;
+        assert_eq!(limit(), crate::dev::fs::DEFAULT_CACHE);
+        // The order of armless.js: the budget, then the tree
+        b.set_fs_cache(64 << 20);
+        b.load_filesystem(br#"{"version":3,"size":0,"fsroot":[]}"#)
+            .unwrap();
+        assert_eq!(limit(), 64 << 20);
+        // And again: a host that loads another tree keeps it
+        b.load_filesystem(br#"{"version":3,"size":0,"fsroot":[]}"#)
+            .unwrap();
+        assert_eq!(limit(), 64 << 20);
     }
 
     #[test]
