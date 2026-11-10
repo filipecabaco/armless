@@ -1127,6 +1127,23 @@ impl Cache {
         }
     }
 
+    /// Keep at most `bytes` of decoded pages (2 pages at the least). Slots already allocated past it stay until
+    /// the cache is dropped (the interpreter may hold a pointer to them); none is allocated past it from now on.
+    pub fn set_limit(&mut self, bytes: usize) {
+        self.max_slots = (bytes / (SLOT_OPS * std::mem::size_of::<Op>())).max(2);
+    }
+
+    /// The slots allocated so far and the bytes they hold, with the cache's tables.
+    pub fn bytes(&self) -> (usize, usize) {
+        let slots = self.slots.len();
+        let tables = self.page_slot.capacity() * 4
+            + self.slot_page.capacity() * 4
+            + self.free.capacity() * 4
+            + self.referenced.capacity()
+            + self.slots.capacity() * std::mem::size_of::<*mut Op>();
+        (slots, slots * SLOT_OPS * std::mem::size_of::<Op>() + tables)
+    }
+
     #[inline(always)]
     pub(crate) fn slot(&self, page: usize) -> u32 {
         self.page_slot[page]
@@ -1460,6 +1477,22 @@ mod tests {
             run_at(&mut c, 0x1000);
             assert_eq!(c.x[0], n as u64);
         }
+    }
+
+    #[test]
+    fn a_limit_in_bytes_caps_the_slots_a_cache_allocates() {
+        let mut c = cpu();
+        c.jit.pre.set_limit(4 * SLOT_OPS * std::mem::size_of::<Op>());
+        assert_eq!(c.jit.pre.max_slots, 4);
+        for p in 0..10 {
+            put(&mut c, 0x1000 * (p + 1), ADD_X0_1);
+            run_at(&mut c, 0x1000 * (p as u64 + 1));
+        }
+        assert_eq!(c.x[0], 10);
+        assert_eq!(c.jit.pre.bytes().0, 4);
+        // Never below two slots: the page running and the one it jumps to
+        c.jit.pre.set_limit(0);
+        assert_eq!(c.jit.pre.max_slots, 2);
     }
 
     #[test]

@@ -86,6 +86,7 @@ More than one CPU needs `SharedArrayBuffer`, so the page must be cross-origin is
 | `cpus` | number of CPUs (default 1) |
 | `filesystem` | `{ json, baseurl }`: the 9p root's tree and where its blobs are fetched from |
 | `fs_cache_mb` | cap on decompressed file contents kept in the page (256 by default); the guest's page cache keeps what it uses often |
+| `predecode_mb` | cap on the pre-decoded instructions each CPU keeps (24 by default), held for the life of the machine |
 | `initial_state` | a snapshot to restore (URL or bytes, zstd or not) |
 | `boot` | for a cold boot: `{ kernel, initrd, cmdline }` (`cmdline` defaults to `console=ttyS0`), or `{ raw, addr }` for a bare-metal binary; without `kernel`, the kernel and initrd under `/boot` in the filesystem |
 | `network` | turns on virtio-net; see below |

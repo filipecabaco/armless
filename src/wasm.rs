@@ -231,6 +231,15 @@ pub extern "C" fn armless_set_fs_cache(mb: u32) {
     vm().board.set_fs_cache((mb as usize) << 20);
 }
 
+/// The most each CPU keeps of pre-decoded instructions, in MiB (24 by default). Set before the machine runs:
+/// what a CPU allocated past it stays.
+#[no_mangle]
+pub extern "C" fn armless_set_predecode(mb: u32) {
+    for c in vm().cpus.iter_mut() {
+        c.jit.pre.set_limit((mb as usize) << 20);
+    }
+}
+
 /// Last error message: pointer (length from `armless_error_len`).
 #[no_mangle]
 pub extern "C" fn armless_error() -> u32 {
@@ -362,13 +371,24 @@ pub extern "C" fn armless_mem_report() -> u32 {
     #[cfg(not(target_arch = "wasm32"))]
     let (memory, heap) = (0u64, (0usize, 0usize, 0usize, 0usize));
     let j = &vm.cpus[0].jit;
+    // Every CPU has a pre-decoded cache and JIT tables of its own
+    let (mut pre_slots, mut pre_bytes, mut jit_bytes, mut jit_pages) = (0usize, 0usize, 0usize, 0usize);
+    for c in vm.cpus.iter() {
+        let (s, b) = c.jit.pre.bytes();
+        pre_slots += s;
+        pre_bytes += b;
+        let (jb, jp) = c.jit.bytes();
+        jit_bytes += jb;
+        jit_pages += jp;
+    }
     out(format!(
         concat!(
             "{{\"memory\":{},\"guest_ram\":{},\"guest_ram_at\":{},",
             "\"heap\":{{\"live\":{},\"peak\":{},\"large\":{},\"kept\":{}}},",
             "\"fs\":{{\"inodes\":{},\"cached_blobs\":{},\"cached_bytes\":{},\"cache_limit\":{},",
             "\"written_buffers\":{},\"written_bytes\":{},\"written_capacity\":{}}},",
-            "\"jit\":{{\"compiled\":{},\"flushes\":{}}}}}"
+            "\"jit\":{{\"compiled\":{},\"flushes\":{},\"cpus\":{},\"table_bytes\":{},\"pages\":{}}},",
+            "\"predecode\":{{\"slots\":{},\"bytes\":{}}}}}"
         ),
         memory,
         vm.board.io.mem.len(),
@@ -387,6 +407,11 @@ pub extern "C" fn armless_mem_report() -> u32 {
         fs.written_capacity,
         j.compiled,
         j.flushes,
+        vm.cpus.len(),
+        jit_bytes,
+        jit_pages,
+        pre_slots,
+        pre_bytes,
     ).into_bytes())
 }
 
