@@ -881,6 +881,11 @@ impl Fs {
         self.evict();
     }
 
+    /// See `set_cache_limit`.
+    pub fn cache_limit(&self) -> usize {
+        self.max_cached
+    }
+
     fn evict(&mut self) {
         // Pinned chunks stay, at the front, until the read waiting on them completes.
         let mut kept = Vec::new();
@@ -1024,10 +1029,11 @@ impl Fs {
 
     // ------------------------------------------------------------ snapshot
 
-    /// An upper bound of the bytes `save` writes, to size its buffer once: a buffer that grows by
-    /// doubling leaves the smaller ones behind in the heap, which for the contents of the files the
-    /// guest wrote is as much again.
-    pub fn save_size_hint(&self) -> usize {
+    /// An upper bound of the bytes `save` writes to `w`, to size its buffer once: a buffer that grows
+    /// by doubling leaves the smaller ones behind in the heap. The contents `w` leaves out (W::contents)
+    /// don't count.
+    pub fn save_size_hint(&self, w: &W) -> usize {
+        let held = |d: &Vec<u8>| if w.leaves(d.len()) { 0 } else { d.len() };
         let mut n = 8 + self.inodes.len();
         for i in self.inodes.iter().flatten() {
             n += 96 + match &i.content {
@@ -1036,14 +1042,14 @@ impl Fs {
                 },
                 Content::Symlink(t) => t.len(),
                 Content::Blob(name) => name.len(),
-                Content::Mem(d) => d.len(),
+                Content::Mem(d) => held(d),
                 Content::Special => 0,
                 Content::Chunks(chunks) => chunks
                     .iter()
                     .map(|c| {
                         17 + match &c.data {
                             Piece::Blob(name) => name.len(),
-                            Piece::Mem(d) => d.len(),
+                            Piece::Mem(d) => held(d),
                         }
                     })
                     .sum::<usize>(),
@@ -1052,9 +1058,23 @@ impl Fs {
         n
     }
 
+    /// The contents of a file the guest wrote, or of chunk `chunk` of it, as `save` writes them
+    /// (W::contents): what a snapshot's writer left out, given out from here.
+    pub fn saved_contents(&self, ino: Ino, chunk: Option<usize>) -> Option<&[u8]> {
+        match (&self.get(ino)?.content, chunk) {
+            (Content::Mem(d), None) => Some(d),
+            (Content::Chunks(chunks), Some(k)) => match &chunks.get(k)?.data {
+                Piece::Mem(d) => Some(d),
+                Piece::Blob(_) => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn save(&self, w: &mut W) {
         w.u64(self.inodes.len() as u64);
-        for slot in &self.inodes {
+        for (ino, slot) in self.inodes.iter().enumerate() {
+            let ino = ino as Ino;
             let Some(i) = slot else {
                 w.u8(0);
                 continue;
@@ -1090,14 +1110,14 @@ impl Fs {
                 },
                 Content::Mem(d) => {
                     w.u8(3);
-                    w.bytes(d);
+                    w.contents(ino, None, d);
                 },
                 Content::Special => w.u8(4),
                 Content::Chunks(chunks) => {
                     // Only written chunks carry their bytes.
                     w.u8(5);
                     w.u64(chunks.len() as u64);
-                    for c in chunks {
+                    for (k, c) in chunks.iter().enumerate() {
                         w.u64(c.len);
                         match &c.data {
                             Piece::Blob(n) => {
@@ -1106,7 +1126,7 @@ impl Fs {
                             },
                             Piece::Mem(d) => {
                                 w.u8(1);
-                                w.bytes(d);
+                                w.contents(ino, Some(k), d);
                             },
                         }
                     }
@@ -1331,6 +1351,36 @@ mod chunk_tests {
         };
         assert_eq!(c.len(), 4);
         assert_eq!(fs.read(big, 10, 10).unwrap(), b"\0\0Z!");
+    }
+
+    #[test]
+    fn a_save_that_leaves_contents_out_writes_the_rest_where_it_was() {
+        let mut fs = image();
+        provide_all(&mut fs);
+        // Written in memory: a whole file, and a chunk of a chunked one (past the end, with a hole)
+        let old = fs.lookup_path("/old").unwrap();
+        fs.write(old, 9000, b"!", 1).unwrap();
+        let big = fs.lookup_path("/big").unwrap();
+        fs.write(big, 20_000, b"Z", 1).unwrap();
+        fs.write(big, 5, b"XY", 1).unwrap(); // a small chunk, copied
+        let mut whole = W::new();
+        fs.save(&mut whole);
+        let mut left = W::leaving_contents();
+        fs.save(&mut left);
+        let later = left.later();
+        assert_eq!(later.len(), 2, "{later:?}");
+        assert!(left.0.len() + 25_000 < whole.0.len());
+        // The contents put back where they were noted make what a whole save writes
+        let mut spliced = Vec::new();
+        let mut at = 0;
+        for l in &later {
+            spliced.extend_from_slice(&left.0[at..l.at]);
+            spliced.extend_from_slice(fs.saved_contents(l.ino, l.chunk).unwrap());
+            at = l.at;
+        }
+        spliced.extend_from_slice(&left.0[at..]);
+        assert_eq!(spliced, whole.0);
+        assert!(fs.save_size_hint(&W::leaving_contents()) + 25_000 < fs.save_size_hint(&W::new()));
     }
 
     #[test]

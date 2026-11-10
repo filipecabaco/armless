@@ -704,9 +704,13 @@ pub fn save_state_cpus<H: Host>(
 /// A snapshot made piece by piece, with the bytes `save_state_cpus` returns: a host that writes it
 /// out (or compresses it) as it comes never holds more than one piece of it.
 pub struct StateSaver {
-    /// The header and the machine state, which are made at once; `at` is how much was given out
+    /// The header and the machine state, which are made at once, without the contents of the files
+    /// the guest wrote (`later`, in order, read from the file system as they are given out); `at`
+    /// is how much of `head` was given out, `later_at` how much of `later[0]`
     head: Vec<u8>,
     at: usize,
+    later: std::collections::VecDeque<crate::ser::Later>,
+    later_at: usize,
     /// The next RAM page to look at
     page: usize,
     done: bool,
@@ -725,16 +729,16 @@ impl StateSaver {
             // snapshot does not hold yet
             return Err("a machine with the hypervisor's GICv3 can't be saved yet".into());
         }
-        // The header and the state in one buffer, the state written where it stays, with its length
-        // filled in once it is known: it holds the contents of the files the guest wrote
-        // (Fs::save), which a copy into a second buffer would double. Fs::save itself still
-        // builds them in memory, once; handing them out in pieces would take a sink in place of W.
+        // The header and the state, with the state's length filled in once it is known. The contents
+        // of the files the guest wrote stay out of it (W::leaving_contents): they can be most of the
+        // state, and are in the file system already, so `next` gives them out from there, a piece
+        // at a time, and a save holds no copy of them.
         let mem = &board.io.mem;
-        let mut head = W::new();
+        let mut head = W::leaving_contents();
         // Once, with room for the CPUs and the other devices: growing by doubling would leave the
         // smaller buffers in the heap, which a wasm heap does not give back
-        head.0
-            .reserve_exact(board.devices.lock().save_size_hint() + (1 << 20));
+        let hint = board.devices.lock().save_size_hint(&head);
+        head.0.reserve_exact(hint + (1 << 20));
         head.0.extend_from_slice(MAGIC);
         head.u64(mem.len() as u64);
         head.u32(n as u32);
@@ -742,15 +746,64 @@ impl StateSaver {
         let state = head.0.len();
         head.bytes(&Cpu::save_machine_state_cpus(cpus, n)?);
         board.devices.lock().save(&mut head);
-        let len = (head.0.len() - state) as u64;
+        let later = head.later();
+        let len = (head.0.len() - state + later.iter().map(|l| l.len).sum::<usize>()) as u64;
         head.0[state - 8..state].copy_from_slice(&len.to_le_bytes());
-        let head = head.0;
         Ok(StateSaver {
-            head,
+            head: head.0,
             at: 0,
+            later: later.into(),
+            later_at: 0,
             page: 0,
             done: false,
         })
+    }
+
+    /// The header and the state, in pieces of at most `room` bytes appended to `out`, the contents
+    /// left out of `head` read where they go. False once all of it was given out.
+    fn next_state(&mut self, board: &Board, out: &mut Vec<u8>, room: usize) -> bool {
+        let start = out.len();
+        while out.len() - start < room {
+            let left = room - (out.len() - start);
+            let until = self.later.front().map_or(self.head.len(), |l| l.at);
+            if self.at < until {
+                let n = (until - self.at).min(left);
+                out.extend_from_slice(&self.head[self.at..self.at + n]);
+                self.at += n;
+                continue;
+            }
+            let Some(l) = self.later.front().copied() else {
+                break;
+            };
+            let n = (l.len - self.later_at).min(left);
+            {
+                let devices = board.devices.lock();
+                // The CPUs stay stopped until the snapshot is out, so the file is as it was. Were it
+                // not, zeros keep the snapshot's shape (and the debug build says so).
+                let d = devices
+                    .saved_contents(l.ino, l.chunk)
+                    .filter(|d| d.len() == l.len);
+                debug_assert!(
+                    d.is_some(),
+                    "inode {} changed while it was being saved",
+                    l.ino
+                );
+                match d {
+                    Some(d) => out.extend_from_slice(&d[self.later_at..self.later_at + n]),
+                    None => out.resize(out.len() + n, 0),
+                }
+            }
+            self.later_at += n;
+            if self.later_at == l.len {
+                self.later.pop_front();
+                self.later_at = 0;
+            }
+        }
+        if self.at == self.head.len() && self.later.is_empty() && !self.head.is_empty() {
+            self.head = Vec::new();
+            self.at = 0;
+        }
+        out.len() > start
     }
 
     /// Appends the next piece to `out`: the header and the state, then the RAM pages, in pieces of
@@ -758,14 +811,8 @@ impl StateSaver {
     /// and nothing was appended.
     pub fn next(&mut self, board: &Board, out: &mut Vec<u8>, max: usize) -> bool {
         let start = out.len();
-        if self.at < self.head.len() {
-            let n = (self.head.len() - self.at).min(max);
-            out.extend_from_slice(&self.head[self.at..self.at + n]);
-            self.at += n;
-            if self.at == self.head.len() {
-                self.head = Vec::new();
-                self.at = 0;
-            }
+        if (self.at < self.head.len() || !self.later.is_empty()) && self.next_state(board, out, max)
+        {
             return true;
         }
         let mem = &board.io.mem;
@@ -964,6 +1011,12 @@ impl StateLoader {
                                 return Err("this snapshot's RAM is in an image: restore it onto RAM from that image".into());
                             }
                             self.fresh = mem.take_fresh() || on_image;
+                            // Once, at its size: the state holds the files the guest wrote, and a
+                            // buffer grown by doubling would need half as much again on top while
+                            // it moves (and leave the old one in a wasm heap, which never shrinks)
+                            self.buf.try_reserve_exact(meta).map_err(|_| {
+                                format!("no memory for the snapshot's {} MiB of state", meta >> 20)
+                            })?;
                             Stage::Meta(meta)
                         },
                         Stage::Meta(_) => {
@@ -1336,5 +1389,75 @@ mod host_fs_tests {
         );
         // A file in the way
         assert!(b.fs_mkdir("/job/in/a/b").is_err());
+    }
+
+    #[test]
+    fn a_save_gives_the_files_the_guest_wrote_out_from_the_file_system() {
+        let config = || Config {
+            memory_size: 16 << 20,
+            cpus: 1,
+            devices: DeviceConfig {
+                fs_tag: Some("root".into()),
+                ..Default::default()
+            },
+        };
+        let (mut vm, _clock) = crate::runner::new_vm(config()).unwrap();
+        vm.board
+            .load_filesystem(br#"{"version":3,"size":0,"fsroot":[]}"#)
+            .unwrap();
+        let big: Vec<u8> = (0..3_000_000u32)
+            .map(|i| (i * 7 + i / 4096) as u8)
+            .collect();
+        vm.board.fs_write_file("/big", &big, 0o644).unwrap();
+        vm.board.fs_write_file("/small", b"small", 0o644).unwrap();
+        vm.board.io.mem.store(3 * super::PAGE, 1, 0x5a);
+        let whole = vm.save_state();
+
+        // In pieces of about 64 KiB, none of them held twice: the saver holds no copy of the file
+        let mut refs: Vec<_> = vm.cpus.iter_mut().collect();
+        let mut saver = super::StateSaver::new(&vm.board, &mut refs, 1).unwrap();
+        assert!(
+            saver.head.len() < 1 << 20,
+            "the head holds the file: {}",
+            saver.head.len()
+        );
+        let mut pieces = Vec::new();
+        loop {
+            let mut piece = Vec::new();
+            if !saver.next(&vm.board, &mut piece, 64 << 10) {
+                break;
+            }
+            assert!(piece.len() <= 64 << 10);
+            pieces.push(piece);
+        }
+        assert!(pieces.len() > 3_000_000 / (64 << 10));
+        // The same bytes as a save in one, but for the CPUs' state (their timers moved on): the
+        // header, its length, then the rest
+        let got = pieces.concat();
+        assert_eq!(got.len(), whole.len());
+        let cpu_len = |s: &[u8]| u64::from_le_bytes(s[27..35].try_into().unwrap()) as usize;
+        assert_eq!(cpu_len(&got), cpu_len(&whole));
+        let rest = 35 + cpu_len(&whole);
+        assert!(got[..35] == whole[..35], "the header");
+        assert!(
+            got[rest..] == whole[rest..],
+            "the devices, the files and the RAM"
+        );
+
+        // Restored, onto a fresh machine and onto this one (whose files go first), keeping each
+        // machine's own budget for file contents
+        let limit = |vm: &mut crate::Vm<_>| vm.board.devices.lock().p9().unwrap().1.fs.cache_limit();
+        let (mut back, _clock) = crate::runner::new_vm(config()).unwrap();
+        back.board.set_fs_cache(1 << 20);
+        back.load_state(&whole).unwrap();
+        assert_eq!(limit(&mut back), 1 << 20);
+        vm.board.fs_write_file("/big", b"changed", 0o644).unwrap();
+        vm.load_state(&whole).unwrap();
+        for vm in [&mut back, &mut vm] {
+            let files = vm.board.fs_read_tree("/").unwrap().unwrap();
+            assert!(files.contains(&("big".to_string(), big.clone())));
+            assert!(files.contains(&("small".to_string(), b"small".to_vec())));
+            assert_eq!(vm.board.io.mem.load(3 * super::PAGE, 1), 0x5a);
+        }
     }
 }
