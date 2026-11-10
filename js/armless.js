@@ -474,7 +474,7 @@
       const e = this.exports;
       if (!e.armless_mem_report) throw new Error("armless: this build has no memory report");
       const n = e.armless_mem_report();
-      const r = JSON.parse(new TextDecoder().decode(new Uint8Array(this.memory.buffer, e.armless_buf(), n)));
+      const r = JSON.parse(new TextDecoder().decode(new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice()));
       // The memory may have grown since the report was made: its size now
       r.memory = this.memory.buffer.byteLength;
       if (scan) {
