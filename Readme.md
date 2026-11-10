@@ -58,7 +58,9 @@ Events and calls:
   the guest's page cache keeps what it uses often), `Board::set_fs_cache` natively.
 - **Calls:** `console_input`, `console_resize`, `serial_input`, `provide_blob`
   (preload), `connect(port)` (a connection into the guest), `save_state()`,
-  `restore_state()`, `stop()`, `run()` and `destroy()`.
+  `save_state_pieces()` (the same snapshot in pieces of about 1 MiB, to write or compress as
+  they come), `restore_state()`, `stop()`, `run()` and `destroy()`. A save never grows the
+  machine's memory by the snapshot's size: it is handed out a piece at a time.
 
 `network` options:
 - `tls`: the CA as `tls.json` (`caSubject`, `caKeyId`, `leafSpki`, `caKey` and
