@@ -691,16 +691,53 @@
       return conn;
     }
 
-    /** A snapshot of the machine (uncompressed). */
-    async save_state() {
+    /**
+     * A snapshot of the machine (uncompressed), in pieces of about 1 MiB, in order: the machine
+     * hands it out a piece at a time, so its memory (which never shrinks again) holds one piece
+     * of it, not the whole, and a host that writes or compresses the pieces as it goes never
+     * holds the whole either. The CPUs stay stopped while it is taken.
+     */
+    async save_state_pieces() {
       await this.ready;
+      const e = this.exports;
       const was_running = this.running;
       if (this.cpus > 1) await this._pause();
-      const n = this.exports.armless_save_state();
-      const state = new Uint8Array(this.memory.buffer, this.exports.armless_buf(), n).slice();
-      if (this.cpus > 1 && was_running) {
-        Atomics.store(this._ctrl, CTRL_PAUSE, 0);
-        Atomics.notify(this._ctrl, CTRL_PAUSE);
+      try {
+        // A machine built before the snapshot came in pieces: the one buffer
+        if (!e.armless_save_begin) {
+          const n = e.armless_save_state();
+          return [new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice()];
+        }
+        if (e.armless_save_begin() !== 0) throw new Error("armless: snapshot: " + this._error());
+        // No await until the last piece: nothing runs the machine in between
+        const pieces = [];
+        try {
+          for (let n; (n = e.armless_save_next()) !== 0;) {
+            pieces.push(new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice());
+          }
+        } catch (err) {
+          e.armless_save_abort();
+          throw err;
+        }
+        return pieces;
+      } finally {
+        if (this.cpus > 1 && was_running) {
+          Atomics.store(this._ctrl, CTRL_PAUSE, 0);
+          Atomics.notify(this._ctrl, CTRL_PAUSE);
+        }
+      }
+    }
+
+    /** A snapshot of the machine (uncompressed), in one buffer (see save_state_pieces). */
+    async save_state() {
+      const pieces = await this.save_state_pieces();
+      if (pieces.length === 1) return pieces[0];
+      const state = new Uint8Array(pieces.reduce((n, p) => n + p.length, 0));
+      let at = 0;
+      for (let i = 0; i < pieces.length; i++) {
+        state.set(pieces[i], at);
+        at += pieces[i].length;
+        pieces[i] = null; // each piece can go as soon as it is in
       }
       return state;
     }
