@@ -1127,6 +1127,17 @@ impl Cache {
         }
     }
 
+    /// The slots allocated so far and the bytes they hold, with the cache's tables.
+    pub fn bytes(&self) -> (usize, usize) {
+        let slots = self.slots.len();
+        let tables = self.page_slot.capacity() * 4
+            + self.slot_page.capacity() * 4
+            + self.free.capacity() * 4
+            + self.referenced.capacity()
+            + self.slots.capacity() * std::mem::size_of::<*mut Op>();
+        (slots, slots * SLOT_OPS * std::mem::size_of::<Op>() + tables)
+    }
+
     #[inline(always)]
     pub(crate) fn slot(&self, page: usize) -> u32 {
         self.page_slot[page]

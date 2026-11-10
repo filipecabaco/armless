@@ -255,6 +255,24 @@ fn page_of(key: u64) -> u64 {
 }
 
 impl Jit {
+    /// The bytes the JIT's own tables hold (its compiled code is not here: the host keeps that), and the pages it
+    /// tracks.
+    pub fn bytes(&self) -> (usize, usize) {
+        let tables = self.slot_used.capacity()
+            + self.slot_later.capacity()
+            + self.lookup_key.capacity() * 8
+            + self.lookup_slot.capacity() * 4
+            + self.slot_page.capacity() * 8
+            + self.slot_state.capacity()
+            + self.free.capacity() * 4
+            + self.code_page.capacity();
+        let maps = (self.pages.capacity() * std::mem::size_of::<(u64, PageInfo)>())
+            + self.page_keys.capacity() * 32
+            + self.covered.capacity() * (4 + 8 + 128)
+            + self.decoded_writes.capacity() * 8;
+        (tables + maps, self.pages.len())
+    }
+
     pub fn new(memory_size: usize) -> Jit {
         Jit {
             enabled: false,
