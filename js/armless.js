@@ -410,6 +410,8 @@
       }
       // Decompressed file contents kept in this page (the guest caches what it uses itself)
       if (o.fs_cache_mb != null) e.armless_set_fs_cache(o.fs_cache_mb >>> 0);
+      // Pre-decoded instructions each CPU keeps (24 MiB by default): what the interpreter runs from
+      if (o.predecode_mb != null && e.armless_set_predecode) e.armless_set_predecode(o.predecode_mb >>> 0);
       // Testing aid: every block is compiled before it first runs
       if (o.jit_sync) e.armless_jit_sync(1);
       this._jit_pending = new Set();
