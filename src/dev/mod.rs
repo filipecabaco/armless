@@ -374,6 +374,14 @@ impl Devices {
         }
     }
 
+    /// What the 9p filesystem holds in host memory (none: there is no file system).
+    pub fn fs_stats(&self) -> fs::Stats {
+        match self.pci.slot(SLOT_FS) {
+            Some((_, virtio::Device::P9(p))) => p.fs.stats(),
+            _ => fs::Stats::default(),
+        }
+    }
+
     /// What `save` left out of a writer that leaves contents out (ser::Later): from the 9p filesystem
     pub fn saved_contents(&self, ino: u64, chunk: Option<usize>) -> Option<&[u8]> {
         match self.pci.slot(SLOT_FS) {

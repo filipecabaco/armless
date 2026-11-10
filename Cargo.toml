@@ -1,6 +1,6 @@
 [package]
 name = "armless"
-version = "0.9.8"
+version = "0.9.9"
 edition = "2021"
 # Cranelift (the native-jit feature) needs 1.97
 rust-version = "1.97"

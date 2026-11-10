@@ -32,6 +32,48 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+/// What the allocator has handed out and not had back: the bytes (as asked for, not as dlmalloc rounds them), the most
+/// it was, and how much of it is in blocks of `RELEASE_MIN` or more. `armless_mem_report` shows them, to tell what the
+/// heap of a machine holds apart from the memory of the guest.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+static LARGE: AtomicUsize = AtomicUsize::new(0);
+
+fn count_up(size: usize) {
+    let now = LIVE.fetch_add(size, Relaxed) + size;
+    PEAK.fetch_max(now, Relaxed);
+    if size >= RELEASE_MIN {
+        LARGE.fetch_add(size, Relaxed);
+    }
+}
+
+fn count_down(size: usize) {
+    LIVE.fetch_sub(size, Relaxed);
+    if size >= RELEASE_MIN {
+        LARGE.fetch_sub(size, Relaxed);
+    }
+}
+
+/// What the heap holds (see `LIVE`). `kept` is in `live` too: freed big blocks held to be handed out again.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stats {
+    pub live: usize,
+    pub peak: usize,
+    pub large: usize,
+    pub kept: usize,
+}
+
+pub fn stats() -> Stats {
+    Stats {
+        live: LIVE.load(Relaxed),
+        peak: PEAK.load(Relaxed),
+        large: LARGE.load(Relaxed),
+        // Not counted when another thread holds the cache at this instant
+        kept: lock().map_or(0, |c| c.bytes),
+    }
+}
 
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
@@ -224,6 +266,9 @@ unsafe impl GlobalAlloc for Heap {
             None => unsafe { System.alloc(layout) },
         };
         learn(p, layout.size());
+        if !p.is_null() {
+            count_up(layout.size());
+        }
         p
     }
 
@@ -242,6 +287,7 @@ unsafe impl GlobalAlloc for Heap {
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let size = layout.size();
+        count_down(size);
         if size >= RELEASE_MIN {
             if size <= CACHE_BUDGET {
                 if let Some(mut c) = lock() {
@@ -282,6 +328,12 @@ unsafe impl GlobalAlloc for Heap {
             give(at + new_size + KEEP_HEAD, (at + old).saturating_sub(KEEP_TAIL));
         }
         // SAFETY: the caller's contract of `realloc`.
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        // A block that shrinks stays where it is (see above), so the bytes it holds change by the difference
+        if !p.is_null() {
+            count_down(old);
+            count_up(new_size);
+        }
+        p
     }
 }

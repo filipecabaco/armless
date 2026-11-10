@@ -342,6 +342,54 @@ pub extern "C" fn armless_heap_flush() {
     crate::heap::flush();
 }
 
+/// What the instance's memory holds, as JSON (the length; the text is at `armless_buf`): the guest's RAM, the heap (what
+/// the allocator has handed out, its peak, the big blocks, the freed ones it keeps) and the file system's contents, with
+/// the size of the whole linear memory. The memory of a wasm instance never shrinks and the host cannot see inside it,
+/// so this is how a host tells what the part of it outside the guest's RAM is made of.
+#[no_mangle]
+pub extern "C" fn armless_mem_report() -> u32 {
+    let vm = vm();
+    let fs = vm.board.devices.lock().fs_stats();
+    // [live, peak, large, kept]; a native build has no wasm memory and no counting allocator
+    #[cfg(target_arch = "wasm32")]
+    let (memory, heap) = {
+        let h = crate::heap::stats();
+        (
+            (core::arch::wasm32::memory_size::<0>() as u64) << 16,
+            (h.live, h.peak, h.large, h.kept),
+        )
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let (memory, heap) = (0u64, (0usize, 0usize, 0usize, 0usize));
+    let j = &vm.cpus[0].jit;
+    out(format!(
+        concat!(
+            "{{\"memory\":{},\"guest_ram\":{},\"guest_ram_at\":{},",
+            "\"heap\":{{\"live\":{},\"peak\":{},\"large\":{},\"kept\":{}}},",
+            "\"fs\":{{\"inodes\":{},\"cached_blobs\":{},\"cached_bytes\":{},\"cache_limit\":{},",
+            "\"written_buffers\":{},\"written_bytes\":{},\"written_capacity\":{}}},",
+            "\"jit\":{{\"compiled\":{},\"flushes\":{}}}}}"
+        ),
+        memory,
+        vm.board.io.mem.len(),
+        // Where the RAM is in the memory; `armless_mem_ptr` also marks it written, which a report must not do
+        vm.board.io.mem.as_ptr() as usize,
+        heap.0,
+        heap.1,
+        heap.2,
+        heap.3,
+        fs.inodes,
+        fs.cached_blobs,
+        fs.cached_bytes,
+        fs.cache_limit,
+        fs.written_buffers,
+        fs.written_bytes,
+        fs.written_capacity,
+        j.compiled,
+        j.flushes,
+    ).into_bytes())
+}
+
 #[no_mangle]
 pub extern "C" fn armless_mem_ptr() -> u32 {
     // The page may write RAM through it

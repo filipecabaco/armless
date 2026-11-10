@@ -122,6 +122,20 @@ impl From<u32> for Fail {
 
 pub type Res<T> = Result<T, Fail>;
 
+/// What a file system holds in host memory: the decompressed blobs it fetched (at most `cache_limit` bytes), and the
+/// contents of the files the guest wrote, which stay until the file is removed (`written_capacity` is what the buffers
+/// were made at, `written_bytes` what is in them).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stats {
+    pub inodes: usize,
+    pub cached_blobs: usize,
+    pub cached_bytes: usize,
+    pub cache_limit: usize,
+    pub written_buffers: usize,
+    pub written_bytes: usize,
+    pub written_capacity: usize,
+}
+
 pub struct Fs {
     inodes: Vec<Option<Inode>>,
     free: Vec<Ino>,
@@ -934,6 +948,36 @@ impl Fs {
         self.max_cached
     }
 
+    /// What the file system holds in host memory (see `Stats`).
+    pub fn stats(&self) -> Stats {
+        let mut s = Stats {
+            cache_limit: self.max_cached,
+            cached_bytes: self.cached,
+            cached_blobs: self.blobs.len(),
+            ..Stats::default()
+        };
+        let mut mem = |d: &Vec<u8>| {
+            s.written_buffers += 1;
+            s.written_bytes += d.len();
+            s.written_capacity += d.capacity();
+        };
+        for i in self.inodes.iter().flatten() {
+            match &i.content {
+                Content::Mem(d) => mem(d),
+                Content::Chunks(chunks) => {
+                    for c in chunks {
+                        if let Piece::Mem(d) = &c.data {
+                            mem(d);
+                        }
+                    }
+                },
+                _ => {},
+            }
+            s.inodes += 1;
+        }
+        s
+    }
+
     fn evict(&mut self) {
         // Pinned chunks stay, at the front, until the read waiting on them completes.
         let mut kept = Vec::new();
@@ -1429,6 +1473,28 @@ mod chunk_tests {
         spliced.extend_from_slice(&left.0[at..]);
         assert_eq!(spliced, whole.0);
         assert!(fs.save_size_hint(&W::leaving_contents()) + 25_000 < fs.save_size_hint(&W::new()));
+    }
+
+    #[test]
+    fn stats_tell_the_blobs_that_were_fetched_from_the_files_the_guest_wrote() {
+        let mut fs = image();
+        let before = fs.stats();
+        assert_eq!((before.cached_blobs, before.written_buffers, before.written_bytes), (0, 0, 0));
+        assert_eq!(before.cache_limit, DEFAULT_CACHE);
+        provide_all(&mut fs);
+        let fetched = fs.stats();
+        assert!(fetched.cached_blobs > 0 && fetched.cached_bytes > 0, "{fetched:?}");
+        assert_eq!(fetched.written_buffers, 0);
+        // A file written is held in memory for as long as it lives, whatever the cache holds
+        let old = fs.lookup_path("/old").unwrap();
+        fs.write(old, 9000, b"!", 1).unwrap();
+        let after = fs.stats();
+        assert_eq!(after.written_buffers, 1);
+        assert!(after.written_bytes >= 9001 && after.written_capacity >= after.written_bytes, "{after:?}");
+        assert_eq!(after.inodes, before.inodes);
+        fs.set_cache_limit(0);
+        assert_eq!(fs.stats().cache_limit, 0);
+        assert!(fs.stats().cached_blobs <= 1);
     }
 
     #[test]
