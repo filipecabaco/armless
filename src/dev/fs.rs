@@ -36,6 +36,10 @@ pub const EPERM: u32 = 1;
 
 /// Largest file the guest may grow (they live in host memory).
 const MAX_FILE: u64 = 1 << 31;
+/// A file the guest writes past this size is kept in chunks of it (Content::Chunks): it grows a
+/// chunk at a time, each made once at its size, instead of in one buffer that doubles (and moves,
+/// leaving the old one in a wasm heap, which never shrinks) as the file grows.
+const WRITE_CHUNK: usize = 1 << 20;
 /// Fetched file contents kept at most by default; older ones are fetched again
 /// when needed (the guest's page cache keeps what it uses often anyway). Hosts
 /// set their own budget (`DeviceConfig::fs_cache`, `Board::set_fs_cache`).
@@ -698,7 +702,37 @@ impl Fs {
         Ok(())
     }
 
-    /// Grow or shrink a chunked file to `size` bytes (zeros when growing).
+    /// `data` in chunks of `WRITE_CHUNK`, the last with room to grow to that size.
+    fn into_chunks(data: &[u8]) -> Vec<Chunk> {
+        data.chunks(WRITE_CHUNK)
+            .map(|c| {
+                let mut d = Vec::with_capacity(WRITE_CHUNK);
+                d.extend_from_slice(c);
+                Chunk {
+                    len: c.len() as u64,
+                    data: Piece::Mem(d),
+                }
+            })
+            .collect()
+    }
+
+    /// A whole file (in memory, or in one blob) about to be `size` bytes: past `WRITE_CHUNK`, kept
+    /// in chunks from now on.
+    fn chunk_if_large(&mut self, ino: Ino, size: u64) -> Res<()> {
+        if size <= WRITE_CHUNK as u64 {
+            return Ok(());
+        }
+        let chunks = match &self.inode(ino)?.content {
+            Content::Blob(_) => Self::into_chunks(self.data(ino)?),
+            Content::Mem(d) => Self::into_chunks(d),
+            _ => return Ok(()),
+        };
+        self.inode_mut(ino)?.content = Content::Chunks(chunks);
+        Ok(())
+    }
+
+    /// Grow or shrink a chunked file to `size` bytes (zeros when growing): grown a `WRITE_CHUNK` at
+    /// a time, the last in-memory chunk first up to that size.
     fn resize_chunks(chunks: &mut Vec<Chunk>, size: u64) {
         let mut pos = 0u64;
         let mut keep = 0;
@@ -717,21 +751,30 @@ impl Fs {
             keep += 1;
         }
         chunks.truncate(keep);
-        if pos < size {
-            let grow = size - pos;
-            match chunks.last_mut() {
-                Some(Chunk {
-                    len,
-                    data: Piece::Mem(d),
-                }) => {
-                    *len += grow;
-                    d.resize(*len as usize, 0);
-                },
-                _ => chunks.push(Chunk {
-                    len: grow,
-                    data: Piece::Mem(vec![0; grow as usize]),
-                }),
+        let mut grow = size.saturating_sub(pos);
+        if let Some(Chunk {
+            len,
+            data: Piece::Mem(d),
+        }) = chunks.last_mut()
+        {
+            let n = (WRITE_CHUNK as u64).saturating_sub(*len).min(grow);
+            if n > 0 {
+                // Room for the whole chunk at once: appends then never move it
+                d.reserve_exact(WRITE_CHUNK.saturating_sub(d.len()));
+                *len += n;
+                d.resize(*len as usize, 0);
+                grow -= n;
             }
+        }
+        while grow > 0 {
+            let n = grow.min(WRITE_CHUNK as u64);
+            let mut d = Vec::with_capacity(WRITE_CHUNK);
+            d.resize(n as usize, 0);
+            chunks.push(Chunk {
+                len: n,
+                data: Piece::Mem(d),
+            });
+            grow -= n;
         }
     }
 
@@ -798,6 +841,8 @@ impl Fs {
         if end > MAX_FILE {
             return Err(EFBIG.into());
         }
+        let size = self.inode(ino)?.size;
+        self.chunk_if_large(ino, size.max(end))?;
         if let Content::Chunks(_) = self.inode(ino)?.content {
             self.write_chunks(ino, offset, bytes)?;
             let i = self.inode_mut(ino)?;
@@ -826,6 +871,9 @@ impl Fs {
             if let Content::Blob(_) | Content::Chunks(_) = self.inode(ino)?.content {
                 self.inode_mut(ino)?.content = Content::Mem(Vec::new());
             }
+        }
+        if size > self.inode(ino)?.size {
+            self.chunk_if_large(ino, size)?;
         }
         if let Content::Chunks(chunks) = &mut self.inode_mut(ino)?.content {
             Self::resize_chunks(chunks, size);
@@ -1406,6 +1454,61 @@ mod chunk_tests {
         fs.truncate(big, 0).unwrap();
         assert_eq!(fs.read_all(big).unwrap(), b"");
         assert!(matches!(fs.inode(big).unwrap().content, Content::Mem(_)));
+    }
+
+    /// A file's contents, and each in-memory chunk's (length, room).
+    fn written(fs: &mut Fs, ino: Ino) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let Content::Chunks(c) = &fs.inode(ino).unwrap().content else {
+            panic!("not in chunks")
+        };
+        let shape = c
+            .iter()
+            .map(|c| match &c.data {
+                Piece::Mem(d) => (d.len(), d.capacity()),
+                Piece::Blob(_) => (c.len as usize, 0),
+            })
+            .collect();
+        (fs.read_all(ino).unwrap(), shape)
+    }
+
+    #[test]
+    fn a_growing_file_grows_a_chunk_at_a_time() {
+        let mut fs = image();
+        let ino = fs.create(ROOT, b"log", S_IFREG | 0o644, 0, 0, 1).unwrap();
+        // Appended 8 KiB at a time, as a database writes, to 2.5 MiB
+        let page: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+        let n = (5 * WRITE_CHUNK / 2) / page.len();
+        for k in 0..n {
+            fs.write(ino, (k * page.len()) as u64, &page, 1).unwrap();
+        }
+        let (data, shape) = written(&mut fs, ino);
+        assert_eq!(data, page.repeat(n));
+        // Two whole chunks and half of one, each made once at its size: no buffer doubled or moved
+        let half = WRITE_CHUNK / 2;
+        assert_eq!(shape, [(WRITE_CHUNK, WRITE_CHUNK), (WRITE_CHUNK, WRITE_CHUNK), (half, WRITE_CHUNK)]);
+        // Writes inside still land where they belong
+        fs.write(ino, WRITE_CHUNK as u64 - 1, b"AB", 2).unwrap();
+        assert_eq!(fs.read(ino, WRITE_CHUNK as u64 - 1, 2).unwrap(), b"AB");
+    }
+
+    #[test]
+    fn whole_files_go_to_chunks_once_they_are_large() {
+        let mut fs = image();
+        provide_all(&mut fs);
+        // A small file stays whole
+        let old = fs.lookup_path("/old").unwrap();
+        fs.write(old, 3, b"!", 1).unwrap();
+        assert!(matches!(fs.inode(old).unwrap().content, Content::Mem(_)));
+        // Grown past a chunk by a truncate, then by a write: in chunks, the contents kept
+        fs.truncate(old, WRITE_CHUNK as u64 + 10).unwrap();
+        let (data, shape) = written(&mut fs, old);
+        assert_eq!(&data[..4], b"xyz!");
+        assert!(data[4..].iter().all(|&b| b == 0));
+        assert_eq!(shape, [(WRITE_CHUNK, WRITE_CHUNK), (10, WRITE_CHUNK)]);
+        let new = fs.create(ROOT, b"new", S_IFREG | 0o644, 0, 0, 1).unwrap();
+        let big = vec![7u8; 3 * WRITE_CHUNK / 2];
+        fs.write(new, 0, &big, 1).unwrap();
+        assert_eq!(written(&mut fs, new).0, big);
     }
 
     #[test]
