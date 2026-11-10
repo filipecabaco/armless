@@ -366,11 +366,19 @@ impl Devices {
         }
     }
 
-    /// An upper bound of what the 9p filesystem adds to `save` (the rest is small)
-    pub fn save_size_hint(&self) -> usize {
+    /// An upper bound of what the 9p filesystem adds to `save` into `w` (the rest is small)
+    pub fn save_size_hint(&self, w: &W) -> usize {
         match self.pci.slot(SLOT_FS) {
-            Some((_, virtio::Device::P9(p))) => p.fs.save_size_hint(),
+            Some((_, virtio::Device::P9(p))) => p.fs.save_size_hint(w),
             _ => 0,
+        }
+    }
+
+    /// What `save` left out of a writer that leaves contents out (ser::Later): from the 9p filesystem
+    pub fn saved_contents(&self, ino: u64, chunk: Option<usize>) -> Option<&[u8]> {
+        match self.pci.slot(SLOT_FS) {
+            Some((_, virtio::Device::P9(p))) => p.fs.saved_contents(ino, chunk),
+            _ => None,
         }
     }
 

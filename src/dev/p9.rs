@@ -602,7 +602,13 @@ impl P9 {
     }
 
     pub fn load(&mut self, r: &mut R) -> Option<()> {
+        // The host's budget for file contents is this machine's, not the snapshot's. The files go
+        // before the snapshot's are made, so the two are never held at once: the RAM is the
+        // snapshot's already, and a load that fails leaves a machine to restore again, not this one.
+        let limit = self.fs.cache_limit();
+        self.fs = Fs::empty();
         self.fs = Fs::load(r)?;
+        self.fs.set_cache_limit(limit);
         // As a Tversion would: the replies size their payloads from it
         self.msize = r.u32()?.clamp(4096, MAX_MSIZE);
         self.fids.clear();

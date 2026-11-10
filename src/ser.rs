@@ -1,10 +1,54 @@
 //! Little-endian byte writer/reader for snapshots.
 
-pub struct W(pub Vec<u8>);
+pub struct W(pub Vec<u8>, Option<Vec<Later>>);
+
+/// Contents of a file the guest wrote that a snapshot's writer left out: `len` bytes that go at `at`
+/// of its bytes, read from the file system (inode `ino`, or chunk `chunk` of it) when the snapshot
+/// is given out (`vm::StateSaver`), so they are never held twice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Later {
+    pub at: usize,
+    pub ino: u64,
+    pub chunk: Option<usize>,
+    pub len: usize,
+}
+
+/// Contents smaller than this are copied: leaving them out saves nothing worth the bookkeeping.
+const LATER_MIN: usize = 4096;
 
 impl W {
     pub fn new() -> W {
-        W(Vec::new())
+        W(Vec::new(), None)
+    }
+    /// A writer that leaves the contents of the files the guest wrote out (see `contents`).
+    pub fn leaving_contents() -> W {
+        W(Vec::new(), Some(Vec::new()))
+    }
+    /// Whether `contents` of `len` bytes would be left out.
+    pub fn leaves(&self, len: usize) -> bool {
+        self.1.is_some() && len >= LATER_MIN
+    }
+    /// The contents of a file the guest wrote (inode `ino`, or chunk `chunk` of it), as `bytes`
+    /// writes them; a writer made with `leaving_contents` writes their length only, and notes where
+    /// they go (`later`).
+    pub fn contents(&mut self, ino: u64, chunk: Option<usize>, v: &[u8]) {
+        if !self.leaves(v.len()) {
+            return self.bytes(v);
+        }
+        self.u64(v.len() as u64);
+        let at = self.0.len();
+        if let Some(later) = &mut self.1 {
+            later.push(Later {
+                at,
+                ino,
+                chunk,
+                len: v.len(),
+            });
+        }
+    }
+    /// The contents left out, in the order they go in.
+    pub fn later(&mut self) -> Vec<Later> {
+        self.1.take().unwrap_or_default()
     }
     pub fn u8(&mut self, v: u8) {
         self.0.push(v);
