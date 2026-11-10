@@ -1,86 +1,137 @@
 # armless
 
-An AArch64 virtual machine that runs unmodified arm64 Linux in a browser tab, and
-natively. It is written in Rust:
+An AArch64 machine emulator written in Rust. It boots unmodified arm64 Linux, in a
+browser tab (WebAssembly, driven by [`js/armless.js`](js/armless.js)) and natively
+(a Rust crate and the `armless-run` command). The whole machine, devices included, is
+Rust; the host only provides time, file contents and the other end of network connections.
 
-- CPU: ARMv8-A EL0/EL1 with FP/AdvSIMD, AES/PMULL, SHA1, SHA256, CRC32 and the
-  ARMv8.1 atomics (LSE). Interpreted, with a JIT that translates
-  hot pages to WebAssembly in a page, and to host code natively (Cranelift).
-- SMP: up to 8 CPUs, one Web Worker (or native thread) each.
-- Interrupts and time: GICv2 and the generic timer.
-- Devices, all in Rust:
-  - a PL031 RTC and a 16550 UART (`ttyS0`);
-  - virtio-console (`hvc0`, with the terminal size);
-  - a 9p root filesystem built from content-addressed blobs that are fetched on
-    first read (large files in chunks: a read fetches only what it covers);
-  - virtio-net with a user-mode network. DHCP, DNS and ping are answered
-    locally.
-  - a web relay inside the machine. HTTP and HTTPS (ports 80 and 443; HTTPS is
-    terminated with a CA the guest trusts) and WebSockets reach the host as
-    requests to make, so a page answers them with `fetch()` and a native host with
-    any HTTP client, proxies included. Other TCP connections become streams.
-- Snapshots of the whole machine, restored by streaming.
+[snowglobe](https://github.com/filipecabaco/snowglobe) uses armless to turn Docker images
+into static sites that restore a running app in the visitor's browser in about a second.
+armless started as a fork of [v86](https://github.com/copy/v86).
 
-The host (a page, or a native program) only provides time, file contents and the
-other end of TCP connections. [snowglobe](https://github.com/filipecabaco/snowglobe)
-uses armless to turn Docker images into static sites that restore a running app
-in about a second.
+## What it has
 
-## In a page
+- **CPU:** ARMv8-A at EL0 and EL1 with FP/AdvSIMD, AES/PMULL, SHA1, SHA256, CRC32 and the
+  ARMv8.1 atomics (LSE). A software MMU with a TLB, and up to 8 CPUs, one Web Worker or
+  native thread each.
+- **Execution backends:** an interpreter; a JIT that turns hot pages into WebAssembly
+  modules (browser) or host code with Cranelift (native); and, opt in, hardware
+  virtualization (Hypervisor.framework on Apple silicon macOS, KVM on Linux arm64).
+- **Interrupts and time:** GICv2, the generic timer, a PL031 RTC, and a VM generation ID
+  so a restored guest reseeds its random generator.
+- **Devices:** a 16550 UART (`ttyS0`), and virtio-pci devices: console (`hvc0`, with the
+  terminal size), 9p filesystem, and network.
+- **Filesystem:** a 9p root built from content-addressed blobs, fetched on first read.
+  Large files are split into chunks, so a read fetches only what it covers.
+- **Network:** virtio-net with an in-process TCP/IP stack. DHCP, DNS and ping are answered
+  locally. HTTP and HTTPS (ports 80 and 443; HTTPS ends in the machine with a CA the guest
+  trusts) and WebSockets reach the host as requests to make: a page answers them with
+  `fetch()` and `WebSocket`, a native host with its own HTTP client, proxies included.
+  Other TCP connections become streams the host accepts, refuses, or carries over a
+  WebSocket tunnel.
+- **Snapshots:** the whole machine can be saved and restored. A restore streams straight
+  into guest memory, zstd-compressed or not, and a save is handed out in pieces.
+
+## Quick start
+
+### Native
+
+```sh
+cargo build --release
+cargo run --release --bin armless-run -- --kernel Image --initrd initrd.cpio --smp 2
+cargo run --release --bin armless-run -- --help
+```
+
+`armless-run` runs Linux kernels (`Image`, `Image.gz`, zstd or EFI zboot) and bare-metal
+binaries (`--raw FILE[@ADDR]`). Besides `--kernel`, `--initrd`, `--append`, `-m MB` and
+`--smp N`, it takes `--fs DIR` (a 9p root; `--boot-fs` boots the kernel under `/boot` in
+it), `--net` with `--tunnel [H:]P=URL` and `--allow-private`, `--timeout`, input flags for
+scripted runs, and `--stats` / `--fallbacks` for JIT numbers.
+
+Rust 1.97 or newer is needed (Cranelift, behind the default `native-jit` feature).
+
+### Browser
+
+Build `armless.wasm` (see [Building](#building)) or take the files from a
+[release](#releases), then:
 
 ```html
 <script src="armless.js"></script>
 <script>
   const vm = new Armless({
-    wasm: "armless.wasm",            // armless-smp.wasm next to it for cpus > 1
+    wasm: "armless.wasm",            // armless-smp.wasm next to it is used for cpus > 1
     memory_mb: 512,
     cpus: 1,
     filesystem: { json: "filesystem.json", baseurl: "filesystem/" },
     initial_state: "state.bin.zst",  // or boot: { kernel, initrd, cmdline }
-    network: { tls: "tls.json" },    // the guest's HTTP(S) and WebSockets go out with
-  });                                //   fetch() and WebSocket
+    network: { tls: "tls.json" },    // the guest's HTTP(S) and WebSockets go out via fetch()
+  });
   vm.on("console", (bytes) => term.write(bytes));
   term.onData((text) => vm.console_input(text));
   vm.on("ready", () => vm.console_resize(term.cols, term.rows));
 </script>
 ```
 
-Several CPUs need `SharedArrayBuffer`, so the page must be cross-origin isolated
-(COOP `same-origin` + COEP `require-corp` or `credentialless`).
+More than one CPU needs `SharedArrayBuffer`, so the page must be cross-origin isolated
+(COOP `same-origin` with COEP `require-corp` or `credentialless`).
 
-Events and calls:
+## Browser API
 
-- **Events:** `console` and `serial` (bytes), `progress` (`{file, loaded, total}`),
-  `blob` (a file being fetched), `tcp-connection` (a `Connection`), `stop`
-  (`{reason}`) and `error`.
-- **Memory:** `memory_mb` is the guest's RAM; a restored snapshot only commits the pages it
-  holds. `fs_cache_mb` caps the decompressed file contents kept on the host (256 by default;
-  the guest's page cache keeps what it uses often), `Board::set_fs_cache` natively.
-- **Calls:** `console_input`, `console_resize`, `serial_input`, `provide_blob`
-  (preload), `connect(port)` (a connection into the guest), `save_state()`,
-  `save_state_pieces()` (the same snapshot in pieces of about 1 MiB, to write or compress as
-  they come), `restore_state()`, `stop()`, `run()` and `destroy()`. A save never grows the
-  machine's memory by the snapshot's size: it is handed out a piece at a time.
+### Options
+
+| option | meaning |
+|---|---|
+| `wasm`, `wasm_smp` | the wasm to load (a URL, bytes or a `WebAssembly.Module`). With `cpus > 1`, `wasm_smp`, or else `wasm` with `armless.wasm` replaced by `armless-smp.wasm` |
+| `memory_mb` | the guest's RAM (default 512). A restored snapshot only commits the pages it holds |
+| `cpus` | number of CPUs (default 1) |
+| `filesystem` | `{ json, baseurl }`: the 9p root's tree and where its blobs are fetched from |
+| `fs_cache_mb` | cap on decompressed file contents kept in the page (256 by default); the guest's page cache keeps what it uses often |
+| `initial_state` | a snapshot to restore (URL or bytes, zstd or not) |
+| `boot` | for a cold boot: `{ kernel, initrd, cmdline }` (`cmdline` defaults to `console=ttyS0`), or `{ raw, addr }` for a bare-metal binary; without `kernel`, the kernel and initrd under `/boot` in the filesystem |
+| `network` | turns on virtio-net; see below |
+| `console` | virtio-console on or off (default on) |
+| `mac` | the NIC's MAC address, `"aa:bb:cc:dd:ee:ff"` |
+| `jit`, `jit_threshold` | the wasm JIT on or off (default on) and how often a block runs before it is compiled |
+| `autostart` | run as soon as it is set up (default true); otherwise call `run()` |
 
 `network` options:
-- `tls`: the CA as `tls.json` (`caSubject`, `caKeyId`, `leafSpki`, `caKey` and
-  `leafKey`, base64 DER). Without it, port 443 is plain TCP.
+
+- `tls`: the CA as `tls.json` (`caSubject`, `caKeyId`, `leafSpki`, `caKey` and `leafKey`,
+  base64 DER), as an object or a URL. Without it, port 443 is plain TCP.
 - `fetch` and `WebSocket`: replace the page's own.
-- `upgrade_https`: ask for https:// and wss:// when the guest uses http:// and ws://.
-  This is the default on https pages.
-- `tunnels`: `[{ host, port, url }]`, guest TCP destinations carried over a WebSocket
-  to `url` as binary messages (websockify, websocat, Neon's wsproxy). Leave out `host`
-  to match any name on that port. `url` can be a function of `{ host, port }`, returning a
-  URL or a promise of one, called for each connection (to add a fresh access token, say);
-  if it throws or rejects, the guest's connection is refused.
+- `upgrade_https`: ask for `https://` and `wss://` when the guest uses `http://` and
+  `ws://`. This is the default on https pages.
+- `tunnels`: `[{ host, port, url }]`, guest TCP destinations carried over a WebSocket to
+  `url` as binary messages (websockify, websocat, Neon's wsproxy). Leave out `host` to match
+  any name on that port. `url` can be a function of `{ host, port }` returning a URL or a
+  promise of one, called for each connection (to add a fresh access token, say); if it
+  throws or rejects, the guest's connection is refused.
 
-TCP connections to other ports are `tcp-connection` events with a `Connection`. It
-has `host` (the name the guest resolved) and `port`, and supports `accept()`,
-`refuse()`, `hold()` (decide later), `write()`, `close()` and `drain()`, plus the
-`data`, `end`, `connect` and `close` events. A page can't make raw TCP connections,
-so connections nobody accepts (and no tunnel takes) are refused.
+### Events
 
-## Natively
+Subscribe with `vm.on(name, fn)` (`off` removes).
+
+- `console` and `serial`: output bytes.
+- `ready`: set up. `progress` (`{ file, loaded, total }`): a snapshot or file loading.
+- `blob`: a file being fetched. `stop` (`{ reason }`) and `error`.
+- `tcp-connection`: a `Connection` from the guest to a port nothing else handles.
+
+A `Connection` has `host` (the name the guest resolved) and `port`, and supports
+`accept()`, `refuse()`, `hold()` (decide later), `write()`, `close()` and `drain()`, plus
+the `data`, `end`, `connect` and `close` events. A page can't make raw TCP connections, so
+connections nobody accepts, and no tunnel takes, are refused.
+
+### Calls
+
+- Input: `console_input(data)`, `console_resize(cols, rows)`, `serial_input(data)`.
+- Files: `provide_blob(name, data)` to preload a blob, `has_blob(name)`.
+- `connect(port)`: a connection into a server in the guest.
+- Snapshots: `save_state()` returns the snapshot as one buffer; `save_state_pieces()`
+  returns it in pieces of about 1 MiB, to write or compress as they come;
+  `restore_state(src)` replaces the machine's state.
+- Lifecycle: `run()`, `stop()` and `destroy()`; `vm.ready` is a promise for the setup.
+
+## Native API
 
 ```rust
 use armless::{native::{Egress, HostOptions, NativeHost}, runner::{self, Runner}, vm::Config};
@@ -96,75 +147,118 @@ runner.load_state(&std::fs::read("state.bin.zst")?)?;
 runner.start();
 ```
 
-`Egress::from_env()` goes out through the proxy the environment names
-(`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`), with TLS checked against the
-system's roots (`SSL_CERT_FILE` included). That covers sandboxes whose only way out is
-a TLS-intercepting proxy. Private and loopback addresses are off limits unless
-`allow_private` is set.
-
-`runner::new_vm` and every `Runner` restore seed the machine from the host
-(`Board::seed`): a restored guest gets a new VM generation id, so Linux reseeds its
-random generator at once instead of replaying the saved machine's.
-
-The native JIT compiles hot guest code to host code with Cranelift, on a compiler
-thread per CPU; `Cpu::enable_native_jit` turns it on, and `ARMLESS_JIT=native` does
-for `runner::new_vm`. It needs no hypervisor, so it runs in sandboxes too. Each CPU
-keeps up to `ARMLESS_JIT_CODE_MB` (default 16) MB of compiled code, stale code of
-replaced pages included, and starts over when that is full; its compiler gives back
-its working memory whenever it has nothing queued.
-
-Compiled code covers the integer instructions, the SIMD&FP loads and stores, the common
-integer NEON operations (bitwise, add/sub, compares with zero, max/min, multiply-long, pairwise
-add, widening shifts, permutes, EXT, lane moves, immediates), PC-relative loads, DC ZVA, and
-scalar floating point: single-precision arithmetic, fused multiply-add,
-double-precision addition and subtraction, compares, selects, moves and conversions, inline
-whenever FPCR is as Linux runs it and the numbers are ordinary, with the architecture's results
-and FPSR flags (NaNs, infinities, subnormals and underflow go to the interpreter). Vector floating
-point (FMLA, FMUL, FADD, FDIV, ...) runs lane by lane through the interpreter's own arithmetic,
-without decoding the instruction each time. Indirect branches within a page stay in compiled
-code. What it can't translate it hands to the interpreter one instruction at a time.
-`ARMLESS_JIT_HELPER_STATS=1` (or `armless-run --fallbacks`) counts those by opcode
-(`Jit::helper_hist`), and
-`ARMLESS_JIT_THRESHOLD` sets how often an entry runs before it is compiled (1024).
-
-A restore starts with no compiled code. `Runner::jit_profile` lists the pages a machine
-compiled and ran (each with a hash of its contents), `jit::profile::merge` combines the
-profiles of many runs, ordered by how many used each page, and `Runner::jit_prewarm`
-compiles a profile's pages as soon as a machine restored from the same snapshot starts,
-behind whatever code it needs right away. A page that holds other code than when it was
-profiled is skipped. `HostOptions::blob_source` serves blobs from anywhere (an archive in
-memory, say) instead of a directory.
-
-`armless-run` is a command-line runner for kernels and bare-metal binaries
-(`cargo run --release --bin armless-run -- --help`).
+- `Egress::from_env()` goes out through the proxy the environment names (`HTTPS_PROXY`,
+  `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`), with TLS checked against the system's roots
+  (`SSL_CERT_FILE` included). That covers sandboxes whose only way out is a
+  TLS-intercepting proxy. Private and loopback addresses are off limits unless
+  `allow_private` is set. [`examples/fetch.rs`](examples/fetch.rs) makes a request this way.
+- `Board::set_fs_cache` is the native counterpart of `fs_cache_mb`.
+- `runner::new_vm` and every `Runner` restore seed the machine from the host
+  (`Board::seed`), so a restored guest gets a new VM generation id and Linux reseeds its
+  random generator at once.
+- `HostOptions::blob_source` serves blobs from anywhere (an archive in memory, say)
+  instead of a directory.
 
 ## Building
 
 ```sh
-cargo test --release            # unit tests, the bare-metal CPU suite
+cargo build --release           # the crate and armless-run
 sh build-wasm.sh                # build/armless.wasm
-SMP=1 sh build-wasm.sh          # build/armless-smp.wasm (needs the rust-src component)
+SMP=1 sh build-wasm.sh          # build/armless-smp.wasm
 ```
 
-The wasm builds need clang and lld (for the C zstd decoder in `lib/zstd`).
+The wasm builds need the `wasm32-unknown-unknown` target, plus clang and lld for the C zstd
+decoder in [`lib/zstd`](lib/zstd). `SMP=1` builds std from source with atomics, so it also
+needs the `rust-src` component (`rustup component add rust-src`). `js/armless.js` is used
+as it is.
+
+Cargo features: `native-jit` (default; Cranelift), `hypervisor` (see
+[docs/hypervisor.md](docs/hypervisor.md)) and `wasm-api` (compiles the wasm export layer
+natively, to type-check it).
+
+## How it works
+
+[docs/armless.md](docs/armless.md) has the design in full; the main points:
+
+- **Interpreter and JIT.** The interpreter decodes and runs instructions. Hot entries (1024
+  runs by default, `ARMLESS_JIT_THRESHOLD`) are compiled a page at a time: to WebAssembly
+  in the browser, to host code with Cranelift natively, on a compiler thread per CPU.
+  Compiled code covers the integer instructions, SIMD&FP loads and stores, the common
+  integer NEON operations, scalar floating point (inline when FPCR is as Linux runs it and
+  the numbers are ordinary), and in-page indirect branches. Vector floating point runs lane
+  by lane through the interpreter's arithmetic; atomics and crypto instructions go to the
+  interpreter. Anything else is handed to the interpreter one instruction at a time.
+- **Native JIT.** `ARMLESS_JIT=native` turns it on for `runner::new_vm` (or call
+  `Cpu::enable_native_jit`). It needs no hypervisor, so it works in sandboxes. Each CPU keeps
+  up to `ARMLESS_JIT_CODE_MB` (default 16) MB of compiled code and starts over when full.
+  `armless-run --fallbacks` or `ARMLESS_JIT_HELPER_STATS=1` counts what falls back to the
+  interpreter, by opcode.
+- **Warm JIT.** A restore starts with no compiled code. `Runner::jit_profile` lists the pages
+  a machine compiled and ran, `jit::profile::merge` combines the profiles of many runs, and
+  `Runner::jit_prewarm` compiles a profile's pages as soon as a machine restored from the
+  same snapshot starts. A page that holds other code than when it was profiled is skipped.
+- **Hardware backends.** `ARMLESS_HV=1` with the `hypervisor` feature runs the CPUs on the
+  host's own cores where Hypervisor.framework (Apple silicon) or `/dev/kvm` (Linux arm64) is
+  available, and falls back to the interpreter and JIT otherwise. See
+  [docs/hypervisor.md](docs/hypervisor.md), including the macOS entitlement.
+- **MMU.** A software page-table walker with a direct-mapped TLB, ASID-aware; TLBI by VA
+  invalidates what it names and other invalidations flush everything. With several CPUs,
+  TLB shootdowns are delivered between them. Code pages written by the guest or by DMA are
+  invalidated on every CPU.
+- **SMP.** One host thread or Web Worker per CPU. Devices run on whichever thread touches
+  them, under one lock. Atomics are host compare-and-swap on guest RAM. In the browser,
+  `armless-smp.wasm` imports a shared memory that every worker instantiates on.
+- **Devices.** UART, GIC and RTC are memory-mapped; the virtio devices sit on a PCI bus in
+  fixed slots (1 console, 2 9p with tag `host9p`, 3 network). The machine never calls the
+  host synchronously: what the host must do is queued as events and answered through
+  `Board`.
+- **Snapshots.** CPUs, GIC, timers, device state and the filesystem tree (with the files the
+  guest wrote), plus every non-zero RAM page, in a streamable format. Blobs are not saved;
+  the guest's unmodified files are fetched again after a restore. A machine can be saved as
+  one of its first n CPUs once the guest has taken the others offline.
+- **Browser memory model.** WebAssembly memory never shrinks, so every peak stays committed
+  until the page goes. The decompressed file cache is capped (`fs_cache_mb`), files the guest
+  writes grow a chunk at a time, a restore only commits the pages the snapshot holds, and a
+  save is produced a piece at a time rather than as one buffer the size of the snapshot.
+  With a large guest, write or compress the pieces as they arrive instead of calling
+  `save_state()`, which joins them into one buffer.
+
+## Filesystem images
+
+Test and example filesystems are built with scripts under [`tests/fs`](tests/fs):
+`make-9pfs.sh` builds a test image, `alpine/` a real Alpine, and `fs2json.py` with
+`copy-to-sha256.py` turn a directory into the tree and its content-addressed blobs. Files
+of 2 MiB and more are split into chunks (`--chunk-threshold`); `--no-chunks` makes images
+for armless 0.2.10 and older.
 
 ## Testing
 
 | | |
 |---|---|
-| `cargo test --release` | unit tests; bare-metal CPU suite (`guest/`); four CPUs racing on shared counters with LSE atomics and exclusives; TLS and HTTP of the web relay against rustls |
-| `tests/difftest/run.sh CLASS N SEED` | random instructions vs qemu-aarch64; CLASS is `int`, `fp`, `simd`, `simds`, `ldst`, `crypto` or `lse` (`DUT=jit`: the wasm JIT) |
-| `tests/linux/{boot,userspace,smp}.sh` | Linux on `armless-run`; userspace and SMP stress output vs qemu-aarch64 |
+| `cargo test --release` | unit tests; the bare-metal CPU suite (`guest/`); four CPUs racing on shared counters with LSE atomics and exclusives; TLS and HTTP of the web relay against rustls |
+| `tests/difftest/run.sh CLASS N SEED` | random instructions against qemu-aarch64; CLASS is `int`, `fp`, `simd`, `simds`, `ldst`, `crypto` or `lse` (`DUT=jit`: the wasm JIT) |
+| `tests/linux/{boot,userspace,smp}.sh` | Linux on `armless-run`; userspace and SMP stress output against qemu-aarch64 |
 | `ARMLESS_9PFS=DIR cargo test --release --test vm` | the snowglobe flow natively: 9p root, console, snapshot, restore |
 | `node tests/js/flow.mjs DIR [CPUS]` | the same through `armless.js`, plus HTTP over fetch and port forwarding |
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
-| `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node): phase times, what the JIT did, comparisons and profiles (`docs/profiling.md`) |
-| `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands, natively, per site and compared with a saved run |
+| `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node) |
+| `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands |
 | `cargo bench --bench machine` | host-side costs with criterion: an instruction interpreted and compiled, a page's compile, a snapshot |
 
-`tests/fs/make-9pfs.sh` builds the test filesystem, and `tests/fs/alpine/` builds
-a real Alpine image. `tests/fs/fs2json.py` and `copy-to-sha256.py` split files of 2 MiB
-and more into chunks (`--chunk-threshold`); `--no-chunks` makes images for armless 0.2.10
-and older. See `docs/armless.md` for the design.
+[docs/profiling.md](docs/profiling.md) explains the benchmarks and profiles. CI
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the unit tests (with and
+without overflow checks), clippy natively and for wasm32, the KVM backend's lints, the wasm
+builds, and a Linux job that boots a kernel and compares userspace and SMP output with
+qemu-aarch64, natively, with the native JIT and through `armless.js`.
 
-armless started as a fork of [v86](https://github.com/copy/v86).
+## Releases
+
+A push to `main` that changes the version in `Cargo.toml` publishes a GitHub release
+`armless-v<version>` (once per version). It carries `armless.js`, `armless.wasm`,
+`armless-smp.wasm`, and `armless-web.tar.gz` with those three, the license and
+`docs/armless.md`. Native programs use the crate itself, as a git dependency on the tag
+(`publish = false`: it is not on crates.io).
+
+## License
+
+BSD 2-Clause, see [LICENSE](LICENSE).
