@@ -584,6 +584,16 @@ impl Process {
         self.threads.iter().filter(|t| !t.exited).count()
     }
 
+    /// Whether a thread waits on contents of the filesystem the host hasn't given yet (blobs).
+    /// When every thread waits (`Status::Idle`), this tells a program that is busy reading files
+    /// from one that waits for input: a host that answers when the program is done (a REPL's
+    /// answer, up to its next prompt) must not take the first for the second.
+    pub fn waiting_on_blobs(&self) -> bool {
+        self.threads
+            .iter()
+            .any(|t| !t.exited && matches!(t.wait, Some((Wait::Blobs(_), _))))
+    }
+
     /// Guest pages that hold anything: what of RAM a snapshot carries. (Reads all of RAM.)
     pub fn guest_pages(&self) -> u64 {
         (0..self.ram_size / PAGE)

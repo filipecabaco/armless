@@ -148,6 +148,7 @@ fn a_program_waits_for_input_and_answers_it() {
         matches!(status, Status::Idle(None)),
         "waits on stdin, with no deadline: {status:?}"
     );
+    assert!(!p.waiting_on_blobs(), "waiting for input, not for a file");
     p.input(b"one\n");
     assert_eq!(
         run(&mut p, &mut vm.cpus[0]).0,
@@ -257,6 +258,10 @@ fn a_file_whose_contents_havent_arrived_waits_for_them() {
     assert!(
         matches!(status, Status::Idle(None)),
         "the read waits for its blob: {status:?}"
+    );
+    assert!(
+        p.waiting_on_blobs(),
+        "busy reading a file, not waiting for input"
     );
     assert!(
         board
