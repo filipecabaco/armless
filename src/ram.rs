@@ -213,6 +213,56 @@ impl Ram {
         true
     }
 
+    /// Zero `n` bytes at `at` and give the host back the memory under them where it can. False,
+    /// and nothing done, if that is not all RAM.
+    ///
+    /// `zero` writes zeros, which keeps (or, for a page never touched, commits) the host's page.
+    /// Here the whole host pages in the range are replaced with fresh anonymous ones instead,
+    /// which read as zero and hold no memory until written; the guest pages at its edges, inside
+    /// a host page that is bigger than the guest's (16 KiB on Apple silicon), are written with
+    /// zeros. Where the host won't map over RAM (an allocation of its allocator's, on macOS)
+    /// it is all written with zeros, as `zero` does.
+    ///
+    /// Nothing here drops what a CPU decoded or compiled from the range: discard data, not code
+    /// a CPU may still run.
+    pub fn discard(&self, at: usize, n: usize) -> bool {
+        if !self.holds(at, n) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: sysconf has no preconditions.
+            let host =
+                unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(PAGE as libc::c_long) as usize;
+            let (start, end) = (self.ptr as usize + at, self.ptr as usize + at + n);
+            let (hs, he) = (start.next_multiple_of(host), end / host * host);
+            if hs < he {
+                // SAFETY: [hs, he) is whole host pages inside RAM (`holds`, above). MAP_FIXED
+                // replaces just those pages with a private anonymous mapping, readable and
+                // writable as RAM is, so the range stays mapped, now zero; what was there (part
+                // of the allocation or the mapping RAM came from) is still freed or unmapped as
+                // a whole when RAM is dropped.
+                let r = unsafe {
+                    libc::mmap(
+                        hs as *mut libc::c_void,
+                        he - hs,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    )
+                };
+                if r as usize == hs {
+                    self.zero(at, hs - start);
+                    self.zero(he - self.ptr as usize, end - he);
+                    self.mark_written();
+                    return true;
+                }
+            }
+        }
+        self.zero(at, n)
+    }
+
     /// Whether the `n` bytes at `at` are all zero (and RAM). Reading a page the guest never
     /// touched does not commit it (the host maps its zero page).
     pub fn is_zero(&self, at: usize, n: usize) -> bool {
@@ -478,5 +528,40 @@ mod tests {
         assert!(Ram::from_image(&f, 8 * PAGE).is_err());
         assert!(Ram::from_image(&f, 2 * PAGE).is_err());
         assert!(Ram::from_image(&f, 4 * PAGE).is_ok());
+    }
+
+    #[test]
+    fn discard_zeroes_exactly_its_range() {
+        // A range that starts and ends inside host pages (16 KiB on Apple silicon), on both
+        // kinds of RAM: the allocator's, and a mapping
+        let check = |ram: Ram| {
+            for i in 0..64 {
+                ram.store(i * PAGE, 8, 0x1111 + i as u64);
+                ram.store(i * PAGE + PAGE - 8, 8, 0x2222 + i as u64);
+            }
+            assert!(ram.discard(3 * PAGE, 40 * PAGE));
+            for i in 0..64 {
+                let kept = !(3..43).contains(&i);
+                let (head, tail) = (ram.load(i * PAGE, 8), ram.load(i * PAGE + PAGE - 8, 8));
+                assert_eq!((head, tail) != (0, 0), kept, "page {i}");
+                if kept {
+                    assert_eq!(
+                        (head, tail),
+                        (0x1111 + i as u64, 0x2222 + i as u64),
+                        "page {i}"
+                    );
+                }
+            }
+            // Still RAM: written again, read back
+            ram.store(20 * PAGE, 8, 7);
+            assert_eq!(ram.load(20 * PAGE, 8), 7);
+            assert!(!ram.discard(60 * PAGE, 8 * PAGE));
+        };
+        check(Ram::zeroed(64 * PAGE));
+        #[cfg(unix)]
+        {
+            let f = image(64 * PAGE, &[]);
+            check(Ram::from_image(&f, 64 * PAGE).unwrap());
+        }
     }
 }
