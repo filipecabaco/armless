@@ -31,11 +31,11 @@ armless started as a fork of [v86](https://github.com/copy/v86).
   WebSocket tunnel.
 - **Snapshots:** the whole machine can be saved and restored. A restore streams straight
   into guest memory, zstd-compressed or not, and a save is handed out in pieces.
-- **User mode (experimental):** a static aarch64 Linux executable runs with no guest kernel at
-  all ([`user/`](user)): the CPU runs it at EL0 and its system calls are answered by the
-  host. Threads, futexes, epoll and eventfd, stdin and stdout, and snapshots of the running
-  process work; files, sockets, signals and `fork` do not yet. A Go program with goroutines
-  runs this way; its snapshot is 2.5 MB, against 22 MB under a minimal Linux.
+- **User mode (experimental):** a Linux program runs with no guest kernel at all
+  ([`user/`](user)): the CPU runs it at EL0 and its system calls are answered by the host.
+  Static and dynamically linked programs, the machine's filesystem, a terminal, threads, pipes,
+  epoll, poll and select, and snapshots of the running process work; processes, sockets and
+  signal delivery do not yet. Go, Python 3.14 and DuckDB run this way from their own images.
 
 ## Quick start
 
@@ -55,12 +55,14 @@ scripted runs, and `--stats` / `--fallbacks` for JIT numbers.
 
 Rust 1.97 or newer is needed (Cranelift, behind the default `native-jit` feature).
 
-`armless-exec` runs a static aarch64 Linux executable in user mode, with no kernel:
+`armless-exec` runs a Linux program in user mode, with no kernel: a static executable of this
+host's, or (`--fs DIR`, a snowglobe site's `system/` say) one found in a machine's filesystem:
 
 ```sh
 cargo run --release --bin armless-exec -- ./my-static-binary arg1 arg2
+cargo run --release --bin armless-exec -- --fs site/system --keys 'print(6*7)\n' python3
 cargo run --release --bin armless-exec -- --stop-after "ready" --save snap ./server
-cargo run --release --bin armless-exec -- --restore snap --input "a line for its stdin"
+cargo run --release --bin armless-exec -- --restore snap --input "a line for its terminal"
 ```
 
 ### Browser
