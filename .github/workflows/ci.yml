@@ -18,10 +18,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # Ubuntu packages: from GitHub's cache once this runner image has had them (.github/actions/apt)
+      - uses: ./.github/actions/apt
+        with:
+          packages: clang lld llvm
       - name: Toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld llvm
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
       # The dependencies, compiled: restored everywhere, saved by main only (build/ is the target dir)
@@ -68,10 +70,12 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
+      # Ubuntu packages: from GitHub's cache once this runner image has had them (.github/actions/apt)
+      - uses: ./.github/actions/apt
+        with:
+          packages: clang lld llvm
       - name: Toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld llvm
           if ! command -v rustup >/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -96,10 +100,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # Ubuntu packages: from GitHub's cache once this runner image has had them (.github/actions/apt)
+      - uses: ./.github/actions/apt
+        with:
+          packages: gcc-aarch64-linux-gnu flex bison bc linux-source-6.8.0 qemu-user clang lld
       - name: Toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu flex bison bc linux-source-6.8.0 qemu-user clang lld
           sudo pip install --break-system-packages zstandard
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
@@ -200,10 +206,12 @@ jobs:
         classes: [int, fp, simd, simds, ldst, crypto, lse]
     steps:
       - uses: actions/checkout@v7
+      # Ubuntu packages: from GitHub's cache once this runner image has had them (.github/actions/apt)
+      - uses: ./.github/actions/apt
+        with:
+          packages: clang lld llvm gcc-aarch64-linux-gnu qemu-user
       - name: Toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu qemu-user
           rustup target add wasm32-unknown-unknown
       # The classes build the same thing: one of them saves the cache they all restore
       - uses: Swatinem/rust-cache@v2
@@ -242,10 +250,12 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      # Ubuntu packages: from GitHub's cache once this runner image has had them (.github/actions/apt)
+      - uses: ./.github/actions/apt
+        with:
+          packages: clang lld
       - name: Toolchain
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y clang lld
           sudo pip install --break-system-packages zstandard
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
