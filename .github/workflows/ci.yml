@@ -63,12 +63,15 @@ jobs:
       - name: Unit tests with overflow checks
         run: cargo test --workspace
       - name: Type-check the wasm layer natively
-        run: cargo check --features wasm-api
+        run: |
+          cargo check --features wasm-api
+          cargo check -p armless-user --features wasm-api
       - name: Lints (unsafe only where allowed, and documented), natively and for wasm32
         run: |
           rustup component add clippy
           cargo clippy --release --all-targets --features wasm-api --workspace
           cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wasm-api
+          cargo clippy -p armless-user --lib --target wasm32-unknown-unknown --features wasm-api
       - name: Build armless.wasm and armless-smp.wasm
         run: |
           sh build-wasm.sh

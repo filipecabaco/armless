@@ -1,6 +1,11 @@
 #!/bin/sh
 # Build armless.wasm: the machine plus the C zstd decoder (for .zst
-# snapshots and 9p blobs). Output: build/armless.wasm
+# snapshots and 9p blobs), and user mode (programs with no guest kernel).
+# Output: build/armless.wasm
+#
+# The module is the cdylib of the armless-user crate (user/), which depends on
+# armless: armless's exports (armless_*) come with it, next to user mode's
+# (armless_user_*).
 #
 # Uses the wasm32-unknown-unknown std from rustup if installed; otherwise set
 # BUILD_STD=1 to build std from source (needs the rust-src component).
@@ -8,6 +13,7 @@
 # SMP=1 builds the threaded variant instead, ../build/armless-smp.wasm: shared
 # imported memory and atomics, for several vCPUs in Web Workers. That always
 # builds std from source (with atomics), so it needs the rust-src component.
+# It is built from armless alone: user mode runs on one CPU.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root="$here"
@@ -42,10 +48,10 @@ else
         export RUSTC_BOOTSTRAP=1
         extra="-Z build-std=std,panic_abort"
     fi
-    cargo rustc --release --lib --crate-type cdylib --target wasm32-unknown-unknown $extra -- \
+    cargo rustc --release -p armless-user --lib --crate-type cdylib --target wasm32-unknown-unknown $extra -- \
         -C target-feature=+bulk-memory \
         -C link-args="--import-table" \
         -C link-args="$root/build/$name-zstd.o"
-    cp "$root/build/wasm32-unknown-unknown/release/armless.wasm" "$root/build/$name.wasm"
+    cp "$root/build/wasm32-unknown-unknown/release/armless_user.wasm" "$root/build/$name.wasm"
 fi
 ls -l "$root/build/$name.wasm"
