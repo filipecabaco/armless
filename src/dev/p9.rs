@@ -197,6 +197,16 @@ impl P9 {
         }
     }
 
+    /// Ask the host for blobs that something other than a 9p request waits on (a host serving the
+    /// filesystem itself, `Board::want_blobs`): each once until it arrives, as for a request.
+    pub fn request(&mut self, io: &Io, names: &[String]) {
+        for name in names {
+            if self.requested.insert(name.clone()) {
+                io.out.push(Event::Blob(name.clone()));
+            }
+        }
+    }
+
     /// Blobs that parked requests wait for (to ask again after a restore).
     pub fn wanted_blobs(&mut self) -> Vec<String> {
         let mut v: Vec<String> = self.parked.iter().flat_map(|p| p.blobs.clone()).collect();

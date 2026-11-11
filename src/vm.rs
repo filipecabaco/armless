@@ -137,6 +137,24 @@ impl Board {
         Ok(())
     }
 
+    /// The machine's filesystem, for a host that serves a program's file calls itself rather than
+    /// through the 9p device (user mode: armless-user). None when the machine has no filesystem. A
+    /// read of contents that haven't arrived fails with `Fail::Need`: ask for them with `want_blobs`,
+    /// and `provide_blob` delivers them as for the 9p device.
+    pub fn with_fs<T>(&self, f: impl FnOnce(&mut crate::dev::fs::Fs) -> T) -> Option<T> {
+        let mut d = self.devices.lock();
+        let (_, p) = d.p9()?;
+        Some(f(&mut p.fs))
+    }
+
+    /// Ask the host for blobs a `with_fs` read waits on (`Event::Blob`), each once until it arrives.
+    pub fn want_blobs(&self, names: &[String]) {
+        let mut d = self.devices.lock();
+        if let Some((_, p)) = d.p9() {
+            p.request(&self.io, names);
+        }
+    }
+
     /// Contents for a blob that the host has already decompressed (`provide_blob` without the zstd check).
     pub fn provide_raw_blob(&self, name: &str, data: Vec<u8>) -> Result<(), String> {
         let mut d = self.devices.lock();

@@ -14,14 +14,41 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Every job's Ubuntu packages (the sets of .github/actions/apt/packages.txt), fetched once per
+  # runner image into GitHub's cache, before the jobs that install them from there with no mirror:
+  # when Ubuntu's mirrors fail, only this job does, and it is the one to run again
+  packages:
+    name: packages (${{ matrix.set }}, ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, set: wasm }
+          - { runner: ubuntu-24.04, set: linux }
+          - { runner: ubuntu-24.04, set: difftest }
+          - { runner: ubuntu-24.04-arm, set: wasm }
+          - { runner: ubuntu-24.04-arm, set: alpine }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/actions
+      - uses: ./.github/actions/apt
+        with:
+          set: ${{ matrix.set }}
+          fetch-only: "true"
+
   core:
+    needs: packages
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # Ubuntu packages, from GitHub's cache (the packages job fetched them there)
+      - uses: ./.github/actions/apt
+        with:
+          set: wasm
       - name: Toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld llvm
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
       # The dependencies, compiled: restored everywhere, saved by main only (build/ is the target dir)
@@ -65,13 +92,16 @@ jobs:
   # An aarch64 host: the interpreter's floating point checked against the host FPU (src/fp.rs),
   # and the native JIT through Cranelift's arm64 backend
   arm64:
+    needs: packages
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
+      # Ubuntu packages, from GitHub's cache (the packages job fetched them there)
+      - uses: ./.github/actions/apt
+        with:
+          set: wasm
       - name: Toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld llvm
           if ! command -v rustup >/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -93,13 +123,16 @@ jobs:
           cargo clippy --release --all-targets --features hypervisor --workspace
 
   linux:
+    needs: packages
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # Ubuntu packages, from GitHub's cache (the packages job fetched them there)
+      - uses: ./.github/actions/apt
+        with:
+          set: linux
       - name: Toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu flex bison bc linux-source-6.8.0 qemu-user clang lld
           sudo pip install --break-system-packages zstandard
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src
@@ -194,16 +227,19 @@ jobs:
           done
 
   difftest:
+    needs: packages
     runs-on: ubuntu-24.04
     strategy:
       matrix:
         classes: [int, fp, simd, simds, ldst, crypto, lse]
     steps:
       - uses: actions/checkout@v7
+      # Ubuntu packages, from GitHub's cache (the packages job fetched them there)
+      - uses: ./.github/actions/apt
+        with:
+          set: difftest
       - name: Toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu qemu-user
           rustup target add wasm32-unknown-unknown
       # The classes build the same thing: one of them saves the cache they all restore
       - uses: Swatinem/rust-cache@v2
@@ -232,6 +268,7 @@ jobs:
           done
 
   alpine:
+    needs: packages
     # A real arm64 Alpine (linux-virt + OpenRC), prepared and booted the way
     # snowglobe does it, through armless.js. On an arm64 runner, so the image builds natively
     # instead of under QEMU's binfmt emulation.
@@ -242,10 +279,12 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      # Ubuntu packages, from GitHub's cache (the packages job fetched them there)
+      - uses: ./.github/actions/apt
+        with:
+          set: alpine
       - name: Toolchain
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y clang lld
           sudo pip install --break-system-packages zstandard
           rustup target add wasm32-unknown-unknown
           rustup component add rust-src

@@ -1,0 +1,7 @@
+# The Ubuntu packages CI's jobs install, by set: a job names its set (.github/actions/apt, `set`),
+# and ci.yml's packages job fetches every set, on each runner it is used on, into GitHub's cache
+# first. `name: packages`, separated by spaces.
+wasm: clang lld llvm
+linux: gcc-aarch64-linux-gnu flex bison bc linux-source-6.8.0 qemu-user clang lld
+difftest: clang lld llvm gcc-aarch64-linux-gnu qemu-user
+alpine: clang lld

@@ -1,0 +1,101 @@
+# A job's Ubuntu packages (a set of packages.txt), from GitHub's cache: no Ubuntu mirror needed.
+#
+# ci.yml's packages job runs this with fetch-only for every set, on each runner it is used on,
+# before every other job: it fetches the set's .deb files once per runner image (from the runner's
+# mirrors, else from another mirror of Ubuntu's archive) and saves them under a key of the image's
+# version, its architecture and the set. The jobs then install them from the cache. A mirror that
+# fails can only fail the packages job, which is the one to run again; a job that still finds no
+# cache (a runner image rolled out since) fetches its set itself, the same way.
+name: apt
+description: Install a set of Ubuntu packages (packages.txt) from GitHub's cache, or fetch them into it
+inputs:
+  set:
+    description: The set's name in packages.txt
+    required: true
+  fetch-only:
+    description: "true: fetch the set into the cache (when it isn't there yet), and install nothing"
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      env:
+        SET: ${{ inputs.set }}
+        LIST: ${{ github.action_path }}/packages.txt
+      run: |
+        packages=$(sed -n "s/^$SET: *//p" "$LIST")
+        if [ -z "$packages" ]; then
+          echo "::error::no set $SET in packages.txt"
+          exit 1
+        fi
+        sum=$(printf '%s\n' $packages | sort | sha256sum | cut -c1-16)
+        echo "packages=$packages" >> "$GITHUB_OUTPUT"
+        echo "key=apt-${ImageOS:-ubuntu}-${ImageVersion:-unknown}-${RUNNER_ARCH}-$SET-$sum" >> "$GITHUB_OUTPUT"
+    - id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.apt-debs
+        key: ${{ steps.key.outputs.key }}
+    - id: install
+      shell: bash
+      env:
+        PACKAGES: ${{ steps.key.outputs.packages }}
+        HIT: ${{ steps.restore.outputs.cache-hit }}
+        FETCH_ONLY: ${{ inputs.fetch-only }}
+      run: |
+        set -euo pipefail
+        if [ "$HIT" = true ] && [ -f ~/.apt-debs/complete ]; then
+          if [ "$FETCH_ONLY" = true ]; then
+            echo "In the cache already: $PACKAGES"
+          # The cache's .deb files (none, when the image had every package already), installed by
+          # apt, which orders them by their dependencies, and with no download
+          elif ls ~/.apt-debs/*.deb >/dev/null 2>&1; then
+            sudo apt-get install -y --no-download -o Dir::Cache::Archives="$HOME/.apt-debs/" ~/.apt-debs/*.deb
+          fi
+          echo "fetched=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if [ "$FETCH_ONLY" != true ]; then
+          echo "::warning::$PACKAGES not in the cache for this runner image: fetching them here"
+        fi
+        # From the runner's mirrors, again a couple of times while they don't answer
+        fetch() {
+          for _ in 1 2; do
+            sudo apt-get -o Acquire::Retries=2 update &&
+              sudo apt-get -o Acquire::Retries=2 install -y --download-only $PACKAGES && return 0
+            sleep 15
+          done
+          return 1
+        }
+        # Else from a mirror of Ubuntu's archive that isn't Ubuntu's (*.ubuntu.com has failed to
+        # resolve on GitHub's runners for hours while the rest of the network worked): the same
+        # packages, still checked against Ubuntu's archive key (so plain http, as Ubuntu's own sources)
+        use_other_mirror() {
+          case "$(dpkg --print-architecture)" in
+            amd64) mirror=http://mirrors.edge.kernel.org/ubuntu ;;
+            *) mirror=http://mirrors.ocf.berkeley.edu/ubuntu-ports ;;
+          esac
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          echo "Ubuntu's mirrors didn't answer: from $mirror"
+          sudo mkdir -p /etc/apt/sources-runner
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+            [ -f "$f" ] && sudo mv "$f" /etc/apt/sources-runner/
+          done
+          printf 'Types: deb\nURIs: %s\nSuites: %s %s-updates %s-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+            "$mirror" "$codename" "$codename" "$codename" | sudo tee /etc/apt/sources.list.d/other-mirror.sources >/dev/null
+        }
+        fetch || { use_other_mirror && fetch; }
+        rm -rf ~/.apt-debs && mkdir -p ~/.apt-debs
+        cp /var/cache/apt/archives/*.deb ~/.apt-debs/ 2>/dev/null || true
+        touch ~/.apt-debs/complete
+        if [ "$FETCH_ONLY" != true ]; then
+          sudo apt-get install -y --no-download $PACKAGES
+        fi
+        echo "fetched=true" >> "$GITHUB_OUTPUT"
+    # Saved at once, not at the end of the job: a job whose tests fail still saves what it fetched
+    - if: steps.install.outputs.fetched == 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.apt-debs
+        key: ${{ steps.key.outputs.key }}

@@ -11,8 +11,15 @@ use armless_user::{Process, Status};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: armless-exec [options] ELF [ARGS...]
+        "usage: armless-exec [options] PROGRAM [ARGS...]
        armless-exec [options] --restore DIR
+  --fs DIR           the machine's filesystem: DIR/fs.json (or filesystem.json) and its blobs in
+                     DIR/blobs (or DIR/filesystem), a snowglobe site's system/ say. PROGRAM is then
+                     found in it, as execve finds it (PATH when it has no slash); without --fs it
+                     is a static executable of this host's files
+  --cwd DIR          the working directory in that filesystem (default /)
+  --env NAME=VALUE   an environment variable (repeatable; default PATH, HOME and TERM)
+  --keys TEXT        type TEXT into its terminal once it waits for input (\\n, \\r and \\x03 escapes)
   -m MB              RAM (default 1024; untouched RAM costs nothing)
   --stop-after TEXT  stop once the program printed TEXT
   --save DIR         when it stops, write the machine (machine.bin) and the process (process.bin)
@@ -37,6 +44,10 @@ fn main() {
     let mut restore: Option<PathBuf> = None;
     let mut input: Option<String> = None;
     let mut timeout = Duration::from_secs(60);
+    let mut fs_dir: Option<PathBuf> = None;
+    let mut cwd = "/".to_string();
+    let mut env: Vec<String> = Vec::new();
+    let mut keys: Option<String> = None;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.peek().cloned() {
         if !a.starts_with('-') {
@@ -51,6 +62,17 @@ fn main() {
             "--restore" => restore = Some(PathBuf::from(val())),
             "--input" => input = Some(val()),
             "--timeout" => timeout = Duration::from_secs(val().parse().unwrap_or_else(|_| usage())),
+            "--fs" => fs_dir = Some(PathBuf::from(val())),
+            "--cwd" => cwd = val(),
+            "--env" => env.push(val()),
+            "--keys" => {
+                keys = Some(
+                    val()
+                        .replace("\\n", "\n")
+                        .replace("\\r", "\r")
+                        .replace("\\x03", "\x03"),
+                )
+            },
             _ => usage(),
         }
     }
@@ -66,6 +88,7 @@ fn main() {
         cpus: 1,
         devices: armless::dev::DeviceConfig {
             console: false,
+            fs_tag: fs_dir.as_ref().map(|_| "host9p".to_string()),
             ..Default::default()
         },
     };
@@ -82,30 +105,80 @@ fn main() {
     let ram = Ram::from_image(&file, (mem_mb << 20) as usize).unwrap_or_else(|e| die(e));
     let (mut vm, _clock) = armless::runner::new_vm_on(config, Some(ram)).unwrap_or_else(|e| die(e));
 
+    // The filesystem, its blobs served from the directory by armless's native host
+    let mut _host = None;
+    if let Some(dir) = &fs_dir {
+        let json = ["fs.json", "filesystem.json"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| die("no fs.json or filesystem.json"));
+        vm.board
+            .load_filesystem(&std::fs::read(&json).unwrap_or_else(|e| die(e)))
+            .unwrap_or_else(|e| die(e));
+        let blobs = ["blobs", "filesystem"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.is_dir());
+        _host = Some(armless::native::NativeHost::spawn(
+            vm.board.clone(),
+            armless::native::HostOptions {
+                blobs,
+                ..Default::default()
+            },
+            Box::new(|_| {}),
+        ));
+    }
+    let board = fs_dir.as_ref().map(|_| vm.board.clone());
+    if env.is_empty() {
+        env = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+            "TERM=xterm-256color",
+            "LANG=C.UTF-8",
+        ]
+        .map(String::from)
+        .to_vec();
+    }
+
     let mut p = match &restore {
         Some(dir) => {
             let machine = std::fs::read(dir.join("machine.bin")).unwrap_or_else(|e| die(e));
             vm.load_state(&machine).unwrap_or_else(|e| die(e));
             let process = std::fs::read(dir.join("process.bin")).unwrap_or_else(|e| die(e));
-            Process::restore(&mut vm.cpus[0], &process).unwrap_or_else(|e| die(e))
+            Process::restore(&mut vm.cpus[0], board, &process).unwrap_or_else(|e| die(e))
         },
-        None => {
-            let elf = std::fs::read(&guest_args[0])
-                .unwrap_or_else(|e| die(format!("{}: {e}", guest_args[0])));
-            let env = ["PATH=/bin".to_string(), "HOME=/".to_string()];
-            Process::exec(&mut vm.cpus[0], &elf, &guest_args, &env).unwrap_or_else(|e| die(e))
+        None => match board {
+            // Found in the filesystem; its blobs (and its loader's) come from the host meanwhile
+            Some(board) => loop {
+                match Process::exec(&mut vm.cpus[0], board.clone(), &guest_args, &env, &cwd) {
+                    Ok(p) => break p,
+                    Err(armless_user::ExecError::Need(_)) if start.elapsed() < timeout => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    },
+                    Err(e) => die(e),
+                }
+            },
+            None => {
+                let elf = std::fs::read(&guest_args[0])
+                    .unwrap_or_else(|e| die(format!("{}: {e}", guest_args[0])));
+                Process::exec_bytes(&mut vm.cpus[0], None, &elf, &guest_args, &env)
+                    .unwrap_or_else(|e| die(e))
+            },
         },
     };
     let ready = start.elapsed();
     p.trace = std::env::var_os("ARMLESS_EXEC_TRACE").is_some();
+    // The line, and its echo, which isn't the answer waited for
+    let mut printed = Vec::new();
     let lines_before = input.as_ref().map(|line| {
         p.input(format!("{line}\n").as_bytes());
-        0usize
+        printed.extend(p.take_output());
+        printed.iter().filter(|&&b| b == b'\n').count()
     });
 
     // Run, forwarding its output, until it exits, faults, prints what we wait for, or times out
     let cpu = &mut vm.cpus[0];
-    let mut printed = Vec::new();
     let mut first_output = None;
     let mut stopped_at = None;
     let status = loop {
@@ -128,6 +201,7 @@ fn main() {
         }
         match status {
             Status::Running => {},
+            Status::Idle(_) if keys.is_some() => p.input(keys.take().unwrap().as_bytes()),
             Status::Idle(wake) => {
                 let wait = wake.map_or(Duration::from_millis(20), |w| {
                     w.saturating_duration_since(Instant::now())
