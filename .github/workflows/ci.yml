@@ -29,17 +29,18 @@ jobs:
         with:
           workspaces: ". -> build"
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The workspace: armless, and user mode (user/)
       - name: Unit tests and bare-metal guest
-        run: cargo test --release
+        run: cargo test --release --workspace
       # The dev profile checks arithmetic for overflow; release wraps silently
       - name: Unit tests with overflow checks
-        run: cargo test
+        run: cargo test --workspace
       - name: Type-check the wasm layer natively
         run: cargo check --features wasm-api
       - name: Lints (unsafe only where allowed, and documented), natively and for wasm32
         run: |
           rustup component add clippy
-          cargo clippy --release --all-targets --features wasm-api
+          cargo clippy --release --all-targets --features wasm-api --workspace
           cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wasm-api
       - name: Build armless.wasm and armless-smp.wasm
         run: |
@@ -81,15 +82,15 @@ jobs:
           workspaces: ". -> build"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit tests and bare-metal guest
-        run: cargo test --release
+        run: cargo test --release --workspace
       - name: Unit tests with overflow checks
-        run: cargo test
+        run: cargo test --workspace
       # The KVM backend (src/cpu/kvm.rs) is built only with the hypervisor feature on Linux arm64:
       # checked here, where it compiles (running it needs /dev/kvm, which the runner hasn't)
       - name: The hypervisor feature (KVM backend)
         run: |
           rustup component add clippy
-          cargo clippy --release --all-targets --features hypervisor
+          cargo clippy --release --all-targets --features hypervisor --workspace
 
   linux:
     runs-on: ubuntu-24.04

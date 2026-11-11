@@ -1,0 +1,18 @@
+[package]
+name = "armless-user"
+version = "0.10.0"
+edition = "2021"
+publish = false
+description = "User mode for armless: run a static aarch64 Linux ELF with no guest kernel, its syscalls answered by the host"
+license = "BSD-2-Clause"
+
+[[bin]]
+name = "armless-exec"
+path = "src/main.rs"
+
+[dependencies]
+armless = { path = ".." }
+
+[lib]
+name = "armless_user"
+path = "src/lib.rs"

@@ -32,6 +32,7 @@ config, notifications) and a legacy INTx line. The device tree marks the bus
 | `vm.rs` | `Board` (devices + host API), `Vm` (with CPUs), snapshots |
 | `runner.rs`, `native.rs`, `platform.rs` | native hosting: threads, blob directory, TCP NAT |
 | `wasm.rs`, `js/armless.js` | the browser build |
+| `../user/` | user mode: a static Linux executable with no guest kernel (`armless-user`, `armless-exec`) |
 
 ## Host interface
 
@@ -198,3 +199,40 @@ instance creates the machine and serves host calls. Each vCPU worker instantiate
 the same module on that memory, with its own stack, TLS and JIT function table, and
 calls `armless_run` in a loop. The workers raise `host_notify` when events are
 waiting. A shared control block parks every worker for `save_state`.
+
+## User mode (experimental)
+
+`user/` (the `armless-user` crate, and `armless-exec` on the command line) runs one static
+aarch64 Linux executable with no guest kernel. The machine is the same; what is missing is
+EL1. The CPU runs the program at EL0 with the MMU off and no vector table, so every exception
+it takes stops the CPU (`StopReason::UnhandledException`, cpu.rs) with ESR, ELR and FAR. That
+is true in the interpreter and in both JITs, so user mode needs nothing from the CPU it didn't
+already do. The host reads the syscall from x8 and x0–x5, answers it in x0, and resumes at ELR.
+
+- **Memory:** VA is PA. The ELF's segments go where they ask, `brk` after them, the stack at
+  the top of RAM and `mmap` below it, from a free list. Freed ranges are given back to the
+  host with `Ram::discard` (fresh zero pages), so a program that reserves and releases large
+  ranges (Go reserves about 600 MB of address space at start) costs only what it touches.
+  RAM must still be large enough for those reservations.
+- **Threads:** every guest thread is a saved register context, and they take turns on one
+  CPU in slices of instructions; a syscall answered on the way counts against the slice.
+  `clone` (threads only), futexes (with timeouts and bitsets), `set_tid_address` and
+  `CLONE_CHILD_CLEARTID`. A blocking call parks its thread until it is woken, its deadline
+  passes, or (stdin) input arrives.
+- **Files and I/O:** stdin, stdout and stderr; `eventfd2`, `epoll_*` (enough for the Go
+  netpoller). Every `open` fails with ENOENT.
+- **Clocks:** `clock_gettime`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
+  across a snapshot and its restores.
+- **Signals:** handlers are recorded and signals dropped; nothing is delivered yet.
+- **Snapshots:** the machine's own snapshot holds RAM; `Process::save` holds the rest
+  (threads, their waits as time left, the memory map, descriptors, the clock), a few KB.
+  `Process::restore` takes it on a machine that loaded the snapshot.
+
+Not yet: page tables (so no PROT_NONE, no nil-pointer faults, no `fork`), dynamic
+executables, files, sockets, signal delivery, more than one vCPU, and the hypervisor
+backends (an SVC at EL0 traps to EL1 in hardware there, not to the host).
+
+Measured as a snowglobe site (a Go program with eight goroutines, macOS, the same
+`snowglobe-vm` for each): the snapshot is 2.5 MB raw and 0.6 MB compressed, against 22.1 and
+3.6 MB under a stripped Linux and 50.6 and 10.2 under Alpine's `linux-virt`; a machine's
+footprint is 22 MB, against 57 and 136.

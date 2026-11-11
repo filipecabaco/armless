@@ -1,6 +1,9 @@
+[workspace]
+members = ["user"]
+
 [package]
 name = "armless"
-version = "0.9.10"
+version = "0.10.0"
 edition = "2021"
 # Cranelift (the native-jit feature) needs 1.97
 rust-version = "1.97"
