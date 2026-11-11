@@ -34,8 +34,9 @@ armless started as a fork of [v86](https://github.com/copy/v86).
 - **User mode (experimental):** a Linux program runs with no guest kernel at all
   ([`user/`](user)): the CPU runs it at EL0 and its system calls are answered by the host.
   Static and dynamically linked programs, the machine's filesystem, a terminal, threads, pipes,
-  epoll, poll and select, and snapshots of the running process work; processes, sockets and
-  signal delivery do not yet. Go, Python 3.14 and DuckDB run this way from their own images.
+  epoll, poll and select, signals, and snapshots of the running process work; processes and
+  sockets do not yet. Go, Python 3.14 and DuckDB run this way from their own images,
+  natively and in the browser (a snapshot made on one restores on the other).
 
 ## Quick start
 
@@ -90,6 +91,20 @@ Build `armless.wasm` (see [Building](#building)) or take the files from a
 More than one CPU needs `SharedArrayBuffer`, so the page must be cross-origin isolated
 (COOP `same-origin` with COEP `require-corp` or `credentialless`).
 
+In user mode the page runs a program from the filesystem with no kernel, the console being its
+terminal:
+
+```js
+const vm = new Armless({
+  wasm: "armless.wasm",
+  memory_mb: 512,
+  filesystem: { json: "filesystem.json", baseurl: "filesystem/" },
+  user: { argv: ["python3"], env: ["PATH=/usr/bin:/bin", "TERM=xterm-256color"], cwd: "/", cols: 80, rows: 24 },
+  // or, a snapshot of one: initial_state: "state.bin.zst", user_state: "user.bin"
+});
+vm.on("stop", ({ reason, code }) => console.log(reason, code)); // "exit", 0
+```
+
 ## Browser API
 
 ### Options
@@ -104,6 +119,8 @@ More than one CPU needs `SharedArrayBuffer`, so the page must be cross-origin is
 | `predecode_mb` | cap on the pre-decoded instructions each CPU keeps (24 by default), held for the life of the machine |
 | `initial_state` | a snapshot to restore (URL or bytes, zstd or not) |
 | `boot` | for a cold boot: `{ kernel, initrd, cmdline }` (`cmdline` defaults to `console=ttyS0`), or `{ raw, addr }` for a bare-metal binary; without `kernel`, the kernel and initrd under `/boot` in the filesystem |
+| `user` | user mode, instead of `boot`: `{ argv, env, cwd, cols, rows }`, a program started from the filesystem as execve would (by `PATH` in `env` when `argv[0]` has no slash; cwd `/` and 80x24 by default). One CPU only |
+| `user_state` | user mode from a snapshot: the process (URL or bytes) saved with the machine `initial_state` restores, by `save_process()` or natively by `Process::save` (snowglobe's `system/user.bin`). The machine must be made as the one saved was: `memory_mb`, `filesystem`, and `console`, `network` on or off |
 | `network` | turns on virtio-net; see below |
 | `console` | virtio-console on or off (default on) |
 | `mac` | the NIC's MAC address, `"aa:bb:cc:dd:ee:ff"` |
@@ -131,6 +148,10 @@ Subscribe with `vm.on(name, fn)` (`off` removes).
 - `console` and `serial`: output bytes.
 - `ready`: set up. `progress` (`{ file, loaded, total }`): a snapshot or file loading.
 - `blob`: a file being fetched. `stop` (`{ reason }`) and `error`.
+- In user mode, `console` is what the program writes to its terminal; `stop` is
+  `{ reason: "exit", code }` when it exits, `{ reason: "fault", message }` when it faults; and
+  `idle` says it has gone quiet waiting for input (every thread waits, none on a file being
+  fetched), once until it prints or gets input again.
 - `memory`: a sample of the memory (with the `debug` option).
 - `tcp-connection`: a `Connection` from the guest to a port nothing else handles.
 
@@ -146,7 +167,16 @@ connections nobody accepts, and no tunnel takes, are refused.
 - `connect(port)`: a connection into a server in the guest.
 - Snapshots: `save_state()` returns the snapshot as one buffer; `save_state_pieces()`
   returns it in pieces of about 1 MiB, to write or compress as they come;
-  `restore_state(src)` replaces the machine's state.
+  `restore_state(src, { user_state })` replaces the machine's state (and in user mode the
+  process).
+- User mode: `console_input` and `console_resize` go to the program's terminal;
+  `close_input()` ends its input (reads past what is left return 0), `kill(sig = 2)` sends it a
+  signal; `save_process()` returns the process's state, which goes with `save_state()`'s as
+  `user_state` with `initial_state` (save both while stopped); `user_status` says
+  `{ state: "running" | "idle" | "exited" | "fault", waiting_for_input, waiting_on_blobs,
+  wake_ms, code }`, and `idle` fires when the program waits for input (not when it only sleeps
+  or waits for files). An idle program costs nothing: it runs again at its next deadline
+  (`wake_ms`), on input, or when a file it waits on arrives.
 - `memory_report({ scan })`: what the page's memory holds, split into the pieces armless can tell
   apart: the whole linear memory (which never shrinks), the guest's RAM, the host's heap (live,
   peak, big blocks, freed blocks kept to be reused), the file system (blobs fetched, files the
@@ -187,18 +217,19 @@ runner.start();
 
 ```sh
 cargo build --release           # the crate and armless-run
-sh build-wasm.sh                # build/armless.wasm
+sh build-wasm.sh                # build/armless.wasm (with user mode)
 SMP=1 sh build-wasm.sh          # build/armless-smp.wasm
 ```
 
 The wasm builds need the `wasm32-unknown-unknown` target, plus clang and lld for the C zstd
 decoder in [`lib/zstd`](lib/zstd). `SMP=1` builds std from source with atomics, so it also
 needs the `rust-src` component (`rustup component add rust-src`). `js/armless.js` is used
-as it is.
+as it is. armless.wasm is the cdylib of the `armless-user` crate, so it has user mode's exports
+next to the machine's; armless-smp.wasm is armless's alone (user mode runs on one CPU).
 
 Cargo features: `native-jit` (default; Cranelift), `hypervisor` (see
 [docs/hypervisor.md](docs/hypervisor.md)) and `wasm-api` (compiles the wasm export layer
-natively, to type-check it).
+natively, to type-check it; `armless-user` has one of the same name for its own exports).
 
 ## How it works
 
@@ -265,6 +296,7 @@ for armless 0.2.10 and older.
 | `ARMLESS_9PFS=DIR cargo test --release --test vm` | the snowglobe flow natively: 9p root, console, snapshot, restore |
 | `node tests/js/flow.mjs DIR [CPUS]` | the same through `armless.js`, plus HTTP over fetch and port forwarding |
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
+| `node tests/js/user.mjs SITE` | user mode through `armless.js`: a `--kernel none` snowglobe site restored from its native snapshot, asked a question, saved and restored again; `--exec FSDIR PROGRAM ARGS` starts a program from a filesystem |
 | `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node) |
 | `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands |
 | `cargo bench --bench machine` | host-side costs with criterion: an instruction interpreted and compiled, a page's compile, a snapshot |

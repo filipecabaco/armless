@@ -1,6 +1,6 @@
 //! The system calls (arm64 numbers), as Linux answers them.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use armless::cpu::Cpu;
 use armless::dev::fs::{Fs, Ino, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
@@ -12,10 +12,9 @@ use crate::files::{
     O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_TRUNC,
     O_WRONLY,
 };
+use crate::host::{self, Instant};
 use crate::{page_up, Ctx, Process, Ret, Thread, Wait, PAGE};
 
-const EPERM: i64 = 1;
-const ESRCH: i64 = 3;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
@@ -106,7 +105,7 @@ impl Process {
             },
             Kind::Null => Ok(Vec::new()),
             Kind::Zero => Ok(vec![0; max]),
-            Kind::Random => Ok(armless::native::random_bytes(max)),
+            Kind::Random => Ok(host::random_bytes(max)),
             Kind::Dir { .. } => Err(Ret::Val(-EISDIR)),
             Kind::Mem { data, pos } => {
                 let start = at.unwrap_or(pos).min(data.len() as u64) as usize;
@@ -278,7 +277,7 @@ impl Process {
     }
 
     /// The (base, len) pairs of an iovec array
-    fn iovecs(&self, at: u64, n: u64) -> Option<Vec<(u64, u64)>> {
+    pub(crate) fn iovecs(&self, at: u64, n: u64) -> Option<Vec<(u64, u64)>> {
         (0..n.min(1024))
             .map(|i| Some((self.u64_at(at + 16 * i)?, self.u64_at(at + 16 * i + 8)?)))
             .collect()
@@ -1275,6 +1274,7 @@ impl Process {
                     wait: None,
                     resume_deadline: None,
                     exited: false,
+                    sig: self.threads[cur].sig.inherit(),
                 });
                 v(new_tid)
             },
@@ -1369,62 +1369,16 @@ impl Process {
                 v(0)
             },
 
-            // ---------------------------------------------------- signals (recorded, not delivered yet)
-            // rt_sigaction
-            134 => {
-                let sig = a[0];
-                if !(1..=64).contains(&sig) {
-                    return v(-EINVAL);
-                }
-                if a[2] != 0 {
-                    let old = self.sigactions.get(&sig).copied().unwrap_or([0; 32]);
-                    self.write(a[2], &old);
-                }
-                if a[1] != 0 {
-                    let mut act = [0; 32];
-                    self.read(a[1], &mut act);
-                    self.sigactions.insert(sig, act);
-                }
-                v(0)
-            },
-            // rt_sigprocmask
-            135 => {
-                if a[2] != 0 {
-                    self.put_u64(a[2], 0);
-                }
-                v(0)
-            },
-            // sigaltstack: report none set
-            132 => {
-                if a[1] != 0 {
-                    let mut ss = [0u8; 24];
-                    ss[8..12].copy_from_slice(&2u32.to_le_bytes()); // SS_DISABLE
-                    self.write(a[1], &ss);
-                }
-                v(0)
-            },
-            // kill, tkill, tgkill: a signal for this process (Go's SIGURG preemption among them)
-            129..=131 => {
-                let (target, sig) = match nr {
-                    129 => (a[0] as i64, a[1]),
-                    130 => (a[0] as i64, a[1]),
-                    _ => (a[1] as i64, a[2]),
-                };
-                if nr == 129 && target != 1000 && target != 0 && target != -1 {
-                    return v(-ESRCH);
-                }
-                if sig != 0 {
-                    self.signal(sig);
-                }
-                v(0)
-            },
-            // rt_sigreturn: no frame was ever built
-            139 => v(-EPERM),
-            // rt_sigsuspend, rt_sigtimedwait, pause: wait for a signal (none is delivered yet)
-            133 | 137 => Ret::Retry {
-                deadline: None,
-                on_timeout: 0,
-            },
+            // ---------------------------------------------------- signals (signal.rs)
+            134 => self.sys_sigaction(a[0], a[1], a[2], a[3]),
+            135 => self.sys_sigprocmask(cur, &a),
+            136 => self.sys_sigpending(cur, a[0]),
+            132 => self.sys_sigaltstack(cur, a[0], a[1], cpu.sp_el0),
+            // kill, tkill, tgkill (Go's SIGURG preemption among them)
+            129..=131 => self.sys_kill(nr, &a),
+            139 => self.sigreturn(cpu, cur),
+            133 => self.sys_sigsuspend(cur, a[0], a[1]),
+            137 => self.sys_sigtimedwait(cur, &a),
 
             // ---------------------------------------------------- time and the system
             113 => {
@@ -1453,7 +1407,7 @@ impl Process {
             },
             // getrandom
             278 => {
-                let bytes = armless::native::random_bytes(a[1] as usize);
+                let bytes = host::random_bytes(a[1] as usize);
                 v(if self.write(a[0], &bytes) { a[1] as i64 } else { -EFAULT })
             },
             // prlimit64(pid, resource, new, old), getrlimit(resource, old)
@@ -1563,12 +1517,15 @@ impl Process {
                 v(if self.write(arg, &b) { 0 } else { -EFAULT })
             },
             // TIOCSWINSZ
-            (Kind::Tty, 0x5414) => {
-                if let Some(b) = self.bytes_at(arg, 4) {
-                    self.tty.rows = u16::from_le_bytes([b[0], b[1]]);
-                    self.tty.cols = u16::from_le_bytes([b[2], b[3]]);
-                }
-                v(0)
+            (Kind::Tty, 0x5414) => match self.bytes_at(arg, 4) {
+                Some(b) => {
+                    self.resize(
+                        u16::from_le_bytes([b[2], b[3]]),
+                        u16::from_le_bytes([b[0], b[1]]),
+                    );
+                    v(0)
+                },
+                None => v(-EFAULT),
             },
             // TIOCGPGRP, TIOCGSID
             (Kind::Tty, 0x540f | 0x5429) => {
@@ -1602,13 +1559,31 @@ impl Process {
         if len == 0 {
             return v(-EINVAL);
         }
+        let fixed = flags & (0x10 | 0x10_0000) != 0;
+        // MAP_FIXED, MAP_FIXED_NOREPLACE: VA is PA, so anywhere in RAM but the page tables
+        if fixed
+            && (!addr.is_multiple_of(PAGE)
+                || addr + len > self.ram_size
+                || self
+                    .tables_area()
+                    .is_some_and(|(s, e)| addr < e && addr + len > s))
+        {
+            return v(-ENOMEM);
+        }
         // A file mapping is a private copy of its contents (MAP_SHARED ones too: no other process
-        // sees it, and writes don't reach the file)
+        // sees it, and writes don't reach the file): its pages filled as they are touched (mm.rs),
+        // or read in now
+        let mut lazy = None;
         let contents = if flags & 0x20 == 0 {
             let Some(Desc { kind, .. }) = self.files.get(fd).cloned() else {
                 return v(-EBADF);
             };
             match kind {
+                Kind::File { ino, .. } if self.lazy_room(len) => {
+                    let size = self.fs(|fs| fs.get(ino).map_or(0, |i| i.size)).unwrap_or(0);
+                    lazy = Some((ino, size.saturating_sub(off).min(len)));
+                    None
+                },
                 Kind::File { ino, .. } => {
                     match self.fs(|fs| got(fs.read(ino, off, len as usize))) {
                         Some(Got::Ok(b)) => Some(b),
@@ -1623,11 +1598,8 @@ impl Process {
         } else {
             None
         };
-        let at = if flags & (0x10 | 0x10_0000) != 0 {
-            // MAP_FIXED, MAP_FIXED_NOREPLACE: VA is PA, so anywhere in RAM
-            if !addr.is_multiple_of(PAGE) || addr + len > self.ram_size {
-                return v(-ENOMEM);
-            }
+        let at = if fixed {
+            self.forget_lazy(addr, addr + len);
             self.zero_range(addr, len);
             self.carve(addr, addr + len);
             addr
@@ -1638,7 +1610,9 @@ impl Process {
                 None => return v(-ENOMEM),
             }
         };
-        if let Some(b) = contents {
+        if let Some((ino, data)) = lazy {
+            self.map_lazy(at, len, ino, off, data);
+        } else if let Some(b) = contents {
             if !b.is_empty() && !self.write(at, &b) {
                 return v(-EFAULT);
             }
@@ -1661,6 +1635,10 @@ impl Process {
         }
         if flags & 1 == 0 {
             return v(-ENOMEM); // not MREMAP_MAYMOVE
+        }
+        // What moves is filled first (lazy pages don't move), before anything changes
+        if !self.touch(old, old_len) {
+            return v(-EFAULT); // or it waits for blobs and runs again (syscall_lazily)
         }
         let Some(at) = self.alloc(new_len) else {
             return v(-ENOMEM);

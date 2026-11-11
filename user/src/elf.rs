@@ -1,8 +1,6 @@
 //! Loading an ELF executable as execve does: its segments where they ask (a PIE, or the dynamic
 //! loader, at a base of its own), and the initial stack: argc, argv, envp and the auxiliary vector.
 
-use armless::Ram;
-
 use crate::PAGE;
 
 /// What loading an ELF gave.
@@ -86,14 +84,25 @@ pub(crate) fn header(elf: &[u8]) -> Result<Header, String> {
     })
 }
 
-/// Copies the PT_LOAD segments into RAM at `base` plus their addresses (RAM is zero where they
-/// leave a gap, or their bss).
-pub(crate) fn load(ram: &Ram, ram_size: u64, elf: &[u8], base: u64) -> Result<Loaded, String> {
+/// A PT_LOAD segment placed: its file bytes `off..off + filesz` at `at`, and zeros up to
+/// `at + memsz`.
+pub(crate) struct Seg {
+    pub at: u64,
+    pub off: u64,
+    pub filesz: u64,
+}
+
+/// Where the PT_LOAD segments go at `base` plus their addresses, from the ELF's first bytes (its
+/// headers, and the loader's path PT_INTERP names, are there): what loading it gives, and the
+/// segments to copy or map.
+pub(crate) fn plan(elf: &[u8], ram_size: u64, base: u64) -> Result<(Loaded, Vec<Seg>), String> {
+    let all = segments(elf)?;
     let phoff = u64_at(elf, 32);
     let mut phdr = 0;
     let mut end = 0;
     let mut interp = None;
-    for (ty, off, vaddr, filesz, memsz) in segments(elf)? {
+    let mut segs = Vec::new();
+    for (ty, off, vaddr, filesz, memsz) in all {
         match ty {
             3 => {
                 let path = elf
@@ -104,13 +113,10 @@ pub(crate) fn load(ram: &Ram, ram_size: u64, elf: &[u8], base: u64) -> Result<Lo
             6 => phdr = base + vaddr,
             1 => {
                 let at = base + vaddr;
-                if at + memsz > ram_size {
+                if at.checked_add(memsz).is_none_or(|e| e > ram_size) || filesz > memsz {
                     return Err(format!("segment at {at:#x} is past RAM"));
                 }
-                let data = elf
-                    .get(off as usize..(off + filesz) as usize)
-                    .ok_or("truncated ELF")?;
-                ram.write(at as usize, data);
+                segs.push(Seg { at, off, filesz });
                 if phdr == 0 && off == 0 {
                     phdr = at + phoff;
                 }
@@ -119,13 +125,14 @@ pub(crate) fn load(ram: &Ram, ram_size: u64, elf: &[u8], base: u64) -> Result<Lo
             _ => {},
         }
     }
-    Ok(Loaded {
+    let loaded = Loaded {
         entry: base + u64_at(elf, 24),
         phdr,
         phnum: u16_at(elf, 56) as u64,
         end,
         interp,
-    })
+    };
+    Ok((loaded, segs))
 }
 
 /// argc, argv, envp and auxv at the top of the stack, as Linux lays them out. Returns sp.

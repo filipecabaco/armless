@@ -203,6 +203,10 @@ pub struct Cpu<H: Host> {
     pub(crate) jit_pending_flag: u8,
     /// Stop instead of raising an exception on undefined instructions.
     pub trap_undefined: bool,
+    /// Stop (`StopReason::UnhandledException`) at every synchronous exception instead of taking
+    /// it, whatever VBAR and the MMU say: for a host that answers them itself (user mode, whose
+    /// page tables may be on with no vector table).
+    pub stop_on_exceptions: bool,
     /// Whether the CPU runs in hardware (`hv`).
     #[cfg(armless_hw)]
     pub(crate) hv: hw::Backend,
@@ -454,6 +458,7 @@ impl<H: Host> Cpu<H> {
             next_pc: 0,
             insn_count: 0,
             trap_undefined: false,
+            stop_on_exceptions: false,
             #[cfg(armless_hw)]
             hv: hw::Backend::Off,
             last_undefined: None,
@@ -682,7 +687,7 @@ impl<H: Host> Cpu<H> {
         if let Some(f) = far {
             self.sys.far = f;
         }
-        if self.sys.vbar == 0 && self.sys.sctlr & 1 == 0 {
+        if self.stop_on_exceptions || (self.sys.vbar == 0 && self.sys.sctlr & 1 == 0) {
             // Nothing installed a vector table: report rather than spin.
             self.sys.elr = ret;
             return Err(StopReason::UnhandledException {

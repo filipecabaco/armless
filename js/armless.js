@@ -11,6 +11,14 @@
 //   vm.on("console", bytes => term.write(bytes));
 //   term.onData(text => vm.console_input(text));
 //
+// User mode (no guest kernel): a Linux program from the filesystem runs on the machine's CPU
+// and its system calls are answered in armless, with the console as its terminal. Instead of
+// `boot`, `user: { argv: ["python3"], env: ["PATH=/usr/bin", ...], cwd: "/", cols, rows }`
+// starts one; `user_state` (URL or bytes, a process saved with save_process() or natively,
+// system/user.bin of a snowglobe site) restores one next to `initial_state`. The events and
+// console_input/console_resize are the same; "stop" says {reason: "exit", code} when it exits,
+// and "idle" when it has gone quiet waiting for input.
+//
 // Everything the machine does runs in WebAssembly, devices included. This file only
 // loads things, runs the CPUs (here, or one Web Worker per CPU) and answers the
 // machine's requests: files of the 9p filesystem (fetched from `baseurl` the first
@@ -18,7 +26,8 @@
 // events; port 80 goes out through fetch() unless a listener takes it).
 //
 // Events: "ready", "console", "serial", "progress" ({file, loaded, total}),
-// "blob" (name), "tcp-connection" (Connection), "stop" ({reason}), "error".
+// "blob" (name), "tcp-connection" (Connection), "stop" ({reason}), "error", and in user mode
+// "idle".
 (function (root) {
   "use strict";
 
@@ -31,6 +40,10 @@
   const BUDGET = 200000;
   const DEV_CONSOLE = 1, DEV_FS = 2, DEV_NET = 4;
   const STOP_REASONS = { 2: "poweroff", 3: "reset", 4: "halt", 5: "fault" };
+  // User mode: how long a program runs in one go (ms), and the longest it sleeps idle before it
+  // is looked at again (input, a resize and blobs wake it at once)
+  const USER_SLICE_MS = 10;
+  const USER_IDLE_MS = 1000;
   // SMP control block (Int32Array over a SharedArrayBuffer)
   const CTRL_PAUSE = 0, CTRL_PARKED = 1, CTRL_QUIT = 2, CTRL_EXITED = 3, CTRL_WORDS = 4;
   // Bytes buffered towards the guest before a sender waits
@@ -345,6 +358,8 @@
       this.cpus = options.cpus | 0 || 1;
       this.running = false;
       this.stopped = false;
+      // Running a program with no kernel (the `user` or `user_state` option)
+      this.user = false;
       this._conns = new Map();
       this._blobs_in_flight = new Set();
       this._workers = [];
@@ -362,6 +377,8 @@
     async _init() {
       const o = this.options;
       const smp = this.cpus > 1;
+      const user = !!(o.user || o.user_state);
+      if (user && smp) throw new Error("armless: user mode runs on one CPU (cpus: 1)");
       if (smp && typeof SharedArrayBuffer === "undefined") {
         throw new Error("armless: several CPUs need SharedArrayBuffer (a cross-origin isolated page)");
       }
@@ -428,12 +445,15 @@
 
       // Fresh randomness for the guest (a new VM generation ID) and for TLS: after a restore,
       // whose state it replaces, and before a boot, which hands it to Linux as /chosen/rng-seed
+      if (user && !e.armless_user_exec) throw new Error("armless: this build has no user mode");
       if (o.initial_state) {
         await this._restore(o.initial_state.url ?? o.initial_state);
         this._seed();
+        if (o.user_state) await this._user_restore(o.user_state.url ?? o.user_state);
       } else {
         this._seed();
-        if (o.boot) await this._boot(o.boot);
+        if (o.user) await this._user_exec(o.user);
+        else if (o.boot) await this._boot(o.boot);
       }
       if (o.network) {
         this._web_options = web_options(o.network);
@@ -565,6 +585,114 @@
       while (this._blobs_in_flight.size) await sleep(5);
     }
 
+    // ------------------------------------------------------------ user mode
+
+    /** Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows }. */
+    async _user_exec(user) {
+      const e = this.exports;
+      const argv = typeof user.argv === "string" ? [user.argv] : user.argv || [];
+      if (!argv.length) throw new Error("armless: user mode needs a program (user.argv)");
+      // argv and env as NUL-separated lists
+      const list = (items) => utf8.encode(items.map((s) => s + "\0").join(""));
+      const parts = [list(argv), list(user.env || []), utf8.encode(user.cwd || "/")];
+      const ptrs = parts.map((b) => this._copy_in(b));
+      try {
+        // Its executable and loader may be fetched first
+        for (;;) {
+          const r = e.armless_user_exec(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length);
+          if (r === 0) break;
+          if (r < 0) throw new Error("armless: user mode: " + this._error());
+          this._drain();
+          await this._blobs_settled();
+        }
+      } finally {
+        ptrs.forEach((p, i) => e.armless_free(p, parts[i].length));
+      }
+      this.user = true;
+      e.armless_user_resize(user.cols || 80, user.rows || 24);
+    }
+
+    /** The process of a snapshot, on the machine `initial_state` restored (URL or bytes). */
+    async _user_restore(src) {
+      const file = typeof src === "string" ? src : "user_state";
+      const bytes = await load(src, (loaded, total) => this.emit("progress", { file, loaded, total }));
+      if (this._with_bytes(bytes, (p, n) => this.exports.armless_user_restore(p, n)) !== 0) {
+        throw new Error("armless: user state: " + this._error());
+      }
+      this.user = true;
+    }
+
+    /** User mode: run the program a slice, and come back when it has more to do. */
+    _user_slice() {
+      const e = this.exports;
+      const result = e.armless_user_run(USER_SLICE_MS);
+      this._user_waiting = result === 1;
+      this._drain();
+      if (result === 0) {
+        this._user_idle = false;
+        return this._schedule(0);
+      }
+      if (result === 1) {
+        const w = e.armless_user_wake_ms();
+        // Waiting for input, not sleeping or waiting for files on their way: said once until it
+        // runs again
+        if (!this._user_idle && e.armless_user_waiting_for_input()) {
+          this._user_idle = true;
+          this.emit("idle");
+        }
+        return this._schedule(w < 0 ? USER_IDLE_MS : Math.min(USER_IDLE_MS, w - performance.now()));
+      }
+      if (result === 2) return this._stopped(2, { reason: "exit", code: e.armless_user_exit_code() });
+      this._stopped(5, { reason: "fault", message: this._error() });
+    }
+
+    /**
+     * User mode: what the program is doing. state: "running", "idle" (every thread waits:
+     * `waiting_for_input` says whether for input (a REPL at its prompt) rather than only for time,
+     * `waiting_on_blobs` whether on files being fetched, `wake_ms` is the performance.now() time
+     * of its next deadline or -1), "exited" (with `code`) or "fault".
+     */
+    get user_status() {
+      if (!this.user) return null;
+      const e = this.exports;
+      const code = e.armless_user_exit_code();
+      if (this.stopped) return code >= 0 ? { state: "exited", code } : { state: "fault" };
+      return {
+        state: this._user_waiting ? "idle" : "running",
+        waiting_for_input: e.armless_user_waiting_for_input() !== 0,
+        waiting_on_blobs: e.armless_user_waiting_on_blobs() !== 0,
+        wake_ms: this._user_waiting ? e.armless_user_wake_ms() : -1,
+      };
+    }
+
+    /** User mode: end the program's input (its reads past what is left return 0). */
+    close_input() {
+      if (!this.user) return;
+      this.exports.armless_user_close_input();
+      this._poke();
+    }
+
+    /** User mode: a signal for the program, as kill(2) sends it (default 2, SIGINT: what Ctrl-C
+     *  raises from the terminal, for a stop button that doesn't go through it). */
+    kill(sig = 2) {
+      if (!this.user) return;
+      this.exports.armless_user_kill(sig);
+      this._poke();
+    }
+
+    /**
+     * User mode: the process's state (uncompressed). It goes with the machine's (save_state_pieces,
+     * save_state) as `user_state` goes with `initial_state`, and has the bytes of a native host's
+     * Process::save. Take both while the machine is stopped.
+     */
+    async save_process() {
+      await this.ready;
+      if (!this.user) throw new Error("armless: no user-mode process");
+      const e = this.exports;
+      const n = e.armless_user_save();
+      return new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice();
+    }
+
     // ------------------------------------------------------------ running
 
     /** Start (or continue) running the machine. */
@@ -633,6 +761,7 @@
     _slice() {
       this._timer = null;
       if (!this.running) return;
+      if (this.user) return this._user_slice();
       const e = this.exports;
       const t0 = performance.now();
       let result;
@@ -652,13 +781,13 @@
       this._stopped(result);
     }
 
-    _stopped(result) {
+    _stopped(result, info) {
       this.running = false;
       this.stopped = true;
       const reason = STOP_REASONS[result] || "fault";
       // Let the last output out first
       this._drain();
-      this.emit("stop", { reason, pc: this.exports.armless_pc() });
+      this.emit("stop", { reason, pc: this.exports.armless_pc(), ...info });
     }
 
     async _start_workers() {
@@ -713,13 +842,14 @@
     /** Type into the virtio console (hvc0): a string or bytes. Nothing is dropped. */
     console_input(data) {
       const bytes = typeof data === "string" ? utf8.encode(data) : new Uint8Array(data);
-      this._with_bytes(bytes, (p, n) => this._call("armless_console_input", p, n));
+      if (this.user) this._user_idle = false;
+      this._with_bytes(bytes, (p, n) => this._call(this.user ? "armless_user_input" : "armless_console_input", p, n));
       this._poke();
     }
 
     /** Tell the guest its console size. */
     console_resize(cols, rows) {
-      this._call("armless_console_resize", cols, rows);
+      this._call(this.user ? "armless_user_resize" : "armless_console_resize", cols, rows);
       this._poke();
     }
 
@@ -811,13 +941,19 @@
       return state;
     }
 
-    /** Replace the machine's state with a snapshot (ArrayBuffer, bytes or URL). */
-    async restore_state(src) {
+    /**
+     * Replace the machine's state with a snapshot (ArrayBuffer, bytes or URL), and in user mode the
+     * process with `user_state`, saved with it (without one, no process runs: a kernel would).
+     */
+    async restore_state(src, { user_state } = {}) {
       await this.ready;
       const was_running = this.running;
       await this.stop();
       await this._restore(src);
       this._seed();
+      this.user = false;
+      this._user_idle = false;
+      if (user_state) await this._user_restore(user_state.url ?? user_state);
       this._drain();
       if (was_running) this.run();
     }
@@ -918,7 +1054,7 @@
       const text = () => new TextDecoder().decode(data);
       switch (type) {
         case 1: this.emit("serial", data); this.emit("serial0-output-bytes", data); break;
-        case 2: this.emit("console", data); this.emit("virtio-console0-output-bytes", data); break;
+        case 2: if (this.user) this._user_idle = false; this.emit("console", data); this.emit("virtio-console0-output-bytes", data); break;
         case 3: this._fetch_blob(text()); break;
         case 4: {
           const conn = new Connection(this, id, text(), port);
