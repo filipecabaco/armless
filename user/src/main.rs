@@ -202,6 +202,8 @@ fn main() {
         match status {
             Status::Running => {},
             Status::Idle(_) if keys.is_some() => p.input(keys.take().unwrap().as_bytes()),
+            // Blobs come from the host thread soon
+            Status::Idle(_) if p.waiting_on_blobs() => std::thread::sleep(Duration::from_millis(1)),
             Status::Idle(wake) => {
                 let wait = wake.map_or(Duration::from_millis(20), |w| {
                     w.saturating_duration_since(Instant::now())
@@ -246,7 +248,11 @@ fn main() {
     eprintln!("host_footprint_mib: {:.1}", footprint as f64 / 1048576.0);
     eprintln!("saved_bytes (machine, process): {saved:?}");
     eprintln!("guest_pages_nonzero: {}", p.guest_pages());
-    eprintln!("signals_dropped: {}", stats.signals_dropped);
+    eprintln!("lazy_pages (left, filled): {:?}", p.lazy_pages());
+    eprintln!(
+        "signals (delivered, ignored): {} {}",
+        stats.signals_delivered, stats.signals_ignored
+    );
     eprintln!("syscalls: {:?}", stats.syscalls);
     eprintln!("unknown_syscalls: {:?}", stats.unknown);
     eprintln!("opens: {:?}", stats.opens);

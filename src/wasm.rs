@@ -90,11 +90,24 @@ impl Platform for JsPlatform {
     }
 }
 
+// For crates that add exports of their own to the same module (armless-user, whose cdylib is
+// armless.wasm): the clocks JavaScript gives, the machine, and the plumbing of the exports below.
+
+/// Monotonic milliseconds (`performance.now()`): the clock `armless_wake_ms` is in.
+pub fn now_ms() -> f64 {
+    microtick()
+}
+
+/// Milliseconds since the Unix epoch (`Date.now()`).
+pub fn wall_ms() -> f64 {
+    wall_clock_ms()
+}
+
 fn js_clock() -> u64 {
     (wall_clock_ms() / 1000.0) as u64
 }
 
-type JsCpu = Cpu<BoardHost<JsPlatform>>;
+pub type JsCpu = Cpu<BoardHost<JsPlatform>>;
 
 /// The size of a piece of `armless_save_next`
 const SAVE_PIECE: usize = 1 << 20;
@@ -121,7 +134,7 @@ std::thread_local! {
 }
 
 #[allow(static_mut_refs)]
-fn vm() -> &'static mut Vm<JsPlatform> {
+pub fn vm() -> &'static mut Vm<JsPlatform> {
     // SAFETY: `armless_create` sets VM once, before any other export runs, and nothing replaces
     // it. Each instance (a thread) uses its own CPU of it, and the main thread touches the rest
     // only while the workers are paused (snapshots) or through the board's locks.
@@ -133,11 +146,12 @@ fn cpu() -> &'static mut JsCpu {
     &mut vm().cpus[i]
 }
 
-fn set_error(e: impl Into<String>) {
+pub fn set_error(e: impl Into<String>) {
     ERROR.with_borrow_mut(|err| *err = e.into());
 }
 
-fn out(data: Vec<u8>) -> u32 {
+/// Puts `data` where `armless_buf` points and returns its length.
+pub fn out(data: Vec<u8>) -> u32 {
     BUF.with_borrow_mut(|buf| {
         *buf = data;
         buf.len() as u32
@@ -148,7 +162,7 @@ fn out(data: Vec<u8>) -> u32 {
 ///
 /// # Safety
 /// `ptr..ptr + len` is memory of this instance that nothing changes while the slice lives.
-unsafe fn slice<'a>(ptr: u32, len: u32) -> &'a [u8] {
+pub unsafe fn slice<'a>(ptr: u32, len: u32) -> &'a [u8] {
     if len == 0 {
         &[]
     } else {
@@ -159,7 +173,7 @@ unsafe fn slice<'a>(ptr: u32, len: u32) -> &'a [u8] {
 
 /// # Safety
 /// As for `slice`.
-unsafe fn string(ptr: u32, len: u32) -> String {
+pub unsafe fn string(ptr: u32, len: u32) -> String {
     // SAFETY: the caller's promise
     String::from_utf8_lossy(unsafe { slice(ptr, len) }).into_owned()
 }

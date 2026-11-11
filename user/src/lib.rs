@@ -1,6 +1,7 @@
 //! User mode for armless: a Linux program on an armless CPU with no guest kernel. The CPU runs it
-//! at EL0 with the MMU off and no vector table, so every exception it takes stops the CPU
-//! (`StopReason::UnhandledException`) and is answered here: system calls by a Linux personality,
+//! at EL0 with no vector table, and every exception it takes stops the CPU
+//! (`StopReason::UnhandledException`, `Cpu::stop_on_exceptions`) and is answered here: system
+//! calls by a Linux personality, a touch of a lazily mapped page by filling it (mm.rs), other
 //! faults by stopping the process.
 //!
 //! What it gives a program: static or dynamically linked executables (the dynamic loader comes
@@ -9,28 +10,47 @@
 //! threads (clone, futexes), epoll, poll and select, clocks and sleeps. Blocking calls park their
 //! thread and run again when something changes, so a snapshot can be taken whatever it waits on.
 //!
-//! Not yet: page tables (VA = PA, so no PROT_NONE, no nil-pointer faults, no fork), sockets,
-//! signal delivery (handlers are recorded, signals dropped), and more than one vCPU (threads take
-//! turns on one CPU).
+//! Signals are delivered as Linux delivers them (`signal`): handlers on the frame the kernel
+//! builds, masks, alternate stacks, blocking calls interrupted (EINTR, or restarted with
+//! SA_RESTART), and the terminal's Ctrl-C, Ctrl-\ and window size as SIGINT, SIGQUIT and
+//! SIGWINCH. A host signals the process with `kill`.
+//!
+//! Memory is VA = PA. Files are mapped lazily (mm.rs): the executable's segments, its loader's,
+//! and mmap of a file get a page's contents when it is first touched, so a snapshot holds only
+//! the pages a program used. For that the MMU is on, with identity page tables the process keeps
+//! in RAM, once a process maps a file; a program with none runs with it off.
+//!
+//! Not yet: protections (no PROT_NONE, no nil-pointer faults, though the page tables could give
+//! them), fork, sockets, and more than one vCPU (threads take turns on one CPU).
 
-#![forbid(unsafe_code)]
+// No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
+#![deny(unsafe_code)]
 
 mod elf;
 mod files;
+pub mod host;
+mod mm;
 mod ser;
+mod signal;
 mod sys;
 mod tty;
+#[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
+#[allow(unsafe_code)]
+pub mod wasm;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use armless::cpu::{Cpu, Exit, StopReason};
 use armless::dev::fs::{Fs, Ino, ROOT};
 use armless::{Board, Host, Ram};
 
 use files::Files;
+use host::Instant;
 use ser::{R, W};
+use signal::{Signals, ThreadSig};
 use tty::Tty;
 
 pub(crate) const PAGE: u64 = 4096;
@@ -105,6 +125,7 @@ pub(crate) struct Thread {
     /// The deadline a retried call had when it was parked, for it to keep
     pub resume_deadline: Option<Instant>,
     pub exited: bool,
+    pub sig: ThreadSig,
 }
 
 /// What a syscall does to the thread that made it.
@@ -155,6 +176,8 @@ pub struct Process {
     /// Free ranges of the mmap area, start -> end, coalesced. Freed pages are zeroed, so
     /// anything handed out from here reads as zero.
     pub(crate) free: BTreeMap<u64, u64>,
+    /// Files mapped lazily, and the page tables that make them so (mm.rs)
+    pub(crate) lazy: RefCell<mm::Lazy>,
     pub(crate) threads: Vec<Thread>,
     pub(crate) next_tid: i64,
     pub(crate) files: Files,
@@ -163,7 +186,7 @@ pub struct Process {
     pub(crate) umask: u32,
     /// The executable's path, for /proc/self/exe
     pub(crate) exe: Vec<u8>,
-    pub(crate) sigactions: BTreeMap<u64, [u8; 32]>,
+    pub(crate) sig: Signals,
     /// The monotonic clock reads `mono_base` ns at `start`, and goes on from there across a
     /// snapshot and its restores.
     pub(crate) start: Instant,
@@ -189,7 +212,10 @@ pub struct Stats {
     pub syscalls: BTreeMap<u64, u64>,
     pub unknown: BTreeMap<u64, u64>,
     pub opens: Vec<String>,
-    pub signals_dropped: u64,
+    /// Signals dropped: ignored, by their action or by default
+    pub signals_ignored: u64,
+    /// Signals whose handler ran
+    pub signals_delivered: u64,
     pub switches: u64,
 }
 
@@ -220,6 +246,8 @@ fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
         (cpu.sys.sctlr & !1) | (1 << 15) | (1 << 14) | (1 << 16) | (1 << 18) | (1 << 26);
     cpu.sys.cpacr = 3 << 20;
     cpu.sys.cntkctl = 3;
+    // With page tables on too (mm.rs)
+    cpu.stop_on_exceptions = true;
 }
 
 impl Process {
@@ -228,12 +256,14 @@ impl Process {
     pub(crate) fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
         addr.checked_add(buf.len() as u64)
             .is_some_and(|end| end <= self.ram_size)
+            && self.touch(addr, buf.len() as u64)
             && self.ram.read(addr as usize, buf)
     }
 
     pub(crate) fn write(&self, addr: u64, data: &[u8]) -> bool {
         addr.checked_add(data.len() as u64)
             .is_some_and(|end| end <= self.ram_size)
+            && self.touch(addr, data.len() as u64)
             && self.ram.write(addr as usize, data)
     }
 
@@ -275,6 +305,16 @@ impl Process {
     pub(crate) fn zero_range(&self, addr: u64, len: u64) {
         let start = addr & !(PAGE - 1);
         let end = page_up(addr + len).min(self.ram_size);
+        // Never the page tables
+        if let Some((s, e)) = self.tables_area().filter(|&(s, e)| start < e && end > s) {
+            if start < s {
+                self.zero_range(start, s - start);
+            }
+            if end > e {
+                self.zero_range(e, end - e);
+            }
+            return;
+        }
         if start < end {
             self.ram.discard(start as usize, (end - start) as usize);
         }
@@ -324,6 +364,13 @@ impl Process {
         if a >= b {
             return;
         }
+        // Never the page tables
+        if let Some((s, e)) = self.tables_area().filter(|&(s, e)| a < e && b > s) {
+            self.release(a, s);
+            self.release(e, b);
+            return;
+        }
+        self.forget_lazy(a, b);
         self.zero_range(a, b - a);
         self.carve(a, b);
         let (mut s, mut e) = (a, b);
@@ -345,9 +392,7 @@ impl Process {
     pub(crate) fn now_ns(&self, clock: u64) -> u64 {
         match clock {
             // CLOCK_REALTIME, CLOCK_REALTIME_COARSE
-            0 | 5 => SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64),
+            0 | 5 => host::wall_ns(),
             // Monotonic: from a second before the program started, on across snapshots
             _ => self.mono_base + self.start.elapsed().as_nanos() as u64,
         }
@@ -418,8 +463,8 @@ impl Process {
             })
             .ok_or_else(|| fail("the machine has no filesystem".into()))?;
         let (path, ino, cwd_ino) = found.ok_or_else(|| fail(format!("{name}: not found")))?;
-        let elf = read_all(&board, ino)?;
-        let mut p = Process::start(cpu, Some(board), &elf, path.as_bytes(), args, env)?;
+        let image = mm::Image::of(&board, ino, cpu.mem.len() as u64)?;
+        let mut p = Process::start(cpu, Some(board), image, path.as_bytes(), args, env)?;
         p.cwd = cwd_ino;
         Ok(p)
     }
@@ -435,13 +480,13 @@ impl Process {
         let exe = args
             .first()
             .map_or(b"/program".to_vec(), |a| a.as_bytes().to_vec());
-        Process::start(cpu, board, elf, &exe, args, env)
+        Process::start(cpu, board, mm::Image::Bytes(elf.into()), &exe, args, env)
     }
 
     fn start<H: Host>(
         cpu: &mut Cpu<H>,
         board: Option<Arc<Board>>,
-        elf: &[u8],
+        image: mm::Image,
         exe: &[u8],
         args: &[String],
         env: &[String],
@@ -449,9 +494,9 @@ impl Process {
         let fail = ExecError::Fail;
         let ram = cpu.mem.alias();
         let ram_size = ram.len() as u64;
-        let main = elf::header(elf).map_err(fail)?;
+        let main = elf::header(image.head()).map_err(fail)?;
         let base = if main.dyn_ { PIE_BASE } else { 0 };
-        let loaded = elf::load(&ram, ram_size, elf, base).map_err(fail)?;
+        let (loaded, segs) = elf::plan(image.head(), ram_size, base).map_err(fail)?;
         let stack_top = ram_size - PAGE;
         let brk_start = page_up(loaded.end);
         let mmap_top = stack_top - STACK_SIZE - PAGE;
@@ -467,6 +512,7 @@ impl Process {
             mmap_floor: brk_start + BRK_SIZE,
             mmap_top,
             free: BTreeMap::from([(brk_start + BRK_SIZE, mmap_top)]),
+            lazy: RefCell::default(),
             threads: Vec::new(),
             next_tid: 1001,
             files: Files::standard(),
@@ -474,7 +520,7 @@ impl Process {
             cwd: ROOT,
             umask: 0o022,
             exe: exe.to_vec(),
-            sigactions: BTreeMap::new(),
+            sig: Signals::default(),
             start: Instant::now(),
             mono_base: 1_000_000_000,
             output: Vec::new(),
@@ -487,9 +533,9 @@ impl Process {
             trace: false,
             stats: Stats::default(),
         };
-        // The dynamic loader, at a base of its own from the top of the mmap area
-        let (entry, interp_base) = match &loaded.interp {
-            None => (loaded.entry, 0),
+        // The dynamic loader's first, so what waits for blobs does before anything is mapped
+        let ld = match &loaded.interp {
+            None => None,
             Some(path) => {
                 let board = p.board.clone().ok_or_else(|| {
                     fail("dynamically linked: needs the machine's filesystem".into())
@@ -503,17 +549,25 @@ impl Process {
                             String::from_utf8_lossy(path)
                         ))
                     })?;
-                let ld = read_all(&board, ino)?;
-                let h = elf::header(&ld).map_err(fail)?;
+                Some(mm::Image::of(&board, ino, ram_size)?)
+            },
+        };
+        p.place(&image, &segs)?;
+        // The dynamic loader, at a base of its own from the top of the mmap area
+        let (entry, interp_base) = match ld {
+            None => (loaded.entry, 0),
+            Some(ld) => {
+                let h = elf::header(ld.head()).map_err(fail)?;
                 let at = p
                     .alloc(h.span)
                     .ok_or_else(|| fail("no room for the loader".into()))?;
-                let l = elf::load(&p.ram, ram_size, &ld, at).map_err(fail)?;
+                let (l, segs) = elf::plan(ld.head(), ram_size, at).map_err(fail)?;
+                p.place(&ld, &segs)?;
                 (l.entry, at)
             },
         };
         let mut random = [0u8; 16];
-        random.copy_from_slice(&armless::native::random_bytes(16));
+        random.copy_from_slice(&host::random_bytes(16));
         let sp = {
             let write = |a: u64, d: &[u8]| p.write(a, d);
             elf::stack(
@@ -528,6 +582,7 @@ impl Process {
             )
         };
         setup_cpu(cpu);
+        p.sync_mmu(cpu);
         let mut first = Ctx::save(cpu);
         first.x = [0; 31];
         first.v = [0; 32];
@@ -541,6 +596,7 @@ impl Process {
             wait: None,
             resume_deadline: None,
             exited: false,
+            sig: ThreadSig::default(),
         });
         Ok(p)
     }
@@ -550,12 +606,23 @@ impl Process {
     /// Bytes typed into the terminal (keys: the line discipline echoes and edits them as termios
     /// says, and Ctrl-C and the like are signals).
     pub fn input(&mut self, data: &[u8]) {
-        let (echo, signals) = self.tty.input(data);
-        self.output.extend_from_slice(&echo);
-        for sig in signals {
-            self.signal(sig);
+        let typed = self.tty.input(data);
+        if typed.flush_output {
+            // What the program wrote that the host hasn't taken yet goes, as Linux flushes it
+            self.output.clear();
+        }
+        self.output.extend_from_slice(&typed.echo);
+        for sig in typed.signals {
+            self.raise(sig, None, signal::SI_KERNEL);
         }
         self.poked = true;
+    }
+
+    /// A signal for the process from outside it (`kill`: SIGINT for an interrupt the host's
+    /// user asked for outside the terminal, say). Delivered when the process next runs: a thread
+    /// waiting in a call is woken for it, so run it after.
+    pub fn kill(&mut self, sig: u32) {
+        self.raise(sig, None, signal::SI_KERNEL);
     }
 
     /// The end of the terminal's input: reads past what is left return 0.
@@ -566,9 +633,11 @@ impl Process {
 
     /// The terminal's size changed.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.tty.cols = cols;
-        self.tty.rows = rows;
-        self.signal(28); // SIGWINCH
+        if (self.tty.cols, self.tty.rows) != (cols, rows) {
+            self.tty.cols = cols;
+            self.tty.rows = rows;
+            self.raise(signal::SIGWINCH, None, signal::SI_KERNEL);
+        }
     }
 
     /// What the program wrote to its terminal since the last call.
@@ -594,27 +663,24 @@ impl Process {
             .any(|t| !t.exited && matches!(t.wait, Some((Wait::Blobs(_), _))))
     }
 
+    /// Whether the program waits for input: a thread is parked in a call that input could
+    /// complete (a read of the terminal or a pipe, poll, select, epoll), and none waits on blobs.
+    /// When every thread waits (`Status::Idle`), this tells a REPL at its prompt from a program
+    /// that only sleeps (`time.sleep` in the middle of a command, whose threads wait on their
+    /// deadlines or on each other) — both are idle, only the first is done.
+    pub fn waiting_for_input(&self) -> bool {
+        !self.waiting_on_blobs()
+            && self
+                .threads
+                .iter()
+                .any(|t| !t.exited && matches!(t.wait, Some((Wait::Retry { .. }, _))))
+    }
+
     /// Guest pages that hold anything: what of RAM a snapshot carries. (Reads all of RAM.)
     pub fn guest_pages(&self) -> u64 {
         (0..self.ram_size / PAGE)
             .filter(|&i| !self.ram.is_zero((i * PAGE) as usize, PAGE as usize))
             .count() as u64
-    }
-
-    /// A signal for the process. Until signals are delivered: one whose action is to end the
-    /// process ends it, as Linux would with no handler; one with a handler is dropped.
-    pub(crate) fn signal(&mut self, sig: u64) {
-        let handler = self
-            .sigactions
-            .get(&sig)
-            .map(|a| u64::from_le_bytes(a[..8].try_into().unwrap()))
-            .unwrap_or(0);
-        // SIG_DFL whose default is to end the process (not SIGCHLD, SIGWINCH, SIGURG, SIGCONT)
-        if handler == 0 && !matches!(sig, 17 | 18 | 23 | 28) {
-            self.exit_code = Some(128 + sig as i32);
-        } else {
-            self.stats.signals_dropped += 1;
-        }
     }
 
     // ------------------------------------------------------------ running
@@ -631,6 +697,11 @@ impl Process {
             }
             if Instant::now() >= until {
                 return Status::Running;
+            }
+            // Signals first: a call a handler interrupts ends rather than runs again
+            self.deliver_signals(cpu);
+            if self.exit_code.is_some() || self.fault.is_some() {
+                continue;
             }
             self.wake();
             // The next runnable thread, round robin, starting with the current one
@@ -674,16 +745,18 @@ impl Process {
                         continue 'run;
                     },
                     Exit::Stop(StopReason::UnhandledException { esr, elr, far }) => {
-                        let ec = esr >> 26;
-                        if ec != 0x15 {
-                            self.fault = Some(format!("exception class {ec:#x} (esr {esr:#x}) at pc {elr:#x}, far {far:#x}"));
+                        if esr >> 26 != 0x15 {
+                            // A lazy page (filled: on), or a fault
+                            if self.abort(cpu, esr, elr, far) {
+                                continue;
+                            }
                             continue 'run;
                         }
                         cpu.pc = elr;
                         let cur = self.cur;
                         self.resume_deadline = self.threads[cur].resume_deadline.take();
                         let (nr, a0, a1, a2) = (cpu.x[8], cpu.x[0], cpu.x[1], cpu.x[2]);
-                        let ret = self.syscall(cpu, cur);
+                        let ret = self.syscall_lazily(cpu, cur);
                         if self.trace {
                             let r = match &ret {
                                 Ret::Val(r) => format!("{r:#x}"),
@@ -708,7 +781,10 @@ impl Process {
                         match ret {
                             Ret::Val(r) => {
                                 cpu.x[0] = r as u64;
-                                if Instant::now() >= until || self.exit_code.is_some() {
+                                if Instant::now() >= until
+                                    || self.exit_code.is_some()
+                                    || self.signal_ready()
+                                {
                                     continue 'run;
                                 }
                             },
@@ -750,6 +826,11 @@ impl Process {
                                 }
                                 self.threads[cur].exited = true;
                                 self.loaded = None;
+                                // What it had pending goes to the threads left
+                                let left = std::mem::take(&mut self.threads[cur].sig.pending);
+                                for (s, c) in left {
+                                    self.sig.pending.entry(s).or_insert(c);
+                                }
                                 continue 'run;
                             },
                             Ret::GroupExit(code) => {
@@ -841,7 +922,7 @@ impl Process {
 
     /// The process's state for a snapshot (the machine's own snapshot holds its memory and
     /// filesystem): every thread, its waits as time left, the memory map, the descriptors, the
-    /// terminal, the clock.
+    /// terminal, the clock, the signals.
     pub fn save<H: Host>(&mut self, cpu: &Cpu<H>) -> Vec<u8> {
         self.park(cpu);
         let now = Instant::now();
@@ -915,11 +996,9 @@ impl Process {
         w.u(self.cwd);
         w.u(self.umask as u64);
         w.b(&self.exe);
-        w.u(self.sigactions.len() as u64);
-        for (&sig, act) in &self.sigactions {
-            w.u(sig);
-            w.b(act);
-        }
+        self.sig.save_actions(&mut w);
+        self.lazy.borrow().save(&mut w);
+        self.save_signals(&mut w);
         w.0
     }
 
@@ -930,7 +1009,15 @@ impl Process {
         board: Option<Arc<Board>>,
         data: &[u8],
     ) -> Result<Process, String> {
-        let mut r = R(data.strip_prefix(MAGIC).ok_or("not a process state")?);
+        // ARMLUSR2, from before signals were delivered and files were mapped lazily: signal
+        // actions only, and nothing lazy
+        let (mut r, old) = match data.strip_prefix(MAGIC) {
+            Some(d) => (R(d), false),
+            None => (
+                R(data.strip_prefix(MAGIC_2).ok_or("not a process state")?),
+                true,
+            ),
+        };
         let ram = cpu.mem.alias();
         let ram_size = r.u()?;
         if ram_size != ram.len() as u64 {
@@ -1004,6 +1091,7 @@ impl Process {
                 wait: wait.map(|w| (w, deadline)),
                 resume_deadline,
                 exited,
+                sig: ThreadSig::default(),
             });
         }
         let files = Files::load(&mut r)?;
@@ -1011,13 +1099,10 @@ impl Process {
         let cwd = r.u()?;
         let umask = r.u()? as u32;
         let exe = r.b()?.to_vec();
-        let mut sigactions = BTreeMap::new();
-        for _ in 0..r.u()? {
-            let sig = r.u()?;
-            sigactions.insert(sig, r.b()?.try_into().map_err(|_| "bad sigaction")?);
-        }
+        let sig = Signals::load_actions(&mut r)?;
+        let lazy = if old { mm::Lazy::default() } else { mm::Lazy::load(&mut r, ram_size)? };
         setup_cpu(cpu);
-        let p = Process {
+        let mut p = Process {
             ram,
             ram_size,
             board,
@@ -1026,6 +1111,7 @@ impl Process {
             mmap_floor,
             mmap_top,
             free,
+            lazy: RefCell::new(lazy),
             threads,
             next_tid,
             files,
@@ -1033,7 +1119,7 @@ impl Process {
             cwd,
             umask,
             exe,
-            sigactions,
+            sig,
             start: now,
             mono_base,
             output: Vec::new(),
@@ -1047,6 +1133,13 @@ impl Process {
             trace: false,
             stats: Stats::default(),
         };
+        if old {
+            for t in &mut p.threads {
+                t.sig.altstack_unknown = true;
+            }
+        } else {
+            p.load_signals(&mut r)?;
+        }
         let wanted: Vec<String> = p
             .threads
             .iter()
@@ -1057,12 +1150,13 @@ impl Process {
             .flatten()
             .collect();
         p.want_blobs(&wanted);
+        p.sync_mmu(cpu);
         Ok(p)
     }
 }
 
 /// A whole file of the machine's filesystem, for exec (its blobs asked for when they aren't there).
-fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
+pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     match board.with_fs(|fs| files::got(fs.read_all(ino))) {
         Some(files::Got::Ok(b)) => Ok(b),
         Some(files::Got::Need(blobs)) => {
@@ -1074,4 +1168,5 @@ fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-const MAGIC: &[u8; 8] = b"ARMLUSR2";
+const MAGIC: &[u8; 8] = b"ARMLUSR3";
+const MAGIC_2: &[u8; 8] = b"ARMLUSR2";

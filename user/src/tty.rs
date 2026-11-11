@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::ser::{R, W};
+use crate::signal::{SIGINT, SIGQUIT, SIGTSTP};
 
 // c_iflag, c_oflag, c_lflag bits (asm-generic)
 const ICRNL: u32 = 0o400;
@@ -20,6 +21,7 @@ const ECHOE: u32 = 0o20;
 const ECHOK: u32 = 0o40;
 const ECHOCTL: u32 = 0o1000;
 const ECHOKE: u32 = 0o4000;
+const NOFLSH: u32 = 0o200;
 const IEXTEN: u32 = 0o100000;
 // c_cc indices
 const VINTR: usize = 0;
@@ -31,10 +33,6 @@ const VTIME: usize = 5;
 const VMIN: usize = 6;
 const VSUSP: usize = 10;
 const NCCS: usize = 19;
-
-pub(crate) const SIGINT: u64 = 2;
-pub(crate) const SIGQUIT: u64 = 3;
-pub(crate) const SIGTSTP: u64 = 20;
 
 /// The kernel's struct termios (TCGETS and TCSETS read and write these 36 bytes).
 #[derive(Clone)]
@@ -103,6 +101,18 @@ impl Termios {
     }
 }
 
+/// What typing into the terminal did.
+#[derive(Default)]
+pub(crate) struct Typed {
+    /// What to echo back to the screen
+    pub echo: Vec<u8>,
+    /// The signals the keys raise, for the terminal's foreground process
+    pub signals: Vec<u32>,
+    /// A signal key flushed the terminal's output: what the program wrote and the screen hasn't
+    /// shown yet goes
+    pub flush_output: bool,
+}
+
 /// The terminal's state.
 pub(crate) struct Tty {
     pub termios: Termios,
@@ -152,12 +162,15 @@ impl Tty {
         }
     }
 
-    /// Bytes typed in. Returns what to echo back to the screen, and the signals the keys raise.
-    pub fn input(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<u64>) {
+    /// Bytes typed in: what to echo, and the signals the keys raise. With ISIG, VINTR, VQUIT and
+    /// VSUSP raise SIGINT, SIGQUIT and SIGTSTP as n_tty does: unless NOFLSH, the input not read
+    /// yet and the output not shown yet go first, then the key is echoed (^C).
+    pub fn input(&mut self, bytes: &[u8]) -> Typed {
         let t = self.termios.clone();
         let echo = t.lflag & ECHO != 0;
         let mut out = Vec::new();
         let mut signals = Vec::new();
+        let mut flush_output = false;
         for &b0 in bytes {
             let b = if b0 == b'\r' && t.iflag & ICRNL != 0 { b'\n' } else { b0 };
             if t.lflag & ISIG != 0 {
@@ -165,9 +178,15 @@ impl Tty {
                     .into_iter()
                     .find(|&(i, _)| t.cc[i] != 0 && b == t.cc[i]);
                 if let Some((_, sig)) = sig {
-                    self.line.clear();
+                    if t.lflag & NOFLSH == 0 {
+                        self.queue.clear();
+                        self.line.clear();
+                        self.eofs = 0;
+                        out.clear();
+                        flush_output = true;
+                    }
                     if echo {
-                        out.extend_from_slice(&[b'^', b ^ 0x40, b'\r', b'\n']);
+                        self.echo(b, &mut out);
                     }
                     signals.push(sig);
                     continue;
@@ -207,7 +226,11 @@ impl Tty {
                 }
             }
         }
-        (out, signals)
+        Typed {
+            echo: out,
+            signals,
+            flush_output,
+        }
     }
 
     fn echo(&self, b: u8, out: &mut Vec<u8>) {
@@ -308,9 +331,9 @@ mod tests {
     #[test]
     fn a_line_is_edited_then_readable_whole() {
         let mut t = Tty::new(1);
-        let (echo, sigs) = t.input(b"helo\x7f\x7fllo");
-        assert_eq!(echo, b"helo\x08 \x08\x08 \x08llo");
-        assert!(sigs.is_empty());
+        let typed = t.input(b"helo\x7f\x7fllo");
+        assert_eq!(typed.echo, b"helo\x08 \x08\x08 \x08llo");
+        assert!(typed.signals.is_empty());
         assert!(!t.readable(), "no line until its end");
         t.input(b"\r");
         assert_eq!(
@@ -339,13 +362,33 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_is_sigint_and_drops_the_line() {
+    fn ctrl_c_is_sigint_and_flushes_input_and_output() {
         let mut t = Tty::new(1);
-        let (echo, sigs) = t.input(b"abc\x03");
-        assert_eq!(sigs, vec![SIGINT]);
-        assert!(echo.ends_with(b"^C\r\n"));
+        t.input(b"queued\n");
+        let typed = t.input(b"abc\x03");
+        assert_eq!(typed.signals, vec![SIGINT]);
+        assert_eq!(typed.echo, b"^C", "echoed as Linux does: no newline");
+        assert!(typed.flush_output);
+        assert!(!t.readable(), "the line not read yet went too");
         t.input(b"\n");
         assert_eq!(t.read(10), Some(b"\n".to_vec()));
+
+        // Ctrl-\ and Ctrl-Z; NOFLSH keeps what was typed
+        let mut keep = t.termios.clone();
+        keep.lflag |= NOFLSH;
+        t.set(keep, false);
+        t.input(b"x\n");
+        let typed = t.input(b"\x1c\x1a");
+        assert_eq!(typed.signals, vec![SIGQUIT, SIGTSTP]);
+        assert!(!typed.flush_output);
+        assert_eq!(t.read(10), Some(b"x\n".to_vec()));
+
+        // Raw mode with ISIG off: the byte itself
+        let mut raw = t.termios.clone();
+        raw.lflag &= !(ICANON | ISIG | ECHO);
+        t.set(raw, false);
+        assert!(t.input(b"\x03").signals.is_empty());
+        assert_eq!(t.read(10), Some(b"\x03".to_vec()));
     }
 
     #[test]
@@ -360,8 +403,8 @@ mod tests {
             Some(b"q".to_vec()),
             "what was typed before raw mode is readable"
         );
-        let (echo, _) = t.input(b"\x1b[A\x7f");
-        assert!(echo.is_empty(), "no echo");
+        let typed = t.input(b"\x1b[A\x7f");
+        assert!(typed.echo.is_empty(), "no echo");
         assert_eq!(t.read(10), Some(b"\x1b[A\x7f".to_vec()));
     }
 

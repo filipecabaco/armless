@@ -32,7 +32,7 @@ config, notifications) and a legacy INTx line. The device tree marks the bus
 | `vm.rs` | `Board` (devices + host API), `Vm` (with CPUs), snapshots |
 | `runner.rs`, `native.rs`, `platform.rs` | native hosting: threads, blob directory, TCP NAT |
 | `wasm.rs`, `js/armless.js` | the browser build |
-| `../user/` | user mode: a static Linux executable with no guest kernel (`armless-user`, `armless-exec`) |
+| `../user/` | user mode: a Linux program with no guest kernel (`armless-user`, `armless-exec`); its `wasm.rs` adds user mode's exports to armless.wasm |
 
 ## Host interface
 
@@ -204,10 +204,10 @@ waiting. A shared control block parks every worker for `save_state`.
 
 `user/` (the `armless-user` crate, and `armless-exec` on the command line) runs a Linux program
 with no guest kernel. The machine is the same; what is missing is EL1. The CPU runs the program
-at EL0 with the MMU off and no vector table, so every exception it takes stops the CPU
-(`StopReason::UnhandledException`, cpu.rs) with ESR, ELR and FAR. That is true in the
-interpreter and in both JITs, so user mode needs nothing from the CPU it didn't already do. The
-host reads the syscall from x8 and x0–x5, answers it in x0, and resumes at ELR.
+at EL0 with no vector table and `Cpu::stop_on_exceptions` set, so every exception it takes stops
+the CPU (`StopReason::UnhandledException`, cpu.rs) with ESR, ELR and FAR, whether the MMU is on
+or off. That is true in the interpreter and in both JITs. The host reads the syscall from x8 and
+x0–x5, answers it in x0, and resumes at ELR.
 
 - **Programs:** static or dynamically linked. A dynamic one's loader (PT_INTERP, musl's
   `ld-musl-aarch64.so.1` say) comes from the machine's filesystem, as execve has it, and maps the
@@ -219,11 +219,14 @@ host reads the syscall from x8 and x0–x5, answers it in x0, and resumes at ELR
   needs one parks its thread, the machine asks the host for it (`Board::want_blobs`), and the
   call runs again once it is there, as a 9p request does. Descriptors are Linux's: open file
   descriptions with their offset, shared by dup. `/dev/null`, `zero`, `urandom` and `tty`, and a
-  few `/proc` files, are made here. File mappings (`mmap` of a file) are private copies.
+  few `/proc` files, are made here. File mappings (`mmap` of a file) are private copies, filled
+  lazily (below).
 - **The terminal:** stdin, stdout and stderr are a terminal with termios (TCGETS, TCSETS), a
   window size (`Process::resize`, TIOCGWINSZ) and a line discipline, as n_tty: in canonical
-  mode a line is edited and echoed before it is read; in raw mode bytes pass through; Ctrl-C
-  is SIGINT; output newlines start a line (ONLCR).
+  mode a line is edited and echoed before it is read; in raw mode bytes pass through; with
+  ISIG, Ctrl-C, Ctrl-\ and Ctrl-Z are SIGINT, SIGQUIT and SIGTSTP, flushing the input and the
+  output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
+  newlines start a line (ONLCR).
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
 - **Memory:** VA is PA. The ELF's segments go where they ask (a PIE, and the loader, at a base
   of their own), `brk` after them, the stack at the top of RAM and `mmap` below it, from a free
@@ -231,6 +234,23 @@ host reads the syscall from x8 and x0–x5, answers it in x0, and resumes at ELR
   (fresh zero pages), so a program that reserves and releases large ranges (Go reserves about
   600 MB of address space at start) costs only what it touches. RAM must still be large
   enough for those reservations.
+- **Lazy file pages** (user/src/mm.rs): the executable's segments, its loader's, and every
+  `mmap` of a file are mapped, not read: a page gets its contents when something first touches
+  it. So a snapshot holds the pages a program used, not every byte of every library it mapped,
+  and only their blobs are fetched. Once a process maps a file the MMU is on, still VA = PA:
+  identity page tables the process keeps in a 2 MiB block of the mmap area (the program can't
+  touch it, the host refuses it to system calls), 2 MiB blocks for all of RAM and a table of
+  4 KiB pages only for a block with lazy pages, those invalid. A touch of one is a translation
+  fault: the host fills the page from its file (or the thread waits for its blobs, as a read
+  does, and touches it again), makes it valid and resumes at the instruction. A system call
+  that reads or writes a lazy page (a `write` from a mapped page) fills it first; a block whose
+  pages are all filled is a block again. Making a page valid needs no TLB maintenance; a
+  mapping over pages flushes the TLB. A private write fills the page, then writes it. The lazy
+  mappings and the tables' bookkeeping are in the process state. With no room for the tables
+  (or RAM not whole 2 MiB blocks) files are read in at once as before; `ARMLESS_USER_EAGER=1`
+  does that always, for comparisons. The MMU costs nothing measurable: a pointer chase over 256
+  MB and CPU-bound Python run within noise of it off, interpreter and native JIT alike (a fast
+  table miss walks three levels instead of none, and a miss is already the slow path).
 - **Threads:** every guest thread is a saved register context, and they take turns on one
   CPU in slices of instructions; a syscall answered on the way counts against the slice.
   `clone` (threads only), futexes (with timeouts and bitsets), `set_tid_address` and
@@ -240,15 +260,70 @@ host reads the syscall from x8 and x0–x5, answers it in x0, and resumes at ELR
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
 - **Clocks:** `clock_gettime`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
   across a snapshot and its restores.
-- **Signals:** handlers are recorded and not called yet; a signal with no handler whose
-  default is to end the process ends it.
+- **Signals** (signal.rs): actions per process, a mask, a pending set and an alternate stack
+  per thread, a pending set for the process (given to its first thread that doesn't block the
+  signal, the main thread first). A handler runs on the `rt_sigframe` the kernel builds
+  (siginfo, ucontext, sigcontext with an fpsimd_context record), on the alternate stack with
+  SA_ONSTACK, and `rt_sigreturn` takes the thread back from it, mask and FP/SIMD registers too.
+  With no SA_RESTORER (Go on arm64) the handler returns to a page of the process's with the
+  vDSO's two instructions. A thread parked in a call is woken for a signal it handles: reads
+  and writes of the terminal and pipes, and futex waits with no timeout, start again with
+  SA_RESTART and return EINTR without; poll, select, epoll, sleeps (with the time left),
+  `rt_sigsuspend` and `rt_sigtimedwait` return EINTR. A wait for blobs is not interrupted
+  (a disk wait): its signal comes once it ends. SIGCHLD, SIGCONT, SIGURG, SIGWINCH and the
+  stop signals are ignored by default (no job control), the rest end the process with 128 +
+  the signal. `Process::kill` is a signal from the host. Go's SIGURG preemption is delivered.
+  Not yet: queued real-time signals, the masks of ppoll, pselect6 and epoll_pwait, and
+  signals for faults.
 - **Snapshots:** the machine's own snapshot holds RAM and the filesystem; `Process::save` holds
-  the rest (threads, their waits, the memory map, descriptors and pipes, the terminal, the
-  clock), a few KB. `Process::restore` takes it on a machine that loaded the snapshot.
+  the rest (threads, their waits, the memory map and lazy mappings, descriptors and pipes, the
+  terminal, the clock, signals), a few tens of KB. `Process::restore` takes it on a machine that
+  loaded the snapshot, and a state from 0.11 too (`ARMLUSR2`: nothing in it is lazy, and its
+  threads' alternate stacks weren't kept, so a thread's first SA_ONSTACK handler gets one of
+  its own).
+- **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
+  clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
+  in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,
+  `wall_clock_ms`) and a SHA-256 generator keyed by the host's entropy (the last
+  `armless_seed`, which armless.js gives after every restore).
 
-Not yet: page tables (so no PROT_NONE, no nil-pointer faults, no `fork`), processes (`fork`,
-`execve`, `wait4`), sockets, signal delivery, more than one vCPU, and the hypervisor backends
-(an SVC at EL0 traps to EL1 in hardware there, not to the host).
+### In the browser
+
+armless.wasm is the cdylib of `armless-user`, which depends on armless, so one module has both
+export sets: armless's `armless_*` (the `#[no_mangle]` functions of a dependency are exported
+from a cdylib as they are) and user mode's `armless_user_*` (`user/src/wasm.rs`). These run on
+the machine `armless::wasm` keeps, with its `vm()`, `out()`, `set_error()` and pointer helpers.
+armless-smp.wasm is still built from armless alone: user mode runs on one CPU. User mode adds
+about 290 KB to armless.wasm (1.28 to 1.57 MB).
+
+A host makes the machine as for Linux (`armless_create`, `armless_fs_load`, `armless_seed`)
+and then, instead of a boot:
+
+| export | |
+|---|---|
+| `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
+| `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine |
+| `armless_user_run(budget_ms)` | 0 its time ran out, 1 idle, 2 exited, 3 faulted (the reason in `armless_error`), -1 no process |
+| `armless_user_wake_ms()` | after 1: the `microtick()` time of its next deadline, or -1 (only input or a blob wakes it) |
+| `armless_user_waiting_on_blobs()` | 1 when a thread waits on a blob rather than on input |
+| `armless_user_waiting_for_input()` | 1 when a thread waits in a call input could complete (read, poll, epoll) and none on a blob: a REPL at its prompt, not a program asleep |
+| `armless_user_exit_code()` | the exit status, -1 while it runs |
+| `armless_user_input(ptr, len)`, `armless_user_close_input()`, `armless_user_resize(cols, rows)` | the terminal |
+| `armless_user_kill(sig)` | a signal for the program, as kill(2) sends it (SIGINT for a stop button) |
+| `armless_user_save()` | the process's state, at `armless_buf` |
+
+What the program writes comes out of `armless_events` as console output, and the files it
+reads that aren't there yet as blob events, so the event loop a host has for Linux serves it
+too. A snapshot is the pair a native host makes: the machine's state, the bytes of
+`Vm::save_state` (`armless_save_*`), and the process's, those of `Process::save`
+(`armless_user_save`), restored machine first. A site snowglobe saved natively
+(`state.bin.zst` and `user.bin`) restores in a page, and a pair saved in a page restores
+natively.
+
+Not yet: protections (no PROT_NONE, no nil-pointer faults, though the page tables could give
+them as invalid pages with no file), processes (`fork`, `execve`, `wait4`), sockets, more than
+one vCPU, and the hypervisor backends (an SVC at EL0 traps to EL1 in hardware there, not to the
+host).
 
 What runs: snowglobe's `go` (Bubble Tea, static), `python` (the 3.14 REPL, 122 shared
 libraries) and `duckdb` (C++) examples, from their own images' filesystems; a Python REPL saved
@@ -259,3 +334,9 @@ Measured as a snowglobe site (a Go program with eight goroutines, macOS, the sam
 `snowglobe-vm` for each): the snapshot is 2.5 MB raw and 0.6 MB compressed, against 22.1 and
 3.6 MB under a stripped Linux and 50.6 and 10.2 under Alpine's `linux-virt`; a machine's
 footprint is 22 MB, against 57 and 136.
+
+Lazy file pages, measured the same way on snowglobe's examples (compressed snapshot, before and
+after): `duckdb` 15.6 MB to 4.9 MB (64 to 24 MB raw), `python` 4.3 to 3.1 MB, `go` 1.3 to 0.9
+MB. Each answers its first command after a restore as fast as before when its host runs the
+process again as soon as blobs arrive (pages first touched then are filled from the
+filesystem).
