@@ -384,6 +384,11 @@ impl Board {
     pub fn local_unlisten(&self, port: u16) {
         self.with_net(|s, _| s.local_unlisten(port));
     }
+    /// Whether the process listens on TCP `port` right now.
+    pub fn local_listening(&self, port: u16) -> bool {
+        self.with_net(|s, _| s.local_listening(port))
+            .unwrap_or(false)
+    }
     pub fn local_accept(&self, port: u16) -> Option<u32> {
         self.with_net(|s, _| s.local_accept(port)).flatten()
     }

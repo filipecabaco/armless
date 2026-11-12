@@ -158,6 +158,11 @@ impl Stack {
         }
     }
 
+    /// Whether the process listens on `port` right now.
+    pub fn local_listening(&self, port: u16) -> bool {
+        self.locals.listening.contains(&port)
+    }
+
     /// The next connection the host opened to the listening `port`.
     pub fn local_accept(&mut self, port: u16) -> Option<u32> {
         self.locals.pending.get_mut(&port)?.pop_front()

@@ -173,10 +173,17 @@ fn main() {
         let (Some(host), true) = (&host, net) else {
             die("--publish needs --net")
         };
-        let listener =
-            std::net::TcpListener::bind(addr).unwrap_or_else(|e| die(format!("{addr}: {e}")));
-        let (host, port) = (host.clone(), *port);
+        // A port that is taken is said now; the host's side is opened once the program listens
+        // (a connect that succeeds says something is there to answer, as a wait for a port needs)
+        drop(std::net::TcpListener::bind(addr).unwrap_or_else(|e| die(format!("{addr}: {e}"))));
+        let (host, addr, port, board) = (host.clone(), addr.clone(), *port, vm.board.clone());
         std::thread::spawn(move || {
+            while !board.local_listening(port) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let Ok(listener) = std::net::TcpListener::bind(&addr) else {
+                return eprintln!("{addr}: taken since the start");
+            };
             for stream in listener.incoming().flatten() {
                 host.forward(stream, port);
             }

@@ -498,6 +498,31 @@ fn the_host_connects_to_a_port_the_program_listens_on() {
 }
 
 #[test]
+fn a_port_is_listened_on_between_the_listen_and_the_exit() {
+    // What a published port waits for: the host opens its side only once this says yes
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, &sa_in([0, 0, 0, 0], 7001));
+    p.sys(198, &[I(2), I(1), I(0)]).expect(3).save(0x100);
+    p.sys(200, &[W(0x100), D(0x200), I(16)]).expect(0);
+    p.sys(201, &[W(0x100), I(5)]).expect(0);
+    p.sys(202, &[W(0x100), I(0), I(0)]).expect(4).save(0x108); // blocks until the host connects
+    let mut p = start(&mut vm, p);
+    assert!(!vm.board.local_listening(7001), "nothing has run yet");
+    let (mut conn, mut seen) = (None, false);
+    let (_, status) = drive(&mut p, &mut vm, &mut |b, e, idle| match e {
+        None if idle && conn.is_none() => {
+            seen = b.local_listening(7001);
+            conn = Some(b.tcp_connect(7001).unwrap());
+        },
+        _ => {},
+    });
+    ok(&status);
+    assert!(seen, "the program waits in accept: it listens");
+    assert!(!vm.board.local_listening(7001), "and stops when it exits");
+}
+
+#[test]
 fn a_name_is_answered_by_the_networks_resolver() {
     let mut vm = machine();
     let mut p = Prog::default();
