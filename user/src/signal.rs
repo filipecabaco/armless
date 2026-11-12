@@ -43,7 +43,7 @@ pub(crate) const SIGTTIN: u32 = 21;
 pub(crate) const SIGTTOU: u32 = 22;
 pub(crate) const SIGURG: u32 = 23;
 pub(crate) const SIGWINCH: u32 = 28;
-const NSIG: u32 = 64;
+pub(crate) const NSIG: u32 = 64;
 
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;

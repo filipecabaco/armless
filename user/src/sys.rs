@@ -101,6 +101,7 @@ impl Process {
             },
             Kind::Event { count } => (*count > 0, true, false),
             Kind::Sock(id) => self.sock_ready(*id),
+            Kind::Pid(pid) => self.pidfd_ready(*pid),
             Kind::Epoll { watch } => (
                 watch.iter().any(|(&f, w)| {
                     self.ready(f)
@@ -233,7 +234,7 @@ impl Process {
                 }
                 self.sock_recv(fd, id, max, 0).map(|r| r.0)
             },
-            Kind::PipeWrite(_) | Kind::Epoll { .. } => Err(Ret::Val(-EINVAL)),
+            Kind::PipeWrite(_) | Kind::Epoll { .. } | Kind::Pid(_) => Err(Ret::Val(-EINVAL)),
         }
     }
 
@@ -326,6 +327,7 @@ impl Process {
                 self.sock_send(fd, id, data, 0, None)
             },
             Kind::PipeRead(_) | Kind::Epoll { .. } => Err(Ret::Val(-EBADF)),
+            Kind::Pid(_) => Err(Ret::Val(-EINVAL)),
         }
     }
 
@@ -389,7 +391,7 @@ impl Process {
             b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
             b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
             b"/sys/fs/cgroup/cpu.max" => b"max 100000\n".to_vec(),
-            _ => return None,
+            _ => return self.fdinfo(path),
         })
     }
 
@@ -499,7 +501,7 @@ impl Process {
             },
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
             Kind::Sock(_) => Stat::device(files::S_IFSOCK | 0o777, 0),
-            Kind::Event { .. } | Kind::Epoll { .. } => Stat::device(0o600, 0),
+            Kind::Event { .. } | Kind::Epoll { .. } | Kind::Pid(_) => Stat::device(0o600, 0),
         })
     }
 
@@ -907,10 +909,10 @@ impl Process {
                     .strip_prefix(b"/proc/self/fd/")
                     .and_then(|n| std::str::from_utf8(n).ok()?.parse::<i32>().ok())
                 {
-                    if self.files.get(fd).is_some() {
-                        Ok(format!("/dev/fd/{fd}").into_bytes())
-                    } else {
-                        Err(-ENOENT)
+                    match self.files.get(fd).map(|d| &d.kind) {
+                        Some(Kind::Pid(_)) => Ok(b"anon_inode:[pidfd]".to_vec()),
+                        Some(_) => Ok(format!("/dev/fd/{fd}").into_bytes()),
+                        None => Err(-ENOENT),
                     }
                 } else {
                     self.lookup(a[0] as i32, &path, false).and_then(|ino| {
@@ -1329,6 +1331,7 @@ impl Process {
                     ptid: a[2],
                     tls: a[3],
                     ctid: a[4],
+                    pidfd: a[2],
                 },
             ),
             435 => self.sys_clone3(cpu, cur, a[0], a[1]),
@@ -1441,6 +1444,8 @@ impl Process {
             132 => self.sys_sigaltstack(cur, a[0], a[1], cpu.sp_el0),
             // kill, tkill, tgkill (Go's SIGURG preemption among them)
             129..=131 => self.sys_kill(nr, &a),
+            // pidfd_send_signal, pidfd_open, pidfd_getfd (proc.rs)
+            424 | 434 | 438 => self.sys_pidfd(nr, &a),
             139 => self.sigreturn(cpu, cur),
             133 => self.sys_sigsuspend(cur, a[0], a[1]),
             137 => self.sys_sigtimedwait(cur, &a),

@@ -84,6 +84,8 @@ pub(crate) enum Kind {
     },
     /// A socket of `Files::net`
     Sock(u32),
+    /// A process descriptor (pidfd): the process by its id, which is never reused
+    Pid(i64),
 }
 
 /// What an epoll instance watches on a descriptor: the events asked for (EPOLLET: only as the
@@ -319,6 +321,10 @@ impl Files {
                     w.u(11);
                     w.u(*id as u64);
                 },
+                Kind::Pid(pid) => {
+                    w.u(12);
+                    w.u(*pid as u64);
+                },
                 Kind::Epoll { watch } => {
                     w.u(10);
                     w.u(watch.len() as u64);
@@ -376,6 +382,7 @@ impl Files {
                 8 => Kind::PipeWrite(r.u()? as u32),
                 9 => Kind::Event { count: r.u()? },
                 11 => Kind::Sock(r.u()? as u32),
+                12 => Kind::Pid(r.u()? as i64),
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {

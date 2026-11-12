@@ -347,12 +347,19 @@ x0–x5, answers it in x0, and resumes at ELR.
   failure (ENOENT, EACCES, ENOEXEC, E2BIG, ELOOP) leaves the program as it was, and one whose
   file hasn't arrived waits for it and runs again. `wait4` and `waitid` (WNOHANG, a pid, a
   group or any child; a zombie keeps its status), `kill` of a pid, and SIGCHLD when a child
-  ends (a parent that ignores it leaves no zombies). A process's `exit_group` ends only it; its
+  ends (a parent that ignores it leaves no zombies). **Process descriptors:** `pidfd_open` (a
+  group leader, PIDFD_NONBLOCK; ESRCH when gone, EINVAL for a thread), CLONE_PIDFD in `clone`
+  (at parent_tid) and `clone3` (cl_args.pidfd), `pidfd_send_signal` (like `kill`, with an
+  optional siginfo), `pidfd_getfd` (a description of the process's table, close-on-exec) and
+  `waitid(P_PIDFD)` (a non-blocking descriptor never waits: EAGAIN, or 0 with WNOHANG); they are
+  close-on-exec, readable (POLLIN) once the process has ended and hung up (POLLHUP) once it is
+  waited for, in `poll`, `select` and epoll, and `/proc/self/fdinfo/N` and `/proc/self/fd/N` say
+  what they are. A process's `exit_group` ends only it; its
   children go to the first process, and the machine ends when that one does. Not yet: the
   descriptor table, signal actions and working directory shared by CLONE_FILES, CLONE_SIGHAND
   and CLONE_FS (copied instead), futexes across processes (those of a MAP_SHARED page, or of
   CLONE_VM processes, wake only within a process), the siginfo of SIGCHLD (its pid and status),
-  job control (stop and continue), CLONE_PIDFD, namespaces, and a MAP_SHARED area that was
+  job control (stop and continue), PIDFD_THREAD, namespaces, and a MAP_SHARED area that was
   PROT_NONE at a fork shares nothing (the others have their untouched pages made at the fork).
 - **Blocking:** a call that can't complete (a read of the terminal or a pipe, a poll, a wait
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,

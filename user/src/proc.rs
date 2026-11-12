@@ -19,6 +19,12 @@
 //! the address space (`Mm::fork`), or the same one (CLONE_VM, with CLONE_VFORK its parent waits
 //! until the child execs or ends). The descriptor table is always copied, never shared
 //! (CLONE_FILES), and so are the signal actions and the working directory.
+//!
+//! A process descriptor (`pidfd_open`, or CLONE_PIDFD) is a description of `Kind::Pid`: the
+//! process by its id, which is never reused. It is readable once the process has ended (a
+//! zombie), and also hung up once nobody can wait for it any more; `pidfd_send_signal` signals
+//! it, `pidfd_getfd` takes a descriptor of its table, and `waitid(P_PIDFD)` waits for it (a
+//! non-blocking one never blocks). Threads other than a group's leader have none (no PIDFD_THREAD).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,12 +32,14 @@ use std::rc::Rc;
 use armless::cpu::Cpu;
 use armless::Host;
 
+use crate::files::{Kind, EBADF, O_CLOEXEC, O_NONBLOCK};
 use crate::mm::Mm;
 use crate::signal::{self, ThreadSig};
 use crate::{Ctx, Proc, Process, Ret, Thread, Wait, INIT};
 
 const EPERM: i64 = 1;
 const ESRCH: i64 = 3;
+const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const ECHILD: i64 = 10;
@@ -55,6 +63,11 @@ const CLONE_NAMESPACES: u64 =
 /// What clone ignores: CLONE_FS, FILES (the table is copied), PTRACE, SYSVSEM, UNTRACED,
 /// DETACHED, IO, and CLONE_SIGHAND's other side
 const CLONE_IGNORED: u64 = 0x200 | 0x400 | 0x2000 | 0x40000 | 0x40_0000 | 0x80_0000 | 0x8000_0000;
+
+/// waitid's idtype for a process descriptor
+const P_PIDFD: u64 = 3;
+/// pidfd_open's flag (the one other, PIDFD_THREAD, is not supported)
+const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
 
 const WNOHANG: u32 = 1;
 const WSTOPPED: u32 = 2;
@@ -82,6 +95,8 @@ pub(crate) struct CloneArgs {
     pub ptid: u64,
     pub ctid: u64,
     pub tls: u64,
+    /// Where CLONE_PIDFD stores the descriptor (clone: the same as `ptid`)
+    pub pidfd: u64,
 }
 
 /// Which children wait4 and waitid pick.
@@ -346,10 +361,27 @@ impl Process {
         {
             return Ret::Val(-EINVAL);
         }
+        // A non-blocking process descriptor never blocks: with WNOHANG it says nothing yet, else EAGAIN
+        let mut fail_instead_of_wait = false;
         let pick = match kind {
             0 => Pick::Any,
             1 => Pick::Pid(id),
             2 => Pick::Group(if id == 0 { self.p.pgid } else { id }),
+            P_PIDFD => {
+                if id < 0 {
+                    return Ret::Val(-EINVAL);
+                }
+                match self.files.get(id as i32) {
+                    Some(d) => match d.kind {
+                        Kind::Pid(pid) => {
+                            fail_instead_of_wait = d.flags & O_NONBLOCK != 0;
+                            Pick::Pid(pid)
+                        },
+                        _ => return Ret::Val(-EBADF),
+                    },
+                    None => return Ret::Val(-EBADF),
+                }
+            },
             _ => return Ret::Val(-EINVAL),
         };
         match self.children(pick) {
@@ -361,6 +393,7 @@ impl Process {
                 }
                 Ret::Val(0)
             },
+            Some(None) if fail_instead_of_wait => Ret::Val(-EAGAIN),
             Some(None) => Ret::Retry {
                 deadline: None,
                 on_timeout: 0,
@@ -452,6 +485,7 @@ impl Process {
         if f & CLONE_THREAD != 0 && f & (CLONE_SIGHAND | CLONE_VM) != (CLONE_SIGHAND | CLONE_VM)
             || f & CLONE_SIGHAND != 0 && f & CLONE_VM == 0
             || f & CLONE_PIDFD != 0
+                && (f & CLONE_THREAD != 0 || f & CLONE_PARENT_SETTID != 0 && c.pidfd == c.ptid)
             || f & CLONE_VFORK != 0 && f & CLONE_THREAD != 0
             || f & CLONE_PARENT != 0 && self.p.pid == INIT
         {
@@ -462,6 +496,7 @@ impl Process {
         }
         let known = CLONE_VM
             | CLONE_SIGHAND
+            | CLONE_PIDFD
             | CLONE_VFORK
             | CLONE_PARENT
             | CLONE_THREAD
@@ -472,6 +507,15 @@ impl Process {
             | CLONE_IGNORED;
         if f & !known != 0 {
             return v(-EINVAL);
+        }
+        // CLONE_PIDFD: the descriptor's number is stored first, so a bad address fails the call
+        // before there is a child
+        let pidfd_slot = (f & CLONE_PIDFD != 0)
+            .then(|| (0..).find(|n| !self.files.fds.contains_key(n)).unwrap_or(0));
+        if let Some(fd) = pidfd_slot {
+            if !self.put_u32(c.pidfd, fd as u32) {
+                return v(-EFAULT);
+            }
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -541,6 +585,10 @@ impl Process {
             sig: self.p.sig.fork(),
         };
         self.procs.insert(id, child);
+        if let Some(fd) = pidfd_slot {
+            let d = self.files.add(Kind::Pid(id), 2);
+            self.files.put(fd, d, true);
+        }
         self.threads.push(Thread {
             tid: id,
             pid: id,
@@ -590,7 +638,8 @@ impl Process {
             b.get(8 * i..8 * i + 8)
                 .map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap()))
         };
-        let (flags, ctid, ptid, exit_signal) = (field(0), field(2), field(3), field(4));
+        let (flags, pidfd, ctid, ptid, exit_signal) =
+            (field(0), field(1), field(2), field(3), field(4));
         let (stack, stack_size, tls, set_tid_size) = (field(5), field(6), field(7), field(9));
         if flags >> 32 != 0 || flags & 0xff != 0 || exit_signal > 0xff || set_tid_size != 0 {
             return Ret::Val(-EINVAL);
@@ -606,7 +655,135 @@ impl Process {
                 ptid,
                 ctid,
                 tls,
+                pidfd,
             },
         )
+    }
+
+    // ------------------------------------------------------------ process descriptors
+
+    /// What a process descriptor is ready for: readable once the process has ended (a zombie),
+    /// and hung up too once it is gone (waited for) too.
+    pub(crate) fn pidfd_ready(&self, pid: i64) -> (bool, bool, bool) {
+        match self.proc_ref(pid) {
+            Some(p) => (p.zombie.is_some(), false, false),
+            None => (true, false, true),
+        }
+    }
+
+    /// The process a process descriptor `fd` refers to
+    fn pidfd_target(&self, fd: u64) -> Result<i64, i64> {
+        match self.files.get(fd as i32).map(|d| &d.kind) {
+            Some(Kind::Pid(pid)) => Ok(*pid),
+            _ => Err(-EBADF),
+        }
+    }
+
+    /// /proc/self/fdinfo/N of a process descriptor
+    pub(crate) fn fdinfo(&self, path: &[u8]) -> Option<Vec<u8>> {
+        let fd: i32 = std::str::from_utf8(path.strip_prefix(b"/proc/self/fdinfo/")?)
+            .ok()?
+            .parse()
+            .ok()?;
+        let (d, cloexec) = *self.files.fds.get(&fd)?;
+        let desc = self.files.descs.get(&d)?;
+        let Kind::Pid(pid) = desc.kind else {
+            return None;
+        };
+        let flags = desc.flags | if cloexec { O_CLOEXEC } else { 0 };
+        // -1 once it is gone
+        let shown = if self.proc_ref(pid).is_some() { pid } else { -1 };
+        Some(
+            format!("pos:\t0\nflags:\t0{flags:o}\nmnt_id:\t0\nino:\t{pid}\nPid:\t{shown}\nNSpid:\t{shown}\n")
+                .into_bytes(),
+        )
+    }
+
+    /// pidfd_send_signal (424), pidfd_open (434), pidfd_getfd (438)
+    pub(crate) fn sys_pidfd(&mut self, nr: u64, a: &[u64; 6]) -> Ret {
+        Ret::Val(match nr {
+            434 => self.pidfd_open(a[0] as i32 as i64, a[1] as u32),
+            424 => self.pidfd_send_signal(a),
+            _ => self.pidfd_getfd(a),
+        })
+    }
+
+    /// pidfd_open(pid, flags): a descriptor of a process (a group's leader), close on exec
+    fn pidfd_open(&mut self, pid: i64, flags: u32) -> i64 {
+        if flags & !PIDFD_NONBLOCK != 0 || pid <= 0 {
+            return -EINVAL;
+        }
+        if self.proc_ref(pid).is_none() {
+            // A thread is not a process
+            let thread = self.threads.iter().any(|t| !t.exited && t.tid == pid);
+            return if thread { -EINVAL } else { -ESRCH };
+        }
+        let d = self.files.add(Kind::Pid(pid), 2 | flags);
+        self.files.install(d, 0, true) as i64
+    }
+
+    /// pidfd_send_signal(pidfd, sig, info, flags): kill of the process (the signal 0 only looks)
+    fn pidfd_send_signal(&mut self, a: &[u64; 6]) -> i64 {
+        let (sig, info, flags) = (a[1], a[2], a[3]);
+        let pid = match self.pidfd_target(a[0]) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if flags != 0 || sig > signal::NSIG as u64 {
+            return -EINVAL;
+        }
+        let mut code = signal::SI_USER;
+        if info != 0 {
+            let Some(b) = self.bytes_at(info, 128) else {
+                return -EFAULT;
+            };
+            let field = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            if field(0) as u64 != sig {
+                return -EINVAL;
+            }
+            code = field(8);
+            // Another process is only sent what the kernel could tell from a kill: a code that
+            // says a user sent it (negative), not as a thread's own (SI_TKILL)
+            if pid != self.p.pid && (code >= 0 || code == signal::SI_TKILL) {
+                return -EPERM;
+            }
+        }
+        // One that ended and wasn't waited for yet takes the signal and does nothing with it
+        if self.proc_ref(pid).is_none() {
+            return -ESRCH;
+        }
+        if sig != 0 {
+            self.raise_in(pid, sig as u32, None, code);
+        }
+        0
+    }
+
+    /// pidfd_getfd(pidfd, targetfd, flags): the process's description of `targetfd`, in a new
+    /// descriptor of this one (close on exec)
+    fn pidfd_getfd(&mut self, a: &[u64; 6]) -> i64 {
+        let (target_fd, flags) = (a[1] as i32, a[2]);
+        let pid = match self.pidfd_target(a[0]) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if flags != 0 {
+            return -EINVAL;
+        }
+        // The one that runs has its table in `files`, the others in their `Proc`
+        let table = if pid == self.p.pid {
+            Some(&self.files.fds)
+        } else {
+            self.procs.get(&pid).map(|p| &p.fds)
+        };
+        let Some(table) = table else {
+            return -ESRCH;
+        };
+        if self.proc_ref(pid).is_some_and(|p| p.zombie.is_some()) {
+            return -EBADF;
+        }
+        match table.get(&target_fd) {
+            Some(&(d, _)) => self.files.install(d, 0, true) as i64,
+            None => -EBADF,
+        }
     }
 }
