@@ -87,8 +87,10 @@ pub mod id {
     pub const AA64PFR0: u64 = 0x1 | (0x1 << 4);
     /// PARange=32 bits, 8-bit ASIDs, 4K granule only (16K/64K unsupported).
     pub const AA64MMFR0: u64 = 0xF << 24;
-    /// AES (with PMULL), SHA1, SHA256, CRC32 and the LSE atomics.
-    pub const AA64ISAR0: u64 = (2 << 4) | (1 << 8) | (1 << 12) | (1 << 16) | (2 << 20);
+    /// AES (with PMULL), SHA1, SHA256 and SHA512, CRC32, the LSE atomics, SHA3 (EOR3, RAX1, XAR,
+    /// BCAX), SM3 and SM4.
+    pub const AA64ISAR0: u64 =
+        (2 << 4) | (1 << 8) | (2 << 12) | (1 << 16) | (2 << 20) | (1 << 32) | (1 << 36) | (1 << 40);
     /// Debug architecture v8, no PMU.
     pub const AA64DFR0: u64 = 0x6;
     /// 64-byte lines (DminLine/IminLine/ERG/CWG = 16 words), PIPT I-cache,

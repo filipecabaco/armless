@@ -201,8 +201,9 @@ pub(crate) fn stack(
     let rand = sp;
     write(rand, random);
 
-    // FP | ASIMD | AES | PMULL | SHA1 | SHA2 | CRC32 | ATOMICS (what armless implements)
-    let hwcap = 0x1fb;
+    // FP | ASIMD | AES | PMULL | SHA1 | SHA2 | CRC32 | ATOMICS | SHA3 | SM3 | SM4 | SHA512 (what
+    // armless implements)
+    let hwcap = 0x2e_01fb;
     let auxv: &[(u64, u64)] = &[
         (3, exe.phdr),
         (4, 56),

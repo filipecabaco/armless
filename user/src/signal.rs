@@ -28,6 +28,7 @@ use crate::ser::{R, W};
 use crate::{Ctx, Process, Ret, Wait};
 
 pub(crate) const SIGINT: u32 = 2;
+pub(crate) const SIGILL: u32 = 4;
 pub(crate) const SIGQUIT: u32 = 3;
 pub(crate) const SIGKILL: u32 = 9;
 pub(crate) const SIGCHLD: u32 = 17;
@@ -311,6 +312,20 @@ impl Process {
         self.poked = true;
     }
 
+    /// The signal an instruction of the current thread raises itself (`code`: why), when the
+    /// program has a handler for it and the thread doesn't block it: true, and the handler runs
+    /// at the instruction. Linux ends a program that has none (or blocks or ignores it), and so
+    /// does the caller, which reports where.
+    pub(crate) fn raise_fault(&mut self, sig: u32, code: i32) -> bool {
+        let cur = self.cur;
+        let handled = matches!(self.sig.disposition(sig), Disposition::Handle(_))
+            && self.threads[cur].sig.mask & bit(sig) == 0;
+        if handled {
+            self.raise(sig, Some(cur), code);
+        }
+        handled
+    }
+
     /// Whether a thread has a signal it can take now, for the run loop to deliver it
     pub(crate) fn signal_ready(&self) -> bool {
         self.sig.dirty
@@ -463,6 +478,9 @@ impl Process {
         f[8..12].copy_from_slice(&code.to_le_bytes());
         if code <= 0 {
             f[16..20].copy_from_slice(&1000i32.to_le_bytes());
+        } else if sig == SIGILL {
+            // si_addr: the instruction
+            f[16..24].copy_from_slice(&ctx.pc.to_le_bytes());
         }
         let uc = SIGINFO_SIZE;
         // uc_flags, uc_link: 0; uc_stack: the alternate stack as it was

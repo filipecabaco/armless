@@ -11,9 +11,9 @@ armless started as a fork of [v86](https://github.com/copy/v86).
 
 ## What it has
 
-- **CPU:** ARMv8-A at EL0 and EL1 with FP/AdvSIMD, AES/PMULL, SHA1, SHA256, CRC32 and the
-  ARMv8.1 atomics (LSE). A software MMU with a TLB, and up to 8 CPUs, one Web Worker or
-  native thread each.
+- **CPU:** ARMv8-A at EL0 and EL1 with FP/AdvSIMD, AES/PMULL, SHA1, SHA256, SHA512, SHA3, SM3,
+  SM4, CRC32 and the ARMv8.1 atomics (LSE). A software MMU with a TLB, and up to 8 CPUs, one
+  Web Worker or native thread each.
 - **Execution backends:** an interpreter; a JIT that turns hot pages into WebAssembly
   modules (browser) or host code with Cranelift (native); and, opt in, hardware
   virtualization (Hypervisor.framework on Apple silicon macOS, KVM on Linux arm64).
