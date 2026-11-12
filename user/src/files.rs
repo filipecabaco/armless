@@ -7,10 +7,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use armless::dev::fs::{self, Content, Fail, Fs, Ino, ROOT, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
+use crate::net::Net;
 use crate::ser::{R, W};
 
 pub(crate) const S_IFCHR: u32 = 0o020000;
 pub(crate) const S_IFIFO: u32 = 0o010000;
+pub(crate) const S_IFSOCK: u32 = 0o140000;
 
 pub(crate) const O_ACCMODE: u32 = 3;
 pub(crate) const O_WRONLY: u32 = 1;
@@ -79,6 +81,8 @@ pub(crate) enum Kind {
     Epoll {
         watch: BTreeMap<i32, Watch>,
     },
+    /// A socket of `Files::net`
+    Sock(u32),
 }
 
 /// What an epoll instance watches on a descriptor: the events asked for (EPOLLET: only as the
@@ -119,6 +123,8 @@ pub(crate) struct Files {
     pub fds: BTreeMap<i32, (u32, bool)>,
     pub descs: BTreeMap<u32, Desc>,
     pub pipes: BTreeMap<u32, Pipe>,
+    /// The sockets (see net.rs)
+    pub net: Net,
     next_desc: u32,
     next_pipe: u32,
 }
@@ -207,6 +213,7 @@ impl Files {
             Kind::PipeRead(p) => self.pipe_end(p, true),
             Kind::PipeWrite(p) => self.pipe_end(p, false),
             Kind::File { ino, .. } | Kind::Dir { ino, .. } => return Some(Some(ino)),
+            Kind::Sock(id) => self.net.close(id),
             _ => {},
         }
         Some(None)
@@ -278,6 +285,10 @@ impl Files {
                     w.u(9);
                     w.u(*count);
                 },
+                Kind::Sock(id) => {
+                    w.u(11);
+                    w.u(*id as u64);
+                },
                 Kind::Epoll { watch } => {
                     w.u(10);
                     w.u(watch.len() as u64);
@@ -290,9 +301,11 @@ impl Files {
                 },
             }
         }
+        self.net.save(w);
     }
 
-    pub fn load(r: &mut R) -> Result<Files, String> {
+    /// `with_net`: whether the snapshot has the sockets (the ones of ARMLUSR3 and before do not)
+    pub fn load(r: &mut R, with_net: bool) -> Result<Files, String> {
         let mut f = Files {
             next_desc: r.u()? as u32,
             next_pipe: r.u()? as u32,
@@ -337,6 +350,7 @@ impl Files {
                 7 => Kind::PipeRead(r.u()? as u32),
                 8 => Kind::PipeWrite(r.u()? as u32),
                 9 => Kind::Event { count: r.u()? },
+                11 => Kind::Sock(r.u()? as u32),
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {
@@ -354,6 +368,9 @@ impl Files {
                 t => return Err(format!("unknown description {t}")),
             };
             f.descs.insert(id, Desc { kind, flags, refs });
+        }
+        if with_net {
+            f.net = Net::load(r)?;
         }
         Ok(f)
     }
@@ -573,6 +590,7 @@ pub(crate) fn dtype(mode: u32) -> u8 {
         S_IFLNK => 10,
         S_IFCHR => 2,
         S_IFIFO => 1,
+        S_IFSOCK => 12,
         _ => 0,
     }
 }

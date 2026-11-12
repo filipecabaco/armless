@@ -60,6 +60,7 @@ impl Process {
                 )
             },
             Kind::Event { count } => (*count > 0, true, false),
+            Kind::Sock(id) => self.sock_ready(*id),
             Kind::Epoll { watch } => (
                 watch.iter().any(|(&f, w)| {
                     self.ready(f)
@@ -72,7 +73,7 @@ impl Process {
         })
     }
 
-    fn nonblock(&self, fd: i32) -> bool {
+    pub(crate) fn nonblock(&self, fd: i32) -> bool {
         self.files
             .get(fd)
             .is_some_and(|d| d.flags & O_NONBLOCK != 0)
@@ -186,6 +187,12 @@ impl Process {
                 self.poked = true;
                 Ok(count.to_le_bytes().to_vec())
             },
+            Kind::Sock(id) => {
+                if at.is_some() {
+                    return Err(Ret::Val(-ESPIPE));
+                }
+                self.sock_recv(fd, id, max, 0).map(|r| r.0)
+            },
             Kind::PipeWrite(_) | Kind::Epoll { .. } => Err(Ret::Val(-EINVAL)),
         }
     }
@@ -272,6 +279,12 @@ impl Process {
                 self.poked = true;
                 Ok(8)
             },
+            Kind::Sock(id) => {
+                if at.is_some() {
+                    return Err(Ret::Val(-ESPIPE));
+                }
+                self.sock_send(fd, id, data, 0, None)
+            },
             Kind::PipeRead(_) | Kind::Epoll { .. } => Err(Ret::Val(-EBADF)),
         }
     }
@@ -299,7 +312,7 @@ impl Process {
     // ------------------------------------------------------------ paths
 
     /// Where a path given with `dirfd` starts: the cwd, or that directory.
-    fn start_dir(&self, dirfd: i32) -> Result<Ino, i64> {
+    pub(crate) fn start_dir(&self, dirfd: i32) -> Result<Ino, i64> {
         if dirfd == AT_FDCWD {
             return Ok(self.cwd);
         }
@@ -311,7 +324,7 @@ impl Process {
     }
 
     /// The inode `path` names from `dirfd`
-    fn lookup(&self, dirfd: i32, path: &[u8], follow: bool) -> Result<Ino, i64> {
+    pub(crate) fn lookup(&self, dirfd: i32, path: &[u8], follow: bool) -> Result<Ino, i64> {
         let start = self.start_dir(dirfd)?;
         self.fs(|fs| files::resolve(fs, start, path, follow))
             .unwrap_or(Err(-ENOENT))
@@ -427,6 +440,7 @@ impl Process {
                 ..Stat::device(S_IFREG | 0o444, 0)
             },
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
+            Kind::Sock(_) => Stat::device(files::S_IFSOCK | 0o777, 0),
             Kind::Event { .. } | Kind::Epoll { .. } => Stat::device(0o600, 0),
         })
     }
@@ -1208,8 +1222,8 @@ impl Process {
             73 => self.ppoll(a[0], a[1], a[2]),
             // pselect6
             72 => self.pselect(a[0], a[1], a[2], a[3], a[4]),
-            // socket, socketpair and the rest of the network: not yet
-            198..=212 | 242 | 243 | 269 => v(-ENOSYS),
+            // socket, socketpair and the rest of the network (net.rs)
+            198..=212 | 242 | 243 | 269 => self.net_syscall(nr, a),
 
             // ---------------------------------------------------- memory
             // brk
@@ -1544,6 +1558,10 @@ impl Process {
             },
             (Kind::PipeRead(p), 0x541b) => {
                 let n = self.files.pipes.get(&p).map_or(0, |p| p.buf.len());
+                v(if self.put_u32(arg, n as u32) { 0 } else { -EFAULT })
+            },
+            (Kind::Sock(id), 0x541b) => {
+                let n = self.sock_pending(id);
                 v(if self.put_u32(arg, n as u32) { 0 } else { -EFAULT })
             },
             // TIOCSCTTY, TCFLSH, TCXONC, TIOCNOTTY, TCSBRK

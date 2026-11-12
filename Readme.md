@@ -34,8 +34,8 @@ armless started as a fork of [v86](https://github.com/copy/v86).
 - **User mode (experimental):** a Linux program runs with no guest kernel at all
   ([`user/`](user)): the CPU runs it at EL0 and its system calls are answered by the host.
   Static and dynamically linked programs, the machine's filesystem, a terminal, threads, pipes,
-  epoll, poll and select, signals, and snapshots of the running process work; processes and
-  sockets do not yet. Go, Python 3.14 and DuckDB run this way from their own images,
+  epoll, poll and select, signals, sockets (in memory, unix and loopback TCP and UDP, with the
+  host's network behind them) and snapshots of the running process work; processes do not yet. Go, Python 3.14 and DuckDB run this way from their own images,
   natively and in the browser (a snapshot made on one restores on the other).
 
 ## Quick start

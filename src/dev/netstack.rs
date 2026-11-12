@@ -14,6 +14,10 @@ use super::web::{self, cert::TlsKeys, Rng, Web};
 use super::{Event, Outbox};
 use crate::ser::{R, W};
 
+mod local;
+pub use local::LocalState;
+use local::Locals;
+
 pub const ROUTER_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x01, 0x02, 0x03];
 pub const ROUTER_IP: [u8; 4] = [192, 168, 86, 1];
 pub const GUEST_IP: [u8; 4] = [192, 168, 86, 100];
@@ -97,6 +101,8 @@ pub struct Stack {
     names: Vec<String>,
     by_name: HashMap<String, u32>,
     conns: BTreeMap<u32, Conn>,
+    /// Streams of a process with no kernel, which have no frames
+    locals: Locals,
     next_id: u32,
     isn: u32,
     ip_id: u16,
@@ -143,6 +149,7 @@ impl Stack {
             names: Vec::new(),
             by_name: HashMap::new(),
             conns: BTreeMap::new(),
+            locals: Locals::default(),
             next_id: 1,
             isn: 0x1000_0000,
             ip_id: 1,
@@ -332,6 +339,9 @@ impl Stack {
     // ------------------------------------------------------------ host API
 
     pub fn accept(&mut self, id: u32) {
+        if self.is_local(id) {
+            return self.local_accepted(id);
+        }
         let isn = self.next_isn();
         let Some(c) = self.conns.get_mut(&id) else {
             return;
@@ -348,6 +358,9 @@ impl Stack {
 
     /// Refuse a connection the guest opened (TcpClosed follows, like for every TcpOpen).
     pub fn refuse(&mut self, id: u32, out: &Outbox) {
+        if self.is_local(id) {
+            return self.local_refused(id, out);
+        }
         if let Some(c) = self.conns.get(&id) {
             let ack = c.rcv_nxt;
             let (ip, sport, dport) = (c.remote_ip, c.remote_port, c.guest_port);
@@ -358,6 +371,9 @@ impl Stack {
     }
 
     pub fn send(&mut self, id: u32, data: &[u8]) {
+        if self.is_local(id) {
+            return self.local_sent(id, data);
+        }
         if let Some(c) = self.conns.get_mut(&id) {
             if !c.closing {
                 c.buf.extend(data);
@@ -367,6 +383,9 @@ impl Stack {
     }
 
     pub fn close(&mut self, id: u32, out: &Outbox) {
+        if self.is_local(id) {
+            return self.local_closed(id, out);
+        }
         if let Some(c) = self.conns.get_mut(&id) {
             c.closing = true;
         }
@@ -376,6 +395,9 @@ impl Stack {
 
     /// Reset a connection (no TcpClosed: the host knows).
     pub fn abort(&mut self, id: u32) {
+        if self.is_local(id) {
+            return self.local_aborted(id);
+        }
         if let Some(c) = self.conns.get(&id) {
             let seq = c.snd_nxt;
             self.segment(id, RST, seq, &[], &[]);
@@ -401,6 +423,9 @@ impl Stack {
 
     /// Bytes the host gave a connection that the guest has not acknowledged.
     pub fn buffered(&self, id: u32) -> usize {
+        if self.is_local(id) {
+            return self.local_buffered(id);
+        }
         self.conns.get(&id).map_or(0, |c| c.buf.len())
     }
 
@@ -906,6 +931,7 @@ impl Stack {
         self.ip_id = r.u16()?;
         // Connections belonged to the host that saved the state.
         self.conns.clear();
+        self.local_forget();
         self.frames.clear();
         Some(())
     }

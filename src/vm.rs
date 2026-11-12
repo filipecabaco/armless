@@ -337,7 +337,62 @@ impl Board {
     }
     /// Connect to the guest's TCP `port`; `TcpConnected` or `TcpClosed` follows.
     pub fn tcp_connect(&self, port: u16) -> Option<u32> {
-        self.with_net(|s, _| s.connect(port))
+        self.with_net(|s, io| {
+            if s.wants_local(port) {
+                s.connect_local(port, &io.out)
+            } else {
+                s.connect(port)
+            }
+        })
+    }
+
+    // ------------------------------------------- a process with no kernel (armless-user)
+
+    /// The streams of a process with no kernel run on this machine's network: connections to a
+    /// port nobody listens on are refused at once. False if the machine has no network.
+    pub fn local_enable(&self) -> bool {
+        self.with_net(|s, _| s.local_enable()).is_some()
+    }
+    /// Changes whenever the host does something to a stream or a listener of the process.
+    pub fn local_gen(&self) -> u64 {
+        self.with_net(|s, _| s.local_gen()).unwrap_or(0)
+    }
+    /// A connection from the process (`TcpOpen` goes to the host); `None` without a network.
+    pub fn local_open(&self, ip: [u8; 4], port: u16) -> Option<u32> {
+        self.with_net(|s, io| s.local_open(ip, port, &io.out))
+    }
+    pub fn local_state(&self, id: u32) -> crate::dev::netstack::LocalState {
+        self.with_net(|s, _| s.local_state(id)).unwrap_or_default()
+    }
+    pub fn local_read(&self, id: u32, max: usize) -> Vec<u8> {
+        self.with_net(|s, _| s.local_read(id, max))
+            .unwrap_or_default()
+    }
+    pub fn local_write(&self, id: u32, data: &[u8]) -> bool {
+        self.with_net(|s, io| s.local_write(id, data, &io.out))
+            .unwrap_or(false)
+    }
+    pub fn local_shutdown(&self, id: u32) {
+        self.with_net(|s, io| s.local_shutdown(id, &io.out));
+    }
+    pub fn local_drop(&self, id: u32) {
+        self.with_net(|s, io| s.local_drop(id, &io.out));
+    }
+    pub fn local_listen(&self, port: u16) {
+        self.with_net(|s, _| s.local_listen(port));
+    }
+    pub fn local_unlisten(&self, port: u16) {
+        self.with_net(|s, _| s.local_unlisten(port));
+    }
+    pub fn local_accept(&self, port: u16) -> Option<u32> {
+        self.with_net(|s, _| s.local_accept(port)).flatten()
+    }
+    pub fn local_pending(&self, port: u16) -> usize {
+        self.with_net(|s, _| s.local_pending(port)).unwrap_or(0)
+    }
+    /// The router's answer to a DNS query.
+    pub fn local_dns(&self, q: &[u8]) -> Option<Vec<u8>> {
+        self.with_net(|s, _| s.local_dns(q)).flatten()
     }
     /// Timers of the network (retransmissions): call every ~100-500 ms.
     pub fn tick(&self, now_ms: u64) {

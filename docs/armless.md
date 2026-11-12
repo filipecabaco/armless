@@ -228,6 +228,34 @@ x0–x5, answers it in x0, and resumes at ELR.
   output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
   newlines start a line (ONLCR).
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
+- **Sockets** (user/src/net.rs): `socket`, `socketpair`, `bind`, `listen`, `accept` and `accept4`,
+  `connect`, `sendto` and `recvfrom`, `sendmsg` and `recvmsg` (and the `mmsg` pair), `shutdown`,
+  `getsockname`, `getpeername`, `getsockopt` and `setsockopt`; a socket is a descriptor like a
+  pipe's, and read, write, readv, writev, fcntl, poll, select and epoll take it. Blocking and
+  non-blocking (`SOCK_NONBLOCK`, `EAGAIN`, `EINPROGRESS`) as for pipes: a call that can't finish
+  parks its thread and runs again when something changed.
+  - *In memory:* AF_UNIX stream and datagram sockets (paths, which are entries of the
+    filesystem, and abstract names, and `socketpair`), and AF_INET and AF_INET6 TCP and UDP to
+    the loopback (127/8, `::1`, the machine's own address, an unspecified one), through a table of
+    listening ports the process keeps. Streams buffer 64 KiB for the reader, datagram queues hold
+    128; a stream's end that closes gives the other EOF, a write to it EPIPE, a connect to a
+    port nobody listens on ECONNREFUSED. Ports an unbound socket gets start at 49152.
+  - *The host:* on a machine with a network, a connection to any other address is a host
+    stream (`Event::TcpOpen`, with the name the DNS answer gave for a 10.x address, else the
+    dotted address), accepted, refused or carried over a tunnel as for a Linux guest; `connect`
+    waits for the answer. A guest listener is reachable from the host (`Board::tcp_connect(port)`,
+    which `armless-exec --publish [ADDR:]HOSTPORT:PORT` and any host's forward use):
+    the machine keeps the listening ports and the connections made to them (core,
+    `dev/netstack/local.rs`), not the guest netstack's SYNs. A UDP datagram to port 53 of a
+    non-local address is a DNS query the network stack answers (`Board::local_dns`), so
+    resolv.conf's nameserver works; other UDP to the outside and all IPv6 to the outside fail
+    with ENETUNREACH.
+  - *Snapshots:* a socket's state is in the process's, streams and queues with their bytes
+    (`ARMLUSR4`; 0.12's state still loads). A connection to the host can't survive a restore:
+    it reads as closed, and one that was connecting as reset.
+  - *Not supported:* `SCM_RIGHTS` and other ancillary data (`EOPNOTSUPP`), `SOCK_SEQPACKET`,
+    raw and packet sockets, `socketpair` for anything but AF_UNIX, a separate `RDHUP`, backpressure
+    from the guest to the host (a host stream's data is taken as it comes).
 - **Memory:** VA is PA. The ELF's segments go where they ask (a PIE, and the loader, at a base
   of their own), `brk` after them, the stack at the top of RAM and `mmap` below it, from a free
   list; `mremap` moves or grows. Freed ranges are given back to the host with `Ram::discard`
@@ -321,14 +349,14 @@ too. A snapshot is the pair a native host makes: the machine's state, the bytes 
 natively.
 
 Not yet: protections (no PROT_NONE, no nil-pointer faults, though the page tables could give
-them as invalid pages with no file), processes (`fork`, `execve`, `wait4`), sockets, more than
+them as invalid pages with no file), processes (`fork`, `execve`, `wait4`), more than
 one vCPU, and the hypervisor backends (an SVC at EL0 traps to EL1 in hardware there, not to the
 host).
 
 What runs: snowglobe's `go` (Bubble Tea, static), `python` (the 3.14 REPL, 122 shared
 libraries) and `duckdb` (C++) examples, from their own images' filesystems; a Python REPL saved
 with its state and restored in 120 ms. `user/corpus/survey.exs` traces what each of snowglobe's
-examples asks of a kernel, for what comes next (processes, then sockets).
+examples asks of a kernel, for what comes next (processes).
 
 Measured as a snowglobe site (a Go program with eight goroutines, macOS, the same
 `snowglobe-vm` for each): the snapshot is 2.5 MB raw and 0.6 MB compressed, against 22.1 and

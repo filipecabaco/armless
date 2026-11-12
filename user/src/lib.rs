@@ -7,7 +7,8 @@
 //! What it gives a program: static or dynamically linked executables (the dynamic loader comes
 //! from the filesystem, as execve has it), the machine's filesystem (armless's, the one the 9p
 //! device serves a Linux guest), a terminal (termios, the window size, a line discipline), pipes,
-//! threads (clone, futexes), epoll, poll and select, clocks and sleeps. Blocking calls park their
+//! sockets (net.rs: AF_UNIX, and TCP and UDP on the loopback in memory, a network at the host for
+//! the rest), threads (clone, futexes), epoll, poll and select, clocks and sleeps. Blocking calls park their
 //! thread and run again when something changes, so a snapshot can be taken whatever it waits on.
 //!
 //! Signals are delivered as Linux delivers them (`signal`): handlers on the frame the kernel
@@ -21,7 +22,7 @@
 //! in RAM, once a process maps a file; a program with none runs with it off.
 //!
 //! Not yet: protections (no PROT_NONE, no nil-pointer faults, though the page tables could give
-//! them), fork, sockets, and more than one vCPU (threads take turns on one CPU).
+//! them), fork, and more than one vCPU (threads take turns on one CPU).
 
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
@@ -30,6 +31,7 @@ mod elf;
 mod files;
 pub mod host;
 mod mm;
+mod net;
 mod ser;
 mod signal;
 mod sys;
@@ -533,6 +535,7 @@ impl Process {
             trace: false,
             stats: Stats::default(),
         };
+        p.net_attach();
         // The dynamic loader's first, so what waits for blobs does before anything is mapped
         let ld = match &loaded.interp {
             None => None,
@@ -690,6 +693,7 @@ impl Process {
         let until = Instant::now() + budget;
         'run: loop {
             if let Some(c) = self.exit_code {
+                self.net_exit();
                 return Status::Exited(c);
             }
             if let Some(f) = &self.fault {
@@ -757,6 +761,7 @@ impl Process {
                         self.resume_deadline = self.threads[cur].resume_deadline.take();
                         let (nr, a0, a1, a2) = (cpu.x[8], cpu.x[0], cpu.x[1], cpu.x[2]);
                         let ret = self.syscall_lazily(cpu, cur);
+                        self.flush_net();
                         if self.trace {
                             let r = match &ret {
                                 Ret::Val(r) => format!("{r:#x}"),
@@ -852,7 +857,7 @@ impl Process {
     /// something changed) the calls that retry.
     fn wake(&mut self) {
         let now = Instant::now();
-        let poked = std::mem::take(&mut self.poked);
+        let poked = std::mem::take(&mut self.poked) | self.net_changed();
         let blobs_in: Vec<bool> = self
             .threads
             .iter()
@@ -1011,12 +1016,17 @@ impl Process {
     ) -> Result<Process, String> {
         // ARMLUSR2, from before signals were delivered and files were mapped lazily: signal
         // actions only, and nothing lazy
-        let (mut r, old) = match data.strip_prefix(MAGIC) {
-            Some(d) => (R(d), false),
-            None => (
-                R(data.strip_prefix(MAGIC_2).ok_or("not a process state")?),
-                true,
-            ),
+        // ARMLUSR3, from before sockets: no section for them
+        let (mut r, old, with_net) = match data.strip_prefix(MAGIC) {
+            Some(d) => (R(d), false, true),
+            None => match data.strip_prefix(MAGIC_3) {
+                Some(d) => (R(d), false, false),
+                None => (
+                    R(data.strip_prefix(MAGIC_2).ok_or("not a process state")?),
+                    true,
+                    false,
+                ),
+            },
         };
         let ram = cpu.mem.alias();
         let ram_size = r.u()?;
@@ -1094,7 +1104,7 @@ impl Process {
                 sig: ThreadSig::default(),
             });
         }
-        let files = Files::load(&mut r)?;
+        let files = Files::load(&mut r, with_net)?;
         let tty = Tty::load(&mut r)?;
         let cwd = r.u()?;
         let umask = r.u()? as u32;
@@ -1133,6 +1143,7 @@ impl Process {
             trace: false,
             stats: Stats::default(),
         };
+        p.net_attach();
         if old {
             for t in &mut p.threads {
                 t.sig.altstack_unknown = true;
@@ -1168,5 +1179,6 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-const MAGIC: &[u8; 8] = b"ARMLUSR3";
+const MAGIC: &[u8; 8] = b"ARMLUSR4";
+const MAGIC_3: &[u8; 8] = b"ARMLUSR3";
 const MAGIC_2: &[u8; 8] = b"ARMLUSR2";
