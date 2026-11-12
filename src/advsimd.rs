@@ -76,6 +76,9 @@ fn poly_mul(a: u64, b: u64, bits: u32) -> u128 {
 
 impl<H: Host> Cpu<H> {
     pub(crate) fn advsimd(&mut self, insn: u32) -> Res<()> {
+        if insn & 0xff00_0000 == 0xce00_0000 {
+            return self.crypto_v82(insn);
+        }
         let scalar = bit(insn, 28);
         if bit(insn, 31) || (scalar && !bit(insn, 30)) {
             return Err(Event::undefined());
@@ -174,6 +177,52 @@ impl<H: Host> Cpu<H> {
             6 => crypto::sha256su1(d, n, m),
             _ => return Err(Event::undefined()),
         };
+        Ok(())
+    }
+
+    /// The SHA3, SHA512, SM3 and SM4 instructions: EOR3, BCAX, XAR, RAX1, SHA512H, SHA512H2, SHA512SU0,
+    /// SHA512SU1, SM3SS1, SM3TT1A/1B/2A/2B, SM3PARTW1/2, SM4E and SM4EKEY.
+    fn crypto_v82(&mut self, insn: u32) -> Res<()> {
+        let (rd, rn, rm, ra) = (
+            insn & 31,
+            field(insn, 5, 5),
+            field(insn, 16, 5),
+            field(insn, 10, 5),
+        );
+        let (d, n, m) = (self.v(rd), self.v(rn), self.v(rm));
+        let op = field(insn, 10, 2);
+        let r = match (field(insn, 21, 3), field(insn, 12, 4)) {
+            // Four registers: bit 15 is 0.
+            (0b000, 0..=7) => crypto::eor3(n, m, self.v(ra)),
+            (0b001, 0..=7) => crypto::bcax(n, m, self.v(ra)),
+            (0b010, 0..=7) => crypto::sm3ss1(n, m, self.v(ra)),
+            // SM3TT1A, SM3TT1B, SM3TT2A, SM3TT2B: Vm.S[imm2]
+            (0b010, 0b1000..=0b1011) => crypto::sm3tt(op, d, n, m, field(insn, 12, 2)),
+            (0b011, 0b1000) => match op {
+                0 => crypto::sha512h(d, n, m),
+                1 => crypto::sha512h2(d, n, m),
+                2 => crypto::sha512su1(d, n, m),
+                _ => crypto::rax1(n, m),
+            },
+            (0b011, 0b1100) => match op {
+                0 => crypto::sm3partw1(d, n, m),
+                1 => crypto::sm3partw2(d, n, m),
+                2 => crypto::sm4ekey(n, m),
+                _ => return Err(Event::undefined()),
+            },
+            // XAR: the rotate is in 15:10
+            (0b100, _) => crypto::xar(n, m, field(insn, 10, 6)),
+            // SHA512SU0 and SM4E: Rm is 0
+            (0b110, 0b1000) if rm == 0 && op < 2 => {
+                if op == 0 {
+                    crypto::sha512su0(d, n)
+                } else {
+                    crypto::sm4e(d, n)
+                }
+            },
+            _ => return Err(Event::undefined()),
+        };
+        self.vreg[rd as usize] = r;
         Ok(())
     }
 
