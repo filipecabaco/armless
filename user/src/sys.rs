@@ -13,12 +13,10 @@ use crate::files::{
     O_WRONLY,
 };
 use crate::host::{self, Instant};
-use crate::{page_up, Ctx, Process, Ret, Thread, Wait, PAGE};
+use crate::{page_up, Ctx, Process, Ret, Thread, Wait};
 
 const EAGAIN: i64 = 11;
-const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
-const ENODEV: i64 = 19;
 const ECHILD: i64 = 10;
 const ENOTTY: i64 = 25;
 const ESPIPE: i64 = 29;
@@ -314,7 +312,7 @@ impl Process {
     /// Where a path given with `dirfd` starts: the cwd, or that directory.
     pub(crate) fn start_dir(&self, dirfd: i32) -> Result<Ino, i64> {
         if dirfd == AT_FDCWD {
-            return Ok(self.cwd);
+            return Ok(self.p.cwd);
         }
         match self.files.get(dirfd).map(|d| &d.kind) {
             Some(Kind::Dir { ino, .. }) => Ok(*ino),
@@ -342,7 +340,7 @@ impl Process {
                 format!("MemTotal:       {kb} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\n", kb / 2, kb / 2).into_bytes()
             },
             b"/proc/self/stat" | b"/proc/thread-self/stat" => b"1000 (program) R 1 1000 1000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n".to_vec(),
-            b"/proc/self/cmdline" => self.exe.iter().copied().chain([0]).collect(),
+            b"/proc/self/cmdline" => self.p.exe.iter().copied().chain([0]).collect(),
             b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
             b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
             b"/sys/fs/cgroup/cpu.max" => b"max 100000\n".to_vec(),
@@ -377,7 +375,7 @@ impl Process {
             Ok(s) => s,
             Err(e) => return Ret::Val(e),
         };
-        let (now, umask) = (self.now_secs(), self.umask);
+        let (now, umask) = (self.now_secs(), self.p.umask);
         let opened = self.fs(|fs| -> Result<Ino, i64> {
             let ino = if flags & O_CREAT != 0 {
                 let (dir, name) = files::resolve_parent(fs, start, path)?;
@@ -830,7 +828,7 @@ impl Process {
             78 => {
                 let path = self.cstr(a[1]);
                 let target = if path == b"/proc/self/exe" || path == b"/proc/thread-self/exe" {
-                    Ok(self.exe.clone())
+                    Ok(self.p.exe.clone())
                 } else if let Some(fd) = path
                     .strip_prefix(b"/proc/self/fd/")
                     .and_then(|n| std::str::from_utf8(n).ok()?.parse::<i32>().ok())
@@ -887,7 +885,7 @@ impl Process {
             // getcwd
             17 => {
                 let mut path = self
-                    .fs(|fs| files::path_of(fs, self.cwd))
+                    .fs(|fs| files::path_of(fs, self.p.cwd))
                     .unwrap_or_else(|| b"/".to_vec());
                 path.push(0);
                 if path.len() > a[1] as usize {
@@ -902,7 +900,7 @@ impl Process {
                         .fs(|fs| fs.get(ino).is_some_and(|i| i.is_dir()))
                         .unwrap_or(false) =>
                 {
-                    self.cwd = ino;
+                    self.p.cwd = ino;
                     v(0)
                 },
                 Ok(_) => v(-ENOTDIR),
@@ -911,7 +909,7 @@ impl Process {
             // fchdir
             50 => match self.files.get(fd0).map(|d| &d.kind) {
                 Some(Kind::Dir { ino, .. }) => {
-                    self.cwd = *ino;
+                    self.p.cwd = *ino;
                     v(0)
                 },
                 Some(_) => v(-ENOTDIR),
@@ -920,7 +918,7 @@ impl Process {
             // mkdirat
             34 => {
                 let (path, mode, now, umask) =
-                    (self.cstr(a[1]), a[2] as u32, self.now_secs(), self.umask);
+                    (self.cstr(a[1]), a[2] as u32, self.now_secs(), self.p.umask);
                 let start = match self.start_dir(a[0] as i32) {
                     Ok(s) => s,
                     Err(e) => return v(e),
@@ -1063,8 +1061,8 @@ impl Process {
             },
             // umask
             166 => {
-                let old = self.umask;
-                self.umask = a[0] as u32 & 0o777;
+                let old = self.p.umask;
+                self.p.umask = a[0] as u32 & 0o777;
                 v(old as i64)
             },
 
@@ -1227,33 +1225,19 @@ impl Process {
 
             // ---------------------------------------------------- memory
             // brk
-            214 => {
-                if a[0] >= self.brk_start && a[0] <= self.brk_start + crate::BRK_SIZE {
-                    if a[0] < self.brk {
-                        self.zero_range(a[0], self.brk - a[0]);
-                    }
-                    self.brk = a[0];
-                }
-                v(self.brk as i64)
-            },
+            214 => v(self.sys_brk(a[0])),
             // mmap
-            222 => self.mmap(a[0], a[1], a[3], a[4] as i32, a[5]),
+            222 => self.sys_mmap(a[0], a[1], a[2], a[3], a[4] as i32, a[5]),
             // munmap
-            215 => {
-                self.release(a[0] & !(PAGE - 1), page_up(a[0] + a[1]));
-                v(0)
-            },
+            215 => v(self.sys_munmap(a[0], a[1])),
             // mremap(old, old_len, new_len, flags, new)
-            216 => self.mremap(a[0], page_up(a[1]), page_up(a[2]), a[3]),
-            // mprotect, msync, mlock, munlock, mbind, set_mempolicy, get_mempolicy
-            226 | 227 | 228 | 229 | 235 | 237 | 236 => v(0),
-            // madvise: DONTNEED and FREE give zero pages back
-            233 => {
-                if a[2] == 4 || a[2] == 8 {
-                    self.zero_range(a[0], page_up(a[1]));
-                }
-                v(0)
-            },
+            216 => v(self.sys_mremap(a[0], page_up(a[1]), page_up(a[2]), a[3])),
+            // mprotect
+            226 => v(self.sys_mprotect(a[0], a[1], a[2])),
+            // msync, mlock, munlock, mbind, set_mempolicy, get_mempolicy
+            227 | 228 | 229 | 235 | 237 | 236 => v(0),
+            // madvise: DONTNEED and FREE give anonymous pages back
+            233 => v(self.sys_madvise(a[0], a[1], a[2])),
 
             // ---------------------------------------------------- threads
             // clone
@@ -1569,108 +1553,6 @@ impl Process {
             (Kind::File { .. } | Kind::Dir { .. }, _) => v(-ENOTTY),
             _ => v(-ENOTTY),
         }
-    }
-
-    fn mmap(&mut self, addr: u64, len: u64, flags: u64, fd: i32, off: u64) -> Ret {
-        let v = Ret::Val;
-        let len = page_up(len);
-        if len == 0 {
-            return v(-EINVAL);
-        }
-        let fixed = flags & (0x10 | 0x10_0000) != 0;
-        // MAP_FIXED, MAP_FIXED_NOREPLACE: VA is PA, so anywhere in RAM but the page tables
-        if fixed
-            && (!addr.is_multiple_of(PAGE)
-                || addr + len > self.ram_size
-                || self
-                    .tables_area()
-                    .is_some_and(|(s, e)| addr < e && addr + len > s))
-        {
-            return v(-ENOMEM);
-        }
-        // A file mapping is a private copy of its contents (MAP_SHARED ones too: no other process
-        // sees it, and writes don't reach the file): its pages filled as they are touched (mm.rs),
-        // or read in now
-        let mut lazy = None;
-        let contents = if flags & 0x20 == 0 {
-            let Some(Desc { kind, .. }) = self.files.get(fd).cloned() else {
-                return v(-EBADF);
-            };
-            match kind {
-                Kind::File { ino, .. } if self.lazy_room(len) => {
-                    let size = self.fs(|fs| fs.get(ino).map_or(0, |i| i.size)).unwrap_or(0);
-                    lazy = Some((ino, size.saturating_sub(off).min(len)));
-                    None
-                },
-                Kind::File { ino, .. } => {
-                    match self.fs(|fs| got(fs.read(ino, off, len as usize))) {
-                        Some(Got::Ok(b)) => Some(b),
-                        Some(Got::Need(blobs)) => return Ret::Need(blobs),
-                        Some(Got::Err(e)) => return v(e),
-                        None => return v(-EBADF),
-                    }
-                },
-                Kind::Zero => None,
-                _ => return v(-ENODEV),
-            }
-        } else {
-            None
-        };
-        let at = if fixed {
-            self.forget_lazy(addr, addr + len);
-            self.zero_range(addr, len);
-            self.carve(addr, addr + len);
-            addr
-        } else {
-            // Hints are ignored: the highest free range that fits
-            match self.alloc(len) {
-                Some(at) => at,
-                None => return v(-ENOMEM),
-            }
-        };
-        if let Some((ino, data)) = lazy {
-            self.map_lazy(at, len, ino, off, data);
-        } else if let Some(b) = contents {
-            if !b.is_empty() && !self.write(at, &b) {
-                return v(-EFAULT);
-            }
-        }
-        v(at as i64)
-    }
-
-    fn mremap(&mut self, old: u64, old_len: u64, new_len: u64, flags: u64) -> Ret {
-        let v = Ret::Val;
-        if !old.is_multiple_of(PAGE) || new_len == 0 {
-            return v(-EINVAL);
-        }
-        if new_len <= old_len {
-            self.release(old + new_len, old + old_len);
-            return v(old as i64);
-        }
-        if self.is_free(old + old_len, old + new_len) {
-            self.carve(old + old_len, old + new_len);
-            return v(old as i64);
-        }
-        if flags & 1 == 0 {
-            return v(-ENOMEM); // not MREMAP_MAYMOVE
-        }
-        // What moves is filled first (lazy pages don't move), before anything changes
-        if !self.touch(old, old_len) {
-            return v(-EFAULT); // or it waits for blobs and runs again (syscall_lazily)
-        }
-        let Some(at) = self.alloc(new_len) else {
-            return v(-ENOMEM);
-        };
-        let mut buf = vec![0u8; 1 << 20];
-        let mut done = 0;
-        while done < old_len {
-            let n = (old_len - done).min(buf.len() as u64) as usize;
-            self.read(old + done, &mut buf[..n]);
-            self.write(at + done, &buf[..n]);
-            done += n as u64;
-        }
-        self.release(old, old + old_len);
-        v(at as i64)
     }
 }
 

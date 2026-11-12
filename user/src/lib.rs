@@ -1,8 +1,8 @@
 //! User mode for armless: a Linux program on an armless CPU with no guest kernel. The CPU runs it
 //! at EL0 with no vector table, and every exception it takes stops the CPU
 //! (`StopReason::UnhandledException`, `Cpu::stop_on_exceptions`) and is answered here: system
-//! calls by a Linux personality, a touch of a lazily mapped page by filling it (mm.rs), other
-//! faults by stopping the process.
+//! calls by a Linux personality, a touch of a page that has no frame yet by giving it one (mm.rs),
+//! other faults by stopping the process.
 //!
 //! What it gives a program: static or dynamically linked executables (the dynamic loader comes
 //! from the filesystem, as execve has it), the machine's filesystem (armless's, the one the 9p
@@ -16,13 +16,13 @@
 //! SA_RESTART), and the terminal's Ctrl-C, Ctrl-\ and window size as SIGINT, SIGQUIT and
 //! SIGWINCH. A host signals the process with `kill`.
 //!
-//! Memory is VA = PA. Files are mapped lazily (mm.rs): the executable's segments, its loader's,
-//! and mmap of a file get a page's contents when it is first touched, so a snapshot holds only
-//! the pages a program used. For that the MMU is on, with identity page tables the process keeps
-//! in RAM, once a process maps a file; a program with none runs with it off.
+//! Memory is virtual (mm.rs): the MMU is on, with page tables of the process's own, and a page
+//! has a frame of RAM when the program first touches it. Files are mapped lazily: the
+//! executable's segments, its loader's, and mmap of a file get a page's contents when it is
+//! first touched, so a snapshot holds only the pages a program used. Protections hold
+//! (PROT_NONE, read-only and no-execute pages fault).
 //!
-//! Not yet: protections (no PROT_NONE, no nil-pointer faults, though the page tables could give
-//! them), fork, and more than one vCPU (threads take turns on one CPU).
+//! Not yet: fork, and more than one vCPU (threads take turns on one CPU).
 
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
@@ -40,8 +40,10 @@ mod tty;
 #[allow(unsafe_code)]
 pub mod wasm;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,6 +166,16 @@ impl std::fmt::Display for ExecError {
     }
 }
 
+/// What a process has of its own: its address space, working directory, signal actions.
+pub(crate) struct Proc {
+    pub mm: mm::SharedMm,
+    pub cwd: Ino,
+    pub umask: u32,
+    /// The executable's path, for /proc/self/exe
+    pub exe: Vec<u8>,
+    pub sig: Signals,
+}
+
 /// A program's process: its threads, memory map, descriptors, terminal and clock. A snapshot
 /// carries it (`save`, `restore`) next to the machine's own state, which holds its memory, the
 /// CPU and the filesystem.
@@ -171,24 +183,20 @@ pub struct Process {
     pub(crate) ram: Ram,
     pub(crate) ram_size: u64,
     pub(crate) board: Option<Arc<Board>>,
-    pub(crate) brk_start: u64,
-    pub(crate) brk: u64,
-    pub(crate) mmap_floor: u64,
-    pub(crate) mmap_top: u64,
-    /// Free ranges of the mmap area, start -> end, coalesced. Freed pages are zeroed, so
-    /// anything handed out from here reads as zero.
-    pub(crate) free: BTreeMap<u64, u64>,
-    /// Files mapped lazily, and the page tables that make them so (mm.rs)
-    pub(crate) lazy: RefCell<mm::Lazy>,
+    /// The frames of RAM the address spaces are made of (mm.rs)
+    pub(crate) frames: RefCell<mm::Frames>,
+    /// The next ASID to hand out, and the generation they are from
+    pub(crate) asids: Cell<(u64, u64)>,
+    /// Blobs a host access to the program's memory needs and hasn't got (collected by `syscall_lazily`)
+    pub(crate) need: RefCell<Vec<String>>,
+    /// Pages of files read into frames so far
+    pub(crate) filled: Cell<u64>,
+    /// The process that runs
+    pub(crate) p: Proc,
     pub(crate) threads: Vec<Thread>,
     pub(crate) next_tid: i64,
     pub(crate) files: Files,
     pub(crate) tty: Tty,
-    pub(crate) cwd: Ino,
-    pub(crate) umask: u32,
-    /// The executable's path, for /proc/self/exe
-    pub(crate) exe: Vec<u8>,
-    pub(crate) sig: Signals,
     /// The monotonic clock reads `mono_base` ns at `start`, and goes on from there across a
     /// snapshot and its restores.
     pub(crate) start: Instant,
@@ -236,8 +244,62 @@ pub(crate) fn page_up(v: u64) -> u64 {
     (v + PAGE - 1) & !(PAGE - 1)
 }
 
-/// EL0, interrupts masked, MMU off and no vector table: every exception the program takes stops
-/// the CPU, for the process to answer.
+/// Where an executable's pieces go: its segments, the stack, the break and the mmap area.
+struct Layout {
+    loaded: elf::Loaded,
+    segs: Vec<elf::Seg>,
+    stack_top: u64,
+    brk_start: u64,
+    mmap_top: u64,
+}
+
+impl Layout {
+    fn of(head: &[u8], ram_size: u64) -> Result<Layout, ExecError> {
+        let fail = ExecError::Fail;
+        let main = elf::header(head).map_err(fail)?;
+        let base = if main.dyn_ { PIE_BASE } else { 0 };
+        let (loaded, segs) = elf::plan(head, ram_size, base).map_err(ExecError::Fail)?;
+        let stack_top = ram_size - PAGE;
+        let brk_start = page_up(loaded.end);
+        let mmap_top = stack_top - STACK_SIZE - PAGE;
+        if brk_start + BRK_SIZE >= mmap_top {
+            return Err(ExecError::Fail("RAM too small for the program".into()));
+        }
+        Ok(Layout {
+            loaded,
+            segs,
+            stack_top,
+            brk_start,
+            mmap_top,
+        })
+    }
+
+    /// An empty address space for it: the stack, and nothing else.
+    fn space(&self, frames: &mut mm::Frames) -> Result<mm::Mm, ExecError> {
+        let mut mm = mm::Mm::new(
+            frames,
+            self.brk_start,
+            self.brk_start + BRK_SIZE,
+            self.mmap_top,
+        )
+        .ok_or_else(|| ExecError::Fail("no memory for the program".into()))?;
+        let bottom = self.stack_top - STACK_SIZE;
+        mm.insert(
+            bottom,
+            self.stack_top,
+            mm::Vma {
+                end: self.stack_top,
+                prot: mm::PROT_READ | mm::PROT_WRITE,
+                shared: false,
+                file: None,
+            },
+        );
+        Ok(mm)
+    }
+}
+
+/// EL0, interrupts masked and no vector table: every exception the program takes stops the CPU,
+/// for the process to answer. The MMU is switched on with the process's tables (`sync_mmu`).
 fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
     cpu.el = 0;
     cpu.spsel = false;
@@ -248,26 +310,11 @@ fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
         (cpu.sys.sctlr & !1) | (1 << 15) | (1 << 14) | (1 << 16) | (1 << 18) | (1 << 26);
     cpu.sys.cpacr = 3 << 20;
     cpu.sys.cntkctl = 3;
-    // With page tables on too (mm.rs)
     cpu.stop_on_exceptions = true;
 }
 
 impl Process {
     // ------------------------------------------------------------ guest memory
-
-    pub(crate) fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        addr.checked_add(buf.len() as u64)
-            .is_some_and(|end| end <= self.ram_size)
-            && self.touch(addr, buf.len() as u64)
-            && self.ram.read(addr as usize, buf)
-    }
-
-    pub(crate) fn write(&self, addr: u64, data: &[u8]) -> bool {
-        addr.checked_add(data.len() as u64)
-            .is_some_and(|end| end <= self.ram_size)
-            && self.touch(addr, data.len() as u64)
-            && self.ram.write(addr as usize, data)
-    }
 
     pub(crate) fn bytes_at(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
         let mut b = vec![0; len];
@@ -293,100 +340,26 @@ impl Process {
     }
 
     /// A NUL-terminated string of the program's (at most 4 KiB)
-    pub(crate) fn cstr(&self, mut addr: u64) -> Vec<u8> {
+    pub(crate) fn cstr(&self, addr: u64) -> Vec<u8> {
         let mut s = Vec::new();
-        let mut b = [0u8];
-        while s.len() < 4096 && self.read(addr, &mut b) && b[0] != 0 {
-            s.push(b[0]);
-            addr += 1;
+        let mut at = addr;
+        while s.len() < 4096 {
+            let n = (PAGE - at % PAGE) as usize;
+            let mut b = vec![0u8; n];
+            if !self.read(at, &mut b) {
+                break;
+            }
+            match b.iter().position(|&c| c == 0) {
+                Some(i) => {
+                    s.extend_from_slice(&b[..i]);
+                    return s;
+                },
+                None => s.extend_from_slice(&b),
+            }
+            at += n as u64;
         }
+        s.truncate(4096);
         s
-    }
-
-    /// Zero a range the program gave back, and the host memory under it with it.
-    pub(crate) fn zero_range(&self, addr: u64, len: u64) {
-        let start = addr & !(PAGE - 1);
-        let end = page_up(addr + len).min(self.ram_size);
-        // Never the page tables
-        if let Some((s, e)) = self.tables_area().filter(|&(s, e)| start < e && end > s) {
-            if start < s {
-                self.zero_range(start, s - start);
-            }
-            if end > e {
-                self.zero_range(e, end - e);
-            }
-            return;
-        }
-        if start < end {
-            self.ram.discard(start as usize, (end - start) as usize);
-        }
-    }
-
-    /// Highest free range of `len` bytes in the mmap area.
-    pub(crate) fn alloc(&mut self, len: u64) -> Option<u64> {
-        let (&s, &e) = self.free.iter().rev().find(|(&s, &e)| e - s >= len)?;
-        let at = e - len;
-        self.free.remove(&s);
-        if at > s {
-            self.free.insert(s, at);
-        }
-        Some(at)
-    }
-
-    /// Take `[a, b)` out of the free list (MAP_FIXED over it).
-    pub(crate) fn carve(&mut self, a: u64, b: u64) {
-        let hit: Vec<(u64, u64)> = self
-            .free
-            .range(..b)
-            .filter(|(_, &e)| e > a)
-            .map(|(&s, &e)| (s, e))
-            .collect();
-        for (s, e) in hit {
-            self.free.remove(&s);
-            if s < a {
-                self.free.insert(s, a);
-            }
-            if e > b {
-                self.free.insert(b, e);
-            }
-        }
-    }
-
-    /// Whether `[a, b)` is all free.
-    pub(crate) fn is_free(&self, a: u64, b: u64) -> bool {
-        self.free
-            .range(..=a)
-            .next_back()
-            .is_some_and(|(&s, &e)| s <= a && e >= b)
-    }
-
-    /// Give `[a, b)` back to the free list, zeroed, merged with its neighbours.
-    pub(crate) fn release(&mut self, a: u64, b: u64) {
-        let (a, b) = (a.max(self.mmap_floor), b.min(self.mmap_top));
-        if a >= b {
-            return;
-        }
-        // Never the page tables
-        if let Some((s, e)) = self.tables_area().filter(|&(s, e)| a < e && b > s) {
-            self.release(a, s);
-            self.release(e, b);
-            return;
-        }
-        self.forget_lazy(a, b);
-        self.zero_range(a, b - a);
-        self.carve(a, b);
-        let (mut s, mut e) = (a, b);
-        if let Some((&ps, &pe)) = self.free.range(..s).next_back() {
-            if pe == s {
-                self.free.remove(&ps);
-                s = ps;
-            }
-        }
-        if let Some(&ne) = self.free.get(&e) {
-            self.free.remove(&e);
-            e = ne;
-        }
-        self.free.insert(s, e);
     }
 
     // ------------------------------------------------------------ clocks
@@ -465,9 +438,9 @@ impl Process {
             })
             .ok_or_else(|| fail("the machine has no filesystem".into()))?;
         let (path, ino, cwd_ino) = found.ok_or_else(|| fail(format!("{name}: not found")))?;
-        let image = mm::Image::of(&board, ino, cpu.mem.len() as u64)?;
+        let image = mm::Image::of(&board, ino)?;
         let mut p = Process::start(cpu, Some(board), image, path.as_bytes(), args, env)?;
-        p.cwd = cwd_ino;
+        p.p.cwd = cwd_ino;
         Ok(p)
     }
 
@@ -493,36 +466,40 @@ impl Process {
         args: &[String],
         env: &[String],
     ) -> Result<Process, ExecError> {
-        let fail = ExecError::Fail;
         let ram = cpu.mem.alias();
         let ram_size = ram.len() as u64;
-        let main = elf::header(image.head()).map_err(fail)?;
-        let base = if main.dyn_ { PIE_BASE } else { 0 };
-        let (loaded, segs) = elf::plan(image.head(), ram_size, base).map_err(fail)?;
-        let stack_top = ram_size - PAGE;
-        let brk_start = page_up(loaded.end);
-        let mmap_top = stack_top - STACK_SIZE - PAGE;
-        if brk_start + BRK_SIZE >= mmap_top {
-            return Err(fail("RAM too small for the program".into()));
-        }
+        let layout = Layout::of(image.head(), ram_size)?;
+        // What the CPUs decoded from a page of RAM is dropped when its frame is freed or the host
+        // writes it
+        let machine = cpu.machine.clone();
+        let purge = Box::new(move |page: u64| {
+            let flag = &machine.code_pages[page as usize];
+            if flag.load(Ordering::Relaxed) != 0 {
+                flag.store(0, Ordering::Relaxed);
+                machine.invalidate_code(page as u32, usize::MAX);
+            }
+        });
+        let mut frames = mm::Frames::new(ram.alias(), purge);
+        let mm = layout.space(&mut frames)?;
         let mut p = Process {
             ram,
             ram_size,
             board,
-            brk_start,
-            brk: brk_start,
-            mmap_floor: brk_start + BRK_SIZE,
-            mmap_top,
-            free: BTreeMap::from([(brk_start + BRK_SIZE, mmap_top)]),
-            lazy: RefCell::default(),
+            frames: RefCell::new(frames),
+            asids: Cell::new((1, 0)),
+            need: RefCell::new(Vec::new()),
+            filled: Cell::new(0),
+            p: Proc {
+                mm: Rc::new(RefCell::new(mm)),
+                cwd: ROOT,
+                umask: 0o022,
+                exe: exe.to_vec(),
+                sig: Signals::default(),
+            },
             threads: Vec::new(),
             next_tid: 1001,
             files: Files::standard(),
             tty: Tty::new(1000),
-            cwd: ROOT,
-            umask: 0o022,
-            exe: exe.to_vec(),
-            sig: Signals::default(),
             start: Instant::now(),
             mono_base: 1_000_000_000,
             output: Vec::new(),
@@ -536,53 +513,13 @@ impl Process {
             stats: Stats::default(),
         };
         p.net_attach();
-        // The dynamic loader's first, so what waits for blobs does before anything is mapped
-        let ld = match &loaded.interp {
-            None => None,
-            Some(path) => {
-                let board = p.board.clone().ok_or_else(|| {
-                    fail("dynamically linked: needs the machine's filesystem".into())
-                })?;
-                let ino = board
-                    .with_fs(|fs| files::resolve(fs, ROOT, path, true).ok())
-                    .flatten()
-                    .ok_or_else(|| {
-                        fail(format!(
-                            "its loader {} is not in the filesystem",
-                            String::from_utf8_lossy(path)
-                        ))
-                    })?;
-                Some(mm::Image::of(&board, ino, ram_size)?)
+        let (entry, sp) = match p.load_image(&image, &layout, args, env, exe) {
+            Ok(r) => r,
+            Err(e) => {
+                // What it took of RAM goes back to zero, for a start that runs again
+                p.teardown();
+                return Err(e);
             },
-        };
-        p.place(&image, &segs)?;
-        // The dynamic loader, at a base of its own from the top of the mmap area
-        let (entry, interp_base) = match ld {
-            None => (loaded.entry, 0),
-            Some(ld) => {
-                let h = elf::header(ld.head()).map_err(fail)?;
-                let at = p
-                    .alloc(h.span)
-                    .ok_or_else(|| fail("no room for the loader".into()))?;
-                let (l, segs) = elf::plan(ld.head(), ram_size, at).map_err(fail)?;
-                p.place(&ld, &segs)?;
-                (l.entry, at)
-            },
-        };
-        let mut random = [0u8; 16];
-        random.copy_from_slice(&host::random_bytes(16));
-        let sp = {
-            let write = |a: u64, d: &[u8]| p.write(a, d);
-            elf::stack(
-                &write,
-                stack_top,
-                args,
-                env,
-                &loaded,
-                interp_base,
-                exe,
-                &random,
-            )
         };
         setup_cpu(cpu);
         p.sync_mmu(cpu);
@@ -602,6 +539,90 @@ impl Process {
             sig: ThreadSig::default(),
         });
         Ok(p)
+    }
+
+    /// `image`, its loader if it has one, and the initial stack placed in the address space
+    /// `layout` made (`self.p.mm`): where it starts, and the stack pointer.
+    fn load_image(
+        &mut self,
+        image: &mm::Image,
+        layout: &Layout,
+        args: &[String],
+        env: &[String],
+        exe: &[u8],
+    ) -> Result<(u64, u64), ExecError> {
+        let fail = ExecError::Fail;
+        let loaded = &layout.loaded;
+        // The dynamic loader's first, so what waits for blobs does before anything is mapped
+        let ld = match &loaded.interp {
+            None => None,
+            Some(path) => {
+                let board = self.board.clone().ok_or_else(|| {
+                    fail("dynamically linked: needs the machine's filesystem".into())
+                })?;
+                let ino = board
+                    .with_fs(|fs| files::resolve(fs, ROOT, path, true).ok())
+                    .flatten()
+                    .ok_or_else(|| {
+                        fail(format!(
+                            "its loader {} is not in the filesystem",
+                            String::from_utf8_lossy(path)
+                        ))
+                    })?;
+                Some(mm::Image::of(&board, ino)?)
+            },
+        };
+        self.place(image, &layout.segs)?;
+        // The dynamic loader, at a base of its own from the top of the mmap area
+        let (entry, interp_base) = match ld {
+            None => (loaded.entry, 0),
+            Some(ld) => {
+                let h = elf::header(ld.head()).map_err(fail)?;
+                let at = self
+                    .p
+                    .mm
+                    .borrow_mut()
+                    .alloc(h.span)
+                    .ok_or_else(|| fail("no room for the loader".into()))?;
+                let (l, segs) = elf::plan(ld.head(), self.ram_size, at).map_err(fail)?;
+                self.place(&ld, &segs)?;
+                (l.entry, at)
+            },
+        };
+        let mut random = [0u8; 16];
+        random.copy_from_slice(&host::random_bytes(16));
+        let ok = std::cell::Cell::new(true);
+        let sp = {
+            let write = |a: u64, d: &[u8]| {
+                let w = self.write_any(a, d);
+                ok.set(ok.get() && w);
+                w
+            };
+            elf::stack(
+                &write,
+                layout.stack_top,
+                args,
+                env,
+                loaded,
+                interp_base,
+                exe,
+                &random,
+            )
+        };
+        if !ok.get() {
+            return Err(fail("no memory for the stack".into()));
+        }
+        Ok((entry, sp))
+    }
+
+    /// Gives the address space back: everything in it, its frames zeroed.
+    fn teardown(&mut self) {
+        let refs = {
+            let mut mm = self.p.mm.borrow_mut();
+            mm.destroy(&mut self.frames.borrow_mut());
+            mm.take_refs()
+        };
+        self.settle_refs(refs);
     }
 
     // ------------------------------------------------------------ the host's side
@@ -834,7 +855,7 @@ impl Process {
                                 // What it had pending goes to the threads left
                                 let left = std::mem::take(&mut self.threads[cur].sig.pending);
                                 for (s, c) in left {
-                                    self.sig.pending.entry(s).or_insert(c);
+                                    self.p.sig.pending.entry(s).or_insert(c);
                                 }
                                 continue 'run;
                             },
@@ -932,20 +953,11 @@ impl Process {
         self.park(cpu);
         let now = Instant::now();
         let mut w = W(MAGIC.to_vec());
-        for v in [
-            self.ram_size,
-            self.brk_start,
-            self.brk,
-            self.mmap_floor,
-            self.mmap_top,
-        ] {
-            w.u(v);
-        }
-        w.u(self.free.len() as u64);
-        for (&s, &e) in &self.free {
-            w.u(s);
-            w.u(e);
-        }
+        w.u(self.ram_size);
+        self.frames.borrow_mut().save(&mut w);
+        w.u(self.asids.get().0);
+        w.u(self.filled.get());
+        self.p.mm.borrow().save(&mut w);
         w.u(self.next_tid as u64);
         w.u(self.now_ns(1));
         w.u(self.cur as u64);
@@ -998,11 +1010,10 @@ impl Process {
         }
         self.files.save(&mut w);
         self.tty.save(&mut w);
-        w.u(self.cwd);
-        w.u(self.umask as u64);
-        w.b(&self.exe);
-        self.sig.save_actions(&mut w);
-        self.lazy.borrow().save(&mut w);
+        w.u(self.p.cwd);
+        w.u(self.p.umask as u64);
+        w.b(&self.p.exe);
+        self.p.sig.save_actions(&mut w);
         self.save_signals(&mut w);
         w.0
     }
@@ -1014,20 +1025,7 @@ impl Process {
         board: Option<Arc<Board>>,
         data: &[u8],
     ) -> Result<Process, String> {
-        // ARMLUSR2, from before signals were delivered and files were mapped lazily: signal
-        // actions only, and nothing lazy
-        // ARMLUSR3, from before sockets: no section for them
-        let (mut r, old, with_net) = match data.strip_prefix(MAGIC) {
-            Some(d) => (R(d), false, true),
-            None => match data.strip_prefix(MAGIC_3) {
-                Some(d) => (R(d), false, false),
-                None => (
-                    R(data.strip_prefix(MAGIC_2).ok_or("not a process state")?),
-                    true,
-                    false,
-                ),
-            },
-        };
+        let mut r = R(data.strip_prefix(MAGIC).ok_or("not a process state")?);
         let ram = cpu.mem.alias();
         let ram_size = r.u()?;
         if ram_size != ram.len() as u64 {
@@ -1036,11 +1034,19 @@ impl Process {
                 ram.len()
             ));
         }
-        let (brk_start, brk, mmap_floor, mmap_top) = (r.u()?, r.u()?, r.u()?, r.u()?);
-        let mut free = BTreeMap::new();
-        for _ in 0..r.u()? {
-            free.insert(r.u()?, r.u()?);
-        }
+        let machine = cpu.machine.clone();
+        let purge = Box::new(move |page: u64| {
+            let flag = &machine.code_pages[page as usize];
+            if flag.load(Ordering::Relaxed) != 0 {
+                flag.store(0, Ordering::Relaxed);
+                machine.invalidate_code(page as u32, usize::MAX);
+            }
+        });
+        let mut frames = mm::Frames::new(ram.alias(), purge);
+        frames.load(&mut r)?;
+        let _asid = r.u()?;
+        let filled = r.u()?;
+        let mm = mm::Mm::load(&mut r, ram_size)?;
         let next_tid = r.u()? as i64;
         let mono_base = r.u()?;
         let cur = r.u()? as usize;
@@ -1104,32 +1110,32 @@ impl Process {
                 sig: ThreadSig::default(),
             });
         }
-        let files = Files::load(&mut r, with_net)?;
+        let files = Files::load(&mut r, true)?;
         let tty = Tty::load(&mut r)?;
         let cwd = r.u()?;
         let umask = r.u()? as u32;
         let exe = r.b()?.to_vec();
         let sig = Signals::load_actions(&mut r)?;
-        let lazy = if old { mm::Lazy::default() } else { mm::Lazy::load(&mut r, ram_size)? };
         setup_cpu(cpu);
         let mut p = Process {
             ram,
             ram_size,
             board,
-            brk_start,
-            brk,
-            mmap_floor,
-            mmap_top,
-            free,
-            lazy: RefCell::new(lazy),
+            frames: RefCell::new(frames),
+            asids: Cell::new((1, 0)),
+            need: RefCell::new(Vec::new()),
+            filled: Cell::new(filled),
+            p: Proc {
+                mm: Rc::new(RefCell::new(mm)),
+                cwd,
+                umask,
+                exe,
+                sig,
+            },
             threads,
             next_tid,
             files,
             tty,
-            cwd,
-            umask,
-            exe,
-            sig,
             start: now,
             mono_base,
             output: Vec::new(),
@@ -1144,13 +1150,7 @@ impl Process {
             stats: Stats::default(),
         };
         p.net_attach();
-        if old {
-            for t in &mut p.threads {
-                t.sig.altstack_unknown = true;
-            }
-        } else {
-            p.load_signals(&mut r)?;
-        }
+        p.load_signals(&mut r)?;
         let wanted: Vec<String> = p
             .threads
             .iter()
@@ -1180,5 +1180,3 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
 }
 
 const MAGIC: &[u8; 8] = b"ARMLUSR4";
-const MAGIC_3: &[u8; 8] = b"ARMLUSR3";
-const MAGIC_2: &[u8; 8] = b"ARMLUSR2";

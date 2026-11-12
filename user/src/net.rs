@@ -601,7 +601,7 @@ impl Process {
             return Ok([&b"a"[..], path].concat());
         }
         match self.fs(|fs| {
-            files::resolve(fs, self.cwd, path, true).map(|ino| (ino, fs.get(ino).map(|i| i.mode)))
+            files::resolve(fs, self.p.cwd, path, true).map(|ino| (ino, fs.get(ino).map(|i| i.mode)))
         }) {
             None => Ok([&b"p"[..], path].concat()),
             Some(Ok((ino, Some(mode)))) if mode & armless::dev::fs::S_IFMT == S_IFSOCK => {
@@ -1090,8 +1090,8 @@ impl Process {
 
     /// The inode a bound unix socket makes at `path` (EADDRINUSE if there is one), and its key.
     fn unix_create(&mut self, path: &[u8]) -> Result<(Vec<u8>, Option<u64>), Ret> {
-        let (now, mode) = (self.now_secs(), files::S_IFSOCK | (0o777 & !self.umask));
-        let cwd = self.cwd;
+        let (now, mode) = (self.now_secs(), files::S_IFSOCK | (0o777 & !self.p.umask));
+        let cwd = self.p.cwd;
         match self.fs(|fs| {
             let (dir, name) = files::resolve_parent(fs, cwd, path).map_err(Got::Err)?;
             let ino = match files::got(fs.create(dir, &name, mode, 0, 0, now)) {

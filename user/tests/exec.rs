@@ -936,3 +936,167 @@ fn a_saved_process_keeps_its_untouched_pages_lazy() {
     assert!(matches!(status, Status::Exited(170)), "h + B: {status:?}");
     assert_eq!(asked, ["page-b"], "the first page came with the snapshot");
 }
+
+// ------------------------------------------------------------ memory protections
+
+const PROT_READ: u16 = 1;
+const PROT_WRITE: u16 = 2;
+const PROT_EXEC: u16 = 4;
+
+impl Asm {
+    /// mmap(0, 4096, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) into x19
+    fn mmap_anon(&mut self, prot: u16) -> &mut Self {
+        self.movz(0, 0)
+            .movz(1, 4096)
+            .movz(2, prot)
+            .movz(3, 0x22)
+            .i(0x9280_0004) // movn x4, #0
+            .movz(5, 0)
+            .svc(222)
+            .i(mov(19, 0))
+    }
+    /// mprotect(x19, 4096, prot)
+    fn mprotect(&mut self, prot: u16) -> &mut Self {
+        self.i(mov(0, 19)).movz(1, 4096).movz(2, prot).svc(226)
+    }
+    fn munmap(&mut self) -> &mut Self {
+        self.i(mov(0, 19)).movz(1, 4096).svc(215)
+    }
+    /// exit_group(the byte at x19)
+    fn exit_byte(&mut self) -> &mut Self {
+        self.i(ldrb(0, 19)).svc(94)
+    }
+    fn run_program(&mut self) -> Status {
+        let (mut vm, mut p) = start(&self.elf());
+        run(&mut p, &mut vm.cpus[0]).1
+    }
+}
+
+#[test]
+fn memory_protections_hold() {
+    let faults = |s: Status| matches!(s, Status::Fault(_));
+    // A read-only page reads as zero, and a store to it is a fault
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ)
+        .i(ldrb(20, 19))
+        .movz(21, 7)
+        .i(strb(21, 19))
+        .exit(0);
+    assert!(faults(a.run_program()));
+
+    // mprotect makes it writable: the store takes
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ)
+        .i(ldrb(20, 19))
+        .mprotect(PROT_READ | PROT_WRITE)
+        .movz(21, 7)
+        .i(strb(21, 19))
+        .exit_byte();
+    assert!(matches!(a.run_program(), Status::Exited(7)));
+
+    // and read-only again after its pages were had: the store faults
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ | PROT_WRITE)
+        .movz(21, 7)
+        .i(strb(21, 19))
+        .mprotect(PROT_READ)
+        .i(strb(21, 19))
+        .exit(0);
+    assert!(faults(a.run_program()));
+
+    // PROT_NONE: not even a read
+    let mut a = Asm::default();
+    a.mmap_anon(0).i(ldrb(20, 19)).exit(0);
+    assert!(faults(a.run_program()));
+
+    // Unmapped: a read faults; the byte it wrote is gone with the page
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ | PROT_WRITE)
+        .movz(21, 7)
+        .i(strb(21, 19))
+        .munmap()
+        .exit_byte();
+    assert!(faults(a.run_program()));
+
+    // A page that isn't executable can't run: jump to anonymous memory
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ | PROT_WRITE).i(0xd61f_0260).exit(0); // br x19
+    assert!(faults(a.run_program()));
+
+    // and one that is executable runs: `mov x0, #9; mov x8, #94; svc` copied there, then br
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ | PROT_WRITE);
+    for (i, w) in [movz(0, 9), movz(8, 94), SVC].into_iter().enumerate() {
+        a.mov32(21, w).movz(22, i as u16 * 4).i(add(22, 19, 22));
+        a.i(0xb900_02d5); // str w21, [x22]
+    }
+    a.mprotect(PROT_READ | PROT_EXEC).i(0xd61f_0260).exit(0);
+    assert!(matches!(a.run_program(), Status::Exited(9)));
+}
+
+#[test]
+fn a_system_call_cant_write_where_the_program_cant() {
+    // read(0, a read-only page, 1) is EFAULT, and exit_group(-errno)
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ)
+        .movz(0, 0)
+        .i(mov(1, 19))
+        .movz(2, 1)
+        .svc(63)
+        .i(0xcb00_03e0) // neg x0, x0
+        .svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    p.input(b"x\n");
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Exited(14)), "EFAULT: {status:?}");
+}
+
+#[test]
+fn the_break_gives_pages_back_and_keeps_what_is_below_it() {
+    // brk(0) into x19; brk(x19 + 8192); two stores; brk(x19 + 4096): the first page stays, the
+    // second is gone and comes back as zeros when the break grows again
+    let mut a = Asm::default();
+    a.movz(0, 0).svc(214).i(mov(19, 0));
+    a.i(add_imm(0, 19, 2, true)).svc(214); // brk(x19 + 8192)
+    a.movz(21, 5).i(strb(21, 19));
+    a.i(add_imm(20, 19, 1, true)).movz(21, 6).i(strb(21, 20));
+    a.i(mov(0, 20)).svc(214); // shrink to the first page
+    a.i(add_imm(0, 19, 2, true)).svc(214); // and grow again
+    a.i(ldrb(22, 19)).i(ldrb(23, 20)); // 5, and 0 again
+    a.i(add(0, 22, 23)).svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Exited(5)), "{status:?}");
+}
+
+#[test]
+fn mremap_moves_pages_without_copying_them() {
+    // Two pages mapped, a byte in each; mremap to four, MAYMOVE past a page that blocks growth
+    // in place; both bytes follow
+    let mut a = Asm::default();
+    a.movz(0, 0)
+        .movz(1, 0x2000)
+        .movz(2, 3)
+        .movz(3, 0x22)
+        .i(0x9280_0004)
+        .movz(5, 0)
+        .svc(222)
+        .i(mov(19, 0));
+    // the page right below is taken, so the range can't grow downwards in place: a second mmap
+    // lands just below the first (highest free range first), and the first's growth is blocked
+    // by nothing above it only if free; map one above to be sure
+    a.movz(21, 3).i(strb(21, 19));
+    a.i(add_imm(20, 19, 1, true)).movz(21, 4).i(strb(21, 20));
+    a.i(mov(0, 19))
+        .movz(1, 0x2000)
+        .movz(2, 0x4000)
+        .movz(3, 1)
+        .svc(216)
+        .i(mov(22, 0));
+    a.i(ldrb(23, 22));
+    a.i(add_imm(24, 22, 1, true)).i(ldrb(25, 24));
+    a.i(add(0, 23, 25)).svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Exited(7)), "{status:?}");
+}

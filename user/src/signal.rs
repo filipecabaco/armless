@@ -298,36 +298,36 @@ impl Process {
             .threads
             .get(t)
             .is_some_and(|t| t.sig.mask & bit(sig) != 0);
-        if self.sig.disposition(sig) == Disposition::Ignore && !blocked {
+        if self.p.sig.disposition(sig) == Disposition::Ignore && !blocked {
             self.stats.signals_ignored += 1;
             return;
         }
         match thread {
             Some(t) => self.threads[t].sig.pending.entry(sig).or_insert(code),
-            None => self.sig.pending.entry(sig).or_insert(code),
+            None => self.p.sig.pending.entry(sig).or_insert(code),
         };
-        self.sig.dirty = true;
+        self.p.sig.dirty = true;
         // rt_sigtimedwait looks again
         self.poked = true;
     }
 
     /// Whether a thread has a signal it can take now, for the run loop to deliver it
     pub(crate) fn signal_ready(&self) -> bool {
-        self.sig.dirty
+        self.p.sig.dirty
     }
 
     /// Gives what the process has pending to its threads, then delivers what each thread can
     /// take: wakes it from a call it is parked in, and builds the handler's frame (or ends the
     /// process, or drops the signal).
     pub(crate) fn deliver_signals<H: Host>(&mut self, cpu: &mut Cpu<H>) {
-        if !std::mem::take(&mut self.sig.dirty)
-            && self.sig.pending.is_empty()
+        if !std::mem::take(&mut self.p.sig.dirty)
+            && self.p.sig.pending.is_empty()
             && self.threads.iter().all(|t| t.sig.pending.is_empty())
         {
             return;
         }
         // The process's: to the first thread not blocking it, the main thread first
-        let shared: Vec<(u32, i32)> = self.sig.pending.iter().map(|(&s, &c)| (s, c)).collect();
+        let shared: Vec<(u32, i32)> = self.p.sig.pending.iter().map(|(&s, &c)| (s, c)).collect();
         for (sig, code) in shared {
             if let Some(t) = self
                 .threads
@@ -335,7 +335,7 @@ impl Process {
                 .find(|t| !t.exited && t.sig.mask & bit(sig) == 0)
             {
                 t.sig.pending.entry(sig).or_insert(code);
-                self.sig.pending.remove(&sig);
+                self.p.sig.pending.remove(&sig);
             }
         }
         for i in 0..self.threads.len() {
@@ -350,7 +350,7 @@ impl Process {
                     break;
                 };
                 self.threads[i].sig.pending.remove(&sig);
-                match self.sig.disposition(sig) {
+                match self.p.sig.disposition(sig) {
                     Disposition::Ignore => {
                         self.stats.signals_ignored += 1;
                         continue;
@@ -366,7 +366,7 @@ impl Process {
                         self.handle(i, sig, code, act);
                         self.stats.signals_delivered += 1;
                         // One frame at a time: the next once this one's thread runs again
-                        self.sig.dirty = true;
+                        self.p.sig.dirty = true;
                         break;
                     },
                 }
@@ -438,7 +438,10 @@ impl Process {
         if act.flags & SA_ONSTACK != 0 && t.sig.altstack_unknown && t.sig.altstack.size == 0 {
             t.sig.altstack_unknown = false;
             // Go takes a signal on any alternate stack sigaltstack reports, as its own
-            if let Some(at) = self.alloc(LEGACY_ALTSTACK) {
+            if let Some(at) = self.alloc_map(
+                LEGACY_ALTSTACK,
+                crate::mm::PROT_READ | crate::mm::PROT_WRITE,
+            ) {
                 self.threads[i].sig.altstack = AltStack {
                     sp: at,
                     size: LEGACY_ALTSTACK,
@@ -521,21 +524,23 @@ impl Process {
         }
         t.sig.mask = mask & !UNBLOCKABLE;
         if act.flags & SA_RESETHAND != 0 {
-            self.sig.actions[sig as usize] = Action::default();
+            self.p.sig.actions[sig as usize] = Action::default();
         }
     }
 
     /// The sigreturn trampoline (`mov x8, #139; svc #0`), made the first time it is needed.
     fn trampoline(&mut self) -> u64 {
-        if self.sig.trampoline == 0 {
-            if let Some(at) = self.alloc(crate::PAGE) {
+        if self.p.sig.trampoline == 0 {
+            if let Some(at) =
+                self.alloc_map(crate::PAGE, crate::mm::PROT_READ | crate::mm::PROT_EXEC)
+            {
                 let code = [0xd280_1168u32, 0xd400_0001];
                 let b: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
-                self.write(at, &b);
-                self.sig.trampoline = at;
+                self.write_any(at, &b);
+                self.p.sig.trampoline = at;
             }
         }
-        self.sig.trampoline
+        self.p.sig.trampoline
     }
 
     /// rt_sigreturn: the thread as the frame at its stack pointer has it.
@@ -615,7 +620,7 @@ impl Process {
                 };
             }
         }
-        self.sig.dirty = true;
+        self.p.sig.dirty = true;
         Ret::Val(ctx.x[0] as i64)
     }
 
@@ -638,15 +643,15 @@ impl Process {
         } else {
             None
         };
-        if old != 0 && !self.write(old, &self.sig.actions[sig as usize].to_bytes()) {
+        if old != 0 && !self.write(old, &self.p.sig.actions[sig as usize].to_bytes()) {
             return Ret::Val(-EFAULT);
         }
         if let Some(mut a) = new {
             a.mask &= !UNBLOCKABLE;
-            self.sig.actions[sig as usize] = a;
+            self.p.sig.actions[sig as usize] = a;
             // Ignored now: what is pending of it goes
-            if self.sig.disposition(sig) == Disposition::Ignore {
-                self.sig.pending.remove(&sig);
+            if self.p.sig.disposition(sig) == Disposition::Ignore {
+                self.p.sig.pending.remove(&sig);
                 for t in &mut self.threads {
                     t.sig.pending.remove(&sig);
                 }
@@ -680,7 +685,7 @@ impl Process {
         }
         if let Some(m) = new {
             self.threads[cur].sig.mask = m & !UNBLOCKABLE;
-            self.sig.dirty = true;
+            self.p.sig.dirty = true;
         }
         Ret::Val(0)
     }
@@ -691,7 +696,7 @@ impl Process {
         let p = t
             .pending
             .keys()
-            .chain(self.sig.pending.keys())
+            .chain(self.p.sig.pending.keys())
             .fold(0, |a, &s| a | bit(s));
         Ret::Val(if self.put_u64(set, p & t.mask) { 0 } else { -EFAULT })
     }
@@ -748,7 +753,7 @@ impl Process {
             t.saved_mask = Some(t.mask);
         }
         t.mask = m & !UNBLOCKABLE;
-        self.sig.dirty = true;
+        self.p.sig.dirty = true;
         Ret::Retry {
             deadline: None,
             on_timeout: 0,
@@ -775,8 +780,8 @@ impl Process {
                 self.threads[cur].sig.pending.remove(&g.0);
                 Some(g)
             },
-            None => pick(&self.sig.pending).inspect(|g| {
-                self.sig.pending.remove(&g.0);
+            None => pick(&self.p.sig.pending).inspect(|g| {
+                self.p.sig.pending.remove(&g.0);
             }),
         };
         if let Some((sig, code)) = got {
@@ -847,8 +852,8 @@ impl Process {
 
     /// What threads and the process have pending, the masks and alternate stacks
     pub(crate) fn save_signals(&self, w: &mut W) {
-        w.u(self.sig.trampoline);
-        save_pending(w, &self.sig.pending);
+        w.u(self.p.sig.trampoline);
+        save_pending(w, &self.p.sig.pending);
         for t in &self.threads {
             let s = &t.sig;
             w.u(s.mask);
@@ -863,8 +868,8 @@ impl Process {
     }
 
     pub(crate) fn load_signals(&mut self, r: &mut R) -> Result<(), String> {
-        self.sig.trampoline = r.u()?;
-        self.sig.pending = load_pending(r)?;
+        self.p.sig.trampoline = r.u()?;
+        self.p.sig.pending = load_pending(r)?;
         for t in &mut self.threads {
             let s = &mut t.sig;
             s.mask = r.u()?;
@@ -879,7 +884,7 @@ impl Process {
             s.saved_mask = has.then_some(m);
             s.altstack_unknown = r.u()? != 0;
         }
-        self.sig.dirty = true;
+        self.p.sig.dirty = true;
         Ok(())
     }
 }

@@ -33,8 +33,8 @@ fn u64_at(e: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(e[o..o + 8].try_into().unwrap())
 }
 
-/// A program header: (type, file offset, vaddr, file size, memory size)
-type Segment = (u32, u64, u64, u64, u64);
+/// A program header: (type, file offset, vaddr, file size, memory size, flags)
+type Segment = (u32, u64, u64, u64, u64, u32);
 
 fn segments(elf: &[u8]) -> Result<Vec<Segment>, String> {
     if elf.len() < 64
@@ -60,6 +60,7 @@ fn segments(elf: &[u8]) -> Result<Vec<Segment>, String> {
                 u64_at(elf, p + 16),
                 u64_at(elf, p + 32),
                 u64_at(elf, p + 40),
+                u32_at(elf, p + 4),
             ))
         })
         .collect()
@@ -85,11 +86,13 @@ pub(crate) fn header(elf: &[u8]) -> Result<Header, String> {
 }
 
 /// A PT_LOAD segment placed: its file bytes `off..off + filesz` at `at`, and zeros up to
-/// `at + memsz`.
+/// `at + memsz`, with the protection (`mm::PROT_*`) its flags ask for.
 pub(crate) struct Seg {
     pub at: u64,
     pub off: u64,
     pub filesz: u64,
+    pub memsz: u64,
+    pub prot: u8,
 }
 
 /// Where the PT_LOAD segments go at `base` plus their addresses, from the ELF's first bytes (its
@@ -102,7 +105,7 @@ pub(crate) fn plan(elf: &[u8], ram_size: u64, base: u64) -> Result<(Loaded, Vec<
     let mut end = 0;
     let mut interp = None;
     let mut segs = Vec::new();
-    for (ty, off, vaddr, filesz, memsz) in all {
+    for (ty, off, vaddr, filesz, memsz, flags) in all {
         match ty {
             3 => {
                 let path = elf
@@ -116,7 +119,15 @@ pub(crate) fn plan(elf: &[u8], ram_size: u64, base: u64) -> Result<(Loaded, Vec<
                 if at.checked_add(memsz).is_none_or(|e| e > ram_size) || filesz > memsz {
                     return Err(format!("segment at {at:#x} is past RAM"));
                 }
-                segs.push(Seg { at, off, filesz });
+                // PF_X, PF_W, PF_R as PROT_EXEC, PROT_WRITE, PROT_READ
+                let prot = (flags & 4 != 0) as u8 | (flags & 2) as u8 | ((flags & 1) as u8) << 2;
+                segs.push(Seg {
+                    at,
+                    off,
+                    filesz,
+                    memsz,
+                    prot,
+                });
                 if phdr == 0 && off == 0 {
                     phdr = at + phoff;
                 }
