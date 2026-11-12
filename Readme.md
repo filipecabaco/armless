@@ -116,6 +116,7 @@ vm.on("stop", ({ reason, code }) => console.log(reason, code)); // "exit", 0
 | `wasm`, `wasm_smp` | the wasm to load (a URL, bytes or a `WebAssembly.Module`). With `cpus > 1`, `wasm_smp`, or else `wasm` with `armless.wasm` replaced by `armless-smp.wasm` |
 | `memory_mb` | the guest's RAM (default 512). A restored snapshot only commits the pages it holds |
 | `cpus` | number of CPUs (default 1) |
+| `smp_policy` | with several CPUs, how a CPU waits for another: `"adaptive"` (the default: spin briefly, then give up the thread now and then, and learn when the host has fewer cores free than it says) or `"spin-count"` (armless 0.12's). See `set_smp_policy()` |
 | `filesystem` | `{ json, baseurl }`: the 9p root's tree and where its blobs are fetched from |
 | `fs_cache_mb` | cap on decompressed file contents kept in the page (256 by default); the guest's page cache keeps what it uses often |
 | `predecode_mb` | cap on the pre-decoded instructions each CPU keeps (24 by default), held for the life of the machine |
@@ -179,6 +180,12 @@ connections nobody accepts, and no tunnel takes, are refused.
   wake_ms, code }`, and `idle` fires when the program waits for input (not when it only sleeps
   or waits for files). An idle program costs nothing: it runs again at its next deadline
   (`wake_ms`), on input, or when a file it waits on arrives.
+- `smp_report()`: with several CPUs, what they did and what their waits for one another cost:
+  `{ cpus, host_cores, policy, oversubscribed, slow_waits, tlbi, ic_invals, kicks, insns: [per
+  CPU], waits: { tlb, wfe, lock: { waits, spins, yields, ms, max_ms } }, workers: [{ run_ms,
+  idle_ms, yield_ms, slices, idle_waits, events, yields, compiles }], event_delay: { count, ms,
+  max_ms } }` (also `memory_report().smp`); null with one CPU. `set_smp_policy(name)` changes
+  the policy while it runs and returns the one before.
 - `memory_report({ scan })`: what the page's memory holds, split into the pieces armless can tell
   apart: the whole linear memory (which never shrinks), the guest's RAM, the host's heap (live,
   peak, big blocks, freed blocks kept to be reused), the file system (blobs fetched, files the

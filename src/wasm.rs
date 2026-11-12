@@ -81,12 +81,7 @@ impl Platform for JsPlatform {
 
     fn yield_now(&mut self) {
         // vCPU workers may block: sleep ~20 µs so the vCPU we wait for can run.
-        #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-        // SAFETY: waits on a static atomic nobody notifies, for at most 20 µs.
-        unsafe {
-            static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            core::arch::wasm32::memory_atomic_wait32(NEVER.as_ptr() as *mut i32, 0, 20_000);
-        }
+        crate::smp::pause_thread();
     }
 }
 
@@ -278,6 +273,8 @@ pub extern "C" fn armless_buf() -> u32 {
 pub extern "C" fn armless_smp_attach(index: u32) -> i32 {
     if (index as usize) < vm().cpus.len() {
         CURRENT.with(|c| c.set(index as usize));
+        // A worker may block (Atomics.wait), which a page's own thread may not
+        crate::smp::set_may_block();
         0
     } else {
         -1
@@ -300,6 +297,20 @@ pub extern "C" fn armless_smp_wake_addr(index: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn armless_smp_host_cores(n: u32) {
     vm().machine().host_cores.store(n, Ordering::Relaxed);
+}
+
+/// How waiting CPUs behave: 0 adaptive (the default), 1 by spin count as in armless 0.12. Returns
+/// the policy before, or -1 for another value.
+#[no_mangle]
+pub extern "C" fn armless_smp_policy(policy: u32) -> i32 {
+    if policy > crate::smp::POLICY_SPIN_COUNT {
+        return -1;
+    }
+    let m = vm().machine();
+    let before = m.policy.swap(policy, Ordering::Relaxed);
+    // A policy starts with nothing learned
+    m.slow_waits.store(0, Ordering::Relaxed);
+    before as i32
 }
 
 /// Ask every CPU to stop (power off); workers' armless_run then returns 2.
@@ -402,7 +413,7 @@ pub extern "C" fn armless_mem_report() -> u32 {
             "\"fs\":{{\"inodes\":{},\"cached_blobs\":{},\"cached_bytes\":{},\"cache_limit\":{},",
             "\"written_buffers\":{},\"written_bytes\":{},\"written_capacity\":{}}},",
             "\"jit\":{{\"compiled\":{},\"flushes\":{},\"cpus\":{},\"table_bytes\":{},\"pages\":{}}},",
-            "\"predecode\":{{\"slots\":{},\"bytes\":{}}}}}"
+            "\"predecode\":{{\"slots\":{},\"bytes\":{}}},\"smp\":{}}}"
         ),
         memory,
         vm.board.io.mem.len(),
@@ -426,6 +437,7 @@ pub extern "C" fn armless_mem_report() -> u32 {
         jit_pages,
         pre_slots,
         pre_bytes,
+        vm.machine().report_json(&vm.cpus.iter().map(|c| c.insn_count).collect::<Vec<_>>()),
     ).into_bytes())
 }
 
