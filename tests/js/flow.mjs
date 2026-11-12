@@ -161,6 +161,29 @@ check(out.includes("PER-CONNECTION") && tunnelled.at(-1) === "ws://echo/tunnelho
   "tunnel URL made per connection; one that fails is refused", out);
 out = await a.sh("echo kept > /root/note; sync; echo 3 > /proc/sys/vm/drop_caches");
 
+// What the CPUs did and what their waits cost, after the work above
+const smp = a.smp_report();
+if (cpus === 1) {
+  check(smp === null, "no SMP report with one CPU", JSON.stringify(smp));
+} else {
+  const r = JSON.stringify(smp);
+  check(smp.cpus === cpus && smp.policy === "adaptive" && typeof smp.oversubscribed === "boolean", "SMP report: CPUs and policy", r);
+  check(smp.insns.length === cpus && smp.insns.every((n) => n > 0), "SMP report: every CPU ran instructions", r);
+  check(["tlb", "wfe", "lock"].every((k) => smp.waits[k] && smp.waits[k].waits >= 0 && smp.waits[k].ms >= 0), "SMP report: each kind of wait", r);
+  check(smp.workers.length === cpus && smp.workers.every((w) => w.slices > 0 && w.run_ms > 0), "SMP report: each worker's time", r);
+  // A worker lets its event loop run only for JIT compilations under way, never more often than it compiles
+  check(smp.workers.every((w) => w.compiles > 0 && w.yields <= w.slices), "SMP report: workers yield only to compile", r);
+  check(smp.event_delay.count > 0 && smp.event_delay.max_ms >= 0, "SMP report: device events reached the page", r);
+  check(a.memory_report({ scan: false }).smp.workers.length === cpus, "the memory report has it too", r);
+  check(a.set_smp_policy("spin-count") === "adaptive" && a.smp_report().policy === "spin-count", "the policy can be changed", r);
+  let refused = false;
+  try { a.set_smp_policy("fast"); } catch { refused = true; }
+  check(refused, "an unknown policy is refused", r);
+  out = await a.sh("md5sum /data/big.bin");
+  check(out.includes("2b1902602225a2f8cd62faa5381597b4"), "the guest runs on with the spin-count policy", out);
+  a.set_smp_policy("adaptive");
+}
+
 const state = await a.save_state();
 console.log(`snapshot: ${(state.length / 1048576).toFixed(1)} MiB`);
 a.destroy();
