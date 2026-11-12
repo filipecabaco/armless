@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use armless::dev::fs::{self, Content, Fail, Fs, Ino, ROOT, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
-use crate::net::Net;
+use crate::net::{Net, Op};
 use crate::ser::{R, W};
 
 pub(crate) const S_IFCHR: u32 = 0o020000;
@@ -208,6 +208,14 @@ impl Files {
     /// Returns the inode of a file whose last description went, for its reference.
     pub fn close(&mut self, fd: i32) -> Option<Option<Ino>> {
         let (d, _) = self.fds.remove(&fd)?;
+        let r = self.release(d)?;
+        self.reap();
+        Some(r)
+    }
+
+    /// One reference of description `d` is gone. Closing a socket can free what it held in
+    /// flight (`Net::dead`): `reap` goes on with that.
+    fn release(&mut self, d: u32) -> Option<Option<Ino>> {
         let desc = self.descs.get_mut(&d)?;
         desc.refs -= 1;
         if desc.refs > 0 {
@@ -222,6 +230,22 @@ impl Files {
             _ => {},
         }
         Some(None)
+    }
+
+    /// The descriptions that sockets let go of (descriptors that were never delivered, with the
+    /// socket that held them) lose that reference; a file's inode goes to `Net::ops`.
+    pub fn reap(&mut self) {
+        while let Some(d) = self.net.dead.pop() {
+            if let Some(Some(ino)) = self.release(d) {
+                self.net.ops.push(Op::FsDrop(ino));
+            }
+        }
+    }
+
+    /// Lets go of descriptions that were in flight in a message (one reference each).
+    pub fn drop_rights(&mut self, ds: Vec<u32>) {
+        self.net.dead.extend(ds);
+        self.reap();
     }
 
     fn pipe_end(&mut self, p: u32, reader: bool) {

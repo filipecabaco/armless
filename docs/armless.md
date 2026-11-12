@@ -299,7 +299,18 @@ x0–x5, answers it in x0, and resumes at ELR.
   - *Snapshots:* the sockets' state is in the machine's, streams and queues with their bytes,
     whatever process holds them. A connection to the host can't survive a restore:
     it reads as closed, and one that was connecting as reset.
-  - *Not supported:* `SCM_RIGHTS` and other ancillary data (`EOPNOTSUPP`), `SOCK_SEQPACKET`,
+  - *Descriptors:* `sendmsg` and `recvmsg` (and the mmsg pair) pass `SCM_RIGHTS` over AF_UNIX
+    stream, datagram and socketpair sockets, as nginx's master does to its workers: the
+    description travels with a reference, so a pipe or socket in flight stays open, and
+    `recvmsg` installs it in the receiver's table (close-on-exec with `MSG_CMSG_CLOEXEC`;
+    `MSG_CTRUNC` and the extra descriptors closed if the control buffer is short or absent).
+    A datagram carries them; on a stream they go with the first byte of the send, and the read
+    that takes that byte takes them (and ends with that send), also a `read` that asks for no
+    control data (it closes them). `MSG_PEEK` gives copies. What nobody received is closed
+    with the socket that held it. `SCM_CREDENTIALS` is the sender's pid, uid 0 and gid 0 (or
+    what it gave), delivered while the receiver has `SO_PASSCRED`. A socket passed through its
+    own queue is not reclaimed (no cycle collector), and rights in flight survive a snapshot.
+  - *Not supported:* other ancillary data (`EINVAL`), `SOCK_SEQPACKET`,
     raw and packet sockets, `socketpair` for anything but AF_UNIX, a separate `RDHUP`, backpressure
     from the guest to the host (a host stream's data is taken as it comes).
 - **Memory** (user/src/mm.rs): virtual. Each process has page tables of its own (4 KiB pages,
@@ -378,8 +389,9 @@ x0–x5, answers it in x0, and resumes at ELR.
   the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
   and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
   are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
-  A state from before 0.14 does not load (`ARMLUSR5`: addresses are virtual, there are
-  processes, and the sockets are in the machine's state).
+  A state from before 0.14.1 does not load (`ARMLUSR6`: addresses are virtual, there are
+  processes, the sockets are in the machine's state, and a message in flight carries its
+  descriptors and its sender).
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,

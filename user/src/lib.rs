@@ -1367,4 +1367,4 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-const MAGIC: &[u8; 8] = b"ARMLUSR5";
+const MAGIC: &[u8; 8] = b"ARMLUSR6";

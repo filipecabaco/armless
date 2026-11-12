@@ -12,9 +12,19 @@
 //! to port 53 is answered by the network's name service. Without a network (a machine built with
 //! `net: false`) only the processes' own sockets exist.
 //!
-//! Not here: SCM_RIGHTS and other ancillary data (EOPNOTSUPP), UDP to the outside (but DNS),
-//! IPv6 to the outside, raw and packet sockets, SOCK_SEQPACKET, MSG_OOB, and a stream's
-//! backpressure towards the host (what a process writes waits in the network's outbox).
+//! Ancillary data travels over AF_UNIX sockets (stream, datagram, pairs): SCM_RIGHTS passes
+//! descriptors, as a description with its reference, installed in the receiver's table by
+//! `recvmsg` (MSG_CMSG_CLOEXEC, MSG_CTRUNC when the control buffer is short); a datagram carries
+//! them, a stream attaches them to the first byte of the send (a `Mark` at that position), and
+//! the receiver that takes that byte takes them, as in Linux (a read that does not ask for
+//! control data closes them). SCM_CREDENTIALS is the sender's pid and uid 0, gid 0 (or what the
+//! sender gave), delivered when the receiving socket has SO_PASSCRED. Rights nobody received are
+//! closed with the socket that held them. A socket in flight inside its own queue is not
+//! reclaimed (Linux's garbage collector for such cycles is not here).
+//!
+//! Not here: other ancillary data (EINVAL), UDP to the outside (but DNS), IPv6 to the outside,
+//! raw and packet sockets, SOCK_SEQPACKET, MSG_OOB, and a stream's backpressure towards the host
+//! (what a process writes waits in the network's outbox).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -56,6 +66,17 @@ const EINVAL: i64 = 22;
 const MSG_PEEK: u64 = 0x2;
 const MSG_TRUNC: u64 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
+const MSG_CTRUNC: u64 = 0x8;
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+
+const SOL_SOCKET: u32 = 1;
+const SO_PASSCRED: i32 = 16;
+const SCM_RIGHTS: u32 = 1;
+const SCM_CREDENTIALS: u32 = 2;
+/// Descriptors one message carries at most (the kernel's SCM_MAX_FD)
+const SCM_MAX_FD: usize = 253;
+/// sizeof(struct cmsghdr)
+const CMSG_HDR: usize = 16;
 
 /// What a stream holds for its reader at most, as a pipe does
 const STREAM_MAX: usize = 64 << 10;
@@ -71,6 +92,35 @@ const ROUTER_IP: [u8; 4] = [192, 168, 86, 1];
 
 fn e(errno: i64) -> Ret {
     Ret::Val(-errno)
+}
+
+/// Ancillary data of a message: the descriptions of SCM_RIGHTS (each held by a reference the
+/// message owns until it is received or dropped) and SCM_CREDENTIALS (pid, uid, gid).
+#[derive(Default, Clone)]
+pub(crate) struct Cm {
+    pub rights: Vec<u32>,
+    pub cred: Option<[u32; 3]>,
+}
+
+/// A datagram waiting at a socket.
+#[derive(Clone)]
+struct Msg {
+    from: Vec<u8>,
+    data: Vec<u8>,
+    /// Descriptions in flight with it
+    rights: Vec<u32>,
+    /// The sender's pid, uid and gid
+    cred: [u32; 3],
+}
+
+/// What the bytes of a stream from `at` on carry: whose they are, and (when they begin a send
+/// that passes descriptors) the rights that travel with the first of them. `end` is where such a
+/// send ends: a read takes the rights and no more than that send.
+struct Mark {
+    at: u64,
+    end: Option<u64>,
+    cred: [u32; 3],
+    rights: Vec<u32>,
 }
 
 /// A socket.
@@ -98,10 +148,14 @@ pub(crate) struct Sock {
     peer: Option<u32>,
     /// The stream at the host
     host: Option<u32>,
-    /// Stream bytes not read yet
+    /// Stream bytes not read yet, and how many were read (the position `marks` count in)
     rx: VecDeque<u8>,
-    /// Datagrams not read yet: (from, data)
-    msgs: VecDeque<(Vec<u8>, Vec<u8>)>,
+    rx_pos: u64,
+    /// Who sent the stream's bytes and what passes with them: the first mark is the one in
+    /// force at `rx_pos`, the others are ahead
+    marks: VecDeque<Mark>,
+    /// Datagrams not read yet
+    msgs: VecDeque<Msg>,
     /// Connections made and not accepted yet, and how many may wait
     backlog: VecDeque<u32>,
     max_backlog: usize,
@@ -119,6 +173,13 @@ pub(crate) struct Sock {
 impl Sock {
     fn inet(&self) -> bool {
         self.domain != AF_UNIX as u8
+    }
+
+    /// Whether SO_PASSCRED asks for the sender's credentials with what arrives
+    fn passcred(&self) -> bool {
+        self.opts
+            .get(&(SOL_SOCKET as i32, SO_PASSCRED))
+            .is_some_and(|v| v.iter().any(|&b| b != 0))
     }
 
     fn port(&self) -> u16 {
@@ -159,6 +220,8 @@ pub(crate) struct Net {
     next_port: u16,
     /// For `Process::flush_net`
     pub ops: Vec<Op>,
+    /// Descriptions that closed sockets held in flight: `Files::reap` lets go of them
+    pub dead: Vec<u32>,
     /// What `Board::local_gen` was when the process last looked (not saved)
     pub seen_gen: u64,
 }
@@ -257,6 +320,37 @@ fn concrete(sa: &[u8]) -> Vec<u8> {
         _ => {},
     }
     b
+}
+
+/// A message in flight holds a reference of each description it carries.
+fn hold(descs: &mut BTreeMap<u32, Desc>, rights: &[u32]) {
+    for d in rights {
+        if let Some(x) = descs.get_mut(d) {
+            x.refs += 1;
+        }
+    }
+}
+
+fn save_cred(w: &mut W, c: [u32; 3]) {
+    for v in c {
+        w.u(v as u64);
+    }
+}
+
+fn load_cred(r: &mut R) -> Result<[u32; 3], String> {
+    Ok([r.u()? as u32, r.u()? as u32, r.u()? as u32])
+}
+
+/// The descriptions in flight (each one's reference is counted in `Files::descs`)
+fn save_rights(w: &mut W, rights: &[u32]) {
+    w.u(rights.len() as u64);
+    for &d in rights {
+        w.u(d as u64);
+    }
+}
+
+fn load_rights(r: &mut R) -> Result<Vec<u32>, String> {
+    (0..r.u()?).map(|_| Ok(r.u()? as u32)).collect()
 }
 
 impl Net {
@@ -366,6 +460,12 @@ impl Net {
                 self.close(c);
             }
         }
+        for m in s.msgs {
+            self.dead.extend(m.rights);
+        }
+        for m in s.marks {
+            self.dead.extend(m.rights);
+        }
         if let Some(p) = s.peer.and_then(|p| self.socks.get_mut(&p)) {
             if p.peer == Some(id) {
                 p.peer = None;
@@ -404,10 +504,20 @@ impl Net {
             w.b(&s.peer_name);
             w.u(s.peer.map_or(u64::MAX, |p| p as u64));
             w.b(&s.rx.iter().copied().collect::<Vec<u8>>());
+            w.u(s.rx_pos);
+            w.u(s.marks.len() as u64);
+            for m in &s.marks {
+                w.u(m.at);
+                w.u(m.end.unwrap_or(u64::MAX));
+                save_cred(w, m.cred);
+                save_rights(w, &m.rights);
+            }
             w.u(s.msgs.len() as u64);
-            for (from, data) in &s.msgs {
-                w.b(from);
-                w.b(data);
+            for m in &s.msgs {
+                w.b(&m.from);
+                w.b(&m.data);
+                save_cred(w, m.cred);
+                save_rights(w, &m.rights);
             }
             w.u(s.backlog.len() as u64);
             for &c in &s.backlog {
@@ -455,8 +565,28 @@ impl Net {
             s.peer_name = r.b()?.to_vec();
             s.peer = Some(r.u()?).filter(|&p| p != u64::MAX).map(|p| p as u32);
             s.rx = r.b()?.iter().copied().collect();
+            s.rx_pos = r.u()?;
             for _ in 0..r.u()? {
-                s.msgs.push_back((r.b()?.to_vec(), r.b()?.to_vec()));
+                let (at, end) = (r.u()?, Some(r.u()?).filter(|&e| e != u64::MAX));
+                let cred = load_cred(r)?;
+                let rights = load_rights(r)?;
+                s.marks.push_back(Mark {
+                    at,
+                    end,
+                    cred,
+                    rights,
+                });
+            }
+            for _ in 0..r.u()? {
+                let (from, data) = (r.b()?.to_vec(), r.b()?.to_vec());
+                let cred = load_cred(r)?;
+                let rights = load_rights(r)?;
+                s.msgs.push_back(Msg {
+                    from,
+                    data,
+                    rights,
+                    cred,
+                });
             }
             for _ in 0..r.u()? {
                 s.backlog.push_back(r.u()? as u32);
@@ -539,6 +669,7 @@ impl Process {
         for id in socks {
             self.files.net.close(id);
         }
+        self.files.reap();
         self.flush_net();
     }
 
@@ -693,7 +824,7 @@ impl Process {
             return 0;
         };
         if s.ty == SOCK_DGRAM {
-            return s.msgs.front().map_or(0, |m| m.1.len());
+            return s.msgs.front().map_or(0, |m| m.data.len());
         }
         match (s.host, &self.board) {
             (Some(h), Some(b)) => b.local_state(h).readable,
@@ -712,10 +843,44 @@ impl Process {
         max: usize,
         flags: u64,
     ) -> Result<Recvd, Ret> {
+        self.sock_recv_cm(fd, id, max, flags, false).map(|r| r.0)
+    }
+
+    /// `sock_recv`, and the ancillary data that came with what it took. With `want`, the
+    /// rights in it are the caller's to install or drop (one reference each, a peek's included);
+    /// without, a read that takes them closes them and a peek leaves them.
+    pub(crate) fn sock_recv_cm(
+        &mut self,
+        fd: i32,
+        id: u32,
+        max: usize,
+        flags: u64,
+        want: bool,
+    ) -> Result<(Recvd, Cm), Ret> {
+        let (r, mut cm) = self.recv_raw(fd, id, max, flags)?;
+        if flags & MSG_PEEK != 0 {
+            if want {
+                for d in &cm.rights {
+                    if let Some(x) = self.files.descs.get_mut(d) {
+                        x.refs += 1;
+                    }
+                }
+            } else {
+                cm.rights.clear();
+            }
+        } else if !want {
+            self.files.drop_rights(std::mem::take(&mut cm.rights));
+        }
+        Ok((r, cm))
+    }
+
+    /// What `sock_recv_cm` reads: the rights are the queue's own (a peek copies them).
+    fn recv_raw(&mut self, fd: i32, id: u32, max: usize, flags: u64) -> Result<(Recvd, Cm), Ret> {
         let nonblock = self.nonblock(fd) || flags & MSG_DONTWAIT != 0;
         self.sock_refresh(id);
         let peek = flags & MSG_PEEK != 0;
         let board = self.board.clone();
+        let me = [self.p.pid as u32, 0, 0];
         let Some(s) = self.files.net.socks.get_mut(&id) else {
             return Err(e(9));
         };
@@ -723,16 +888,21 @@ impl Process {
             return Err(e(EINVAL));
         }
         if s.ty == SOCK_DGRAM {
-            let Some((from, data)) =
-                (if peek { s.msgs.front().cloned() } else { s.msgs.pop_front() })
-            else {
+            let Some(m) = (if peek { s.msgs.front().cloned() } else { s.msgs.pop_front() }) else {
                 return Err(self.would_block(id, nonblock, 20));
             };
-            let trunc = data.len() > max;
+            let trunc = m.data.len() > max;
+            let cm = Cm {
+                rights: m.rights,
+                cred: s.passcred().then_some(m.cred),
+            };
             if !peek {
                 self.poke();
             }
-            return Ok((data[..max.min(data.len())].to_vec(), from, trunc));
+            return Ok((
+                (m.data[..max.min(m.data.len())].to_vec(), m.from, trunc),
+                cm,
+            ));
         }
         if s.err != 0 {
             let err = std::mem::take(&mut s.err);
@@ -745,18 +915,19 @@ impl Process {
                 e(ENOTCONN)
             });
         }
+        let eof = || Ok(((Vec::new(), Vec::new(), false), Cm::default()));
         if s.rd_shut {
-            return Ok((Vec::new(), Vec::new(), false));
+            return eof();
         }
-        let data = match (s.host, &board) {
+        let (data, cm) = match (s.host, &board) {
             (Some(h), Some(b)) => {
                 let st = b.local_state(h);
                 if st.readable > 0 {
-                    b.local_read(h, max)
+                    (b.local_read(h, max), Cm::default())
                 } else if st.failed {
                     return Err(e(ECONNRESET));
                 } else if st.eof {
-                    return Ok((Vec::new(), Vec::new(), false));
+                    return eof();
                 } else {
                     return Err(self.would_block(id, nonblock, 20));
                 }
@@ -764,21 +935,64 @@ impl Process {
             _ => {
                 if s.rx.is_empty() {
                     return if s.fin || s.gone {
-                        Ok((Vec::new(), Vec::new(), false))
+                        eof()
                     } else {
                         Err(self.would_block(id, nonblock, 20))
                     };
                 }
-                let n = s.rx.len().min(max);
-                if peek {
+                let pos = s.rx_pos;
+                let mut n = s.rx.len().min(max);
+                // The mark in force at the first byte says whose it is. As in Linux, a read
+                // that was asked for the senders' credentials does not run on into bytes of
+                // another sender's, and one that takes a send's descriptors ends with the send.
+                let gov = s.marks.iter().rposition(|m| m.at <= pos);
+                let cred = gov.map_or(me, |i| s.marks[i].cred);
+                let pc = s.passcred();
+                if pc {
+                    let ahead = gov.map_or(0, |i| i + 1);
+                    let range = pos + n as u64;
+                    if let Some(m) = s
+                        .marks
+                        .iter()
+                        .skip(ahead)
+                        .find(|m| m.at < range && m.cred != cred)
+                    {
+                        n = (m.at - pos) as usize;
+                    }
+                }
+                let range = pos + n as u64;
+                let mut rights = Vec::new();
+                if let Some(m) = s
+                    .marks
+                    .iter_mut()
+                    .find(|m| !m.rights.is_empty() && m.at >= pos && m.at < range)
+                {
+                    n = n.min((m.end.unwrap_or(range) - pos) as usize);
+                    rights = if peek { m.rights.clone() } else { std::mem::take(&mut m.rights) };
+                }
+                let data = if peek {
                     s.rx.iter().take(n).copied().collect()
                 } else {
-                    s.rx.drain(..n).collect()
-                }
+                    s.rx_pos += n as u64;
+                    let data = s.rx.drain(..n).collect();
+                    while s.marks.len() >= 2 && s.marks[1].at <= s.rx_pos {
+                        let m = s.marks.pop_front().unwrap();
+                        self.files.net.dead.extend(m.rights);
+                    }
+                    data
+                };
+                (
+                    data,
+                    Cm {
+                        rights,
+                        cred: pc.then_some(cred),
+                    },
+                )
             },
         };
+        self.files.reap();
         self.poke();
-        Ok((data, Vec::new(), false))
+        Ok(((data, Vec::new(), false), cm))
     }
 
     /// Sends `data` on socket `id` (to `dest` for a datagram socket with no address of its own):
@@ -791,15 +1005,30 @@ impl Process {
         flags: u64,
         dest: Option<Vec<u8>>,
     ) -> Result<usize, Ret> {
+        self.sock_send_cm(fd, id, data, flags, dest, Cm::default())
+    }
+
+    /// `sock_send`, with ancillary data: the descriptions in `cm` get a reference each once the
+    /// message is queued, and none if it is not.
+    pub(crate) fn sock_send_cm(
+        &mut self,
+        fd: i32,
+        id: u32,
+        data: &[u8],
+        flags: u64,
+        dest: Option<Vec<u8>>,
+        cm: Cm,
+    ) -> Result<usize, Ret> {
         let nonblock = self.nonblock(fd) || flags & MSG_DONTWAIT != 0;
         self.sock_refresh(id);
         let board = self.board.clone();
+        let me = [self.p.pid as u32, 0, 0];
         let Some(s) = self.files.net.socks.get_mut(&id) else {
             return Err(e(9));
         };
         if s.ty == SOCK_DGRAM {
             let (peer, default) = (s.peer, s.peer_name.clone());
-            return self.dgram_send(id, nonblock, data, peer, dest.unwrap_or(default));
+            return self.dgram_send(id, nonblock, data, peer, dest.unwrap_or(default), cm, me);
         }
         if dest.is_some() && (s.connected || s.listening) {
             return Err(e(EISCONN));
@@ -838,12 +1067,33 @@ impl Process {
             return Err(self.would_block(id, nonblock, 21));
         }
         let n = room.min(data.len());
+        let at = p.rx_pos + p.rx.len() as u64;
         p.rx.extend(&data[..n]);
+        if n > 0 {
+            // What these bytes carry: a send of the same sender joins the mark before it
+            let cred = cm.cred.unwrap_or(me);
+            let rights = cm.rights;
+            if !rights.is_empty()
+                || !p
+                    .marks
+                    .back()
+                    .is_some_and(|b| b.cred == cred && b.end.is_none())
+            {
+                p.marks.push_back(Mark {
+                    at,
+                    end: (!rights.is_empty()).then_some(at + n as u64),
+                    cred,
+                    rights: rights.clone(),
+                });
+            }
+            hold(&mut self.files.descs, &rights);
+        }
         self.poke();
         Ok(n)
     }
 
     /// A datagram to the socket `peer` of a pair, or to the address `dest`.
+    #[allow(clippy::too_many_arguments)]
     fn dgram_send(
         &mut self,
         id: u32,
@@ -851,7 +1101,10 @@ impl Process {
         data: &[u8],
         peer: Option<u32>,
         dest: Vec<u8>,
+        cm: Cm,
+        me: [u32; 3],
     ) -> Result<usize, Ret> {
+        let (rights, cred) = (cm.rights, cm.cred.unwrap_or(me));
         if data.len() > 65507 {
             return Err(e(EMSGSIZE));
         }
@@ -861,7 +1114,13 @@ impl Process {
                 None => Err(e(ECONNREFUSED)),
                 Some(t) if t.msgs.len() >= DGRAM_MAX => Err(self.would_block(id, nonblock, 21)),
                 Some(t) => {
-                    t.msgs.push_back((from, data.to_vec()));
+                    t.msgs.push_back(Msg {
+                        from,
+                        data: data.to_vec(),
+                        rights: rights.clone(),
+                        cred,
+                    });
+                    hold(&mut self.files.descs, &rights);
                     self.poke();
                     Ok(data.len())
                 },
@@ -901,7 +1160,12 @@ impl Process {
                             .get_mut(&id)
                             .unwrap()
                             .msgs
-                            .push_back((dest, r));
+                            .push_back(Msg {
+                                from: dest,
+                                data: r,
+                                rights: Vec::new(),
+                                cred,
+                            });
                         self.poke();
                     }
                     return Ok(data.len());
@@ -914,7 +1178,13 @@ impl Process {
         };
         match target.and_then(|t| self.files.net.socks.get_mut(&t)) {
             Some(t) if t.ty == SOCK_DGRAM && t.msgs.len() < DGRAM_MAX => {
-                t.msgs.push_back((from, data.to_vec()));
+                t.msgs.push_back(Msg {
+                    from,
+                    data: data.to_vec(),
+                    rights: rights.clone(),
+                    cred,
+                });
+                hold(&mut self.files.descs, &rights);
                 self.poke();
                 Ok(data.len())
             },
@@ -1416,24 +1686,7 @@ impl Process {
         ) else {
             return Err(e(EFAULT));
         };
-        // struct cmsghdr: len, level, type: SCM_RIGHTS (1, 1) is not carried
-        let mut off = 0;
-        while off + 16 <= ctllen {
-            let (Some(l), Some(level), Some(ty)) = (
-                self.u64_at(ctl + off),
-                self.u32_at(ctl + off + 8),
-                self.u32_at(ctl + off + 12),
-            ) else {
-                return Err(e(EFAULT));
-            };
-            if level == 1 && ty == 1 {
-                return Err(e(EOPNOTSUPP));
-            }
-            off += (l + 7) & !7;
-            if l < 16 {
-                break;
-            }
-        }
+        let cm = self.cmsgs_in(id, ctl, ctllen)?;
         let iov = self.iovecs(iov, n).ok_or(e(EFAULT))?;
         let mut data = Vec::new();
         for (base, len) in iov {
@@ -1444,23 +1697,118 @@ impl Process {
         } else {
             None
         };
-        self.sock_send(fd, id, &data, flags, dest)
+        self.sock_send_cm(fd, id, &data, flags, dest, cm)
+    }
+
+    /// The ancillary data of a sendmsg (struct cmsghdr: len, level, type, then the data): the
+    /// descriptions of the SCM_RIGHTS descriptors and the SCM_CREDENTIALS given, for a unix
+    /// socket. Other levels are not looked at, other types of SOL_SOCKET are invalid.
+    fn cmsgs_in(&self, id: u32, ctl: u64, ctllen: u64) -> Result<Cm, Ret> {
+        let mut cm = Cm::default();
+        let mut off = 0;
+        while off + CMSG_HDR as u64 <= ctllen {
+            let (Some(l), Some(level), Some(ty)) = (
+                self.u64_at(ctl + off),
+                self.u32_at(ctl + off + 8),
+                self.u32_at(ctl + off + 12),
+            ) else {
+                return Err(e(EFAULT));
+            };
+            if l < CMSG_HDR as u64 || off + l > ctllen {
+                return Err(e(EINVAL));
+            }
+            let len = l as usize - CMSG_HDR;
+            if level == SOL_SOCKET {
+                let unix = self.files.net.socks.get(&id).is_some_and(|s| !s.inet());
+                let data = self
+                    .bytes_at(ctl + off + CMSG_HDR as u64, len)
+                    .ok_or(e(EFAULT))?;
+                match ty {
+                    SCM_RIGHTS if unix => {
+                        for c in data.as_chunks::<4>().0 {
+                            let fd = i32::from_le_bytes(*c);
+                            cm.rights.push(self.files.desc_of(fd).ok_or(e(9))?);
+                        }
+                        if cm.rights.len() > SCM_MAX_FD {
+                            return Err(e(EINVAL));
+                        }
+                    },
+                    SCM_CREDENTIALS if unix && len == 12 => {
+                        let w = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+                        cm.cred = Some([w(0), w(4), w(8)]);
+                    },
+                    _ => return Err(e(EINVAL)),
+                }
+            }
+            off += (l + 7) & !7;
+        }
+        Ok(cm)
+    }
+
+    /// The control data of a recvmsg (a cmsghdr and its data are padded to 8 bytes): the
+    /// credentials, then the descriptors installed as far as the buffer of `room` bytes takes them
+    /// (the others are closed), and MSG_CTRUNC if something did not fit.
+    fn cmsgs_out(&mut self, cm: Cm, room: usize, cloexec: bool) -> (Vec<u8>, bool) {
+        /// One message of `ty` into `out`, cut where `room` ends: whether it was cut.
+        fn put(out: &mut Vec<u8>, room: usize, ty: u32, data: &[u8]) -> bool {
+            let left = room - out.len();
+            if left < CMSG_HDR {
+                return true;
+            }
+            let l = (CMSG_HDR + data.len()).min(left);
+            out.extend_from_slice(&(l as u64).to_le_bytes());
+            out.extend_from_slice(&SOL_SOCKET.to_le_bytes());
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(&data[..l - CMSG_HDR]);
+            let padded = (CMSG_HDR + data.len() + 7) & !7;
+            out.resize(out.len() + padded.min(left) - l, 0);
+            l < CMSG_HDR + data.len()
+        }
+        let mut out = Vec::new();
+        let mut trunc = false;
+        if let Some(c) = cm.cred {
+            let b: Vec<u8> = c.iter().flat_map(|v| v.to_le_bytes()).collect();
+            trunc |= put(&mut out, room, SCM_CREDENTIALS, &b);
+        }
+        if !cm.rights.is_empty() {
+            let left = room - out.len();
+            let max = if left > CMSG_HDR { (left - CMSG_HDR) / 4 } else { 0 };
+            let take = max.min(cm.rights.len());
+            let mut fds = Vec::new();
+            for &d in &cm.rights[..take] {
+                fds.extend_from_slice(&(self.files.install(d, 0, cloexec) as u32).to_le_bytes());
+            }
+            if take < cm.rights.len() {
+                trunc = true;
+            }
+            if take > 0 {
+                trunc |= put(&mut out, room, SCM_RIGHTS, &fds);
+            }
+            // Each description's reference in flight is let go: the descriptor has its own
+            self.files.drop_rights(cm.rights);
+        }
+        (out, trunc)
     }
 
     fn recvmsg_one(&mut self, fd: i32, at: u64, flags: u64) -> Result<usize, Ret> {
         let id = self.sock_id(fd)?;
-        let (Some(name), Some(iov), Some(n)) =
-            (self.u64_at(at), self.u64_at(at + 16), self.u64_at(at + 24))
-        else {
+        let (Some(name), Some(iov), Some(n), Some(ctl), Some(ctllen)) = (
+            self.u64_at(at),
+            self.u64_at(at + 16),
+            self.u64_at(at + 24),
+            self.u64_at(at + 32),
+            self.u64_at(at + 40),
+        ) else {
             return Err(e(EFAULT));
         };
         let iov = self.iovecs(iov, n).ok_or(e(EFAULT))?;
         let total: u64 = iov.iter().map(|&(_, l)| l).sum();
-        let (data, from, trunc) = self.sock_recv(fd, id, total as usize, flags)?;
+        let ((data, from, trunc), cm) = self.sock_recv_cm(fd, id, total as usize, flags, true)?;
         let mut off = 0;
         for (base, len) in iov {
             let n = (len as usize).min(data.len() - off);
             if !self.write(base, &data[off..off + n]) {
+                self.files.drop_rights(cm.rights);
                 return Err(e(EFAULT));
             }
             off += n;
@@ -1470,8 +1818,17 @@ impl Process {
             self.write(name, &from[..from.len().min(cap)]);
             self.put_u32(at + 8, from.len() as u32);
         }
-        self.put_u64(at + 40, 0);
-        self.put_u32(at + 48, if trunc { MSG_TRUNC as u32 } else { 0 });
+        let room = if ctl == 0 { 0 } else { ctllen as usize };
+        let (ctrl, ctrunc) = self.cmsgs_out(cm, room, flags & MSG_CMSG_CLOEXEC != 0);
+        if !ctrl.is_empty() && !self.write(ctl, &ctrl) {
+            return Err(e(EFAULT));
+        }
+        self.put_u64(at + 40, ctrl.len() as u64);
+        let mut mflags = if trunc { MSG_TRUNC } else { 0 };
+        if ctrunc {
+            mflags |= MSG_CTRUNC;
+        }
+        self.put_u32(at + 48, mflags as u32);
         Ok(data.len())
     }
 
