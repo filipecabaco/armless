@@ -1,7 +1,10 @@
 //! Loading an ELF executable as execve does: its segments where they ask (a PIE, or the dynamic
 //! loader, at a base of its own), and the initial stack: argc, argv, envp and the auxiliary vector.
 
-use crate::PAGE;
+use armless::Board;
+
+use crate::mm::Image;
+use crate::{ExecError, PAGE};
 
 /// What loading an ELF gave.
 pub(crate) struct Loaded {
@@ -23,6 +26,22 @@ pub(crate) struct Header {
     pub span: u64,
 }
 
+/// An ELF's headers, read from wherever they are in its file: the program header table and the
+/// loader's path (PT_INTERP) need not be among its first bytes.
+pub(crate) struct Elf {
+    /// ET_EXEC, or ET_DYN (a PIE or a shared object: position independent)
+    dyn_: bool,
+    entry: u64,
+    phoff: u64,
+    phnum: u64,
+    segs: Vec<Segment>,
+    /// The dynamic loader it asks for (PT_INTERP), if any
+    pub interp: Option<Vec<u8>>,
+}
+
+/// How long a loader's path may be (PATH_MAX)
+const INTERP_MAX: u64 = 4096;
+
 fn u16_at(e: &[u8], o: usize) -> u16 {
     u16::from_le_bytes(e[o..o + 2].try_into().unwrap())
 }
@@ -36,52 +55,82 @@ fn u64_at(e: &[u8], o: usize) -> u64 {
 /// A program header: (type, file offset, vaddr, file size, memory size)
 type Segment = (u32, u64, u64, u64, u64);
 
-fn segments(elf: &[u8]) -> Result<Vec<Segment>, String> {
+/// The headers of `image`: its first bytes say where the program headers and the loader's path
+/// are, and those are read from there when they are past them.
+pub(crate) fn parse(image: &Image, board: Option<&Board>) -> Result<Elf, ExecError> {
+    let elf = image.head();
     if elf.len() < 64
         || &elf[..4] != b"\x7fELF"
         || elf[4] != 2
         || elf[5] != 1
         || u16_at(elf, 18) != 183
     {
-        return Err("not a 64-bit little-endian aarch64 ELF".into());
+        return Err(ExecError::Fail(
+            "not a 64-bit little-endian aarch64 ELF".into(),
+        ));
     }
-    let (phoff, phentsize, phnum) = (
-        u64_at(elf, 32) as usize,
-        u16_at(elf, 54) as usize,
-        u16_at(elf, 56) as usize,
-    );
-    (0..phnum)
-        .map(|i| {
-            let p = phoff + i * phentsize;
-            elf.get(p..p + 56).ok_or("truncated ELF")?;
-            Ok((
-                u32_at(elf, p),
-                u64_at(elf, p + 8),
-                u64_at(elf, p + 16),
-                u64_at(elf, p + 32),
-                u64_at(elf, p + 40),
-            ))
-        })
-        .collect()
-}
-
-pub(crate) fn header(elf: &[u8]) -> Result<Header, String> {
-    let segs = segments(elf)?;
     let dyn_ = match u16_at(elf, 16) {
         2 => false,
         3 => true,
-        t => return Err(format!("ELF type {t} is not an executable")),
+        t => {
+            return Err(ExecError::Fail(format!(
+                "ELF type {t} is not an executable"
+            )))
+        },
     };
-    let span = segs
-        .iter()
-        .filter(|s| s.0 == 1)
-        .map(|s| s.2 + s.4)
-        .max()
-        .unwrap_or(0);
-    Ok(Header {
+    let (phoff, phentsize, phnum) = (
+        u64_at(elf, 32),
+        u16_at(elf, 54) as usize,
+        u16_at(elf, 56) as usize,
+    );
+    if phentsize < 56 {
+        return Err(ExecError::Fail("truncated ELF".into()));
+    }
+    let table = image.read(board, phoff, phnum * phentsize)?;
+    let segs: Vec<Segment> = (0..phnum)
+        .map(|i| {
+            let p = i * phentsize;
+            (
+                u32_at(&table, p),
+                u64_at(&table, p + 8),
+                u64_at(&table, p + 16),
+                u64_at(&table, p + 32),
+                u64_at(&table, p + 40),
+            )
+        })
+        .collect();
+    let mut interp = None;
+    if let Some(&(_, off, _, filesz, _)) = segs.iter().find(|s| s.0 == 3) {
+        if filesz > INTERP_MAX {
+            return Err(ExecError::Fail("its loader's path is too long".into()));
+        }
+        let path = image.read(board, off, filesz as usize)?;
+        interp = Some(path.split(|&b| b == 0).next().unwrap_or_default().to_vec());
+    }
+    Ok(Elf {
         dyn_,
-        span: span.next_multiple_of(PAGE),
+        entry: u64_at(elf, 24),
+        phoff,
+        phnum: phnum as u64,
+        segs,
+        interp,
     })
+}
+
+impl Elf {
+    pub(crate) fn header(&self) -> Header {
+        let span = self
+            .segs
+            .iter()
+            .filter(|s| s.0 == 1)
+            .map(|s| s.2 + s.4)
+            .max()
+            .unwrap_or(0);
+        Header {
+            dyn_: self.dyn_,
+            span: span.next_multiple_of(PAGE),
+        }
+    }
 }
 
 /// A PT_LOAD segment placed: its file bytes `off..off + filesz` at `at`, and zeros up to
@@ -92,24 +141,14 @@ pub(crate) struct Seg {
     pub filesz: u64,
 }
 
-/// Where the PT_LOAD segments go at `base` plus their addresses, from the ELF's first bytes (its
-/// headers, and the loader's path PT_INTERP names, are there): what loading it gives, and the
+/// Where the PT_LOAD segments go at `base` plus their addresses: what loading it gives, and the
 /// segments to copy or map.
-pub(crate) fn plan(elf: &[u8], ram_size: u64, base: u64) -> Result<(Loaded, Vec<Seg>), String> {
-    let all = segments(elf)?;
-    let phoff = u64_at(elf, 32);
+pub(crate) fn plan(elf: &Elf, ram_size: u64, base: u64) -> Result<(Loaded, Vec<Seg>), String> {
     let mut phdr = 0;
     let mut end = 0;
-    let mut interp = None;
     let mut segs = Vec::new();
-    for (ty, off, vaddr, filesz, memsz) in all {
+    for &(ty, off, vaddr, filesz, memsz) in &elf.segs {
         match ty {
-            3 => {
-                let path = elf
-                    .get(off as usize..(off + filesz) as usize)
-                    .ok_or("truncated ELF")?;
-                interp = Some(path.split(|&b| b == 0).next().unwrap_or_default().to_vec());
-            },
             6 => phdr = base + vaddr,
             1 => {
                 let at = base + vaddr;
@@ -118,7 +157,7 @@ pub(crate) fn plan(elf: &[u8], ram_size: u64, base: u64) -> Result<(Loaded, Vec<
                 }
                 segs.push(Seg { at, off, filesz });
                 if phdr == 0 && off == 0 {
-                    phdr = at + phoff;
+                    phdr = at + elf.phoff;
                 }
                 end = end.max(at + memsz);
             },
@@ -126,11 +165,11 @@ pub(crate) fn plan(elf: &[u8], ram_size: u64, base: u64) -> Result<(Loaded, Vec<
         }
     }
     let loaded = Loaded {
-        entry: base + u64_at(elf, 24),
+        entry: base + elf.entry,
         phdr,
-        phnum: u16_at(elf, 56) as u64,
+        phnum: elf.phnum,
         end,
-        interp,
+        interp: elf.interp.clone(),
     };
     Ok((loaded, segs))
 }
