@@ -1100,3 +1100,264 @@ fn mremap_moves_pages_without_copying_them() {
     let (_, status) = run(&mut p, &mut vm.cpus[0]);
     assert!(matches!(status, Status::Exited(7)), "{status:?}");
 }
+
+// ------------------------------------------------------------ processes
+
+const CLONE_VM: u32 = 0x100;
+const CLONE_VFORK: u32 = 0x4000;
+const SIGCHLD: u16 = 17;
+const SIGKILL: u16 = 9;
+const WNOHANG: u16 = 1;
+
+impl Asm {
+    /// cbz xt, label
+    fn cbz_to(&mut self, rt: u32, l: &'static str) -> &mut Self {
+        self.fix(0xb400_0000 | rt, l, Fix::Imm19)
+    }
+    /// ldr wt, [xn, #off]
+    fn ldr_w(&mut self, rt: u32, rn: u32, off: u32) -> &mut Self {
+        self.i(0xb940_0000 | (off / 4) << 10 | rn << 5 | rt)
+    }
+    /// sub sp, sp, #64: room for a wait status at [sp], pipe fds at [sp + 8] and a byte at
+    /// [sp + 16]
+    fn room(&mut self) -> &mut Self {
+        self.i(0xd101_03ff)
+    }
+    /// x0 = clone(flags, 0, 0, 0, 0): the child's stack is its parent's (a copy, or the same)
+    fn clone(&mut self, flags: u32) -> &mut Self {
+        self.mov32(0, flags)
+            .movz(1, 0)
+            .movz(2, 0)
+            .movz(3, 0)
+            .movz(4, 0)
+            .svc(220)
+    }
+    /// x0 = fork(): the child gets 0
+    fn fork(&mut self) -> &mut Self {
+        self.clone(SIGCHLD as u32)
+    }
+    /// wait4(pid, &[sp], options, 0): any child when `pid` is None, else the pid in x`pid`
+    fn wait4(&mut self, pid: Option<u32>, options: u16) -> &mut Self {
+        match pid {
+            Some(r) => self.i(mov(0, r)),
+            None => self.i(0x9280_0000), // movn x0, #0: -1
+        };
+        self.i(0x9100_03e1) // mov x1, sp
+            .movz(2, options)
+            .movz(3, 0)
+            .svc(260)
+    }
+    /// pipe2(&[sp + 8], 0), the read end into x23 and the write end into x24
+    fn pipe(&mut self) -> &mut Self {
+        self.i(add_imm(0, 31, 8, false))
+            .movz(1, 0)
+            .svc(59)
+            .cbnz_fail(0);
+        self.ldr_w(23, 31, 8).ldr_w(24, 31, 12)
+    }
+    /// read(x`fd`, [sp + 16], 1) into x0
+    fn read_byte(&mut self, fd: u32) -> &mut Self {
+        self.i(mov(0, fd))
+            .i(add_imm(1, 31, 16, false))
+            .movz(2, 1)
+            .svc(63)
+    }
+    /// write(x`fd`, "W", 1)
+    fn write_w(&mut self, fd: u32) -> &mut Self {
+        self.i(mov(0, fd)).adr(1, "W").movz(2, 1).svc(64)
+    }
+    /// the status wait4 stored must be `status`
+    fn status_is(&mut self, status: u32) -> &mut Self {
+        self.ldr_w(1, 31, 0)
+            .cmp_imm(1, status)
+            .bcond(COND_NE, "fail")
+    }
+    /// "A" and exit(0): the happy ending; then "E" and exit(1) at the label "fail"
+    fn ends(&mut self) -> &mut Self {
+        self.print("A", 1)
+            .exit(0)
+            .label("fail")
+            .print("E", 1)
+            .exit(1)
+    }
+}
+
+#[test]
+fn a_forked_child_ends_alone_and_its_parent_hears_how() {
+    // The child is its own process: its ids are its own, its exit_group ends only it, and
+    // wait4 gives the parent the pid and the status (code << 8)
+    let mut a = Asm::default();
+    a.room().movz(0, 0).svc(172).i(mov(20, 0)); // x20 = my pid
+    a.fork().cbz_to(0, "child");
+    a.i(mov(19, 0)); // the child's pid
+    a.cmp(19, 20).bcond(COND_EQ, "fail");
+    a.wait4(None, 0).cmp(0, 19).bcond(COND_NE, "fail");
+    a.status_is(5 << 8).ends();
+    a.label("child").svc(172).cmp(0, 20).bcond(COND_EQ, "fail"); // not the parent's pid
+    a.svc(173).cmp(0, 20).bcond(COND_NE, "fail"); // but its parent is
+    a.svc(178)
+        .i(mov(19, 0))
+        .svc(172)
+        .cmp(0, 19)
+        .bcond(COND_NE, "fail"); // tid == pid
+    a.exit(5);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn the_machine_ends_when_init_does_with_children_still_alive() {
+    let mut a = Asm::default();
+    a.fork().cbz_to(0, "child");
+    a.exit(3);
+    a.label("child").label("spin").b("spin");
+    let (mut vm, mut p) = start(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Exited(3)), "{status:?}");
+}
+
+#[test]
+fn a_fork_shares_pages_until_either_side_writes() {
+    // 3 before the fork; the parent writes 7 and then tells the child through a pipe, which
+    // reads its page (still 3) and writes 2; the parent's page is still 7 when it is done
+    let mut a = Asm::default();
+    a.room().pipe().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 3).i(strb(21, 19));
+    a.fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.movz(21, 7).i(strb(21, 19));
+    a.write_w(24).cmp_imm(0, 1).bcond(COND_NE, "fail");
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(3 << 8);
+    a.i(ldrb(22, 19)).cmp_imm(22, 7).bcond(COND_NE, "fail");
+    a.ends();
+    a.label("child")
+        .read_byte(23)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    a.i(ldrb(22, 19)).movz(21, 2).i(strb(21, 19));
+    a.i(ldrb(21, 19)).cmp_imm(21, 2).bcond(COND_NE, "fail");
+    a.i(mov(0, 22)).svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_pipe_joins_a_parent_and_its_child_and_closes_when_both_have_let_go() {
+    // The parent reads before the child has written: it waits, the child runs. The second read
+    // gets the end of the file only because the child's copy of the write end went with it.
+    let mut a = Asm::default();
+    a.room().pipe().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.i(mov(0, 24)).svc(57); // close the write end
+    a.read_byte(23).cmp_imm(0, 1).bcond(COND_NE, "fail");
+    a.movz(0, 1).i(add_imm(1, 31, 16, false)).movz(2, 1).svc(64); // and echo it
+    a.read_byte(23).cbnz_fail(0);
+    a.wait4(None, 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(0).ends();
+    a.label("child").i(mov(0, 23)).svc(57);
+    a.adr(1, "B").i(mov(0, 24)).movz(2, 1).svc(64);
+    a.exit(0);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"BA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_vfork_child_runs_in_its_parents_memory_and_the_parent_waits_for_it() {
+    // CLONE_VM | CLONE_VFORK: the child's write lands in the parent's page, and the parent
+    // doesn't run until the child has ended, so it sees the write at once
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 1).i(strb(21, 19));
+    a.clone(CLONE_VM | CLONE_VFORK | SIGCHLD as u32)
+        .cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.i(ldrb(22, 19)).cmp_imm(22, 5).bcond(COND_NE, "fail");
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(3 << 8).ends();
+    a.label("child").movz(21, 5).i(strb(21, 19)).exit(3);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn wait4_says_zero_for_a_running_child_and_echild_when_none_are_left() {
+    // The child waits on a pipe nobody writes; WNOHANG finds it running; SIGKILL ends it with
+    // status 9; a second wait4 finds no children
+    let mut a = Asm::default();
+    a.room().pipe().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(Some(20), WNOHANG).cbnz_fail(0);
+    a.i(mov(0, 20)).movz(1, SIGKILL).svc(129).cbnz_fail(0);
+    a.wait4(None, 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(9);
+    a.wait4(None, 0).cmn_imm(0, 10).bcond(COND_NE, "fail"); // -ECHILD
+    a.ends();
+    a.label("child").read_byte(23).b("fail");
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_child_that_ends_signals_its_parent_with_sigchld() {
+    let mut a = Asm::default();
+    a.room()
+        .sigaction(SIGCHLD, "handler", SA_RESTORER | SA_RESTART);
+    a.fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(None, 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(0).ends();
+    a.label("child").exit(0);
+    a.common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"HA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn processes_survive_a_snapshot_with_their_shared_pages() {
+    // The child waits for stdin; the machine is saved there and goes on in another one. The
+    // child's page is still shared with its parent's: its write stays its own.
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 3).i(strb(21, 19));
+    a.fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(None, 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(3 << 8);
+    a.i(ldrb(22, 19)).cmp_imm(22, 3).bcond(COND_NE, "fail");
+    a.ends();
+    a.label("child")
+        .movz(0, 0)
+        .i(add_imm(1, 31, 16, false))
+        .movz(2, 1)
+        .svc(63);
+    a.i(ldrb(22, 19)).movz(21, 4).i(strb(21, 19));
+    a.i(mov(0, 22)).svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"");
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    p.input(b"x\n");
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"x\r\nA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}

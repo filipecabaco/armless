@@ -312,6 +312,25 @@ impl Mm {
         })
     }
 
+    /// An address space with nothing in it, for a process that has ended
+    pub(crate) fn husk() -> Mm {
+        Mm {
+            root: 0,
+            asid: 0,
+            gen: u64::MAX,
+            stale: false,
+            flush: Vec::new(),
+            vmas: BTreeMap::new(),
+            brk_start: 0,
+            brk: 0,
+            mmap_floor: 0,
+            mmap_top: 0,
+            free: BTreeMap::new(),
+            per_file: BTreeMap::new(),
+            refs: Vec::new(),
+        }
+    }
+
     // ------------------------------------------------------------ page tables
 
     /// The address of the level-3 descriptor of `va`, if its tables exist.
@@ -1227,11 +1246,11 @@ impl Process {
                 false
             },
             Err(Miss::Oom) => {
-                self.fault = Some(format!("out of memory at pc {elr:#x}, far {far:#x}"));
+                self.crash(format!("out of memory at pc {elr:#x}, far {far:#x}"));
                 false
             },
             Err(Miss::Segv) => {
-                self.fault = Some(format!(
+                self.crash(format!(
                     "exception class {ec:#x} (esr {esr:#x}) at pc {elr:#x}, far {far:#x}"
                 ));
                 false

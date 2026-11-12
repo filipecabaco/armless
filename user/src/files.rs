@@ -232,15 +232,40 @@ impl Files {
         }
     }
 
-    pub fn save(&self, w: &mut W) {
-        w.u(self.next_desc as u64);
-        w.u(self.next_pipe as u64);
-        w.u(self.fds.len() as u64);
-        for (&fd, &(d, cloexec)) in &self.fds {
+    /// A copy of the descriptor table for a child process: its descriptors refer to the same
+    /// descriptions (one more reference each).
+    pub fn dup_table(&mut self) -> BTreeMap<i32, (u32, bool)> {
+        for (d, _) in self.fds.values() {
+            if let Some(desc) = self.descs.get_mut(d) {
+                desc.refs += 1;
+            }
+        }
+        self.fds.clone()
+    }
+
+    /// A descriptor table (fd, description, close on exec) for a snapshot.
+    pub fn save_fds(fds: &BTreeMap<i32, (u32, bool)>, w: &mut W) {
+        w.u(fds.len() as u64);
+        for (&fd, &(d, cloexec)) in fds {
             w.u(fd as u64);
             w.u(d as u64);
             w.u(cloexec as u64);
         }
+    }
+
+    pub fn load_fds(r: &mut R) -> Result<BTreeMap<i32, (u32, bool)>, String> {
+        let mut fds = BTreeMap::new();
+        for _ in 0..r.u()? {
+            let fd = r.u()? as i32;
+            fds.insert(fd, (r.u()? as u32, r.u()? != 0));
+        }
+        Ok(fds)
+    }
+
+    /// The descriptions and pipes (the descriptor tables are the processes').
+    pub fn save(&self, w: &mut W) {
+        w.u(self.next_desc as u64);
+        w.u(self.next_pipe as u64);
         w.u(self.pipes.len() as u64);
         for (&id, p) in &self.pipes {
             w.u(id as u64);
@@ -304,17 +329,12 @@ impl Files {
         self.net.save(w);
     }
 
-    /// `with_net`: whether the snapshot has the sockets (the ones of ARMLUSR3 and before do not)
-    pub fn load(r: &mut R, with_net: bool) -> Result<Files, String> {
+    pub fn load(r: &mut R) -> Result<Files, String> {
         let mut f = Files {
             next_desc: r.u()? as u32,
             next_pipe: r.u()? as u32,
             ..Files::default()
         };
-        for _ in 0..r.u()? {
-            let fd = r.u()? as i32;
-            f.fds.insert(fd, (r.u()? as u32, r.u()? != 0));
-        }
         for _ in 0..r.u()? {
             let id = r.u()? as u32;
             let buf = r.b()?.iter().copied().collect();
@@ -369,9 +389,7 @@ impl Files {
             };
             f.descs.insert(id, Desc { kind, flags, refs });
         }
-        if with_net {
-            f.net = Net::load(r)?;
-        }
+        f.net = Net::load(r)?;
         Ok(f)
     }
 }

@@ -32,6 +32,7 @@ mod files;
 pub mod host;
 mod mm;
 mod net;
+mod proc;
 mod ser;
 mod signal;
 mod sys;
@@ -58,6 +59,8 @@ use signal::{Signals, ThreadSig};
 use tty::Tty;
 
 pub(crate) const PAGE: u64 = 4096;
+/// The pid of the first process, the program the machine runs: when it ends, the machine does
+pub(crate) const INIT: i64 = 1000;
 /// Instructions a guest thread runs before the next one gets the CPU.
 const SLICE: u64 = 1 << 20;
 const STACK_SIZE: u64 = 8 << 20;
@@ -80,7 +83,7 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
-    fn save<H: Host>(cpu: &Cpu<H>) -> Ctx {
+    pub(crate) fn save<H: Host>(cpu: &Cpu<H>) -> Ctx {
         let mut x = [0; 31];
         x.copy_from_slice(&cpu.x[..31]);
         Ctx {
@@ -95,7 +98,7 @@ impl Ctx {
         }
     }
 
-    fn load<H: Host>(&self, cpu: &mut Cpu<H>) {
+    pub(crate) fn load<H: Host>(&self, cpu: &mut Cpu<H>) {
         cpu.x[..31].copy_from_slice(&self.x);
         cpu.sp_el0 = self.sp;
         cpu.pc = self.pc;
@@ -119,10 +122,14 @@ pub(crate) enum Wait {
     Retry { on_timeout: i64 },
     /// Blobs of the filesystem: the call runs again once they have all arrived
     Blobs(Vec<String>),
+    /// A child made by vfork, until it execs or exits (its pid): x0 is then the child's pid
+    Vfork(i64),
 }
 
 pub(crate) struct Thread {
     pub tid: i64,
+    /// The process it belongs to
+    pub pid: i64,
     pub ctx: Ctx,
     pub clear_tid: u64,
     pub wait: Option<(Wait, Option<Instant>)>,
@@ -145,7 +152,8 @@ pub(crate) enum Ret {
     /// Park until these blobs arrive, then run the call again
     Need(Vec<String>),
     Yield,
-    ThreadExit,
+    /// The thread ends (exit), with this exit code if it is the process's last
+    ThreadExit(i32),
     GroupExit(i32),
 }
 
@@ -166,9 +174,24 @@ impl std::fmt::Display for ExecError {
     }
 }
 
-/// What a process has of its own: its address space, working directory, signal actions.
+/// What a process has of its own: its place in the process tree, address space, descriptors,
+/// working directory, signal actions. The process that runs (`Process::p`) has its descriptors in
+/// `Process::files`, the others in here (`Process::switch_to` swaps them).
 pub(crate) struct Proc {
+    pub pid: i64,
+    pub ppid: i64,
+    /// Process group and session
+    pub pgid: i64,
+    pub sid: i64,
     pub mm: mm::SharedMm,
+    /// fd -> (description, close on exec): empty while this is the process that runs
+    pub fds: BTreeMap<i32, (u32, bool)>,
+    /// The signal its parent gets when it ends (0: none)
+    pub exit_signal: u32,
+    /// Its wait status once it has ended and no one has waited for it
+    pub zombie: Option<i32>,
+    /// Nobody will wait for it (its parent ignores its end): it goes once it is not the current one
+    pub reap: bool,
     pub cwd: Ino,
     pub umask: u32,
     /// The executable's path, for /proc/self/exe
@@ -193,8 +216,15 @@ pub struct Process {
     pub(crate) filled: Cell<u64>,
     /// The process that runs
     pub(crate) p: Proc,
+    /// The other processes (zombies too), by pid
+    pub(crate) procs: BTreeMap<i64, Proc>,
+    /// The threads of every process, in the order they take turns
     pub(crate) threads: Vec<Thread>,
-    pub(crate) next_tid: i64,
+    /// The next pid or tid: they are one number space
+    pub(crate) next_id: i64,
+    /// Something was signalled or a mask changed: what is pending may be deliverable now
+    pub(crate) sig_dirty: bool,
+    /// The descriptions every process shares, and the current process's descriptors
     pub(crate) files: Files,
     pub(crate) tty: Tty,
     /// The monotonic clock reads `mono_base` ns at `start`, and goes on from there across a
@@ -227,6 +257,8 @@ pub struct Stats {
     /// Signals whose handler ran
     pub signals_delivered: u64,
     pub switches: u64,
+    /// What a process that is not the first faulted on: it died of SIGSEGV
+    pub faults: Vec<String>,
 }
 
 /// What a run of the process ended with.
@@ -490,16 +522,26 @@ impl Process {
             need: RefCell::new(Vec::new()),
             filled: Cell::new(0),
             p: Proc {
+                pid: INIT,
+                ppid: 1,
+                pgid: INIT,
+                sid: INIT,
                 mm: Rc::new(RefCell::new(mm)),
+                fds: BTreeMap::new(),
+                exit_signal: 0,
+                zombie: None,
+                reap: false,
                 cwd: ROOT,
                 umask: 0o022,
                 exe: exe.to_vec(),
                 sig: Signals::default(),
             },
+            procs: BTreeMap::new(),
             threads: Vec::new(),
-            next_tid: 1001,
+            next_id: INIT + 1,
+            sig_dirty: false,
             files: Files::standard(),
-            tty: Tty::new(1000),
+            tty: Tty::new(INIT),
             start: Instant::now(),
             mono_base: 1_000_000_000,
             output: Vec::new(),
@@ -530,7 +572,8 @@ impl Process {
         first.sp = sp;
         first.pc = entry;
         p.threads.push(Thread {
-            tid: 1000,
+            tid: INIT,
+            pid: INIT,
             ctx: first,
             clear_tid: 0,
             wait: None,
@@ -637,16 +680,16 @@ impl Process {
         }
         self.output.extend_from_slice(&typed.echo);
         for sig in typed.signals {
-            self.raise(sig, None, signal::SI_KERNEL);
+            self.signal_foreground(sig);
         }
         self.poked = true;
     }
 
-    /// A signal for the process from outside it (`kill`: SIGINT for an interrupt the host's
-    /// user asked for outside the terminal, say). Delivered when the process next runs: a thread
-    /// waiting in a call is woken for it, so run it after.
+    /// A signal for the first process from outside it (`kill`: SIGINT for an interrupt the
+    /// host's user asked for outside the terminal, say). Delivered when the process next runs: a
+    /// thread waiting in a call is woken for it, so run it after.
     pub fn kill(&mut self, sig: u32) {
-        self.raise(sig, None, signal::SI_KERNEL);
+        self.raise_in(INIT, sig, None, signal::SI_KERNEL);
     }
 
     /// The end of the terminal's input: reads past what is left return 0.
@@ -660,7 +703,7 @@ impl Process {
         if (self.tty.cols, self.tty.rows) != (cols, rows) {
             self.tty.cols = cols;
             self.tty.rows = rows;
-            self.raise(signal::SIGWINCH, None, signal::SI_KERNEL);
+            self.signal_foreground(signal::SIGWINCH);
         }
     }
 
@@ -673,8 +716,14 @@ impl Process {
         self.exit_code
     }
 
+    /// The live threads of all processes.
     pub fn threads(&self) -> usize {
         self.threads.iter().filter(|t| !t.exited).count()
+    }
+
+    /// The processes that haven't ended.
+    pub fn processes(&self) -> usize {
+        self.proc_list().filter(|p| p.zombie.is_none()).count()
     }
 
     /// Whether a thread waits on contents of the filesystem the host hasn't given yet (blobs).
@@ -693,11 +742,13 @@ impl Process {
     /// that only sleeps (`time.sleep` in the middle of a command, whose threads wait on their
     /// deadlines or on each other) — both are idle, only the first is done.
     pub fn waiting_for_input(&self) -> bool {
+        // (A parent that waits for its child, wait4 and waitid, waits for no input.)
         !self.waiting_on_blobs()
-            && self
-                .threads
-                .iter()
-                .any(|t| !t.exited && matches!(t.wait, Some((Wait::Retry { .. }, _))))
+            && self.threads.iter().any(|t| {
+                !t.exited
+                    && matches!(t.wait, Some((Wait::Retry { .. }, _)))
+                    && !matches!(t.ctx.x[8], 260 | 95)
+            })
     }
 
     /// Guest pages that hold anything: what of RAM a snapshot carries. (Reads all of RAM.)
@@ -728,6 +779,7 @@ impl Process {
             if self.exit_code.is_some() || self.fault.is_some() {
                 continue;
             }
+            self.compact();
             self.wake();
             // The next runnable thread, round robin, starting with the current one
             let n = self.threads.len();
@@ -736,7 +788,9 @@ impl Process {
                 .map(|i| (cur + i) % n)
                 .find(|&i| !self.threads[i].exited && self.threads[i].wait.is_none())
             else {
-                if self.threads.iter().all(|t| t.exited) {
+                if self.threads.is_empty() {
+                    // Only the first process ends the machine (`end_process`), so this is a
+                    // state that can't be
                     self.exit_code = Some(0);
                     continue;
                 }
@@ -754,6 +808,10 @@ impl Process {
                 self.stats.switches += 1;
             }
             self.cur = next;
+            // Its process's address space (and descriptors)
+            let pid = self.threads[next].pid;
+            self.switch_to(pid);
+            self.sync_mmu(cpu);
 
             // Run it until it blocks, faults, or its slice ends: syscalls answered on the way
             // count against the slice, so a thread that polls the clock cannot keep the CPU.
@@ -796,19 +854,22 @@ impl Process {
                                 ),
                                 Ret::Need(b) => format!("needs {} blob(s)", b.len()),
                                 Ret::Yield => "yield".into(),
-                                Ret::ThreadExit => "thread exit".into(),
+                                Ret::ThreadExit(c) => format!("thread exit {c}"),
                                 Ret::GroupExit(c) => format!("exit {c}"),
                             };
                             eprintln!(
                                 "[{}] sys {nr}({a0:#x}, {a1:#x}, {a2:#x}) = {r}",
-                                self.threads[cur].tid
+                                self.threads.get(cur).map_or(0, |t| t.tid)
                             );
                         }
                         match ret {
                             Ret::Val(r) => {
                                 cpu.x[0] = r as u64;
+                                // (Its thread may be gone: its process ended)
                                 if Instant::now() >= until
+                                    || self.loaded != Some(cur)
                                     || self.exit_code.is_some()
+                                    || self.fault.is_some()
                                     || self.signal_ready()
                                 {
                                     continue 'run;
@@ -844,29 +905,19 @@ impl Process {
                                 self.cur = (cur + 1) % self.threads.len();
                                 continue 'run;
                             },
-                            Ret::ThreadExit => {
-                                let ct = self.threads[cur].clear_tid;
-                                if ct != 0 {
-                                    self.write(ct, &0u32.to_le_bytes());
-                                    self.futex_wake(ct, 1, u32::MAX);
-                                }
-                                self.threads[cur].exited = true;
-                                self.loaded = None;
-                                // What it had pending goes to the threads left
-                                let left = std::mem::take(&mut self.threads[cur].sig.pending);
-                                for (s, c) in left {
-                                    self.p.sig.pending.entry(s).or_insert(c);
-                                }
+                            Ret::ThreadExit(code) => {
+                                self.thread_exit(cur, code);
                                 continue 'run;
                             },
                             Ret::GroupExit(code) => {
-                                self.exit_code = Some(code);
+                                let pid = self.p.pid;
+                                self.end_process(pid, proc::End::Exit(code));
                                 continue 'run;
                             },
                         }
                     },
                     Exit::Stop(r) => {
-                        self.fault = Some(format!("stopped: {r:?}"));
+                        self.crash(format!("stopped: {r:?}"));
                         continue 'run;
                     },
                 }
@@ -919,11 +970,18 @@ impl Process {
         }
     }
 
+    /// Wakes up to `n` threads of the process that runs waiting on the futex at `addr`. (A futex
+    /// is its process's: threads of other processes, one that shares this one's memory too,
+    /// aren't woken.)
     pub(crate) fn futex_wake(&mut self, addr: u64, n: u64, mask: u32) -> i64 {
+        let pid = self.p.pid;
         let mut woken = 0;
         for t in self.threads.iter_mut() {
             if woken >= n {
                 break;
+            }
+            if t.pid != pid {
+                continue;
             }
             if let Some((Wait::Futex { addr: a, mask: m }, _)) = t.wait {
                 if a == addr && m & mask != 0 {
@@ -946,24 +1004,62 @@ impl Process {
 
     // ------------------------------------------------------------ snapshots
 
-    /// The process's state for a snapshot (the machine's own snapshot holds its memory and
-    /// filesystem): every thread, its waits as time left, the memory map, the descriptors, the
-    /// terminal, the clock, the signals.
+    /// The processes' state for a snapshot (the machine's own snapshot holds its memory and
+    /// filesystem): every process (its address space, descriptors, signals) and thread, its
+    /// waits as time left, the descriptions the descriptors refer to, the terminal, the clock.
     pub fn save<H: Host>(&mut self, cpu: &Cpu<H>) -> Vec<u8> {
         self.park(cpu);
+        self.compact();
         let now = Instant::now();
         let mut w = W(MAGIC.to_vec());
         w.u(self.ram_size);
         self.frames.borrow_mut().save(&mut w);
         w.u(self.asids.get().0);
         w.u(self.filled.get());
-        self.p.mm.borrow().save(&mut w);
-        w.u(self.next_tid as u64);
+        w.u(self.next_id as u64);
         w.u(self.now_ns(1));
         w.u(self.cur as u64);
+        self.files.save(&mut w);
+        self.tty.save(&mut w);
+        // The address spaces, one each whoever shares it (an ended process has none)
+        let mut spaces: Vec<&mm::SharedMm> = Vec::new();
+        for p in self.proc_list().filter(|p| p.zombie.is_none()) {
+            if !spaces.iter().any(|m| Rc::ptr_eq(m, &p.mm)) {
+                spaces.push(&p.mm);
+            }
+        }
+        w.u(spaces.len() as u64);
+        for m in &spaces {
+            m.borrow().save(&mut w);
+        }
+        // The processes (an ended one that nobody waits for is gone)
+        let kept: Vec<&Proc> = self.proc_list().filter(|p| !p.reap).collect();
+        w.u(kept.len() as u64);
+        for p in kept {
+            w.u(p.pid as u64);
+            w.u(p.ppid as u64);
+            w.u(p.pgid as u64);
+            w.u(p.sid as u64);
+            w.u(p.exit_signal as u64);
+            w.u(p.zombie.is_some() as u64);
+            w.u(p.zombie.unwrap_or(0) as u32 as u64);
+            w.u(spaces
+                .iter()
+                .position(|m| Rc::ptr_eq(m, &p.mm))
+                .map_or(u64::MAX, |i| i as u64));
+            Files::save_fds(
+                if p.pid == self.p.pid { &self.files.fds } else { &p.fds },
+                &mut w,
+            );
+            w.u(p.cwd);
+            w.u(p.umask as u64);
+            w.b(&p.exe);
+            p.sig.save(&mut w);
+        }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
             w.u(t.tid as u64);
+            w.u(t.pid as u64);
             w.u(t.clear_tid);
             w.u(t.exited as u64);
             let c = &t.ctx;
@@ -1004,17 +1100,15 @@ impl Process {
                     w.u(names.len() as u64);
                     names.iter().for_each(|n| w.b(n.as_bytes()));
                 },
+                Some((Wait::Vfork(child), _)) => {
+                    w.u(5);
+                    w.u(*child as u64);
+                },
             }
             w.u(left(t.wait.as_ref().and_then(|(_, d)| *d)));
             w.u(left(t.resume_deadline));
+            t.sig.save(&mut w);
         }
-        self.files.save(&mut w);
-        self.tty.save(&mut w);
-        w.u(self.p.cwd);
-        w.u(self.p.umask as u64);
-        w.b(&self.p.exe);
-        self.p.sig.save_actions(&mut w);
-        self.save_signals(&mut w);
         w.0
     }
 
@@ -1046,15 +1140,55 @@ impl Process {
         frames.load(&mut r)?;
         let _asid = r.u()?;
         let filled = r.u()?;
-        let mm = mm::Mm::load(&mut r, ram_size)?;
-        let next_tid = r.u()? as i64;
+        let next_id = r.u()? as i64;
         let mono_base = r.u()?;
         let cur = r.u()? as usize;
+        let mut files = Files::load(&mut r)?;
+        let tty = Tty::load(&mut r)?;
+        let mut spaces = Vec::new();
+        for _ in 0..r.u()? {
+            spaces.push(Rc::new(RefCell::new(mm::Mm::load(&mut r, ram_size)?)));
+        }
+        let mut all = BTreeMap::new();
+        for _ in 0..r.u()? {
+            let (pid, ppid, pgid, sid) =
+                (r.u()? as i64, r.u()? as i64, r.u()? as i64, r.u()? as i64);
+            let exit_signal = r.u()? as u32;
+            let (ended, status) = (r.u()? != 0, r.u()? as u32 as i32);
+            let space = r.u()?;
+            let mm = match (ended, spaces.get(space as usize)) {
+                (false, Some(m)) => Rc::clone(m),
+                (true, _) => Rc::new(RefCell::new(mm::Mm::husk())),
+                (false, None) => return Err("a process has no address space".into()),
+            };
+            let fds = Files::load_fds(&mut r)?;
+            let (cwd, umask) = (r.u()?, r.u()? as u32);
+            let exe = r.b()?.to_vec();
+            let sig = Signals::load(&mut r)?;
+            all.insert(
+                pid,
+                Proc {
+                    pid,
+                    ppid,
+                    pgid,
+                    sid,
+                    mm,
+                    fds,
+                    exit_signal,
+                    zombie: ended.then_some(status),
+                    reap: false,
+                    cwd,
+                    umask,
+                    exe,
+                    sig,
+                },
+            );
+        }
         let now = Instant::now();
         let at = |left: u64| (left != u64::MAX).then(|| now + Duration::from_nanos(left));
         let mut threads = Vec::new();
         for _ in 0..r.u()? {
-            let (tid, clear_tid, exited) = (r.u()? as i64, r.u()?, r.u()? != 0);
+            let (tid, pid, clear_tid, exited) = (r.u()? as i64, r.u()? as i64, r.u()?, r.u()? != 0);
             let mut x = [0; 31];
             for v in x.iter_mut() {
                 *v = r.u()?;
@@ -1096,26 +1230,28 @@ impl Process {
                         .collect::<Result<_, _>>()?;
                     Some(Wait::Blobs(names))
                 },
+                5 => Some(Wait::Vfork(r.u()? as i64)),
                 t => return Err(format!("unknown wait {t}")),
             };
             let deadline = at(r.u()?);
             let resume_deadline = at(r.u()?);
+            if !all.contains_key(&pid) {
+                return Err(format!("a thread of process {pid}, which is not there"));
+            }
             threads.push(Thread {
                 tid,
+                pid,
                 ctx,
                 clear_tid,
                 wait: wait.map(|w| (w, deadline)),
                 resume_deadline,
                 exited,
-                sig: ThreadSig::default(),
+                sig: ThreadSig::load(&mut r)?,
             });
         }
-        let files = Files::load(&mut r, true)?;
-        let tty = Tty::load(&mut r)?;
-        let cwd = r.u()?;
-        let umask = r.u()? as u32;
-        let exe = r.b()?.to_vec();
-        let sig = Signals::load_actions(&mut r)?;
+        // The first process is the one that runs
+        let mut first = all.remove(&INIT).ok_or("no first process")?;
+        files.fds = std::mem::take(&mut first.fds);
         setup_cpu(cpu);
         let mut p = Process {
             ram,
@@ -1125,15 +1261,11 @@ impl Process {
             asids: Cell::new((1, 0)),
             need: RefCell::new(Vec::new()),
             filled: Cell::new(filled),
-            p: Proc {
-                mm: Rc::new(RefCell::new(mm)),
-                cwd,
-                umask,
-                exe,
-                sig,
-            },
+            p: first,
+            procs: all,
             threads,
-            next_tid,
+            next_id,
+            sig_dirty: true,
             files,
             tty,
             start: now,
@@ -1150,7 +1282,6 @@ impl Process {
             stats: Stats::default(),
         };
         p.net_attach();
-        p.load_signals(&mut r)?;
         let wanted: Vec<String> = p
             .threads
             .iter()

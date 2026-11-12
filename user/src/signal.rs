@@ -1,5 +1,5 @@
 //! Signals, as Linux delivers them on arm64: actions per process, a mask, a pending set and an
-//! alternate stack per thread, and a pending set for the process. A signal for the process goes
+//! alternate stack per thread, and a pending set for each process. A signal for a process goes
 //! to its first thread that doesn't block it (the main thread first, as Linux picks); one with a
 //! handler is delivered when its thread next runs, on a `rt_sigframe` built on its stack (or its
 //! alternate stack, SA_ONSTACK) exactly as the kernel lays it out, and `rt_sigreturn` takes the
@@ -13,10 +13,13 @@
 //! uninterruptible disk wait): its signal is delivered once it is done.
 //!
 //! Default actions: SIGCHLD, SIGCONT, SIGURG and SIGWINCH are ignored, and so are the stop signals
-//! (no job control); every other one ends the process, with 128 + the signal as its exit code.
+//! (no job control); every other one ends the process (the first one's exit code is 128 + the
+//! signal; another's wait status says which signal killed it). A process's end raises its exit
+//! signal (SIGCHLD) in its parent. `kill` takes a pid, a process group, or everything.
 //! Not yet: queued real-time signals (one of each pending, as for the standard ones), the
-//! signal masks of ppoll, pselect6 and epoll_pwait, and signals for faults (a fault still stops
-//! the process).
+//! signal masks of ppoll, pselect6 and epoll_pwait, signals for faults (a fault ends the process
+//! as SIGSEGV would, whatever its handler), and the sender's pid in a handler's siginfo (the
+//! first process's, 1000, for kill, tkill and the like; none for SIGCHLD).
 
 use crate::host::Instant;
 use std::collections::BTreeMap;
@@ -24,8 +27,9 @@ use std::collections::BTreeMap;
 use armless::cpu::Cpu;
 use armless::Host;
 
+use crate::proc::End;
 use crate::ser::{R, W};
-use crate::{Ctx, Process, Ret, Wait};
+use crate::{Ctx, Process, Ret, Wait, INIT};
 
 pub(crate) const SIGINT: u32 = 2;
 pub(crate) const SIGQUIT: u32 = 3;
@@ -43,6 +47,7 @@ const NSIG: u32 = 64;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 
+const SA_NOCLDWAIT: u64 = 2;
 const SA_SIGINFO: u64 = 4;
 const SA_RESTORER: u64 = 0x0400_0000;
 const SA_ONSTACK: u64 = 0x0800_0000;
@@ -68,6 +73,7 @@ const EFAULT: i64 = 14;
 const ENOMEM: i64 = 12;
 const EPERM: i64 = 1;
 const EAGAIN: i64 = 11;
+const ESRCH: i64 = 3;
 
 // The frame (arch/arm64/kernel/signal.c): siginfo, then the ucontext, whose sigcontext is at 176
 // and its __reserved records at 288 of that; a frame record (fp, lr) above it all.
@@ -195,8 +201,6 @@ pub(crate) struct Signals {
     actions: [Action; NSIG as usize + 1],
     /// Signals for the process not yet given to a thread, with their si_code
     pub pending: BTreeMap<u32, i32>,
-    /// A signal was raised or a mask changed: what is pending may be deliverable now
-    pub dirty: bool,
     /// Where the sigreturn trampoline is, once made (0: not yet)
     pub trampoline: u64,
 }
@@ -206,13 +210,28 @@ impl Default for Signals {
         Signals {
             actions: [Action::default(); NSIG as usize + 1],
             pending: BTreeMap::new(),
-            dirty: false,
             trampoline: 0,
         }
     }
 }
 
 impl Signals {
+    /// A child process's (fork): the same actions, nothing pending
+    pub fn fork(&self) -> Signals {
+        Signals {
+            actions: self.actions,
+            pending: BTreeMap::new(),
+            trampoline: self.trampoline,
+        }
+    }
+
+    /// Whether the process's children vanish when they end, with no one to wait for them
+    /// (SIGCHLD ignored, or SA_NOCLDWAIT)
+    pub fn children_vanish(&self) -> bool {
+        let a = self.actions[SIGCHLD as usize];
+        a.handler == SIG_IGN || a.flags & SA_NOCLDWAIT != 0
+    }
+
     fn disposition(&self, sig: u32) -> Disposition {
         let a = self.actions[sig as usize];
         match a.handler {
@@ -253,6 +272,52 @@ impl Signals {
         }
         Ok(s)
     }
+
+    /// The actions, the trampoline and what is pending, for a snapshot
+    pub fn save(&self, w: &mut W) {
+        self.save_actions(w);
+        w.u(self.trampoline);
+        save_pending(w, &self.pending);
+    }
+
+    pub fn load(r: &mut R) -> Result<Signals, String> {
+        let mut s = Signals::load_actions(r)?;
+        s.trampoline = r.u()?;
+        s.pending = load_pending(r)?;
+        Ok(s)
+    }
+}
+
+impl ThreadSig {
+    pub fn save(&self, w: &mut W) {
+        w.u(self.mask);
+        save_pending(w, &self.pending);
+        w.u(self.altstack.sp);
+        w.u(self.altstack.size);
+        w.u(self.altstack.autodisarm as u64);
+        w.u(self.saved_mask.map_or(0, |_| 1));
+        w.u(self.saved_mask.unwrap_or(0));
+        w.u(self.altstack_unknown as u64);
+    }
+
+    pub fn load(r: &mut R) -> Result<ThreadSig, String> {
+        let mask = r.u()?;
+        let pending = load_pending(r)?;
+        let altstack = AltStack {
+            sp: r.u()?,
+            size: r.u()?,
+            autodisarm: r.u()? != 0,
+        };
+        let has = r.u()? != 0;
+        let m = r.u()?;
+        Ok(ThreadSig {
+            mask,
+            pending,
+            altstack,
+            saved_mask: has.then_some(m),
+            altstack_unknown: r.u()? != 0,
+        })
+    }
 }
 
 fn save_pending(w: &mut W, p: &BTreeMap<u32, i32>) {
@@ -287,61 +352,75 @@ enum Interrupted {
 impl Process {
     // ------------------------------------------------------------ raising
 
-    /// A signal for the process (`thread`: for that thread, by its index). Ignored ones are
+    /// A signal for process `pid` (`thread`: for that thread, by its index). Ignored ones are
     /// dropped now, as Linux does, unless blocked (a handler may be set before they're unblocked).
-    pub(crate) fn raise(&mut self, sig: u32, thread: Option<usize>, code: i32) {
+    pub(crate) fn raise_in(&mut self, pid: i64, sig: u32, thread: Option<usize>, code: i32) {
         if !(1..=NSIG).contains(&sig) {
             return;
         }
-        let t = thread.unwrap_or(0);
-        let blocked = self
-            .threads
-            .get(t)
-            .is_some_and(|t| t.sig.mask & bit(sig) != 0);
-        if self.p.sig.disposition(sig) == Disposition::Ignore && !blocked {
+        let Some(p) = self.proc_ref(pid).filter(|p| p.zombie.is_none()) else {
+            return;
+        };
+        let ignored = p.sig.disposition(sig) == Disposition::Ignore;
+        // Whether it is blocked: by the thread it is for, or the process's first
+        let t = thread.or_else(|| self.threads.iter().position(|t| t.pid == pid && !t.exited));
+        let blocked = t.is_some_and(|t| self.threads[t].sig.mask & bit(sig) != 0);
+        if ignored && !blocked {
             self.stats.signals_ignored += 1;
             return;
         }
         match thread {
-            Some(t) => self.threads[t].sig.pending.entry(sig).or_insert(code),
-            None => self.p.sig.pending.entry(sig).or_insert(code),
-        };
-        self.p.sig.dirty = true;
+            Some(t) => {
+                self.threads[t].sig.pending.entry(sig).or_insert(code);
+            },
+            None => {
+                if let Some(p) = self.proc_mut(pid) {
+                    p.sig.pending.entry(sig).or_insert(code);
+                }
+            },
+        }
+        self.sig_dirty = true;
         // rt_sigtimedwait looks again
         self.poked = true;
     }
 
     /// Whether a thread has a signal it can take now, for the run loop to deliver it
     pub(crate) fn signal_ready(&self) -> bool {
-        self.p.sig.dirty
+        self.sig_dirty
     }
 
-    /// Gives what the process has pending to its threads, then delivers what each thread can
-    /// take: wakes it from a call it is parked in, and builds the handler's frame (or ends the
-    /// process, or drops the signal).
+    /// Gives what the processes have pending to their threads, then delivers what each thread
+    /// can take: wakes it from a call it is parked in, and builds the handler's frame (or ends
+    /// its process, or drops the signal). (A handler is built in its process's address space:
+    /// that process becomes the one that runs.)
     pub(crate) fn deliver_signals<H: Host>(&mut self, cpu: &mut Cpu<H>) {
-        if !std::mem::take(&mut self.p.sig.dirty)
-            && self.p.sig.pending.is_empty()
+        if !std::mem::take(&mut self.sig_dirty)
+            && self.proc_list().all(|p| p.sig.pending.is_empty())
             && self.threads.iter().all(|t| t.sig.pending.is_empty())
         {
             return;
         }
-        // The process's: to the first thread not blocking it, the main thread first
-        let shared: Vec<(u32, i32)> = self.p.sig.pending.iter().map(|(&s, &c)| (s, c)).collect();
-        for (sig, code) in shared {
-            if let Some(t) = self
+        // The processes': to the first thread not blocking it, the main thread first
+        let shared: Vec<(i64, u32, i32)> = self
+            .proc_list()
+            .flat_map(|p| p.sig.pending.iter().map(move |(&s, &c)| (p.pid, s, c)))
+            .collect();
+        for (pid, sig, code) in shared {
+            let to = self
                 .threads
-                .iter_mut()
-                .find(|t| !t.exited && t.sig.mask & bit(sig) == 0)
-            {
-                t.sig.pending.entry(sig).or_insert(code);
-                self.p.sig.pending.remove(&sig);
+                .iter()
+                .position(|t| t.pid == pid && !t.exited && t.sig.mask & bit(sig) == 0);
+            if let Some(t) = to {
+                self.threads[t].sig.pending.entry(sig).or_insert(code);
+                if let Some(p) = self.proc_mut(pid) {
+                    p.sig.pending.remove(&sig);
+                }
             }
         }
         for i in 0..self.threads.len() {
             loop {
                 let t = &self.threads[i];
-                if t.exited || matches!(t.wait, Some((Wait::Blobs(_), _))) {
+                if t.exited || matches!(t.wait, Some((Wait::Blobs(_) | Wait::Vfork(_), _))) {
                     break;
                 }
                 let mask = t.sig.mask & !UNBLOCKABLE;
@@ -349,24 +428,32 @@ impl Process {
                 else {
                     break;
                 };
+                let pid = t.pid;
                 self.threads[i].sig.pending.remove(&sig);
-                match self.p.sig.disposition(sig) {
+                let Some(disposition) = self.proc_ref(pid).map(|p| p.sig.disposition(sig)) else {
+                    break;
+                };
+                match disposition {
                     Disposition::Ignore => {
                         self.stats.signals_ignored += 1;
                         continue;
                     },
                     Disposition::Terminate => {
-                        self.exit_code = Some(128 + sig as i32);
-                        return;
+                        self.end_process(pid, End::Signal(sig));
+                        if self.exit_code.is_some() {
+                            return;
+                        }
+                        break;
                     },
                     Disposition::Handle(act) => {
                         if self.loaded == Some(i) {
                             self.park(cpu);
                         }
+                        self.switch_to(pid);
                         self.handle(i, sig, code, act);
                         self.stats.signals_delivered += 1;
                         // One frame at a time: the next once this one's thread runs again
-                        self.p.sig.dirty = true;
+                        self.sig_dirty = true;
                         break;
                     },
                 }
@@ -386,7 +473,7 @@ impl Process {
         let how = match wait {
             // Reads and writes of terminals and pipes (ERESTARTSYS), the rest EINTR
             Wait::Retry { .. } => match nr {
-                29 | 56 | 63..=70 if restart => Interrupted::Restarts,
+                29 | 56 | 63..=70 | 260 | 95 if restart => Interrupted::Restarts,
                 _ => Interrupted::Returns(-EINTR),
             },
             // A futex wait with no timeout restarts with SA_RESTART; with one, EINTR
@@ -408,7 +495,7 @@ impl Process {
                 }
                 Interrupted::Returns(-EINTR)
             },
-            Wait::Blobs(_) => unreachable!("not interrupted"),
+            Wait::Blobs(_) | Wait::Vfork(_) => unreachable!("not interrupted"),
         };
         let t = &mut self.threads[i];
         // A Retry wait has its pc on the svc; a Block one past it
@@ -496,7 +583,7 @@ impl Process {
             && self.put_u64(record + 8, ctx.x[30]);
         if !ok {
             // Linux would kill it with SIGSEGV
-            self.fault = Some(format!(
+            self.crash(format!(
                 "no room for signal {sig}'s frame at {frame:#x} (sp {:#x})",
                 ctx.sp
             ));
@@ -550,7 +637,7 @@ impl Process {
             .then(|| self.bytes_at(frame, FRAME_SIZE as usize))
             .flatten()
         else {
-            self.fault = Some(format!("rt_sigreturn: bad frame at {frame:#x}"));
+            self.crash(format!("rt_sigreturn: bad frame at {frame:#x}"));
             return Ret::Val(-EFAULT);
         };
         let get = |at: u64| u64::from_le_bytes(f[at as usize..at as usize + 8].try_into().unwrap());
@@ -595,7 +682,7 @@ impl Process {
             at += size;
         }
         if !fpsimd {
-            self.fault = Some(format!(
+            self.crash(format!(
                 "rt_sigreturn: no FP/SIMD record in the frame at {frame:#x}"
             ));
             return Ret::Val(-EFAULT);
@@ -620,7 +707,7 @@ impl Process {
                 };
             }
         }
-        self.p.sig.dirty = true;
+        self.sig_dirty = true;
         Ret::Val(ctx.x[0] as i64)
     }
 
@@ -652,9 +739,16 @@ impl Process {
             // Ignored now: what is pending of it goes
             if self.p.sig.disposition(sig) == Disposition::Ignore {
                 self.p.sig.pending.remove(&sig);
-                for t in &mut self.threads {
+                let me = self.p.pid;
+                for t in self.threads.iter_mut().filter(|t| t.pid == me) {
                     t.sig.pending.remove(&sig);
                 }
+            }
+            // Children that end are no longer waited for: those that have are gone
+            if sig == SIGCHLD && self.p.sig.children_vanish() {
+                let me = self.p.pid;
+                self.procs
+                    .retain(|_, c| !(c.ppid == me && c.zombie.is_some()));
             }
         }
         Ret::Val(0)
@@ -685,7 +779,7 @@ impl Process {
         }
         if let Some(m) = new {
             self.threads[cur].sig.mask = m & !UNBLOCKABLE;
-            self.p.sig.dirty = true;
+            self.sig_dirty = true;
         }
         Ret::Val(0)
     }
@@ -753,7 +847,7 @@ impl Process {
             t.saved_mask = Some(t.mask);
         }
         t.mask = m & !UNBLOCKABLE;
-        self.p.sig.dirty = true;
+        self.sig_dirty = true;
         Ret::Retry {
             deadline: None,
             on_timeout: 0,
@@ -816,76 +910,47 @@ impl Process {
     /// kill, tkill, tgkill (nr 129, 130, 131)
     pub(crate) fn sys_kill(&mut self, nr: u64, a: &[u64; 6]) -> Ret {
         let (target, sig) = match nr {
-            129 | 130 => (a[0] as i64, a[1]),
-            _ => (a[1] as i64, a[2]),
+            129 | 130 => (a[0] as i32 as i64, a[1]),
+            _ => (a[1] as i32 as i64, a[2]),
         };
         if sig > NSIG as u64 {
             return Ret::Val(-EINVAL);
         }
-        let thread = if nr == 129 {
-            // This process, its group, or everything it may signal
-            if !matches!(target, 1000 | 0 | -1 | -1000) {
-                return Ret::Val(-3); // ESRCH
+        let me = self.p.pid;
+        if nr == 129 {
+            // A process, a group (0: this process's), or everything but the first and this one
+            let pids: Vec<i64> = self
+                .proc_list()
+                .filter(|p| p.zombie.is_none())
+                .filter(|p| match target {
+                    t if t > 0 => p.pid == t,
+                    0 => p.pgid == self.p.pgid,
+                    -1 => p.pid != me && p.pid != INIT,
+                    t => p.pgid == -t,
+                })
+                .map(|p| p.pid)
+                .collect();
+            if pids.is_empty() {
+                return Ret::Val(-ESRCH);
             }
-            None
-        } else {
-            if nr == 131 && a[0] as i64 != 1000 {
-                return Ret::Val(-3);
+            if sig != 0 {
+                for pid in pids {
+                    self.raise_in(pid, sig as u32, None, SI_USER);
+                }
             }
-            match self
-                .threads
-                .iter()
-                .position(|t| !t.exited && t.tid == target)
-            {
-                Some(i) => Some(i),
-                None => return Ret::Val(-3),
-            }
+            return Ret::Val(0);
+        }
+        // A thread, by its tid (tgkill: of that process)
+        let Some(i) = self.threads.iter().position(|t| {
+            !t.exited && t.tid == target && (nr != 131 || t.pid == a[0] as i32 as i64)
+        }) else {
+            return Ret::Val(-ESRCH);
         };
         if sig != 0 {
-            let code = if nr == 129 { SI_USER } else { SI_TKILL };
-            self.raise(sig as u32, thread, code);
+            let pid = self.threads[i].pid;
+            self.raise_in(pid, sig as u32, Some(i), SI_TKILL);
         }
         Ret::Val(0)
-    }
-
-    // ------------------------------------------------------------ snapshots
-
-    /// What threads and the process have pending, the masks and alternate stacks
-    pub(crate) fn save_signals(&self, w: &mut W) {
-        w.u(self.p.sig.trampoline);
-        save_pending(w, &self.p.sig.pending);
-        for t in &self.threads {
-            let s = &t.sig;
-            w.u(s.mask);
-            save_pending(w, &s.pending);
-            w.u(s.altstack.sp);
-            w.u(s.altstack.size);
-            w.u(s.altstack.autodisarm as u64);
-            w.u(s.saved_mask.map_or(0, |_| 1));
-            w.u(s.saved_mask.unwrap_or(0));
-            w.u(s.altstack_unknown as u64);
-        }
-    }
-
-    pub(crate) fn load_signals(&mut self, r: &mut R) -> Result<(), String> {
-        self.p.sig.trampoline = r.u()?;
-        self.p.sig.pending = load_pending(r)?;
-        for t in &mut self.threads {
-            let s = &mut t.sig;
-            s.mask = r.u()?;
-            s.pending = load_pending(r)?;
-            s.altstack = AltStack {
-                sp: r.u()?,
-                size: r.u()?,
-                autodisarm: r.u()? != 0,
-            };
-            let has = r.u()? != 0;
-            let m = r.u()?;
-            s.saved_mask = has.then_some(m);
-            s.altstack_unknown = r.u()? != 0;
-        }
-        self.p.sig.dirty = true;
-        Ok(())
     }
 }
 

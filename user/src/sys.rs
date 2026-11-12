@@ -13,11 +13,11 @@ use crate::files::{
     O_WRONLY,
 };
 use crate::host::{self, Instant};
-use crate::{page_up, Ctx, Process, Ret, Thread, Wait};
+use crate::proc::CloneArgs;
+use crate::{page_up, Process, Ret, Wait};
 
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
-const ECHILD: i64 = 10;
 const ENOTTY: i64 = 25;
 const ESPIPE: i64 = 29;
 const EPIPE: i64 = 32;
@@ -294,7 +294,7 @@ impl Process {
             .collect()
     }
 
-    fn close_fd(&mut self, fd: i32) -> bool {
+    pub(crate) fn close_fd(&mut self, fd: i32) -> bool {
         match self.files.close(fd) {
             None => false,
             Some(ino) => {
@@ -339,7 +339,10 @@ impl Process {
                 let kb = self.ram_size / 1024;
                 format!("MemTotal:       {kb} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\n", kb / 2, kb / 2).into_bytes()
             },
-            b"/proc/self/stat" | b"/proc/thread-self/stat" => b"1000 (program) R 1 1000 1000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n".to_vec(),
+            b"/proc/self/stat" | b"/proc/thread-self/stat" => {
+                let (pid, ppid, pgid, sid) = (self.p.pid, self.p.ppid, self.p.pgid, self.p.sid);
+                format!("{pid} (program) R {ppid} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n").into_bytes()
+            },
             b"/proc/self/cmdline" => self.p.exe.iter().copied().chain([0]).collect(),
             b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
             b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
@@ -1240,44 +1243,20 @@ impl Process {
             233 => v(self.sys_madvise(a[0], a[1], a[2])),
 
             // ---------------------------------------------------- threads
-            // clone
-            220 => {
-                let flags = a[0];
-                const CLONE_VM: u64 = 0x100;
-                const CLONE_THREAD: u64 = 0x10000;
-                if flags & (CLONE_VM | CLONE_THREAD) != CLONE_VM | CLONE_THREAD {
-                    return v(-ENOSYS); // fork: needs page tables
-                }
-                let new_tid = self.next_tid;
-                self.next_tid += 1;
-                let mut ctx = Ctx::save(cpu);
-                ctx.x[0] = 0;
-                if a[1] != 0 {
-                    ctx.sp = a[1];
-                }
-                if flags & 0x80000 != 0 {
-                    ctx.tpidr = a[3]; // CLONE_SETTLS
-                }
-                if flags & 0x10_0000 != 0 {
-                    self.put_u32(a[2], new_tid as u32); // CLONE_PARENT_SETTID
-                }
-                if flags & 0x100_0000 != 0 {
-                    self.put_u32(a[4], new_tid as u32); // CLONE_CHILD_SETTID
-                }
-                let clear_tid = if flags & 0x20_0000 != 0 { a[4] } else { 0 };
-                self.threads.push(Thread {
-                    tid: new_tid,
-                    ctx,
-                    clear_tid,
-                    wait: None,
-                    resume_deadline: None,
-                    exited: false,
-                    sig: self.threads[cur].sig.inherit(),
-                });
-                v(new_tid)
-            },
-            // clone3: callers fall back to clone
-            435 => v(-ENOSYS),
+            // clone: a thread, or a process (fork, vfork)
+            220 => self.sys_clone(
+                cpu,
+                cur,
+                CloneArgs {
+                    flags: a[0] & !0xff,
+                    exit_signal: (a[0] & 0xff) as u32,
+                    sp: a[1],
+                    ptid: a[2],
+                    tls: a[3],
+                    ctid: a[4],
+                },
+            ),
+            435 => self.sys_clone3(cpu, cur, a[0], a[1]),
             // futex
             98 => {
                 let (addr, op, val) = (a[0], a[1] as u32, a[2]);
@@ -1334,18 +1313,18 @@ impl Process {
                 v(0)
             },
             // exit
-            93 => Ret::ThreadExit,
+            93 => Ret::ThreadExit(a[0] as i32),
             // exit_group
             94 => Ret::GroupExit(a[0] as i32),
-            // wait4, waitid: no children
-            260 | 95 => v(-ECHILD),
+            260 => self.sys_wait4(&a),
+            95 => self.sys_waitid(&a),
             // execve, fork-like: not yet
             221 | 281 => v(-ENOSYS),
 
             // ---------------------------------------------------- ids
             178 => v(tid),
-            172 => v(1000),
-            173 => v(1),
+            172 => v(self.p.pid),
+            173 => v(self.p.ppid),
             174..=177 => v(0),
             // setuid, setgid, setreuid, setregid, setresuid, setresgid, setfsuid, setfsgid
             146 | 144 | 145 | 143 | 147 | 149 | 151 | 152 => v(0),
@@ -1356,9 +1335,12 @@ impl Process {
                 }
                 v(0)
             },
-            // getpgid, getsid, setsid, setpgid, getgroups
-            155..=157 => v(1000),
-            154 | 158 => v(0),
+            // getpgid, getsid
+            155 | 156 => self.sys_getpgid(nr, a[0] as i32 as i64),
+            157 => self.sys_setsid(),
+            154 => self.sys_setpgid(a[0] as i32 as i64, a[1] as i32 as i64),
+            // getgroups
+            158 => v(0),
             // capget: no capabilities
             90 => {
                 if a[1] != 0 {
@@ -1440,7 +1422,7 @@ impl Process {
                 b[0..8].copy_from_slice(&self.start.elapsed().as_secs().to_le_bytes());
                 b[32..40].copy_from_slice(&self.ram_size.to_le_bytes());
                 b[40..48].copy_from_slice(&(self.ram_size / 2).to_le_bytes());
-                b[80..82].copy_from_slice(&(self.threads() as u16).to_le_bytes());
+                b[80..82].copy_from_slice(&(self.processes() as u16).to_le_bytes());
                 b[104..108].copy_from_slice(&1u32.to_le_bytes());
                 v(if self.write(a[0], &b) { 0 } else { -EFAULT })
             },
