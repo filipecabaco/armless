@@ -52,8 +52,8 @@ fn u64_at(e: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(e[o..o + 8].try_into().unwrap())
 }
 
-/// A program header: (type, file offset, vaddr, file size, memory size)
-type Segment = (u32, u64, u64, u64, u64);
+/// A program header: (type, file offset, vaddr, file size, memory size, flags)
+type Segment = (u32, u64, u64, u64, u64, u32);
 
 /// The headers of `image`: its first bytes say where the program headers and the loader's path
 /// are, and those are read from there when they are past them.
@@ -96,11 +96,12 @@ pub(crate) fn parse(image: &Image, board: Option<&Board>) -> Result<Elf, ExecErr
                 u64_at(&table, p + 16),
                 u64_at(&table, p + 32),
                 u64_at(&table, p + 40),
+                u32_at(&table, p + 4),
             )
         })
         .collect();
     let mut interp = None;
-    if let Some(&(_, off, _, filesz, _)) = segs.iter().find(|s| s.0 == 3) {
+    if let Some(&(_, off, _, filesz, _, _)) =segs.iter().find(|s| s.0 == 3) {
         if filesz > INTERP_MAX {
             return Err(ExecError::Fail("its loader's path is too long".into()));
         }
@@ -134,28 +135,38 @@ impl Elf {
 }
 
 /// A PT_LOAD segment placed: its file bytes `off..off + filesz` at `at`, and zeros up to
-/// `at + memsz`.
+/// `at + memsz`, with the protection (`mm::PROT_*`) its flags ask for.
 pub(crate) struct Seg {
     pub at: u64,
     pub off: u64,
     pub filesz: u64,
+    pub memsz: u64,
+    pub prot: u8,
 }
 
 /// Where the PT_LOAD segments go at `base` plus their addresses: what loading it gives, and the
 /// segments to copy or map.
-pub(crate) fn plan(elf: &Elf, ram_size: u64, base: u64) -> Result<(Loaded, Vec<Seg>), String> {
+pub(crate) fn plan(elf: &Elf, limit: u64, base: u64) -> Result<(Loaded, Vec<Seg>), String> {
     let mut phdr = 0;
     let mut end = 0;
     let mut segs = Vec::new();
-    for &(ty, off, vaddr, filesz, memsz) in &elf.segs {
+    for &(ty, off, vaddr, filesz, memsz, flags) in &elf.segs {
         match ty {
             6 => phdr = base + vaddr,
             1 => {
                 let at = base + vaddr;
-                if at.checked_add(memsz).is_none_or(|e| e > ram_size) || filesz > memsz {
-                    return Err(format!("segment at {at:#x} is past RAM"));
+                if at.checked_add(memsz).is_none_or(|e| e > limit) || filesz > memsz {
+                    return Err(format!("segment at {at:#x} is past the address space"));
                 }
-                segs.push(Seg { at, off, filesz });
+                // PF_X, PF_W, PF_R as PROT_EXEC, PROT_WRITE, PROT_READ
+                let prot = (flags & 4 != 0) as u8 | (flags & 2) as u8 | ((flags & 1) as u8) << 2;
+                segs.push(Seg {
+                    at,
+                    off,
+                    filesz,
+                    memsz,
+                    prot,
+                });
                 if phdr == 0 && off == 0 {
                     phdr = at + elf.phoff;
                 }

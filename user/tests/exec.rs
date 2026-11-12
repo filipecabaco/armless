@@ -289,6 +289,8 @@ struct Asm {
     labels: std::collections::HashMap<&'static str, usize>,
     /// (instruction index, label, how to patch it)
     fixups: Vec<(usize, &'static str, Fix)>,
+    /// Strings of its own after the standard ones, NUL-terminated and padded to a word
+    texts: Vec<(&'static str, &'static [u8])>,
 }
 
 #[derive(Clone, Copy)]
@@ -305,6 +307,12 @@ const COND_EQ: u32 = 0;
 const COND_NE: u32 = 1;
 
 impl Asm {
+    fn with_texts(texts: Vec<(&'static str, &'static [u8])>) -> Asm {
+        Asm {
+            texts,
+            ..Asm::default()
+        }
+    }
     fn i(&mut self, w: u32) -> &mut Self {
         self.code.push(w);
         self
@@ -411,10 +419,15 @@ impl Asm {
         for (i, s) in strings.iter().enumerate() {
             self.labels.insert(s, at + i);
         }
-        let data: Vec<u8> = strings
+        let mut data: Vec<u8> = strings
             .iter()
             .flat_map(|s| [s.as_bytes()[0], 0, 0, 0])
             .collect();
+        for &(l, text) in &self.texts {
+            self.labels.insert(l, at + data.len() / 4);
+            data.extend_from_slice(text);
+            data.resize((data.len() / 4 + 1) * 4, 0);
+        }
         let mut code = self.code.clone();
         for &(i, l, f) in &self.fixups {
             let off = (self.labels[l] as i64 - i as i64) * 4;
@@ -937,6 +950,1027 @@ fn a_saved_process_keeps_its_untouched_pages_lazy() {
     assert_eq!(asked, ["page-b"], "the first page came with the snapshot");
 }
 
+// ------------------------------------------------------------ memory protections
+
+const PROT_READ: u16 = 1;
+const PROT_WRITE: u16 = 2;
+const PROT_EXEC: u16 = 4;
+
+impl Asm {
+    /// mmap(0, 4096, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) into x19
+    fn mmap_anon(&mut self, prot: u16) -> &mut Self {
+        self.movz(0, 0)
+            .movz(1, 4096)
+            .movz(2, prot)
+            .movz(3, 0x22)
+            .i(0x9280_0004) // movn x4, #0
+            .movz(5, 0)
+            .svc(222)
+            .i(mov(19, 0))
+    }
+    /// mprotect(x19, 4096, prot)
+    fn mprotect(&mut self, prot: u16) -> &mut Self {
+        self.i(mov(0, 19)).movz(1, 4096).movz(2, prot).svc(226)
+    }
+    fn munmap(&mut self) -> &mut Self {
+        self.i(mov(0, 19)).movz(1, 4096).svc(215)
+    }
+    /// exit_group(the byte at x19)
+    fn exit_byte(&mut self) -> &mut Self {
+        self.i(ldrb(0, 19)).svc(94)
+    }
+    fn run_program(&mut self) -> Status {
+        let (mut vm, mut p) = start(&self.elf());
+        run(&mut p, &mut vm.cpus[0]).1
+    }
+}
+
+#[test]
+fn memory_protections_hold() {
+    let faults = |s: Status| matches!(s, Status::Fault(_));
+    // A read-only page reads as zero, and a store to it is a fault
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ)
+        .i(ldrb(20, 19))
+        .movz(21, 7)
+        .i(strb(21, 19))
+        .exit(0);
+    assert!(faults(a.run_program()));
+
+    // mprotect makes it writable: the store takes
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ)
+        .i(ldrb(20, 19))
+        .mprotect(PROT_READ | PROT_WRITE)
+        .movz(21, 7)
+        .i(strb(21, 19))
+        .exit_byte();
+    assert!(matches!(a.run_program(), Status::Exited(7)));
+
+    // and read-only again after its pages were had: the store faults
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ | PROT_WRITE)
+        .movz(21, 7)
+        .i(strb(21, 19))
+        .mprotect(PROT_READ)
+        .i(strb(21, 19))
+        .exit(0);
+    assert!(faults(a.run_program()));
+
+    // PROT_NONE: not even a read
+    let mut a = Asm::default();
+    a.mmap_anon(0).i(ldrb(20, 19)).exit(0);
+    assert!(faults(a.run_program()));
+
+    // Unmapped: a read faults; the byte it wrote is gone with the page
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ | PROT_WRITE)
+        .movz(21, 7)
+        .i(strb(21, 19))
+        .munmap()
+        .exit_byte();
+    assert!(faults(a.run_program()));
+
+    // A page that isn't executable can't run: jump to anonymous memory
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ | PROT_WRITE).i(0xd61f_0260).exit(0); // br x19
+    assert!(faults(a.run_program()));
+
+    // and one that is executable runs: `mov x0, #9; mov x8, #94; svc` copied there, then br
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ | PROT_WRITE);
+    for (i, w) in [movz(0, 9), movz(8, 94), SVC].into_iter().enumerate() {
+        a.mov32(21, w).movz(22, i as u16 * 4).i(add(22, 19, 22));
+        a.i(0xb900_02d5); // str w21, [x22]
+    }
+    a.mprotect(PROT_READ | PROT_EXEC).i(0xd61f_0260).exit(0);
+    assert!(matches!(a.run_program(), Status::Exited(9)));
+}
+
+#[test]
+fn a_system_call_cant_write_where_the_program_cant() {
+    // read(0, a read-only page, 1) is EFAULT, and exit_group(-errno)
+    let mut a = Asm::default();
+    a.mmap_anon(PROT_READ)
+        .movz(0, 0)
+        .i(mov(1, 19))
+        .movz(2, 1)
+        .svc(63)
+        .i(0xcb00_03e0) // neg x0, x0
+        .svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    p.input(b"x\n");
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Exited(14)), "EFAULT: {status:?}");
+}
+
+#[test]
+fn the_break_gives_pages_back_and_keeps_what_is_below_it() {
+    // brk(0) into x19; brk(x19 + 8192); two stores; brk(x19 + 4096): the first page stays, the
+    // second is gone and comes back as zeros when the break grows again
+    let mut a = Asm::default();
+    a.movz(0, 0).svc(214).i(mov(19, 0));
+    a.i(add_imm(0, 19, 2, true)).svc(214); // brk(x19 + 8192)
+    a.movz(21, 5).i(strb(21, 19));
+    a.i(add_imm(20, 19, 1, true)).movz(21, 6).i(strb(21, 20));
+    a.i(mov(0, 20)).svc(214); // shrink to the first page
+    a.i(add_imm(0, 19, 2, true)).svc(214); // and grow again
+    a.i(ldrb(22, 19)).i(ldrb(23, 20)); // 5, and 0 again
+    a.i(add(0, 22, 23)).svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Exited(5)), "{status:?}");
+}
+
+#[test]
+fn mremap_moves_pages_without_copying_them() {
+    // Two pages mapped, a byte in each; mremap to four, MAYMOVE past a page that blocks growth
+    // in place; both bytes follow
+    let mut a = Asm::default();
+    a.movz(0, 0)
+        .movz(1, 0x2000)
+        .movz(2, 3)
+        .movz(3, 0x22)
+        .i(0x9280_0004)
+        .movz(5, 0)
+        .svc(222)
+        .i(mov(19, 0));
+    // the page right below is taken, so the range can't grow downwards in place: a second mmap
+    // lands just below the first (highest free range first), and the first's growth is blocked
+    // by nothing above it only if free; map one above to be sure
+    a.movz(21, 3).i(strb(21, 19));
+    a.i(add_imm(20, 19, 1, true)).movz(21, 4).i(strb(21, 20));
+    a.i(mov(0, 19))
+        .movz(1, 0x2000)
+        .movz(2, 0x4000)
+        .movz(3, 1)
+        .svc(216)
+        .i(mov(22, 0));
+    a.i(ldrb(23, 22));
+    a.i(add_imm(24, 22, 1, true)).i(ldrb(25, 24));
+    a.i(add(0, 23, 25)).svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Exited(7)), "{status:?}");
+}
+
+// ------------------------------------------------------------ the address space is not the RAM
+
+/// movz xd, #imm, lsl #32
+fn movz_hi(rd: u32, imm: u32) -> u32 {
+    0xd2c0_0000 | imm << 5 | rd
+}
+
+impl Asm {
+    /// x`rd` = mmap(0, `gib` GiB, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
+    fn reserve(&mut self, rd: u32, gib: u32) -> &mut Self {
+        self.movz(0, 0)
+            .i(movz_hi(1, gib / 4))
+            .movz(2, 0)
+            .movz(3, 0x4022)
+            .i(0x9280_0004) // movn x4, #0
+            .movz(5, 0)
+            .svc(222)
+            .i(mov(rd, 0))
+    }
+}
+
+#[test]
+fn a_reservation_larger_than_ram_costs_frames_only_where_it_is_touched() {
+    // The machine has 128 MiB. The program reserves 8 GiB (a JavaScript engine's heap cage, a
+    // WebAssembly memory's guard region): that costs no frame. Three pages 4 GiB into it (past
+    // the end of RAM: a virtual address is not a physical one) are made writable and written:
+    // they and their tables cost frames, and nothing else does. madvise(DONTNEED) gives two of
+    // them back; they read as zeros again, which takes frames again, and munmap gives back
+    // everything, tables too.
+    let mut a = Asm::default();
+    a.room().read_byte(31); // (x31 reads as 0: stdin) wait: nothing mapped yet
+    a.reserve(19, 8);
+    a.i(movz_hi(22, 1)).i(add(22, 19, 22)); // x22 = x19 + 4 GiB
+    a.i(mov(0, 22))
+        .movz(1, 3 * 4096)
+        .movz(2, 3)
+        .svc(226)
+        .cbnz_fail(0);
+    a.read_byte(31); // wait: reserved, and nothing touched
+    for page in 0..3 {
+        a.i(add_imm(23, 22, page, true))
+            .movz(21, 7 + page as u16)
+            .i(strb(21, 23));
+    }
+    a.read_byte(31); // wait: three pages written
+    a.i(mov(0, 22))
+        .movz(1, 2 * 4096)
+        .movz(2, 4)
+        .svc(233)
+        .cbnz_fail(0); // MADV_DONTNEED
+    a.read_byte(31); // wait: two pages given back
+    a.i(ldrb(20, 22));
+    a.i(add_imm(23, 22, 1, true))
+        .i(ldrb(21, 23))
+        .i(add(20, 20, 21));
+    a.cbnz_fail(20); // both read as zero
+    a.i(add_imm(23, 22, 2, true))
+        .i(ldrb(21, 23))
+        .cmp_imm(21, 9)
+        .bcond(COND_NE, "fail");
+    a.i(mov(0, 19)).i(movz_hi(1, 2)).svc(215).cbnz_fail(0); // munmap all 8 GiB
+    a.read_byte(31); // wait: nothing left
+    a.ends();
+    let (mut vm, mut p) = start(&a.elf());
+    let mut frames = Vec::new();
+    for _ in 0..5 {
+        let (_, status) = run(&mut p, &mut vm.cpus[0]);
+        assert!(
+            matches!(status, Status::Idle(None)),
+            "waits for input: {status:?}"
+        );
+        frames.push(p.frames_in_use());
+        p.input(b"\n");
+    }
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(out.ends_with(b"A"), "{out:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    let [before, reserved, touched, advised, unmapped] = frames[..] else {
+        unreachable!()
+    };
+    assert_eq!(
+        reserved, before,
+        "8 GiB reserved, and no frame taken for it"
+    );
+    // three pages, a table of the second level and one or two of the third (the pages are in
+    // one range of 2 MiB or straddle two)
+    assert!((5..=6).contains(&(touched - reserved)), "{frames:?}");
+    assert_eq!(advised, touched - 2, "{frames:?}");
+    assert_eq!(unmapped, before, "{frames:?}");
+}
+
+#[test]
+fn the_address_space_holds_many_reservations_and_ends_where_it_ends() {
+    // Sixteen reservations of 8 GiB (128 GiB, a thousand times the RAM) all succeed, and are not
+    // the same range; a terabyte is more than the space and is ENOMEM
+    let mut a = Asm::default();
+    a.room().movz(19, 0);
+    for _ in 0..16 {
+        a.i(mov(20, 19)).reserve(19, 8);
+        a.cmn_imm(19, 4095).bcond(2, "fail"); // not an errno
+        a.cmp(19, 20).bcond(COND_EQ, "fail");
+    }
+    a.movz(0, 0)
+        .i(movz_hi(1, 256))
+        .movz(2, 0)
+        .movz(3, 0x4022)
+        .i(0x9280_0004)
+        .movz(5, 0)
+        .svc(222);
+    a.cmn_imm(0, 12).bcond(COND_NE, "fail"); // ENOMEM
+    a.ends();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+// ------------------------------------------------------------ processes
+
+const CLONE_VM: u32 = 0x100;
+const CLONE_VFORK: u32 = 0x4000;
+const SIGCHLD: u16 = 17;
+const SIGKILL: u16 = 9;
+const WNOHANG: u16 = 1;
+
+impl Asm {
+    /// cbz xt, label
+    fn cbz_to(&mut self, rt: u32, l: &'static str) -> &mut Self {
+        self.fix(0xb400_0000 | rt, l, Fix::Imm19)
+    }
+    /// ldr wt, [xn, #off]
+    fn ldr_w(&mut self, rt: u32, rn: u32, off: u32) -> &mut Self {
+        self.i(0xb940_0000 | (off / 4) << 10 | rn << 5 | rt)
+    }
+    /// sub sp, sp, #64: room for a wait status at [sp], pipe fds at [sp + 8] and a byte at
+    /// [sp + 16]
+    fn room(&mut self) -> &mut Self {
+        self.i(0xd101_03ff)
+    }
+    /// x0 = clone(flags, 0, 0, 0, 0): the child's stack is its parent's (a copy, or the same)
+    fn clone(&mut self, flags: u32) -> &mut Self {
+        self.mov32(0, flags)
+            .movz(1, 0)
+            .movz(2, 0)
+            .movz(3, 0)
+            .movz(4, 0)
+            .svc(220)
+    }
+    /// x0 = fork(): the child gets 0
+    fn fork(&mut self) -> &mut Self {
+        self.clone(SIGCHLD as u32)
+    }
+    /// wait4(pid, &[sp], options, 0): any child when `pid` is None, else the pid in x`pid`
+    fn wait4(&mut self, pid: Option<u32>, options: u16) -> &mut Self {
+        match pid {
+            Some(r) => self.i(mov(0, r)),
+            None => self.i(0x9280_0000), // movn x0, #0: -1
+        };
+        self.i(0x9100_03e1) // mov x1, sp
+            .movz(2, options)
+            .movz(3, 0)
+            .svc(260)
+    }
+    /// pipe2(&[sp + 8], 0), the read end into x23 and the write end into x24
+    fn pipe(&mut self) -> &mut Self {
+        self.i(add_imm(0, 31, 8, false))
+            .movz(1, 0)
+            .svc(59)
+            .cbnz_fail(0);
+        self.ldr_w(23, 31, 8).ldr_w(24, 31, 12)
+    }
+    /// read(x`fd`, [sp + 16], 1) into x0
+    fn read_byte(&mut self, fd: u32) -> &mut Self {
+        self.i(mov(0, fd))
+            .i(add_imm(1, 31, 16, false))
+            .movz(2, 1)
+            .svc(63)
+    }
+    /// write(x`fd`, "W", 1)
+    fn write_w(&mut self, fd: u32) -> &mut Self {
+        self.i(mov(0, fd)).adr(1, "W").movz(2, 1).svc(64)
+    }
+    /// the status wait4 stored must be `status`
+    fn status_is(&mut self, status: u32) -> &mut Self {
+        self.ldr_w(1, 31, 0)
+            .cmp_imm(1, status)
+            .bcond(COND_NE, "fail")
+    }
+    /// "A" and exit(0): the happy ending; then "E" and exit(1) at the label "fail"
+    fn ends(&mut self) -> &mut Self {
+        self.print("A", 1)
+            .exit(0)
+            .label("fail")
+            .print("E", 1)
+            .exit(1)
+    }
+}
+
+#[test]
+fn a_forked_child_ends_alone_and_its_parent_hears_how() {
+    // The child is its own process: its ids are its own, its exit_group ends only it, and
+    // wait4 gives the parent the pid and the status (code << 8)
+    let mut a = Asm::default();
+    a.room().movz(0, 0).svc(172).i(mov(20, 0)); // x20 = my pid
+    a.fork().cbz_to(0, "child");
+    a.i(mov(19, 0)); // the child's pid
+    a.cmp(19, 20).bcond(COND_EQ, "fail");
+    a.wait4(None, 0).cmp(0, 19).bcond(COND_NE, "fail");
+    a.status_is(5 << 8).ends();
+    a.label("child").svc(172).cmp(0, 20).bcond(COND_EQ, "fail"); // not the parent's pid
+    a.svc(173).cmp(0, 20).bcond(COND_NE, "fail"); // but its parent is
+    a.svc(178)
+        .i(mov(19, 0))
+        .svc(172)
+        .cmp(0, 19)
+        .bcond(COND_NE, "fail"); // tid == pid
+    a.exit(5);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn the_machine_ends_when_init_does_with_children_still_alive() {
+    let mut a = Asm::default();
+    a.fork().cbz_to(0, "child");
+    a.exit(3);
+    a.label("child").label("spin").b("spin");
+    let (mut vm, mut p) = start(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Exited(3)), "{status:?}");
+}
+
+#[test]
+fn a_fork_shares_pages_until_either_side_writes() {
+    // 3 before the fork; the parent writes 7 and then tells the child through a pipe, which
+    // reads its page (still 3) and writes 2; the parent's page is still 7 when it is done
+    let mut a = Asm::default();
+    a.room().pipe().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 3).i(strb(21, 19));
+    a.fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.movz(21, 7).i(strb(21, 19));
+    a.write_w(24).cmp_imm(0, 1).bcond(COND_NE, "fail");
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(3 << 8);
+    a.i(ldrb(22, 19)).cmp_imm(22, 7).bcond(COND_NE, "fail");
+    a.ends();
+    a.label("child")
+        .read_byte(23)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    a.i(ldrb(22, 19)).movz(21, 2).i(strb(21, 19));
+    a.i(ldrb(21, 19)).cmp_imm(21, 2).bcond(COND_NE, "fail");
+    a.i(mov(0, 22)).svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_pipe_joins_a_parent_and_its_child_and_closes_when_both_have_let_go() {
+    // The parent reads before the child has written: it waits, the child runs. The second read
+    // gets the end of the file only because the child's copy of the write end went with it.
+    let mut a = Asm::default();
+    a.room().pipe().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.i(mov(0, 24)).svc(57); // close the write end
+    a.read_byte(23).cmp_imm(0, 1).bcond(COND_NE, "fail");
+    a.movz(0, 1).i(add_imm(1, 31, 16, false)).movz(2, 1).svc(64); // and echo it
+    a.read_byte(23).cbnz_fail(0);
+    a.wait4(None, 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(0).ends();
+    a.label("child").i(mov(0, 23)).svc(57);
+    a.adr(1, "B").i(mov(0, 24)).movz(2, 1).svc(64);
+    a.exit(0);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"BA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_vfork_child_runs_in_its_parents_memory_and_the_parent_waits_for_it() {
+    // CLONE_VM | CLONE_VFORK: the child's write lands in the parent's page, and the parent
+    // doesn't run until the child has ended, so it sees the write at once
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 1).i(strb(21, 19));
+    a.clone(CLONE_VM | CLONE_VFORK | SIGCHLD as u32)
+        .cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.i(ldrb(22, 19)).cmp_imm(22, 5).bcond(COND_NE, "fail");
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(3 << 8).ends();
+    a.label("child").movz(21, 5).i(strb(21, 19)).exit(3);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn wait4_says_zero_for_a_running_child_and_echild_when_none_are_left() {
+    // The child waits on a pipe nobody writes; WNOHANG finds it running; SIGKILL ends it with
+    // status 9; a second wait4 finds no children
+    let mut a = Asm::default();
+    a.room().pipe().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(Some(20), WNOHANG).cbnz_fail(0);
+    a.i(mov(0, 20)).movz(1, SIGKILL).svc(129).cbnz_fail(0);
+    a.wait4(None, 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(9);
+    a.wait4(None, 0).cmn_imm(0, 10).bcond(COND_NE, "fail"); // -ECHILD
+    a.ends();
+    a.label("child").read_byte(23).b("fail");
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_child_that_ends_signals_its_parent_with_sigchld() {
+    let mut a = Asm::default();
+    a.room()
+        .sigaction(SIGCHLD, "handler", SA_RESTORER | SA_RESTART);
+    a.fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(None, 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(0).ends();
+    a.label("child").exit(0);
+    a.common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"HA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn processes_survive_a_snapshot_with_their_shared_pages() {
+    // The child waits for stdin; the machine is saved there and goes on in another one. The
+    // child's page is still shared with its parent's: its write stays its own.
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 3).i(strb(21, 19));
+    a.fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(None, 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(3 << 8);
+    a.i(ldrb(22, 19)).cmp_imm(22, 3).bcond(COND_NE, "fail");
+    a.ends();
+    a.label("child")
+        .movz(0, 0)
+        .i(add_imm(1, 31, 16, false))
+        .movz(2, 1)
+        .svc(63);
+    a.i(ldrb(22, 19)).movz(21, 4).i(strb(21, 19));
+    a.i(mov(0, 22)).svc(94);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"");
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    p.input(b"x\n");
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"x\r\nA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+// ------------------------------------------------------------ exec
+
+/// ldr xt, [xn, #off]
+fn ldr(rt: u32, rn: u32, off: u32) -> u32 {
+    0xf940_0000 | (off / 8) << 10 | rn << 5 | rt
+}
+
+/// A machine whose filesystem has these files (name, mode, contents: a symlink's target). The contents of those not in
+/// `now` come as blobs when asked for: `run_with_files` gives them.
+fn machine_with(
+    files: &[(&str, u32, &[u8])],
+    now: &[&str],
+) -> Vm<armless::platform::NativePlatform> {
+    let config = Config {
+        memory_size: 128 << 20,
+        cpus: 1,
+        devices: armless::dev::DeviceConfig {
+            console: false,
+            fs_tag: Some("host9p".into()),
+            ..Default::default()
+        },
+    };
+    let vm = armless::runner::new_vm(config).unwrap().0;
+    let entries: Vec<String> = files
+        .iter()
+        .map(|(n, mode, data)| {
+            // A symlink's contents are its target
+            let target = if mode & 0o170000 == 0o120000 {
+                String::from_utf8_lossy(data).into_owned()
+            } else {
+                format!("{n}-blob")
+            };
+            format!(r#"["{n}",{},0,{mode},0,0,"{target}"]"#, data.len())
+        })
+        .collect();
+    let json = format!(r#"{{"version":3,"fsroot":[{}]}}"#, entries.join(","));
+    vm.board.load_filesystem(json.as_bytes()).unwrap();
+    for (n, _, data) in files {
+        if now.contains(n) {
+            vm.board
+                .provide_raw_blob(&format!("{n}-blob"), data.to_vec())
+                .unwrap();
+        }
+    }
+    vm
+}
+
+/// Runs to the end, giving the files' blobs when the machine asks for them: what it printed, how
+/// it ended, and the blobs it asked for.
+fn run_with_files(
+    p: &mut Process,
+    vm: &mut Vm<armless::platform::NativePlatform>,
+    files: &[(&str, u32, &[u8])],
+) -> (Vec<u8>, Status, Vec<String>) {
+    let mut out = Vec::new();
+    let mut asked = Vec::new();
+    loop {
+        let (o, status) = run(p, &mut vm.cpus[0]);
+        out.extend(o);
+        let wanted: Vec<String> = vm
+            .board
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                armless::Event::Blob(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        if !p.waiting_on_blobs() {
+            return (out, status, asked);
+        }
+        assert!(!wanted.is_empty(), "waits on blobs it didn't ask for");
+        for n in wanted {
+            let (_, _, data) = files
+                .iter()
+                .find(|(f, _, _)| n == format!("{f}-blob"))
+                .unwrap_or_else(|| panic!("asked for {n}"));
+            vm.board.provide_raw_blob(&n, data.to_vec()).unwrap();
+            asked.push(n);
+        }
+    }
+}
+
+const EXE: u32 = 0o100755;
+const PLAIN: u32 = 0o100644;
+
+/// The first process of a machine with these files, from /prog.
+fn exec_prog(vm: &mut Vm<armless::platform::NativePlatform>) -> Process {
+    let board = vm.board.clone();
+    Process::exec(&mut vm.cpus[0], board, &["/prog".into()], &[], "/").unwrap()
+}
+
+impl Asm {
+    /// execve(label, NULL, NULL) into x0
+    fn execve(&mut self, path: &'static str) -> &mut Self {
+        self.adr(0, path).movz(1, 0).movz(2, 0).svc(221)
+    }
+    /// execve(path, {path, arg, NULL}, envp) with the arrays built on the stack: envp is
+    /// {env, NULL} when `env` is given, else empty
+    fn execve_with(
+        &mut self,
+        path: &'static str,
+        arg: &'static str,
+        env: Option<&'static str>,
+    ) -> &mut Self {
+        self.i(0xd100_c3ff) // sub sp, sp, #48
+            .adr(9, path)
+            .str_sp(9, 0)
+            .adr(9, arg)
+            .str_sp(9, 8)
+            .str_sp(31, 16);
+        if let Some(env) = env {
+            self.adr(9, env).str_sp(9, 24);
+        } else {
+            self.str_sp(31, 24);
+        }
+        self.str_sp(31, 32)
+            .adr(0, path)
+            .i(0x9100_03e1) // mov x1, sp
+            .i(add_imm(2, 31, 24, false))
+            .svc(221)
+    }
+}
+
+/// What /prog execs in the exec tests: argc must be 2, argv[1] start with "a", envp[0] with "K";
+/// descriptor 5 is open and 4 closed (the pipe's write end, dup'ed without close-on-exec and not);
+/// it prints "B" and sends itself SIGUSR1.
+fn exec_target() -> Vec<u8> {
+    let mut a = Asm::default();
+    a.i(ldr(19, 31, 0)).cmp_imm(19, 2).bcond(COND_NE, "fail");
+    a.i(ldr(1, 31, 16))
+        .i(ldrb(2, 1))
+        .cmp_imm(2, b'a' as u32)
+        .bcond(COND_NE, "fail");
+    a.i(ldr(1, 31, 32))
+        .i(ldrb(2, 1))
+        .cmp_imm(2, b'K' as u32)
+        .bcond(COND_NE, "fail");
+    a.movz(21, 5)
+        .write_w(21)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    a.movz(21, 4)
+        .write_w(21)
+        .cmn_imm(0, 9)
+        .bcond(COND_NE, "fail"); // EBADF
+    a.print("B", 1);
+    a.svc(172).movz(1, SIGUSR1).svc(129); // kill(getpid(), SIGUSR1)
+    a.exit(0);
+    a.label("fail").print("E", 1).exit(1);
+    a.elf()
+}
+
+#[test]
+fn exec_runs_another_program_in_the_same_process() {
+    // The process forks and its child execs /child, whose blob comes only when asked for (the
+    // call waits and runs again). The child's pid is still the one wait4 was given; the pipe end
+    // that was close-on-exec is closed in it and the dup'ed one is not; its SIGUSR1 handler from
+    // before is the default again, so the signal ends it (status 10) with no "H".
+    let mut a = Asm::with_texts(vec![
+        ("target", b"/child"),
+        ("arg", b"arg"),
+        ("env", b"K=V"),
+    ]);
+    a.room().sigaction(SIGUSR1, "handler", SA_RESTORER);
+    a.i(add_imm(0, 31, 8, false))
+        .mov32(1, 0x80000)
+        .svc(59)
+        .cbnz_fail(0); // pipe2(O_CLOEXEC)
+    a.ldr_w(23, 31, 8).ldr_w(24, 31, 12);
+    a.i(mov(0, 24)).svc(23).cmp_imm(0, 5).bcond(COND_NE, "fail"); // dup of the write end: fd 5
+    a.fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(SIGUSR1 as u32);
+    a.read_byte(23).cmp_imm(0, 1).bcond(COND_NE, "fail"); // what the new program wrote to fd 5
+    a.ends();
+    a.label("child")
+        .execve_with("target", "arg", Some("env"))
+        .b("fail");
+    a.common();
+    let prog = a.elf();
+    let target = exec_target();
+    let files: [(&str, u32, &[u8]); 2] = [("prog", EXE, &prog), ("child", EXE, &target)];
+    let mut vm = machine_with(&files, &["prog"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, asked) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"BA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    assert_eq!(asked, ["child-blob"]);
+}
+
+#[test]
+fn a_script_runs_its_interpreter_with_the_scripts_path() {
+    // /script is "#!/args -v": the interpreter gets {"/args", "-v", "/script", "arg"}: it prints
+    // the first byte of argv[1] and exits with argc
+    let mut args = Asm::default();
+    args.i(ldr(19, 31, 0))
+        .i(ldr(1, 31, 16))
+        .movz(0, 1)
+        .movz(2, 1)
+        .svc(64);
+    args.i(mov(0, 19)).svc(94);
+    let args = args.elf();
+    let mut a = Asm::with_texts(vec![("script", b"/script"), ("arg", b"arg")]);
+    a.room().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(4 << 8).ends();
+    a.label("child")
+        .execve_with("script", "arg", None)
+        .b("fail");
+    let prog = a.elf();
+    let files: [(&str, u32, &[u8]); 3] = [
+        ("prog", EXE, &prog),
+        ("args", EXE, &args),
+        ("script", EXE, b"#!/args -v\nignored\n"),
+    ];
+    let mut vm = machine_with(&files, &["prog", "args", "script"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"-A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_vfork_parent_goes_on_when_its_child_execs() {
+    // The child writes in the shared page and execs a program that waits for input forever; the
+    // parent runs again then, and the page it has is intact and has the child's write
+    let mut waits = Asm::default();
+    waits
+        .i(0xd100_43ff)
+        .i(0x9100_03e1)
+        .movz(0, 0)
+        .movz(2, 1)
+        .svc(63)
+        .exit(0); // read(0, sp, 1)
+    let waits = waits.elf();
+    let mut a = Asm::with_texts(vec![("wait", b"/wait")]);
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 1).i(strb(21, 19));
+    a.clone(CLONE_VM | CLONE_VFORK | SIGCHLD as u32)
+        .cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.i(ldrb(22, 19)).cmp_imm(22, 9).bcond(COND_NE, "fail");
+    a.wait4(Some(20), WNOHANG).cbnz_fail(0); // the child lives on, as the new program
+    a.ends();
+    a.label("child")
+        .movz(21, 9)
+        .i(strb(21, 19))
+        .execve("wait")
+        .b("fail");
+    let prog = a.elf();
+    let files: [(&str, u32, &[u8]); 2] = [("prog", EXE, &prog), ("wait", EXE, &waits)];
+    let mut vm = machine_with(&files, &["prog", "wait"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_failed_exec_returns_the_error_and_leaves_the_program_as_it_was() {
+    let mut a = Asm::with_texts(vec![
+        ("missing", b"/missing"),
+        ("plain", b"/plain"),
+        ("text", b"/text"),
+        ("root", b"/"),
+    ]);
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 7).i(strb(21, 19));
+    a.execve("missing").cmn_imm(0, 2).bcond(COND_NE, "fail"); // ENOENT
+    a.execve("plain").cmn_imm(0, 13).bcond(COND_NE, "fail"); // EACCES: not executable
+    a.execve("root").cmn_imm(0, 13).bcond(COND_NE, "fail"); // EACCES: a directory
+    a.execve("text").cmn_imm(0, 8).bcond(COND_NE, "fail"); // ENOEXEC: not an ELF
+    a.i(ldrb(22, 19)).cmp_imm(22, 7).bcond(COND_NE, "fail");
+    a.ends();
+    let prog = a.elf();
+    let target = exec_target();
+    let files: [(&str, u32, &[u8]); 3] = [
+        ("prog", EXE, &prog),
+        ("plain", PLAIN, &target),
+        ("text", EXE, b"hello\n"),
+    ];
+    let mut vm = machine_with(&files, &["prog", "plain", "text"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+const LINK: u32 = 0o120777;
+
+#[test]
+fn a_symlink_to_a_device_opens_the_device_as_the_images_log_files_do() {
+    // nginx opens /var/log/nginx/error.log, a link to /dev/stderr, to append to it; the device
+    // is not in the filesystem, the terminal is what it names
+    let mut a = Asm::with_texts(vec![("log", b"log"), ("chain", b"chain")]);
+    a.room().room(); // 128 bytes: a struct stat
+    for (path, fd, text) in [("log", 3, "H"), ("chain", 4, "R")] {
+        a.i(0x9280_0c60) // AT_FDCWD
+            .adr(1, path)
+            .movz(2, 0x441) // O_WRONLY | O_CREAT | O_APPEND
+            .movz(3, 0o644)
+            .svc(56)
+            .cmp_imm(0, fd)
+            .bcond(COND_NE, "fail")
+            .movz(0, fd as u16)
+            .adr(1, text)
+            .movz(2, 1)
+            .svc(64)
+            .cmp_imm(0, 1)
+            .bcond(COND_NE, "fail");
+    }
+    // fstatat(AT_FDCWD, "chain", &st, 0): a character device, though the link is a file
+    a.i(0x9280_0c60)
+        .adr(1, "chain")
+        .i(0x9100_03e2)
+        .movz(3, 0)
+        .svc(79);
+    a.cbnz_fail(0);
+    a.i(0xb940_13e9) // ldr w9, [sp, #16]: st_mode
+        .i(0x1214_0d29) // and w9, w9, #0xf000
+        .i(0x530c_7d29) // lsr w9, w9, #12
+        .cmp_imm(9, 2) // S_IFCHR
+        .bcond(COND_NE, "fail");
+    a.ends();
+    let prog = a.elf();
+    let files: [(&str, u32, &[u8]); 3] = [
+        ("prog", EXE, &prog),
+        ("log", LINK, b"/dev/stderr"),
+        ("chain", LINK, b"log"),
+    ];
+    let mut vm = machine_with(&files, &["prog"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"HRA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+const CLONE_SIGHAND: u32 = 0x800;
+const CLONE_THREAD: u32 = 0x10000;
+
+impl Asm {
+    /// A thread that waits on the futex word at x19 + `at` and, when woken, prints "B" and ends
+    /// alone: it goes on at the label "waiter", which each call that follows `spawn_waiter` can
+    /// reuse with its own address in x20
+    fn spawn_waiter(&mut self, at: u32) -> &mut Self {
+        self.i(add_imm(20, 19, at, false))
+            .clone(CLONE_VM | CLONE_SIGHAND | CLONE_THREAD)
+            .cbz_to(0, "waiter")
+    }
+    /// The thread's body: futex(x20, FUTEX_WAIT, 0, NULL), print "B", exit(0)
+    fn waiter(&mut self) -> &mut Self {
+        self.label("waiter")
+            .i(mov(0, 20))
+            .movz(1, 0)
+            .movz(2, 0)
+            .movz(3, 0)
+            .svc(98)
+            .print("B", 1)
+            .movz(0, 0)
+            .svc(93)
+    }
+    /// futex(x19 + `at`, op, val, val2, x19 + `at2`, val3) into x0
+    fn futex(&mut self, at: u32, op: u16, val: u32, val2: u32, at2: u32, val3: u32) -> &mut Self {
+        self.i(add_imm(0, 19, at, false))
+            .movz(1, op)
+            .mov32(2, val)
+            .mov32(3, val2)
+            .i(add_imm(4, 19, at2, false))
+            .mov32(5, val3)
+            .svc(98)
+    }
+}
+
+fn run_threads(a: &mut Asm) {
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"BBA", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_futex_requeue_moves_waiters_to_another_word_and_wakes_the_rest_there() {
+    // FUTEX_CMP_REQUEUE: of two waiters on the first word, one wakes and one moves to the
+    // second; waking the first word finds nobody, waking the second finds the one it got
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.spawn_waiter(0).spawn_waiter(0);
+    a.movz(0, 0).svc(124); // sched_yield: both threads run to their waits
+    a.futex(0, 4, 1, 0x7fff_ffff, 8, 0) // wake 1, requeue all the rest
+        .cmp_imm(0, 2)
+        .bcond(COND_NE, "fail");
+    a.futex(0, 4, 1, 0, 8, 1) // the word is not 1: EAGAIN, nothing moves or wakes
+        .cmn_imm(0, 11)
+        .bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124); // the woken thread prints "B"
+    a.futex(0, 1, 10, 0, 0, 0) // nobody waits on the first word any more
+        .cbnz_fail(0);
+    a.futex(8, 1, 10, 0, 0, 0) // one waits on the second
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124).ends();
+    a.waiter();
+    run_threads(&mut a);
+}
+
+#[test]
+fn a_futex_wake_op_changes_a_word_and_wakes_by_its_old_value() {
+    // FUTEX_WAKE_OP (word2 += 1, wake word2's waiter if its old value was 0): one waiter on
+    // each word, both wake, and the second word holds 1
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.spawn_waiter(0).spawn_waiter(8);
+    a.movz(0, 0).svc(124);
+    a.futex(0, 5, 1, 1, 8, 0x1000_1000) // op ADD 1, cmp EQ 0
+        .cmp_imm(0, 2)
+        .bcond(COND_NE, "fail");
+    a.ldr_w(22, 19, 8).cmp_imm(22, 1).bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124).movz(0, 0).svc(124).ends();
+    a.waiter();
+    run_threads(&mut a);
+}
+
+// -------------------------------------------------------------- undefined instructions
+
+const SIGILL: u16 = 4;
+/// An SVE instruction, which armless doesn't implement: OpenSSL's probe for SVE.
+const SVE_PROBE: u32 = 0x04a0_3000;
+
+#[test]
+fn an_undefined_instruction_is_sigill_for_a_program_with_a_handler() {
+    let mut a = Asm::default();
+    a.sigaction(SIGILL, "check", SA_SIGINFO | SA_RESTORER)
+        .adr(10, "ill")
+        .label("ill")
+        .i(SVE_PROBE)
+        .print("B", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        // The handler: SIGILL, ILL_ILLOPC, si_addr the instruction; it skips the instruction
+        // (the pc of the ucontext is where sigreturn goes on)
+        .label("check")
+        .cmp_imm(0, SIGILL as u32)
+        .bcond(COND_NE, "fail")
+        .i(0xb940_0829) // ldr w9, [x1, #8]: si_code
+        .cmp_imm(9, 1)
+        .bcond(COND_NE, "fail")
+        .i(0xf940_0829) // ldr x9, [x1, #16]: si_addr
+        .cmp(9, 10)
+        .bcond(COND_NE, "fail")
+        .i(0xf940_dc49) // ldr x9, [x2, #440]: the pc
+        .i(0x9100_1129) // add x9, x9, #4
+        .i(0xf900_dc49) // str x9, [x2, #440]
+        .b("handler")
+        .common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"HB", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    assert_eq!(p.stats.signals_delivered, 1);
+}
+
+#[test]
+fn an_undefined_instruction_ends_a_program_with_no_handler_saying_where() {
+    let (mut vm, mut p) = start(&elf(&[SVE_PROBE], &[]));
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(out.is_empty());
+    let Status::Fault(f) = status else {
+        panic!("{status:?}")
+    };
+    assert!(
+        f.contains("exception class 0x0") && f.contains(&format!("pc {:#x}", BASE + CODE)),
+        "{f}"
+    );
+}
+
 // ------------------------------------------------------ headers past the first bytes
 
 /// An executable of `ty` whose first bytes are only its ELF header and its code: its program
@@ -1029,58 +2063,4 @@ fn the_program_headers_and_the_loaders_path_are_read_from_wherever_they_are_in_t
     let (out, status, _) = run_serving(&mut p, &mut vm);
     assert_eq!(out, b"hello\r\n", "the loader the far PT_INTERP names ran");
     assert!(matches!(status, Status::Exited(3)), "{status:?}");
-}
-
-// -------------------------------------------------------------- undefined instructions
-
-const SIGILL: u16 = 4;
-/// An SVE instruction, which armless doesn't implement: OpenSSL's probe for SVE.
-const SVE_PROBE: u32 = 0x04a0_3000;
-
-#[test]
-fn an_undefined_instruction_is_sigill_for_a_program_with_a_handler() {
-    let mut a = Asm::default();
-    a.sigaction(SIGILL, "check", SA_SIGINFO | SA_RESTORER)
-        .adr(10, "ill")
-        .label("ill")
-        .i(SVE_PROBE)
-        .print("B", 1)
-        .exit(0)
-        .label("fail")
-        .exit(1)
-        // The handler: SIGILL, ILL_ILLOPC, si_addr the instruction; it skips the instruction
-        // (the pc of the ucontext is where sigreturn goes on)
-        .label("check")
-        .cmp_imm(0, SIGILL as u32)
-        .bcond(COND_NE, "fail")
-        .i(0xb940_0829) // ldr w9, [x1, #8]: si_code
-        .cmp_imm(9, 1)
-        .bcond(COND_NE, "fail")
-        .i(0xf940_0829) // ldr x9, [x1, #16]: si_addr
-        .cmp(9, 10)
-        .bcond(COND_NE, "fail")
-        .i(0xf940_dc49) // ldr x9, [x2, #440]: the pc
-        .i(0x9100_1129) // add x9, x9, #4
-        .i(0xf900_dc49) // str x9, [x2, #440]
-        .b("handler")
-        .common();
-    let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
-    assert_eq!(out, b"HB", "{status:?}");
-    assert!(matches!(status, Status::Exited(0)), "{status:?}");
-    assert_eq!(p.stats.signals_delivered, 1);
-}
-
-#[test]
-fn an_undefined_instruction_ends_a_program_with_no_handler_saying_where() {
-    let (mut vm, mut p) = start(&elf(&[SVE_PROBE], &[]));
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
-    assert!(out.is_empty());
-    let Status::Fault(f) = status else {
-        panic!("{status:?}")
-    };
-    assert!(
-        f.contains("exception class 0x0") && f.contains(&format!("pc {:#x}", BASE + CODE)),
-        "{f}"
-    );
 }

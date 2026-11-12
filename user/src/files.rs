@@ -7,10 +7,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use armless::dev::fs::{self, Content, Fail, Fs, Ino, ROOT, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
+use crate::net::Net;
 use crate::ser::{R, W};
 
 pub(crate) const S_IFCHR: u32 = 0o020000;
 pub(crate) const S_IFIFO: u32 = 0o010000;
+pub(crate) const S_IFSOCK: u32 = 0o140000;
 
 pub(crate) const O_ACCMODE: u32 = 3;
 pub(crate) const O_WRONLY: u32 = 1;
@@ -19,6 +21,7 @@ pub(crate) const O_EXCL: u32 = 0o200;
 pub(crate) const O_TRUNC: u32 = 0o1000;
 pub(crate) const O_APPEND: u32 = 0o2000;
 pub(crate) const O_NONBLOCK: u32 = 0o4000;
+pub(crate) const O_ASYNC: u32 = 0o20000;
 pub(crate) const O_DIRECTORY: u32 = 0o40000;
 pub(crate) const O_NOFOLLOW: u32 = 0o100000;
 pub(crate) const O_CLOEXEC: u32 = 0o2000000;
@@ -79,6 +82,8 @@ pub(crate) enum Kind {
     Epoll {
         watch: BTreeMap<i32, Watch>,
     },
+    /// A socket of `Files::net`
+    Sock(u32),
 }
 
 /// What an epoll instance watches on a descriptor: the events asked for (EPOLLET: only as the
@@ -89,6 +94,10 @@ pub(crate) struct Watch {
     pub events: u32,
     pub data: u64,
     pub last: u32,
+    /// `Process::epoch` when it was last looked at (an edge-triggered watch on a descriptor that
+    /// stays readable is reported again once something changed since). Not saved: a restored
+    /// machine starts its epochs again.
+    pub epoch: u64,
 }
 
 /// An open file description: what it is of, its status flags (O_NONBLOCK, O_APPEND, the access
@@ -119,6 +128,8 @@ pub(crate) struct Files {
     pub fds: BTreeMap<i32, (u32, bool)>,
     pub descs: BTreeMap<u32, Desc>,
     pub pipes: BTreeMap<u32, Pipe>,
+    /// The sockets (see net.rs)
+    pub net: Net,
     next_desc: u32,
     next_pipe: u32,
 }
@@ -207,6 +218,7 @@ impl Files {
             Kind::PipeRead(p) => self.pipe_end(p, true),
             Kind::PipeWrite(p) => self.pipe_end(p, false),
             Kind::File { ino, .. } | Kind::Dir { ino, .. } => return Some(Some(ino)),
+            Kind::Sock(id) => self.net.close(id),
             _ => {},
         }
         Some(None)
@@ -225,15 +237,40 @@ impl Files {
         }
     }
 
-    pub fn save(&self, w: &mut W) {
-        w.u(self.next_desc as u64);
-        w.u(self.next_pipe as u64);
-        w.u(self.fds.len() as u64);
-        for (&fd, &(d, cloexec)) in &self.fds {
+    /// A copy of the descriptor table for a child process: its descriptors refer to the same
+    /// descriptions (one more reference each).
+    pub fn dup_table(&mut self) -> BTreeMap<i32, (u32, bool)> {
+        for (d, _) in self.fds.values() {
+            if let Some(desc) = self.descs.get_mut(d) {
+                desc.refs += 1;
+            }
+        }
+        self.fds.clone()
+    }
+
+    /// A descriptor table (fd, description, close on exec) for a snapshot.
+    pub fn save_fds(fds: &BTreeMap<i32, (u32, bool)>, w: &mut W) {
+        w.u(fds.len() as u64);
+        for (&fd, &(d, cloexec)) in fds {
             w.u(fd as u64);
             w.u(d as u64);
             w.u(cloexec as u64);
         }
+    }
+
+    pub fn load_fds(r: &mut R) -> Result<BTreeMap<i32, (u32, bool)>, String> {
+        let mut fds = BTreeMap::new();
+        for _ in 0..r.u()? {
+            let fd = r.u()? as i32;
+            fds.insert(fd, (r.u()? as u32, r.u()? != 0));
+        }
+        Ok(fds)
+    }
+
+    /// The descriptions and pipes (the descriptor tables are the processes').
+    pub fn save(&self, w: &mut W) {
+        w.u(self.next_desc as u64);
+        w.u(self.next_pipe as u64);
         w.u(self.pipes.len() as u64);
         for (&id, p) in &self.pipes {
             w.u(id as u64);
@@ -278,6 +315,10 @@ impl Files {
                     w.u(9);
                     w.u(*count);
                 },
+                Kind::Sock(id) => {
+                    w.u(11);
+                    w.u(*id as u64);
+                },
                 Kind::Epoll { watch } => {
                     w.u(10);
                     w.u(watch.len() as u64);
@@ -290,6 +331,7 @@ impl Files {
                 },
             }
         }
+        self.net.save(w);
     }
 
     pub fn load(r: &mut R) -> Result<Files, String> {
@@ -298,10 +340,6 @@ impl Files {
             next_pipe: r.u()? as u32,
             ..Files::default()
         };
-        for _ in 0..r.u()? {
-            let fd = r.u()? as i32;
-            f.fds.insert(fd, (r.u()? as u32, r.u()? != 0));
-        }
         for _ in 0..r.u()? {
             let id = r.u()? as u32;
             let buf = r.b()?.iter().copied().collect();
@@ -337,6 +375,7 @@ impl Files {
                 7 => Kind::PipeRead(r.u()? as u32),
                 8 => Kind::PipeWrite(r.u()? as u32),
                 9 => Kind::Event { count: r.u()? },
+                11 => Kind::Sock(r.u()? as u32),
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {
@@ -346,6 +385,7 @@ impl Files {
                                 events: r.u()? as u32,
                                 data: r.u()?,
                                 last: r.u()? as u32,
+                                epoch: 0,
                             },
                         );
                     }
@@ -355,6 +395,7 @@ impl Files {
             };
             f.descs.insert(id, Desc { kind, flags, refs });
         }
+        f.net = Net::load(r)?;
         Ok(f)
     }
 }
@@ -441,6 +482,32 @@ pub(crate) fn resolve_parent(fs: &Fs, start: Ino, path: &[u8]) -> Result<(Ino, V
         return Err(-ENOTDIR);
     }
     Ok((dir, name.to_vec()))
+}
+
+/// Where `path` goes when it is a symlink (or a chain of them) that ends at a path `special`
+/// recognizes, a device or a /proc file the kernel makes rather than the filesystem holds:
+/// images link their log files to /dev/stdout and /dev/stderr, and opening one opens the device.
+pub(crate) fn link_to_special(
+    fs: &Fs,
+    mut start: Ino,
+    path: &[u8],
+    special: impl Fn(&[u8]) -> bool,
+) -> Option<Vec<u8>> {
+    let mut path = path.to_vec();
+    for _ in 0..40 {
+        if path.first() == Some(&b'/') && special(&path) {
+            return Some(path);
+        }
+        let (dir, name) = resolve_parent(fs, start, &path).ok()?;
+        let ino = fs.lookup(dir, &name).ok()?;
+        let Content::Symlink(target) = &fs.get(ino)?.content else {
+            return None;
+        };
+        // A relative target is from the directory the link is in
+        start = dir;
+        path = target.clone();
+    }
+    None
 }
 
 /// The absolute path of a directory (for getcwd), from its parents' entries.
@@ -573,6 +640,7 @@ pub(crate) fn dtype(mode: u32) -> u8 {
         S_IFLNK => 10,
         S_IFCHR => 2,
         S_IFIFO => 1,
+        S_IFSOCK => 12,
         _ => 0,
     }
 }

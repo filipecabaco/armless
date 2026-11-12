@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use armless::vm::Config;
@@ -26,6 +27,15 @@ fn usage() -> ! {
   --restore DIR      start from what --save wrote instead of an ELF
   --input LINE       type LINE (and a newline) into its stdin, and stop at the next line it prints
   --timeout SECS     stop after SECS of wall time
+  --net              a network: connections to addresses that are not the loopback's are made
+                     from here, and what the program listens on can be published
+  --publish [ADDR:]HOSTPORT:PORT
+                     listen on this host's ADDR:HOSTPORT (default 127.0.0.1) and carry each
+                     connection to the program's TCP PORT (repeatable; needs --net)
+  --tunnel [H:]P=URL carry the program's TCP to H:P over a WebSocket to URL (ws://, wss://) or
+                     a TCP connection to it (tcp://HOST:PORT) instead (repeatable; needs --net)
+  --allow-private    let the program reach loopback, private and link-local addresses at
+                     this host (a local tunnel endpoint, say)
   ARMLESS_EXEC_TRACE=1 prints every syscall"
     );
     std::process::exit(2)
@@ -48,6 +58,10 @@ fn main() {
     let mut cwd = "/".to_string();
     let mut env: Vec<String> = Vec::new();
     let mut keys: Option<String> = None;
+    let mut net = false;
+    let mut publish: Vec<(String, u16)> = Vec::new();
+    let mut tunnels = Vec::new();
+    let mut allow_private = false;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.peek().cloned() {
         if !a.starts_with('-') {
@@ -64,6 +78,20 @@ fn main() {
             "--timeout" => timeout = Duration::from_secs(val().parse().unwrap_or_else(|_| usage())),
             "--fs" => fs_dir = Some(PathBuf::from(val())),
             "--cwd" => cwd = val(),
+            "--net" => net = true,
+            "--publish" => {
+                // [ADDR:]HOSTPORT:PORT
+                let v = val();
+                let (host, port) = v.rsplit_once(':').unwrap_or_else(|| usage());
+                let port: u16 = port.parse().unwrap_or_else(|_| usage());
+                let host =
+                    if host.contains(':') { host.to_string() } else { format!("127.0.0.1:{host}") };
+                publish.push((host, port));
+            },
+            "--tunnel" => {
+                tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
+            },
+            "--allow-private" => allow_private = true,
             "--env" => env.push(val()),
             "--keys" => {
                 keys = Some(
@@ -88,6 +116,7 @@ fn main() {
         cpus: 1,
         devices: armless::dev::DeviceConfig {
             console: false,
+            net,
             fs_tag: fs_dir.as_ref().map(|_| "host9p".to_string()),
             ..Default::default()
         },
@@ -106,7 +135,13 @@ fn main() {
     let (mut vm, _clock) = armless::runner::new_vm_on(config, Some(ram)).unwrap_or_else(|e| die(e));
 
     // The filesystem, its blobs served from the directory by armless's native host
-    let mut _host = None;
+    let mut host: Option<Arc<armless::native::NativeHost>> = None;
+    let blobs = fs_dir.as_ref().and_then(|dir| {
+        ["blobs", "filesystem"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.is_dir())
+    });
     if let Some(dir) = &fs_dir {
         let json = ["fs.json", "filesystem.json"]
             .iter()
@@ -116,20 +151,45 @@ fn main() {
         vm.board
             .load_filesystem(&std::fs::read(&json).unwrap_or_else(|e| die(e)))
             .unwrap_or_else(|e| die(e));
-        let blobs = ["blobs", "filesystem"]
-            .iter()
-            .map(|n| dir.join(n))
-            .find(|p| p.is_dir());
-        _host = Some(armless::native::NativeHost::spawn(
+    }
+    // The host's side of the machine: its blobs, its network
+    if fs_dir.is_some() || net {
+        host = Some(Arc::new(armless::native::NativeHost::spawn(
             vm.board.clone(),
             armless::native::HostOptions {
                 blobs,
+                network: net,
+                egress: armless::native::Egress {
+                    allow_private,
+                    ..armless::native::Egress::from_env()
+                },
+                tunnels,
                 ..Default::default()
             },
             Box::new(|_| {}),
-        ));
+        )));
     }
-    let board = fs_dir.as_ref().map(|_| vm.board.clone());
+    for (addr, port) in &publish {
+        let (Some(host), true) = (&host, net) else {
+            die("--publish needs --net")
+        };
+        // A port that is taken is said now; the host's side is opened once the program listens
+        // (a connect that succeeds says something is there to answer, as a wait for a port needs)
+        drop(std::net::TcpListener::bind(addr).unwrap_or_else(|e| die(format!("{addr}: {e}"))));
+        let (host, addr, port, board) = (host.clone(), addr.clone(), *port, vm.board.clone());
+        std::thread::spawn(move || {
+            while !board.local_listening(port) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let Ok(listener) = std::net::TcpListener::bind(&addr) else {
+                return eprintln!("{addr}: taken since the start");
+            };
+            for stream in listener.incoming().flatten() {
+                host.forward(stream, port);
+            }
+        });
+    }
+    let board = (fs_dir.is_some() || net).then(|| vm.board.clone());
     if env.is_empty() {
         env = [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -150,7 +210,7 @@ fn main() {
         },
         None => match board {
             // Found in the filesystem; its blobs (and its loader's) come from the host meanwhile
-            Some(board) => loop {
+            Some(board) if fs_dir.is_some() => loop {
                 match Process::exec(&mut vm.cpus[0], board.clone(), &guest_args, &env, &cwd) {
                     Ok(p) => break p,
                     Err(armless_user::ExecError::Need(_)) if start.elapsed() < timeout => {
@@ -159,10 +219,10 @@ fn main() {
                     Err(e) => die(e),
                 }
             },
-            None => {
+            board => {
                 let elf = std::fs::read(&guest_args[0])
                     .unwrap_or_else(|e| die(format!("{}: {e}", guest_args[0])));
-                Process::exec_bytes(&mut vm.cpus[0], None, &elf, &guest_args, &env)
+                Process::exec_bytes(&mut vm.cpus[0], board, &elf, &guest_args, &env)
                     .unwrap_or_else(|e| die(e))
             },
         },

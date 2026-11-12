@@ -9,17 +9,15 @@ use armless::Host;
 use crate::files::{self, device, got, Desc, Got, Kind, Stat, PIPE_BUF_MAX, S_IFIFO};
 use crate::files::{EACCES, EBADF, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR};
 use crate::files::{
-    O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_TRUNC,
-    O_WRONLY,
+    O_ACCMODE, O_APPEND, O_ASYNC, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_NONBLOCK,
+    O_TRUNC, O_WRONLY,
 };
 use crate::host::{self, Instant};
-use crate::{page_up, Ctx, Process, Ret, Thread, Wait, PAGE};
+use crate::proc::CloneArgs;
+use crate::{page_up, Process, Ret, Wait};
 
 const EAGAIN: i64 = 11;
-const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
-const ENODEV: i64 = 19;
-const ECHILD: i64 = 10;
 const ENOTTY: i64 = 25;
 const ESPIPE: i64 = 29;
 const EPIPE: i64 = 32;
@@ -37,6 +35,48 @@ const NCPUS_REPORTED: u64 = 4;
 type Ready = (bool, bool, bool);
 
 impl Process {
+    /// FUTEX_WAKE_OP: applies the operation `enc` (the kernel's encoded `op`, `oparg`, `cmp` and
+    /// `cmparg`) to the word at `addr2`, wakes up to `nwake` threads waiting on `addr`, and, if
+    /// the old value of the word satisfies the comparison, up to `nwake2` waiting on `addr2`.
+    fn futex_wake_op(&mut self, addr: u64, nwake: u64, addr2: u64, nwake2: u64, enc: u32) -> i64 {
+        let sign = |v: u32| ((v << 20) as i32) >> 20;
+        let (mut op, cmp) = ((enc >> 28) & 0xf, (enc >> 24) & 0xf);
+        let (mut oparg, cmparg) = (sign((enc >> 12) & 0xfff), sign(enc & 0xfff));
+        if op & 8 != 0 {
+            op &= 7;
+            oparg = 1i32.wrapping_shl(oparg as u32 & 31);
+        }
+        let Some(old) = self.u32_at(addr2) else {
+            return -EFAULT;
+        };
+        let old = old as i32;
+        let new = match op {
+            0 => oparg,
+            1 => old.wrapping_add(oparg),
+            2 => old | oparg,
+            3 => old & !oparg,
+            4 => old ^ oparg,
+            _ => return -ENOSYS,
+        };
+        let hit = match cmp {
+            0 => old == cmparg,
+            1 => old != cmparg,
+            2 => old < cmparg,
+            3 => old <= cmparg,
+            4 => old > cmparg,
+            5 => old >= cmparg,
+            _ => return -ENOSYS,
+        };
+        if !self.put_u32(addr2, new as u32) {
+            return -EFAULT;
+        }
+        let mut woken = self.futex_wake(addr, nwake, u32::MAX);
+        if hit {
+            woken += self.futex_wake(addr2, nwake2, u32::MAX);
+        }
+        woken
+    }
+
     // ------------------------------------------------------------ descriptors
 
     fn ready(&self, fd: i32) -> Option<Ready> {
@@ -60,6 +100,7 @@ impl Process {
                 )
             },
             Kind::Event { count } => (*count > 0, true, false),
+            Kind::Sock(id) => self.sock_ready(*id),
             Kind::Epoll { watch } => (
                 watch.iter().any(|(&f, w)| {
                     self.ready(f)
@@ -72,7 +113,7 @@ impl Process {
         })
     }
 
-    fn nonblock(&self, fd: i32) -> bool {
+    pub(crate) fn nonblock(&self, fd: i32) -> bool {
         self.files
             .get(fd)
             .is_some_and(|d| d.flags & O_NONBLOCK != 0)
@@ -159,7 +200,7 @@ impl Process {
                 }
                 let n = pipe.buf.len().min(max);
                 let out = pipe.buf.drain(..n).collect();
-                self.poked = true;
+                self.poke();
                 Ok(out)
             },
             Kind::Event { count } => {
@@ -183,8 +224,14 @@ impl Process {
                 {
                     *count = 0;
                 }
-                self.poked = true;
+                self.poke();
                 Ok(count.to_le_bytes().to_vec())
+            },
+            Kind::Sock(id) => {
+                if at.is_some() {
+                    return Err(Ret::Val(-ESPIPE));
+                }
+                self.sock_recv(fd, id, max, 0).map(|r| r.0)
             },
             Kind::PipeWrite(_) | Kind::Epoll { .. } => Err(Ret::Val(-EINVAL)),
         }
@@ -254,7 +301,7 @@ impl Process {
                 }
                 let n = room.min(data.len());
                 pipe.buf.extend(&data[..n]);
-                self.poked = true;
+                self.poke();
                 Ok(n)
             },
             Kind::Event { .. } => {
@@ -269,8 +316,14 @@ impl Process {
                 {
                     *count += add;
                 }
-                self.poked = true;
+                self.poke();
                 Ok(8)
+            },
+            Kind::Sock(id) => {
+                if at.is_some() {
+                    return Err(Ret::Val(-ESPIPE));
+                }
+                self.sock_send(fd, id, data, 0, None)
             },
             Kind::PipeRead(_) | Kind::Epoll { .. } => Err(Ret::Val(-EBADF)),
         }
@@ -283,14 +336,14 @@ impl Process {
             .collect()
     }
 
-    fn close_fd(&mut self, fd: i32) -> bool {
+    pub(crate) fn close_fd(&mut self, fd: i32) -> bool {
         match self.files.close(fd) {
             None => false,
             Some(ino) => {
                 if let Some(ino) = ino {
                     self.fs(|fs| fs.drop_ref(ino));
                 }
-                self.poked = true;
+                self.poke();
                 true
             },
         }
@@ -299,9 +352,9 @@ impl Process {
     // ------------------------------------------------------------ paths
 
     /// Where a path given with `dirfd` starts: the cwd, or that directory.
-    fn start_dir(&self, dirfd: i32) -> Result<Ino, i64> {
+    pub(crate) fn start_dir(&self, dirfd: i32) -> Result<Ino, i64> {
         if dirfd == AT_FDCWD {
-            return Ok(self.cwd);
+            return Ok(self.p.cwd);
         }
         match self.files.get(dirfd).map(|d| &d.kind) {
             Some(Kind::Dir { ino, .. }) => Ok(*ino),
@@ -311,7 +364,7 @@ impl Process {
     }
 
     /// The inode `path` names from `dirfd`
-    fn lookup(&self, dirfd: i32, path: &[u8], follow: bool) -> Result<Ino, i64> {
+    pub(crate) fn lookup(&self, dirfd: i32, path: &[u8], follow: bool) -> Result<Ino, i64> {
         let start = self.start_dir(dirfd)?;
         self.fs(|fs| files::resolve(fs, start, path, follow))
             .unwrap_or(Err(-ENOENT))
@@ -328,13 +381,26 @@ impl Process {
                 let kb = self.ram_size / 1024;
                 format!("MemTotal:       {kb} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\n", kb / 2, kb / 2).into_bytes()
             },
-            b"/proc/self/stat" | b"/proc/thread-self/stat" => b"1000 (program) R 1 1000 1000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n".to_vec(),
-            b"/proc/self/cmdline" => self.exe.iter().copied().chain([0]).collect(),
+            b"/proc/self/stat" | b"/proc/thread-self/stat" => {
+                let (pid, ppid, pgid, sid) = (self.p.pid, self.p.ppid, self.p.pgid, self.p.sid);
+                format!("{pid} (program) R {ppid} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n").into_bytes()
+            },
+            b"/proc/self/cmdline" => self.p.exe.iter().copied().chain([0]).collect(),
             b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
             b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
             b"/sys/fs/cgroup/cpu.max" => b"max 100000\n".to_vec(),
             _ => return None,
         })
+    }
+
+    /// Where a symlink in the filesystem sends `path` when its target is a device or a /proc file
+    fn special_target(&self, start: Ino, path: &[u8]) -> Option<Vec<u8>> {
+        self.fs(|fs| {
+            files::link_to_special(fs, start, path, |p| {
+                device(p).is_some() || self.proc_file(p).is_some()
+            })
+        })
+        .flatten()
     }
 
     fn openat(&mut self, dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Ret {
@@ -364,7 +430,12 @@ impl Process {
             Ok(s) => s,
             Err(e) => return Ret::Val(e),
         };
-        let (now, umask) = (self.now_secs(), self.umask);
+        if flags & O_NOFOLLOW == 0 {
+            if let Some(target) = self.special_target(start, path) {
+                return self.openat(AT_FDCWD, &target, flags & !(O_CREAT | O_EXCL), mode);
+            }
+        }
+        let (now, umask) = (self.now_secs(), self.p.umask);
         let opened = self.fs(|fs| -> Result<Ino, i64> {
             let ino = if flags & O_CREAT != 0 {
                 let (dir, name) = files::resolve_parent(fs, start, path)?;
@@ -427,6 +498,7 @@ impl Process {
                 ..Stat::device(S_IFREG | 0o444, 0)
             },
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
+            Kind::Sock(_) => Stat::device(files::S_IFSOCK | 0o777, 0),
             Kind::Event { .. } | Kind::Epoll { .. } => Stat::device(0o600, 0),
         })
     }
@@ -447,6 +519,12 @@ impl Process {
         }
         if path == b"/proc" || path == b"/proc/self" || path == b"/dev" {
             return Ok(Stat::device(S_IFDIR | 0o555, 0));
+        }
+        if flags & AT_SYMLINK_NOFOLLOW == 0 {
+            let start = self.start_dir(dirfd)?;
+            if let Some(target) = self.special_target(start, path) {
+                return self.stat_path(AT_FDCWD, &target, flags);
+            }
         }
         let ino = self.lookup(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         self.fs(|fs| Stat::of(fs, ino)).flatten().ok_or(-ENOENT)
@@ -583,6 +661,7 @@ impl Process {
         else {
             return Vec::new();
         };
+        let epoch = self.epoch;
         let mut now: Vec<(i32, u32)> = Vec::new();
         for (&fd, w) in watch {
             let Some((r, wr, hup)) = self.ready(fd) else {
@@ -610,11 +689,18 @@ impl Process {
         let mut ready = Vec::new();
         for (fd, got) in now {
             let w = watch.get_mut(&fd).unwrap();
-            // Edge-triggered: only what it became ready for since it was last reported
-            let report = if w.events & EPOLLET != 0 { got & !w.last } else { got };
+            // Edge-triggered: what it became ready for since it was last reported, and more input
+            // in a descriptor that was never drained (a write to an eventfd that nobody reads is
+            // an edge each time, as the kernel counts every wakeup of the file)
+            let report = if w.events & EPOLLET != 0 {
+                got & !w.last | if w.epoch != epoch { got & 1 } else { 0 }
+            } else {
+                got
+            };
             if take {
                 // What it is no longer ready for may be reported again once it is
                 w.last &= got;
+                w.epoch = epoch;
             }
             if report == 0 || w.events & 0x3fff == 0 || ready.len() >= max {
                 continue;
@@ -816,7 +902,7 @@ impl Process {
             78 => {
                 let path = self.cstr(a[1]);
                 let target = if path == b"/proc/self/exe" || path == b"/proc/thread-self/exe" {
-                    Ok(self.exe.clone())
+                    Ok(self.p.exe.clone())
                 } else if let Some(fd) = path
                     .strip_prefix(b"/proc/self/fd/")
                     .and_then(|n| std::str::from_utf8(n).ok()?.parse::<i32>().ok())
@@ -873,7 +959,7 @@ impl Process {
             // getcwd
             17 => {
                 let mut path = self
-                    .fs(|fs| files::path_of(fs, self.cwd))
+                    .fs(|fs| files::path_of(fs, self.p.cwd))
                     .unwrap_or_else(|| b"/".to_vec());
                 path.push(0);
                 if path.len() > a[1] as usize {
@@ -888,7 +974,7 @@ impl Process {
                         .fs(|fs| fs.get(ino).is_some_and(|i| i.is_dir()))
                         .unwrap_or(false) =>
                 {
-                    self.cwd = ino;
+                    self.p.cwd = ino;
                     v(0)
                 },
                 Ok(_) => v(-ENOTDIR),
@@ -897,7 +983,7 @@ impl Process {
             // fchdir
             50 => match self.files.get(fd0).map(|d| &d.kind) {
                 Some(Kind::Dir { ino, .. }) => {
-                    self.cwd = *ino;
+                    self.p.cwd = *ino;
                     v(0)
                 },
                 Some(_) => v(-ENOTDIR),
@@ -906,7 +992,7 @@ impl Process {
             // mkdirat
             34 => {
                 let (path, mode, now, umask) =
-                    (self.cstr(a[1]), a[2] as u32, self.now_secs(), self.umask);
+                    (self.cstr(a[1]), a[2] as u32, self.now_secs(), self.p.umask);
                 let start = match self.start_dir(a[0] as i32) {
                     Ok(s) => s,
                     Err(e) => return v(e),
@@ -1049,8 +1135,8 @@ impl Process {
             },
             // umask
             166 => {
-                let old = self.umask;
-                self.umask = a[0] as u32 & 0o777;
+                let old = self.p.umask;
+                self.p.umask = a[0] as u32 & 0o777;
                 v(old as i64)
             },
 
@@ -1085,8 +1171,8 @@ impl Process {
                     3 => v(self.files.descs[&d].flags as i64),
                     4 => {
                         let desc = self.files.descs.get_mut(&d).unwrap();
-                        desc.flags = (desc.flags & !(O_APPEND | O_NONBLOCK))
-                            | (a[2] as u32 & (O_APPEND | O_NONBLOCK));
+                        desc.flags = (desc.flags & !(O_APPEND | O_NONBLOCK | O_ASYNC))
+                            | (a[2] as u32 & (O_APPEND | O_NONBLOCK | O_ASYNC));
                         v(0)
                     },
                     // F_GETLK: unlocked; F_SETLK(W), OFD locks: granted
@@ -1095,6 +1181,9 @@ impl Process {
                         v(0)
                     },
                     6 | 7 | 37 | 38 => v(0),
+                    // F_SETOWN, F_SETSIG: who gets SIGIO, which isn't sent; F_GETOWN, F_GETSIG
+                    8 | 10 => v(0),
+                    9 | 11 => v(0),
                     // F_SETPIPE_SZ, F_GETPIPE_SZ
                     1031 | 1032 => v(PIPE_BUF_MAX as i64),
                     _ => v(-EINVAL),
@@ -1163,6 +1252,7 @@ impl Process {
                                 events: ev,
                                 data,
                                 last: 0,
+                                epoch: self.epoch,
                             },
                         );
                     },
@@ -1208,78 +1298,40 @@ impl Process {
             73 => self.ppoll(a[0], a[1], a[2]),
             // pselect6
             72 => self.pselect(a[0], a[1], a[2], a[3], a[4]),
-            // socket, socketpair and the rest of the network: not yet
-            198..=212 | 242 | 243 | 269 => v(-ENOSYS),
+            // socket, socketpair and the rest of the network (net.rs)
+            198..=212 | 242 | 243 | 269 => self.net_syscall(nr, a),
 
             // ---------------------------------------------------- memory
             // brk
-            214 => {
-                if a[0] >= self.brk_start && a[0] <= self.brk_start + crate::BRK_SIZE {
-                    if a[0] < self.brk {
-                        self.zero_range(a[0], self.brk - a[0]);
-                    }
-                    self.brk = a[0];
-                }
-                v(self.brk as i64)
-            },
+            214 => v(self.sys_brk(a[0])),
             // mmap
-            222 => self.mmap(a[0], a[1], a[3], a[4] as i32, a[5]),
+            222 => self.sys_mmap(a[0], a[1], a[2], a[3], a[4] as i32, a[5]),
             // munmap
-            215 => {
-                self.release(a[0] & !(PAGE - 1), page_up(a[0] + a[1]));
-                v(0)
-            },
+            215 => v(self.sys_munmap(a[0], a[1])),
             // mremap(old, old_len, new_len, flags, new)
-            216 => self.mremap(a[0], page_up(a[1]), page_up(a[2]), a[3]),
-            // mprotect, msync, mlock, munlock, mbind, set_mempolicy, get_mempolicy
-            226 | 227 | 228 | 229 | 235 | 237 | 236 => v(0),
-            // madvise: DONTNEED and FREE give zero pages back
-            233 => {
-                if a[2] == 4 || a[2] == 8 {
-                    self.zero_range(a[0], page_up(a[1]));
-                }
-                v(0)
-            },
+            216 => v(self.sys_mremap(a[0], page_up(a[1]), page_up(a[2]), a[3])),
+            // mprotect
+            226 => v(self.sys_mprotect(a[0], a[1], a[2])),
+            // msync, mlock, munlock, mbind, set_mempolicy, get_mempolicy
+            227 | 228 | 229 | 235 | 237 | 236 => v(0),
+            // madvise: DONTNEED and FREE give anonymous pages back
+            233 => v(self.sys_madvise(a[0], a[1], a[2])),
 
             // ---------------------------------------------------- threads
-            // clone
-            220 => {
-                let flags = a[0];
-                const CLONE_VM: u64 = 0x100;
-                const CLONE_THREAD: u64 = 0x10000;
-                if flags & (CLONE_VM | CLONE_THREAD) != CLONE_VM | CLONE_THREAD {
-                    return v(-ENOSYS); // fork: needs page tables
-                }
-                let new_tid = self.next_tid;
-                self.next_tid += 1;
-                let mut ctx = Ctx::save(cpu);
-                ctx.x[0] = 0;
-                if a[1] != 0 {
-                    ctx.sp = a[1];
-                }
-                if flags & 0x80000 != 0 {
-                    ctx.tpidr = a[3]; // CLONE_SETTLS
-                }
-                if flags & 0x10_0000 != 0 {
-                    self.put_u32(a[2], new_tid as u32); // CLONE_PARENT_SETTID
-                }
-                if flags & 0x100_0000 != 0 {
-                    self.put_u32(a[4], new_tid as u32); // CLONE_CHILD_SETTID
-                }
-                let clear_tid = if flags & 0x20_0000 != 0 { a[4] } else { 0 };
-                self.threads.push(Thread {
-                    tid: new_tid,
-                    ctx,
-                    clear_tid,
-                    wait: None,
-                    resume_deadline: None,
-                    exited: false,
-                    sig: self.threads[cur].sig.inherit(),
-                });
-                v(new_tid)
-            },
-            // clone3: callers fall back to clone
-            435 => v(-ENOSYS),
+            // clone: a thread, or a process (fork, vfork)
+            220 => self.sys_clone(
+                cpu,
+                cur,
+                CloneArgs {
+                    flags: a[0] & !0xff,
+                    exit_signal: (a[0] & 0xff) as u32,
+                    sp: a[1],
+                    ptid: a[2],
+                    tls: a[3],
+                    ctid: a[4],
+                },
+            ),
+            435 => self.sys_clone3(cpu, cur, a[0], a[1]),
             // futex
             98 => {
                 let (addr, op, val) = (a[0], a[1] as u32, a[2]);
@@ -1305,6 +1357,16 @@ impl Process {
                     },
                     1 => v(self.futex_wake(addr, val, u32::MAX)),
                     10 => v(self.futex_wake(addr, val, a[5] as u32)),
+                    // FUTEX_REQUEUE and FUTEX_CMP_REQUEUE (a[5] is the value to compare with):
+                    // musl's condition variables broadcast with them.
+                    3 | 4 => {
+                        if op & 0x7f == 4 && self.u32_at(addr) != Some(a[5] as u32) {
+                            return v(-EAGAIN);
+                        }
+                        let (woken, moved) = self.futex_requeue(addr, val, a[4], a[3]);
+                        v((woken + moved) as i64)
+                    },
+                    5 => v(self.futex_wake_op(addr, val, a[4], a[3], a[5] as u32)),
                     _ => v(-ENOSYS),
                 }
             },
@@ -1336,18 +1398,18 @@ impl Process {
                 v(0)
             },
             // exit
-            93 => Ret::ThreadExit,
+            93 => Ret::ThreadExit(a[0] as i32),
             // exit_group
             94 => Ret::GroupExit(a[0] as i32),
-            // wait4, waitid: no children
-            260 | 95 => v(-ECHILD),
-            // execve, fork-like: not yet
-            221 | 281 => v(-ENOSYS),
+            260 => self.sys_wait4(&a),
+            95 => self.sys_waitid(&a),
+            221 => self.sys_execve(cpu, cur, AT_FDCWD, [a[0], a[1], a[2], 0]),
+            281 => self.sys_execve(cpu, cur, a[0] as i32, [a[1], a[2], a[3], a[4]]),
 
             // ---------------------------------------------------- ids
             178 => v(tid),
-            172 => v(1000),
-            173 => v(1),
+            172 => v(self.p.pid),
+            173 => v(self.p.ppid),
             174..=177 => v(0),
             // setuid, setgid, setreuid, setregid, setresuid, setresgid, setfsuid, setfsgid
             146 | 144 | 145 | 143 | 147 | 149 | 151 | 152 => v(0),
@@ -1358,9 +1420,12 @@ impl Process {
                 }
                 v(0)
             },
-            // getpgid, getsid, setsid, setpgid, getgroups
-            155..=157 => v(1000),
-            154 | 158 => v(0),
+            // getpgid, getsid
+            155 | 156 => self.sys_getpgid(nr, a[0] as i32 as i64),
+            157 => self.sys_setsid(),
+            154 => self.sys_setpgid(a[0] as i32 as i64, a[1] as i32 as i64),
+            // getgroups
+            158 => v(0),
             // capget: no capabilities
             90 => {
                 if a[1] != 0 {
@@ -1385,6 +1450,15 @@ impl Process {
                 let ns = self.now_ns(a[0]);
                 let ok = self.put_u64(a[1], ns / 1_000_000_000)
                     && self.put_u64(a[1] + 8, ns % 1_000_000_000);
+                v(if ok { 0 } else { -EFAULT })
+            },
+            // gettimeofday: V8 reads its Date.now() with it, and keeps what was there when it fails
+            169 => {
+                let ns = self.now_ns(0);
+                let ok = (a[0] == 0
+                    || self.put_u64(a[0], ns / 1_000_000_000)
+                        && self.put_u64(a[0] + 8, ns % 1_000_000_000 / 1000))
+                    && (a[1] == 0 || self.put_u64(a[1], 0));
                 v(if ok { 0 } else { -EFAULT })
             },
             114 => {
@@ -1442,7 +1516,7 @@ impl Process {
                 b[0..8].copy_from_slice(&self.start.elapsed().as_secs().to_le_bytes());
                 b[32..40].copy_from_slice(&self.ram_size.to_le_bytes());
                 b[40..48].copy_from_slice(&(self.ram_size / 2).to_le_bytes());
-                b[80..82].copy_from_slice(&(self.threads() as u16).to_le_bytes());
+                b[80..82].copy_from_slice(&(self.processes() as u16).to_le_bytes());
                 b[104..108].copy_from_slice(&1u32.to_le_bytes());
                 v(if self.write(a[0], &b) { 0 } else { -EFAULT })
             },
@@ -1484,6 +1558,14 @@ impl Process {
                 desc.flags = if on { desc.flags | O_NONBLOCK } else { desc.flags & !O_NONBLOCK };
                 return v(0);
             },
+            // FIOASYNC: the flag is kept, but SIGIO isn't sent: a program that asks for it
+            // (nginx does, for the channel between its processes) reads with its event loop
+            0x5452 => {
+                let on = self.u32_at(arg).unwrap_or(0) != 0;
+                let desc = self.files.descs.get_mut(&d).unwrap();
+                desc.flags = if on { desc.flags | O_ASYNC } else { desc.flags & !O_ASYNC };
+                return v(0);
+            },
             // FIOCLEX, FIONCLEX
             0x5451 | 0x5450 => {
                 self.files.fds.get_mut(&fd).unwrap().1 = req == 0x5451;
@@ -1504,7 +1586,7 @@ impl Process {
                         crate::tty::Termios::from_bytes(&b.try_into().unwrap()),
                         req == 0x5404,
                     );
-                    self.poked = true;
+                    self.poke();
                     v(0)
                 },
                 None => v(-EFAULT),
@@ -1546,113 +1628,15 @@ impl Process {
                 let n = self.files.pipes.get(&p).map_or(0, |p| p.buf.len());
                 v(if self.put_u32(arg, n as u32) { 0 } else { -EFAULT })
             },
+            (Kind::Sock(id), 0x541b) => {
+                let n = self.sock_pending(id);
+                v(if self.put_u32(arg, n as u32) { 0 } else { -EFAULT })
+            },
             // TIOCSCTTY, TCFLSH, TCXONC, TIOCNOTTY, TCSBRK
             (Kind::Tty, 0x540e | 0x540b | 0x540a | 0x5422 | 0x5409) => v(0),
             (Kind::File { .. } | Kind::Dir { .. }, _) => v(-ENOTTY),
             _ => v(-ENOTTY),
         }
-    }
-
-    fn mmap(&mut self, addr: u64, len: u64, flags: u64, fd: i32, off: u64) -> Ret {
-        let v = Ret::Val;
-        let len = page_up(len);
-        if len == 0 {
-            return v(-EINVAL);
-        }
-        let fixed = flags & (0x10 | 0x10_0000) != 0;
-        // MAP_FIXED, MAP_FIXED_NOREPLACE: VA is PA, so anywhere in RAM but the page tables
-        if fixed
-            && (!addr.is_multiple_of(PAGE)
-                || addr + len > self.ram_size
-                || self
-                    .tables_area()
-                    .is_some_and(|(s, e)| addr < e && addr + len > s))
-        {
-            return v(-ENOMEM);
-        }
-        // A file mapping is a private copy of its contents (MAP_SHARED ones too: no other process
-        // sees it, and writes don't reach the file): its pages filled as they are touched (mm.rs),
-        // or read in now
-        let mut lazy = None;
-        let contents = if flags & 0x20 == 0 {
-            let Some(Desc { kind, .. }) = self.files.get(fd).cloned() else {
-                return v(-EBADF);
-            };
-            match kind {
-                Kind::File { ino, .. } if self.lazy_room(len) => {
-                    let size = self.fs(|fs| fs.get(ino).map_or(0, |i| i.size)).unwrap_or(0);
-                    lazy = Some((ino, size.saturating_sub(off).min(len)));
-                    None
-                },
-                Kind::File { ino, .. } => {
-                    match self.fs(|fs| got(fs.read(ino, off, len as usize))) {
-                        Some(Got::Ok(b)) => Some(b),
-                        Some(Got::Need(blobs)) => return Ret::Need(blobs),
-                        Some(Got::Err(e)) => return v(e),
-                        None => return v(-EBADF),
-                    }
-                },
-                Kind::Zero => None,
-                _ => return v(-ENODEV),
-            }
-        } else {
-            None
-        };
-        let at = if fixed {
-            self.forget_lazy(addr, addr + len);
-            self.zero_range(addr, len);
-            self.carve(addr, addr + len);
-            addr
-        } else {
-            // Hints are ignored: the highest free range that fits
-            match self.alloc(len) {
-                Some(at) => at,
-                None => return v(-ENOMEM),
-            }
-        };
-        if let Some((ino, data)) = lazy {
-            self.map_lazy(at, len, ino, off, data);
-        } else if let Some(b) = contents {
-            if !b.is_empty() && !self.write(at, &b) {
-                return v(-EFAULT);
-            }
-        }
-        v(at as i64)
-    }
-
-    fn mremap(&mut self, old: u64, old_len: u64, new_len: u64, flags: u64) -> Ret {
-        let v = Ret::Val;
-        if !old.is_multiple_of(PAGE) || new_len == 0 {
-            return v(-EINVAL);
-        }
-        if new_len <= old_len {
-            self.release(old + new_len, old + old_len);
-            return v(old as i64);
-        }
-        if self.is_free(old + old_len, old + new_len) {
-            self.carve(old + old_len, old + new_len);
-            return v(old as i64);
-        }
-        if flags & 1 == 0 {
-            return v(-ENOMEM); // not MREMAP_MAYMOVE
-        }
-        // What moves is filled first (lazy pages don't move), before anything changes
-        if !self.touch(old, old_len) {
-            return v(-EFAULT); // or it waits for blobs and runs again (syscall_lazily)
-        }
-        let Some(at) = self.alloc(new_len) else {
-            return v(-ENOMEM);
-        };
-        let mut buf = vec![0u8; 1 << 20];
-        let mut done = 0;
-        while done < old_len {
-            let n = (old_len - done).min(buf.len() as u64) as usize;
-            self.read(old + done, &mut buf[..n]);
-            self.write(at + done, &buf[..n]);
-            done += n as u64;
-        }
-        self.release(old, old + old_len);
-        v(at as i64)
     }
 }
 
