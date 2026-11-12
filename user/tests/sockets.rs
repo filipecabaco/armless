@@ -435,6 +435,39 @@ fn nonblocking_sockets_fail_with_eagain_and_report_readiness() {
 }
 
 #[test]
+fn an_edge_triggered_watch_reports_each_write_to_an_eventfd_that_nobody_reads() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    // struct epoll_event: EPOLLIN | EPOLLET, and a datum
+    let mut ev = (1u32 | 1 << 31).to_le_bytes().to_vec();
+    ev.extend_from_slice(&[0; 4]);
+    ev.extend_from_slice(&0x77u64.to_le_bytes());
+    p.put(0x230, &ev).put(0x240, &1u64.to_le_bytes());
+    p.sys(19, &[I(0), I(0x800)]).expect(3); // eventfd2, nonblocking
+    p.sys(20, &[I(0)]).expect(4).save(0x108); // epoll_create1
+    p.sys(21, &[W(0x108), I(1), I(3), D(0x230)]).expect(0);
+    let wait = |p: &mut Prog, n: i64| {
+        p.sys(22, &[W(0x108), D(0x400), I(4), I(0), I(0), I(8)])
+            .expect(n);
+    };
+    wait(&mut p, 0);
+    p.sys(64, &[I(3), D(0x240), I(8)]).expect(8);
+    wait(&mut p, 1);
+    wait(&mut p, 0); // nothing new: an edge reports once
+    p.sys(64, &[I(3), D(0x240), I(8)]).expect(8);
+    wait(&mut p, 1); // the second write, though the first was never read
+    wait(&mut p, 0);
+    // Read to empty and written again between two waits: still one edge
+    p.sys(63, &[I(3), D(0x300), I(8)]).expect(8);
+    p.sys(64, &[I(3), D(0x240), I(8)]).expect(8);
+    wait(&mut p, 1);
+    wait(&mut p, 0);
+    let mut p = start(&mut vm, p);
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
 fn a_connection_to_an_address_out_there_goes_to_the_host() {
     let mut vm = machine();
     let mut p = Prog::default();

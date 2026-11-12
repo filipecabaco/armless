@@ -1499,7 +1499,7 @@ fn ldr(rt: u32, rn: u32, off: u32) -> u32 {
     0xf940_0000 | (off / 8) << 10 | rn << 5 | rt
 }
 
-/// A machine whose filesystem has these files (name, mode, contents). The contents of those not in
+/// A machine whose filesystem has these files (name, mode, contents: a symlink's target). The contents of those not in
 /// `now` come as blobs when asked for: `run_with_files` gives them.
 fn machine_with(
     files: &[(&str, u32, &[u8])],
@@ -1517,7 +1517,15 @@ fn machine_with(
     let vm = armless::runner::new_vm(config).unwrap().0;
     let entries: Vec<String> = files
         .iter()
-        .map(|(n, mode, data)| format!(r#"["{n}",{},0,{mode},0,0,"{n}-blob"]"#, data.len()))
+        .map(|(n, mode, data)| {
+            // A symlink's contents are its target
+            let target = if mode & 0o170000 == 0o120000 {
+                String::from_utf8_lossy(data).into_owned()
+            } else {
+                format!("{n}-blob")
+            };
+            format!(r#"["{n}",{},0,{mode},0,0,"{target}"]"#, data.len())
+        })
         .collect();
     let json = format!(r#"{{"version":3,"fsroot":[{}]}}"#, entries.join(","));
     vm.board.load_filesystem(json.as_bytes()).unwrap();
@@ -1772,5 +1780,54 @@ fn a_failed_exec_returns_the_error_and_leaves_the_program_as_it_was() {
     let mut p = exec_prog(&mut vm);
     let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
     assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+const LINK: u32 = 0o120777;
+
+#[test]
+fn a_symlink_to_a_device_opens_the_device_as_the_images_log_files_do() {
+    // nginx opens /var/log/nginx/error.log, a link to /dev/stderr, to append to it; the device
+    // is not in the filesystem, the terminal is what it names
+    let mut a = Asm::with_texts(vec![("log", b"log"), ("chain", b"chain")]);
+    a.room().room(); // 128 bytes: a struct stat
+    for (path, fd, text) in [("log", 3, "H"), ("chain", 4, "R")] {
+        a.i(0x9280_0c60) // AT_FDCWD
+            .adr(1, path)
+            .movz(2, 0x441) // O_WRONLY | O_CREAT | O_APPEND
+            .movz(3, 0o644)
+            .svc(56)
+            .cmp_imm(0, fd)
+            .bcond(COND_NE, "fail")
+            .movz(0, fd as u16)
+            .adr(1, text)
+            .movz(2, 1)
+            .svc(64)
+            .cmp_imm(0, 1)
+            .bcond(COND_NE, "fail");
+    }
+    // fstatat(AT_FDCWD, "chain", &st, 0): a character device, though the link is a file
+    a.i(0x9280_0c60)
+        .adr(1, "chain")
+        .i(0x9100_03e2)
+        .movz(3, 0)
+        .svc(79);
+    a.cbnz_fail(0);
+    a.i(0xb940_13e9) // ldr w9, [sp, #16]: st_mode
+        .i(0x1214_0d29) // and w9, w9, #0xf000
+        .i(0x530c_7d29) // lsr w9, w9, #12
+        .cmp_imm(9, 2) // S_IFCHR
+        .bcond(COND_NE, "fail");
+    a.ends();
+    let prog = a.elf();
+    let files: [(&str, u32, &[u8]); 3] = [
+        ("prog", EXE, &prog),
+        ("log", LINK, b"/dev/stderr"),
+        ("chain", LINK, b"log"),
+    ];
+    let mut vm = machine_with(&files, &["prog"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"HRA");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }

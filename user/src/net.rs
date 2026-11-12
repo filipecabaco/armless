@@ -730,7 +730,7 @@ impl Process {
             };
             let trunc = data.len() > max;
             if !peek {
-                self.poked = true;
+                self.poke();
             }
             return Ok((data[..max.min(data.len())].to_vec(), from, trunc));
         }
@@ -777,7 +777,7 @@ impl Process {
                 }
             },
         };
-        self.poked = true;
+        self.poke();
         Ok((data, Vec::new(), false))
     }
 
@@ -839,7 +839,7 @@ impl Process {
         }
         let n = room.min(data.len());
         p.rx.extend(&data[..n]);
-        self.poked = true;
+        self.poke();
         Ok(n)
     }
 
@@ -862,7 +862,7 @@ impl Process {
                 Some(t) if t.msgs.len() >= DGRAM_MAX => Err(self.would_block(id, nonblock, 21)),
                 Some(t) => {
                     t.msgs.push_back((from, data.to_vec()));
-                    self.poked = true;
+                    self.poke();
                     Ok(data.len())
                 },
             };
@@ -902,7 +902,7 @@ impl Process {
                             .unwrap()
                             .msgs
                             .push_back((dest, r));
-                        self.poked = true;
+                        self.poke();
                     }
                     return Ok(data.len());
                 }
@@ -915,7 +915,7 @@ impl Process {
         match target.and_then(|t| self.files.net.socks.get_mut(&t)) {
             Some(t) if t.ty == SOCK_DGRAM && t.msgs.len() < DGRAM_MAX => {
                 t.msgs.push_back((from, data.to_vec()));
-                self.poked = true;
+                self.poke();
                 Ok(data.len())
             },
             // UDP drops what a full socket cannot take, and what nobody listens for
@@ -955,7 +955,7 @@ impl Process {
             _ => e(38),
         };
         if matches!(r, Ret::Val(_)) && !matches!(nr, 198 | 204 | 205 | 208 | 209) {
-            self.poked = true;
+            self.poke();
         }
         r
     }

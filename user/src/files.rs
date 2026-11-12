@@ -93,6 +93,10 @@ pub(crate) struct Watch {
     pub events: u32,
     pub data: u64,
     pub last: u32,
+    /// `Process::epoch` when it was last looked at (an edge-triggered watch on a descriptor that
+    /// stays readable is reported again once something changed since). Not saved: a restored
+    /// machine starts its epochs again.
+    pub epoch: u64,
 }
 
 /// An open file description: what it is of, its status flags (O_NONBLOCK, O_APPEND, the access
@@ -380,6 +384,7 @@ impl Files {
                                 events: r.u()? as u32,
                                 data: r.u()?,
                                 last: r.u()? as u32,
+                                epoch: 0,
                             },
                         );
                     }
@@ -476,6 +481,32 @@ pub(crate) fn resolve_parent(fs: &Fs, start: Ino, path: &[u8]) -> Result<(Ino, V
         return Err(-ENOTDIR);
     }
     Ok((dir, name.to_vec()))
+}
+
+/// Where `path` goes when it is a symlink (or a chain of them) that ends at a path `special`
+/// recognizes, a device or a /proc file the kernel makes rather than the filesystem holds:
+/// images link their log files to /dev/stdout and /dev/stderr, and opening one opens the device.
+pub(crate) fn link_to_special(
+    fs: &Fs,
+    mut start: Ino,
+    path: &[u8],
+    special: impl Fn(&[u8]) -> bool,
+) -> Option<Vec<u8>> {
+    let mut path = path.to_vec();
+    for _ in 0..40 {
+        if path.first() == Some(&b'/') && special(&path) {
+            return Some(path);
+        }
+        let (dir, name) = resolve_parent(fs, start, &path).ok()?;
+        let ino = fs.lookup(dir, &name).ok()?;
+        let Content::Symlink(target) = &fs.get(ino)?.content else {
+            return None;
+        };
+        // A relative target is from the directory the link is in
+        start = dir;
+        path = target.clone();
+    }
+    None
 }
 
 /// The absolute path of a directory (for getcwd), from its parents' entries.

@@ -158,7 +158,7 @@ impl Process {
                 }
                 let n = pipe.buf.len().min(max);
                 let out = pipe.buf.drain(..n).collect();
-                self.poked = true;
+                self.poke();
                 Ok(out)
             },
             Kind::Event { count } => {
@@ -182,7 +182,7 @@ impl Process {
                 {
                     *count = 0;
                 }
-                self.poked = true;
+                self.poke();
                 Ok(count.to_le_bytes().to_vec())
             },
             Kind::Sock(id) => {
@@ -259,7 +259,7 @@ impl Process {
                 }
                 let n = room.min(data.len());
                 pipe.buf.extend(&data[..n]);
-                self.poked = true;
+                self.poke();
                 Ok(n)
             },
             Kind::Event { .. } => {
@@ -274,7 +274,7 @@ impl Process {
                 {
                     *count += add;
                 }
-                self.poked = true;
+                self.poke();
                 Ok(8)
             },
             Kind::Sock(id) => {
@@ -301,7 +301,7 @@ impl Process {
                 if let Some(ino) = ino {
                     self.fs(|fs| fs.drop_ref(ino));
                 }
-                self.poked = true;
+                self.poke();
                 true
             },
         }
@@ -351,6 +351,16 @@ impl Process {
         })
     }
 
+    /// Where a symlink in the filesystem sends `path` when its target is a device or a /proc file
+    fn special_target(&self, start: Ino, path: &[u8]) -> Option<Vec<u8>> {
+        self.fs(|fs| {
+            files::link_to_special(fs, start, path, |p| {
+                device(p).is_some() || self.proc_file(p).is_some()
+            })
+        })
+        .flatten()
+    }
+
     fn openat(&mut self, dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Ret {
         let cloexec = flags & O_CLOEXEC != 0;
         let status = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
@@ -378,6 +388,11 @@ impl Process {
             Ok(s) => s,
             Err(e) => return Ret::Val(e),
         };
+        if flags & O_NOFOLLOW == 0 {
+            if let Some(target) = self.special_target(start, path) {
+                return self.openat(AT_FDCWD, &target, flags & !(O_CREAT | O_EXCL), mode);
+            }
+        }
         let (now, umask) = (self.now_secs(), self.p.umask);
         let opened = self.fs(|fs| -> Result<Ino, i64> {
             let ino = if flags & O_CREAT != 0 {
@@ -462,6 +477,12 @@ impl Process {
         }
         if path == b"/proc" || path == b"/proc/self" || path == b"/dev" {
             return Ok(Stat::device(S_IFDIR | 0o555, 0));
+        }
+        if flags & AT_SYMLINK_NOFOLLOW == 0 {
+            let start = self.start_dir(dirfd)?;
+            if let Some(target) = self.special_target(start, path) {
+                return self.stat_path(AT_FDCWD, &target, flags);
+            }
         }
         let ino = self.lookup(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         self.fs(|fs| Stat::of(fs, ino)).flatten().ok_or(-ENOENT)
@@ -598,6 +619,7 @@ impl Process {
         else {
             return Vec::new();
         };
+        let epoch = self.epoch;
         let mut now: Vec<(i32, u32)> = Vec::new();
         for (&fd, w) in watch {
             let Some((r, wr, hup)) = self.ready(fd) else {
@@ -625,11 +647,18 @@ impl Process {
         let mut ready = Vec::new();
         for (fd, got) in now {
             let w = watch.get_mut(&fd).unwrap();
-            // Edge-triggered: only what it became ready for since it was last reported
-            let report = if w.events & EPOLLET != 0 { got & !w.last } else { got };
+            // Edge-triggered: what it became ready for since it was last reported, and more input
+            // in a descriptor that was never drained (a write to an eventfd that nobody reads is
+            // an edge each time, as the kernel counts every wakeup of the file)
+            let report = if w.events & EPOLLET != 0 {
+                got & !w.last | if w.epoch != epoch { got & 1 } else { 0 }
+            } else {
+                got
+            };
             if take {
                 // What it is no longer ready for may be reported again once it is
                 w.last &= got;
+                w.epoch = epoch;
             }
             if report == 0 || w.events & 0x3fff == 0 || ready.len() >= max {
                 continue;
@@ -1178,6 +1207,7 @@ impl Process {
                                 events: ev,
                                 data,
                                 last: 0,
+                                epoch: self.epoch,
                             },
                         );
                     },
@@ -1484,7 +1514,7 @@ impl Process {
                         crate::tty::Termios::from_bytes(&b.try_into().unwrap()),
                         req == 0x5404,
                     );
-                    self.poked = true;
+                    self.poke();
                     v(0)
                 },
                 None => v(-EFAULT),

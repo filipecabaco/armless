@@ -252,7 +252,7 @@ impl Process {
         first.pc = entry;
         first.load(cpu);
         self.release_vfork(pid);
-        self.poked = true;
+        self.poke();
         v(0)
     }
 }

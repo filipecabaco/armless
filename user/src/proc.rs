@@ -254,7 +254,7 @@ impl Process {
             self.raise_in(ppid, exit_signal, None, code);
         }
         // Those waiting for it look again
-        self.poked = true;
+        self.poke();
     }
 
     /// The parent that is suspended until process `child` execs or ends (vfork) goes on.

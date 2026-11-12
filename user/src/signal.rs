@@ -393,7 +393,7 @@ impl Process {
         }
         self.sig_dirty = true;
         // rt_sigtimedwait looks again
-        self.poked = true;
+        self.poke();
     }
 
     /// Whether a thread has a signal it can take now, for the run loop to deliver it
