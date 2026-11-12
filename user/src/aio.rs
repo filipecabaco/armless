@@ -97,7 +97,7 @@ impl Process {
                     }
                 }
             }
-            let r = self.write_fd(fd, &all, at);
+            let r = self.write_fd_at(fd, &all, at, flags & RWF_NOAPPEND != 0);
             if let (Some(from), Ok(n), Some(Kind::File { pos, .. })) =
                 (moves, &r, self.files.get_mut(fd).map(|d| &mut d.kind))
             {

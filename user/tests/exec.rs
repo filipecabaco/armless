@@ -2367,13 +2367,62 @@ fn pwritev2_takes_noappend_and_dontcache_and_not_atomic() {
     // without it the description's O_APPEND sends the write to the end
     a.rwv2(true, 80, 1, None, 0).ret_is(3);
     // RWF_DONTCACHE changes nothing, on a write or on a read
-    a.rwv2(true, 112, 1, Some(0), 0x80).ret_is(1);
+    a.rwv2(true, 112, 1, Some(0), 0xa0).ret_is(1);
     a.rwv2(false, 192, 1, Some(0), 0x80).ret_is(6);
     a.print_sp(256, 6);
     // RWF_ATOMIC is not for this file system
     a.rwv2(true, 112, 1, Some(0), 0x40).ret_err(95);
     a.ends();
     a.run_checked(b"ZZcdefA");
+}
+
+#[test]
+fn pwrite_on_a_file_opened_for_appending_writes_at_its_end() {
+    let mut a = Asm::with_texts(vec![("f", b"f"), ("abc", b"abc"), ("Z", b"Z")]);
+    a.big_room();
+    // x19 = openat(AT_FDCWD, "f", O_RDWR | O_CREAT | O_APPEND, 0644)
+    a.i(0x9280_0c60)
+        .adr(1, "f")
+        .movz(2, 0x442)
+        .movz(3, 0o644)
+        .svc(56)
+        .i(mov(19, 0))
+        .cmp_imm(19, 3)
+        .bcond(COND_NE, "fail");
+    for (slot, l, n) in [(0, "abc", 3), (1, "Z", 1)] {
+        a.adr(9, l).str_sp(9, 64 + 16 * slot);
+        a.movz(9, n).str_sp(9, 72 + 16 * slot);
+    }
+    a.sp_plus(9, 256).str_sp(9, 192);
+    a.movz(9, 16).str_sp(9, 200);
+    // write "abc": the position is 3
+    a.rwv2(true, 64, 1, None, 0).ret_is(3);
+    // pwrite64 "Z" at 0 goes to the end, and the position stays
+    a.i(mov(0, 19))
+        .adr(1, "Z")
+        .movz(2, 1)
+        .movz(3, 0)
+        .svc(68)
+        .ret_is(1);
+    a.i(mov(0, 19)).movz(1, 0).movz(2, 1).svc(62).ret_is(3);
+    // pwritev (vectored, a position) too
+    a.i(mov(0, 19))
+        .sp_plus(1, 80)
+        .movz(2, 1)
+        .movz(3, 0)
+        .svc(70)
+        .ret_is(1);
+    a.i(mov(0, 19)).movz(1, 0).movz(2, 1).svc(62).ret_is(3);
+    // pwritev2 without RWF_NOAPPEND too
+    a.rwv2(true, 80, 1, Some(0), 0).ret_is(1);
+    a.rwv2(false, 192, 1, Some(0), 0).ret_is(6);
+    a.print_sp(256, 6);
+    // with RWF_NOAPPEND at 0 it writes there
+    a.rwv2(true, 80, 1, Some(0), 0x20).ret_is(1);
+    a.rwv2(false, 192, 1, Some(0), 0).ret_is(6);
+    a.print_sp(256, 6);
+    a.ends();
+    a.run_checked(b"abcZZZZbcZZZA");
 }
 
 #[test]

@@ -238,7 +238,19 @@ impl Process {
     }
 
     /// Writes `data` to `fd` (at `at`, for pwrite): how much it took, or what the call must do.
+    /// As on Linux, a write at a position on a file opened for appending goes to its end.
     pub(crate) fn write_fd(&mut self, fd: i32, data: &[u8], at: Option<u64>) -> Result<usize, Ret> {
+        self.write_fd_at(fd, data, at, false)
+    }
+
+    /// `write_fd`, with `noappend` (RWF_NOAPPEND) for a write at `at` though the file appends.
+    pub(crate) fn write_fd_at(
+        &mut self,
+        fd: i32,
+        data: &[u8],
+        at: Option<u64>,
+        noappend: bool,
+    ) -> Result<usize, Ret> {
         let nonblock = self.nonblock(fd);
         let Some(d) = self.files.get(fd).cloned() else {
             return Err(Ret::Val(-EBADF));
@@ -259,8 +271,12 @@ impl Process {
                 let now = self.now_secs();
                 let append = d.flags & O_APPEND != 0;
                 let r = self.fs(|fs| {
-                    let off =
-                        at.unwrap_or(if append { fs.get(ino).map_or(0, |i| i.size) } else { pos });
+                    let end = || fs.get(ino).map_or(0, |i| i.size);
+                    let off = match at {
+                        Some(a) if !append || noappend => a,
+                        _ if append => end(),
+                        _ => pos,
+                    };
                     got(fs.write(ino, off, data, now)).map_ok(|n| (n, off))
                 });
                 match r {
