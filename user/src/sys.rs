@@ -1441,6 +1441,7 @@ impl Process {
             132 => self.sys_sigaltstack(cur, a[0], a[1], cpu.sp_el0),
             // kill, tkill, tgkill (Go's SIGURG preemption among them)
             129..=131 => self.sys_kill(nr, &a),
+            102 | 103 | 107..=111 => self.sys_timer(nr, cur, &a),
             139 => self.sigreturn(cpu, cur),
             133 => self.sys_sigsuspend(cur, a[0], a[1]),
             137 => self.sys_sigtimedwait(cur, &a),

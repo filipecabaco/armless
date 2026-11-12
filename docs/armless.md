@@ -358,7 +358,25 @@ x0–x5, answers it in x0, and resumes at ELR.
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
 - **Clocks:** `clock_gettime`, `gettimeofday`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
-  across a snapshot and its restores.
+  across a snapshot and its restores. CLOCK_TAI reads as the wall clock; CLOCK_PROCESS_CPUTIME_ID
+  and CLOCK_THREAD_CPUTIME_ID read the host time the process or thread held the CPU (an
+  approximation: there is no count of instructions, and system calls count as CPU time).
+- **Timers** (timer.rs): `setitimer` and `getitimer` (aarch64 has no `alarm`: glibc's is
+  `setitimer`) and the POSIX timers `timer_create`, `timer_settime`, `timer_gettime`,
+  `timer_getoverrun` and `timer_delete`. ITIMER_REAL sends SIGALRM at wall-clock time;
+  ITIMER_VIRTUAL (SIGVTALRM) and ITIMER_PROF (SIGPROF) count the process's CPU time as above,
+  and run alike (no split between user and system time), checked at each scheduling slice, so
+  they can fire up to a slice late. An interval timer reloads, `getitimer` gives the time left
+  and `setitimer` the old value, EINVAL for a bad timer or a microsecond count of a million or
+  more. A POSIX timer is on CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME (and the TAI and
+  alarm clocks, as those) or a CPU clock, with SIGEV_SIGNAL, SIGEV_THREAD (as SIGEV_SIGNAL),
+  SIGEV_THREAD_ID or SIGEV_NONE; its signal's siginfo has si_code SI_TIMER, si_timerid,
+  si_overrun and si_value; TIMER_ABSTIME works; ids are per process. As signals are not queued
+  here, an expiry while its signal is still pending is counted as an overrun (as Linux does),
+  and the count is that of the signal delivered. A pending timer signal ends a parked call as
+  any signal does, and an armed wall-clock timer wakes a machine that waits (`Status::Idle`
+  carries its time). A forked child has no timers; execve keeps interval timers and deletes POSIX
+  timers; a process's end deletes both.
 - **Signals** (signal.rs): actions per process, a mask, a pending set and an alternate stack
   per thread, a pending set for the process (given to its first thread that doesn't block the
   signal, the main thread first). A handler runs on the `rt_sigframe` the kernel builds
@@ -376,7 +394,8 @@ x0–x5, answers it in x0, and resumes at ELR.
   signals for faults.
 - **Snapshots:** the machine's own snapshot holds RAM and the filesystem; `Process::save` holds
   the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
-  and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
+  and pipes, the terminal, the clock, signals, armed timers as the time left and the CPU time
+  counted), a few tens of KB; the frames and page tables
   are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
   A state from before 0.14 does not load (`ARMLUSR5`: addresses are virtual, there are
   processes, and the sockets are in the machine's state).

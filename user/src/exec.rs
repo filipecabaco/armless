@@ -224,6 +224,8 @@ impl Process {
         let pid = self.p.pid;
         self.p.exe = exe;
         self.p.sig.exec();
+        // (Interval timers stay; POSIX timers go)
+        self.timers.exec(pid);
         for (i, t) in self.threads.iter_mut().enumerate() {
             if t.pid == pid && i != cur {
                 t.exited = true;

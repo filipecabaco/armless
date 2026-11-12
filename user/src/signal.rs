@@ -16,6 +16,7 @@
 //! (no job control); every other one ends the process (the first one's exit code is 128 + the
 //! signal; another's wait status says which signal killed it). A process's end raises its exit
 //! signal (SIGCHLD) in its parent. `kill` takes a pid, a process group, or everything.
+//! A POSIX timer's signal (si_code SI_TIMER) has the timer's id, overrun count and value (timer.rs).
 //! Not yet: queued real-time signals (one of each pending, as for the standard ones), the
 //! signal masks of ppoll, pselect6 and epoll_pwait, signals for faults (a fault ends the process
 //! as SIGSEGV would, whatever its handler), and the sender's pid in a handler's siginfo (the
@@ -29,6 +30,7 @@ use armless::Host;
 
 use crate::proc::End;
 use crate::ser::{R, W};
+use crate::timer::TimerInfo;
 use crate::{Ctx, Process, Ret, Wait, INIT};
 
 pub(crate) const SIGINT: u32 = 2;
@@ -67,6 +69,8 @@ const LEGACY_ALTSTACK: u64 = 64 << 10;
 pub(crate) const SI_USER: i32 = 0;
 pub(crate) const SI_TKILL: i32 = -6;
 pub(crate) const SI_KERNEL: i32 = 0x80;
+/// ... and by a POSIX timer (timer.rs): its siginfo has the timer's id, overrun count and value
+pub(crate) const SI_TIMER: i32 = -2;
 
 const EINTR: i64 = 4;
 const EINVAL: i64 = 22;
@@ -458,6 +462,10 @@ impl Process {
                 };
                 let pid = t.pid;
                 self.threads[i].sig.pending.remove(&sig);
+                let tid = self.threads[i].tid;
+                let timer = (code == SI_TIMER)
+                    .then(|| self.timer_dequeue(pid, sig, tid))
+                    .flatten();
                 let Some(disposition) = self.proc_ref(pid).map(|p| p.sig.disposition(sig)) else {
                     break;
                 };
@@ -478,7 +486,7 @@ impl Process {
                             self.park(cpu);
                         }
                         self.switch_to(pid);
-                        self.handle(i, sig, code, act);
+                        self.handle(i, sig, code, act, timer);
                         self.stats.signals_delivered += 1;
                         // One frame at a time: the next once this one's thread runs again
                         self.sig_dirty = true;
@@ -544,7 +552,7 @@ impl Process {
     }
 
     /// Runs `act`'s handler for `sig` on thread `i` (its registers in the process).
-    fn handle(&mut self, i: usize, sig: u32, code: i32, act: Action) {
+    fn handle(&mut self, i: usize, sig: u32, code: i32, act: Action, timer: Option<TimerInfo>) {
         self.interrupt(i, &act);
         let t = &mut self.threads[i];
         let ctx = t.ctx.clone();
@@ -579,7 +587,9 @@ impl Process {
         // siginfo: si_signo, si_errno, si_code, then si_pid and si_uid for a sender
         f[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
         f[8..12].copy_from_slice(&code.to_le_bytes());
-        if code <= 0 {
+        if let Some(t) = &timer {
+            t.put(&mut f);
+        } else if code <= 0 {
             f[16..20].copy_from_slice(&1000i32.to_le_bytes());
         } else if sig == SIGILL {
             // si_addr: the instruction
@@ -910,11 +920,17 @@ impl Process {
             }),
         };
         if let Some((sig, code)) = got {
+            let tid = self.threads[cur].tid;
+            let timer = (code == SI_TIMER)
+                .then(|| self.timer_dequeue(self.p.pid, sig, tid))
+                .flatten();
             if info != 0 {
                 let mut b = [0u8; SIGINFO_SIZE as usize];
                 b[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
                 b[8..12].copy_from_slice(&code.to_le_bytes());
-                if code <= 0 {
+                if let Some(t) = &timer {
+                    t.put(&mut b);
+                } else if code <= 0 {
                     b[16..20].copy_from_slice(&1000i32.to_le_bytes());
                 }
                 if !self.write(info, &b) {

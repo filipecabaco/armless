@@ -2064,3 +2064,350 @@ fn the_program_headers_and_the_loaders_path_are_read_from_wherever_they_are_in_t
     assert_eq!(out, b"hello\r\n", "the loader the far PT_INTERP names ran");
     assert!(matches!(status, Status::Exited(3)), "{status:?}");
 }
+
+// ---------------------------------------------------------------- timers
+
+/// Like `run`, but a machine that waits for an armed timer (or a deadline) sleeps until then
+/// and goes on, as a host does.
+fn run_timed(p: &mut Process, cpu: &mut NativeCpu) -> (Vec<u8>, Status) {
+    let mut out = Vec::new();
+    let begun = Instant::now();
+    loop {
+        let status = p.run(cpu, Duration::from_millis(50));
+        out.extend(p.take_output());
+        assert!(begun.elapsed() < Duration::from_secs(10), "still running");
+        match status {
+            Status::Running => {},
+            Status::Idle(Some(at)) => {
+                std::thread::sleep(at.saturating_duration_since(Instant::now()))
+            },
+            s => return (out, s),
+        }
+    }
+}
+
+const SIGALRM: u16 = 14;
+const COND_HS: u32 = 2;
+const COND_LO: u32 = 3;
+const CLOCK_MONOTONIC: u16 = 1;
+const SIGEV_NONE: u32 = 1;
+const SIGEV_THREAD_ID: u32 = 4;
+
+/// ldrsw xt, [xn, #off]
+fn ldrsw(rt: u32, rn: u32, off: u32) -> u32 {
+    0xb980_0000 | (off / 4) << 10 | rn << 5 | rt
+}
+
+/// Stack layout of the timer programs, after `troom`: the sigevent [sp] (value, signo, notify,
+/// tid), timer ids at [sp + 64] and [sp + 68], an itimerval or itimerspec at [sp + 80] to set
+/// and another at [sp + 112] to read.
+impl Asm {
+    /// sub sp, sp, #192
+    fn troom(&mut self) -> &mut Self {
+        self.i(0xd103_03ff)
+    }
+    /// ppoll(NULL, 0, NULL, NULL, 8): waits for a signal
+    fn pause(&mut self) -> &mut Self {
+        self.movz(0, 0)
+            .movz(1, 0)
+            .movz(2, 0)
+            .movz(3, 0)
+            .movz(4, 8)
+            .svc(73)
+    }
+    /// ppoll(NULL, 0, {0, ns}, NULL, 8): sleeps, or until a signal
+    fn nap(&mut self, ns: u32) -> &mut Self {
+        self.mov32(9, ns)
+            .str_sp(31, 144)
+            .str_sp(9, 152)
+            .movz(0, 0)
+            .movz(1, 0)
+            .i(add_imm(2, 31, 144, false))
+            .movz(3, 0)
+            .movz(4, 8)
+            .svc(73)
+    }
+    /// [sp + 80 ..] = {{0, interval_us}, {value_sec, value_us}} (or in ns, for a timespec)
+    fn pair(&mut self, interval: u32, sec: u16, value: u32) -> &mut Self {
+        self.str_sp(31, 80)
+            .mov32(9, interval)
+            .str_sp(9, 88)
+            .movz(9, sec)
+            .str_sp(9, 96)
+            .mov32(9, value)
+            .str_sp(9, 104)
+    }
+    /// setitimer(which, [sp + 80], NULL)
+    fn setitimer(&mut self, which: u16) -> &mut Self {
+        self.movz(0, which)
+            .i(add_imm(1, 31, 80, false))
+            .movz(2, 0)
+            .svc(103)
+    }
+    /// getitimer(which, [sp + 112])
+    fn getitimer(&mut self, which: u16) -> &mut Self {
+        self.movz(0, which).i(add_imm(1, 31, 112, false)).svc(102)
+    }
+    /// The sigevent: value, signal, how to notify (and the thread, for SIGEV_THREAD_ID)
+    fn sigevent(&mut self, value: u16, sig: u16, notify: u32) -> &mut Self {
+        self.movz(9, value)
+            .str_sp(9, 0)
+            .movz(9, sig)
+            .i(0xb900_0000 | 2 << 10 | 31 << 5 | 9) // str w9, [sp, #8]
+            .movz(9, notify as u16)
+            .i(0xb900_0000 | 3 << 10 | 31 << 5 | 9) // str w9, [sp, #12]
+            .svc(178)
+            .i(0xb900_0000 | 4 << 10 | 31 << 5); // str w0, [sp, #16]
+        self
+    }
+    /// timer_create(clock, [sp], [sp + at])
+    fn timer_create(&mut self, clock: u16, at: u32) -> &mut Self {
+        self.movz(0, clock)
+            .i(0x9100_03e1)
+            .i(add_imm(2, 31, at, false))
+            .svc(107)
+    }
+    /// timer_settime(id at [sp + at], flags, [sp + 80], NULL)
+    fn timer_settime(&mut self, at: u32, flags: u16) -> &mut Self {
+        self.ldr_w(0, 31, at)
+            .movz(1, flags)
+            .i(add_imm(2, 31, 80, false))
+            .movz(3, 0)
+            .svc(110)
+    }
+    /// the call before it returned `-errno` in x0
+    fn fails_with(&mut self, errno: u32) -> &mut Self {
+        self.cmn_imm(0, errno).bcond(COND_NE, "fail")
+    }
+}
+
+#[test]
+fn setitimer_signals_every_interval_and_wakes_an_idle_machine() {
+    // SIGALRM every 10 ms: each ends the wait it arrived in with EINTR, and the handler prints H.
+    // Nothing else is waiting on a deadline: the timer wakes the machine. Disarmed, no more.
+    let mut a = Asm::default();
+    a.troom().sigaction(SIGALRM, "handler", SA_RESTORER);
+    a.pair(10_000, 0, 10_000).setitimer(0).cbnz_fail(0);
+    for _ in 0..3 {
+        a.pause().fails_with(4);
+    }
+    a.pair(0, 0, 0).setitimer(0).cbnz_fail(0);
+    a.nap(40_000_000).cbnz_fail(0); // times out: nothing signals
+    a.print("B", 1).exit(0).label("fail").exit(1).common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run_timed(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"HHHB", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn getitimer_counts_down_and_setitimer_gives_back_the_old_timer() {
+    let mut a = Asm::default();
+    a.troom();
+    // 40 ms, then a nap of 5: 0 < what is left < 40 ms, and the interval is the one set
+    // ITIMER_VIRTUAL counts CPU time, of which the program has used little: it is armed
+    a.pair(7_000, 0, 40_000).setitimer(1).cbnz_fail(0);
+    a.getitimer(1).cbnz_fail(0);
+    a.i(ldr(9, 31, 136)).cbz_to(9, "fail");
+    a.pair(0, 0, 0).setitimer(1).cbnz_fail(0);
+    a.pair(7_000, 0, 40_000).setitimer(0).cbnz_fail(0);
+    a.nap(5_000_000).cbnz_fail(0);
+    a.getitimer(0).cbnz_fail(0);
+    a.i(ldr(9, 31, 112)).cbnz_fail(9); // interval: 0 s and 7 ms
+    a.i(ldr(9, 31, 120))
+        .mov32(10, 7_000)
+        .cmp(9, 10)
+        .bcond(COND_NE, "fail");
+    a.i(ldr(9, 31, 128)).cbnz_fail(9); // left: 0 s
+    a.i(ldr(9, 31, 136)).cbz_to(9, "fail"); // some us
+    a.mov32(10, 40_000).cmp(9, 10).bcond(COND_HS, "fail");
+    // The old timer comes back from the next setitimer, which disarms it
+    a.pair(0, 0, 0)
+        .movz(0, 0)
+        .i(add_imm(1, 31, 80, false))
+        .i(add_imm(2, 31, 112, false))
+        .svc(103)
+        .cbnz_fail(0);
+    a.i(ldr(9, 31, 136)).cbz_to(9, "fail");
+    a.mov32(10, 40_000).cmp(9, 10).bcond(COND_HS, "fail");
+    a.getitimer(0).cbnz_fail(0);
+    a.i(ldr(9, 31, 136)).cbnz_fail(9); // disarmed
+                                       // A bad timer or a bad microsecond count is EINVAL
+    a.pair(0, 0, 1_000_000).setitimer(0).fails_with(22);
+    a.pair(0, 0, 0).setitimer(3).fails_with(22);
+    a.getitimer(3).fails_with(22);
+    a.print("B", 1).exit(0).label("fail").exit(1);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run_timed(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"B", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+/// Handler of a POSIX timer's signal: si_code SI_TIMER (-2), si_timerid 1, si_overrun in x21's
+/// place at [x1 + 20] (>= `overrun`), si_value 0x123; prints H.
+fn timer_handler(a: &mut Asm, overrun: u32) {
+    a.label("tcheck")
+        .i(ldrsw(9, 1, 8))
+        .cmn_imm(9, 2)
+        .bcond(COND_NE, "fail")
+        .ldr_w(9, 1, 16)
+        .cmp_imm(9, 1)
+        .bcond(COND_NE, "fail")
+        .ldr_w(9, 1, 20)
+        .cmp_imm(9, overrun)
+        .bcond(COND_LO, "fail")
+        .i(ldr(9, 1, 24))
+        .cmp_imm(9, 0x123)
+        .bcond(COND_NE, "fail")
+        .b("handler");
+}
+
+fn posix_timer(notify: u32) -> Vec<u8> {
+    let mut a = Asm::default();
+    a.troom()
+        .sigaction(SIGUSR1, "tcheck", SA_SIGINFO | SA_RESTORER);
+    a.sigevent(0x123, SIGUSR1, notify);
+    // The first timer takes id 0 (never armed); the one that signals is 1
+    a.timer_create(CLOCK_MONOTONIC, 64).cbnz_fail(0);
+    a.timer_create(CLOCK_MONOTONIC, 68).cbnz_fail(0);
+    a.ldr_w(9, 31, 64).cbnz_fail(9);
+    a.ldr_w(9, 31, 68).cmp_imm(9, 1).bcond(COND_NE, "fail");
+    a.pair(0, 0, 10_000_000).timer_settime(68, 0).cbnz_fail(0);
+    a.pause().fails_with(4);
+    a.ldr_w(0, 31, 68).svc(109).cbnz_fail(0); // timer_getoverrun: 0
+    a.ldr_w(0, 31, 68).svc(111).cbnz_fail(0); // timer_delete
+    a.timer_settime(68, 0).fails_with(22); // gone
+    a.print("B", 1).exit(0).label("fail").exit(1).common();
+    timer_handler(&mut a, 0);
+    a.elf()
+}
+
+#[test]
+fn a_posix_timer_signals_with_its_id_and_value() {
+    let (mut vm, mut p) = start(&posix_timer(0));
+    let (out, status) = run_timed(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"HB", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_posix_timer_can_signal_a_thread() {
+    // SIGEV_THREAD_ID, the way glibc's SIGEV_THREAD has it
+    let (mut vm, mut p) = start(&posix_timer(SIGEV_THREAD_ID));
+    let (out, status) = run_timed(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"HB", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_deleted_posix_timer_is_quiet_and_so_is_one_with_no_notification() {
+    let mut a = Asm::default();
+    a.troom().sigaction(SIGUSR1, "handler", SA_RESTORER);
+    a.sigevent(0, SIGUSR1, 0);
+    a.timer_create(CLOCK_MONOTONIC, 64).cbnz_fail(0);
+    a.pair(0, 0, 10_000_000).timer_settime(64, 0).cbnz_fail(0);
+    a.ldr_w(0, 31, 64).svc(111).cbnz_fail(0); // timer_delete
+    a.nap(40_000_000).cbnz_fail(0); // times out: no signal
+                                    // SIGEV_NONE: it runs down, and nothing is signalled
+    a.sigevent(0, SIGUSR1, SIGEV_NONE);
+    a.timer_create(CLOCK_MONOTONIC, 68).cbnz_fail(0);
+    a.pair(0, 0, 10_000_000).timer_settime(68, 0).cbnz_fail(0);
+    a.nap(40_000_000).cbnz_fail(0);
+    a.ldr_w(0, 31, 68)
+        .i(add_imm(1, 31, 112, false))
+        .svc(108) // timer_gettime
+        .cbnz_fail(0);
+    a.i(ldr(9, 31, 128)).i(ldr(10, 31, 136)).i(0xaa0a_0129); // orr x9, x9, x10
+    a.cbnz_fail(9); // not armed any more
+    a.print("B", 1).exit(0).label("fail").exit(1).common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run_timed(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"B", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_posix_timer_counts_the_expiries_a_blocked_signal_missed() {
+    // 5 ms for 60 ms with the signal blocked: one signal when it is unblocked, and it says how
+    // many more there were
+    let mut a = Asm::default();
+    a.troom()
+        .sigaction(SIGUSR1, "tcheck", SA_SIGINFO | SA_RESTORER);
+    a.sigprocmask(0, SIGUSR1 as u32);
+    a.sigevent(0x123, SIGUSR1, 0);
+    a.timer_create(CLOCK_MONOTONIC, 64).cbnz_fail(0);
+    a.ldr_w(9, 31, 64).cbnz_fail(9);
+    // (tcheck wants id 1: make a second timer and arm that one)
+    a.timer_create(CLOCK_MONOTONIC, 68).cbnz_fail(0);
+    a.pair(5_000_000, 0, 5_000_000)
+        .timer_settime(68, 0)
+        .cbnz_fail(0);
+    a.nap(60_000_000).cbnz_fail(0);
+    a.sigprocmask(1, SIGUSR1 as u32); // the handler runs here: si_overrun >= 4
+    a.ldr_w(0, 31, 68).svc(109); // timer_getoverrun: the same
+    a.cmp_imm(0, 4).bcond(COND_LO, "fail");
+    a.ldr_w(0, 31, 68).svc(111).cbnz_fail(0);
+    a.print("B", 1).exit(0).label("fail").exit(1).common();
+    timer_handler(&mut a, 4);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run_timed(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"HB", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_forked_child_has_no_timers() {
+    let mut a = Asm::default();
+    a.troom();
+    a.sigevent(0, SIGUSR1, 0);
+    a.timer_create(CLOCK_MONOTONIC, 64).cbnz_fail(0);
+    a.pair(0, 5, 0).setitimer(0).cbnz_fail(0); // 5 s: the parent disarms it
+    a.fork().cbz_to(0, "child");
+    a.i(mov(19, 0));
+    a.wait4(Some(19), 0).cmp(0, 19).bcond(COND_NE, "fail");
+    a.status_is(0);
+    // Its own is still there
+    a.getitimer(0).cbnz_fail(0);
+    a.i(ldr(9, 31, 128)).cbz_to(9, "fail");
+    a.pair(0, 0, 0).setitimer(0).cbnz_fail(0);
+    a.print("B", 1).exit(0).label("fail").exit(1);
+    a.label("child");
+    a.getitimer(0).cbnz_fail(0);
+    for off in [112, 120, 128, 136] {
+        a.i(ldr(9, 31, off)).cbnz_fail(9);
+    }
+    a.ldr_w(0, 31, 64)
+        .i(add_imm(1, 31, 112, false))
+        .svc(108)
+        .fails_with(22); // the parent's POSIX timer is not here
+    a.exit(0);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run_timed(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"B", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn an_armed_timer_goes_on_in_a_restored_process() {
+    // Saved with 60 ms left on an itimer, while the program waits for it: another machine
+    // restores it, and the signal comes at its time
+    let mut a = Asm::default();
+    a.troom().sigaction(SIGALRM, "handler", SA_RESTORER);
+    a.pair(0, 0, 60_000).setitimer(0).cbnz_fail(0);
+    a.pause().fails_with(4);
+    a.print("B", 1).exit(0).label("fail").exit(1).common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(out.is_empty());
+    assert!(matches!(status, Status::Idle(Some(_))), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let (out, status) = run_timed(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"HB", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
