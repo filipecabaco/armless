@@ -46,6 +46,13 @@
   const USER_IDLE_MS = 1000;
   // SMP control block (Int32Array over a SharedArrayBuffer)
   const CTRL_PAUSE = 0, CTRL_PARKED = 1, CTRL_QUIT = 2, CTRL_EXITED = 3, CTRL_WORDS = 4;
+  // What each vCPU worker's time went on (a Float64Array over a SharedArrayBuffer, STAT_WORDS a
+  // CPU, each written by its worker alone): running the guest, waiting idle, letting the worker's
+  // other tasks run (JIT compilations), slices run, idle waits, events posted to the page, times
+  // it let them run, JIT compilations it asked for
+  const STAT_RUN_MS = 0, STAT_IDLE_MS = 1, STAT_YIELD_MS = 2, STAT_SLICES = 3, STAT_IDLE_WAITS = 4,
+    STAT_EVENTS = 5, STAT_YIELDS = 6, STAT_COMPILES = 7, STAT_WORDS = 8;
+  const SMP_POLICIES = { adaptive: 0, "spin-count": 1 };
   // Bytes buffered towards the guest before a sender waits
   const TCP_BACKLOG = 1 << 20;
 
@@ -164,8 +171,12 @@
       if (!msg || !msg.module) return;
       const { memory, index } = msg;
       const ctrl = new Int32Array(msg.ctrl);
+      // This CPU's words of the shared statistics (same layout as STAT_*: this is stringified)
+      const stat = new Float64Array(msg.stats, index * 8 * 8, 8);
       const offset = performance.timeOrigin - msg.time_origin;
       const now = () => performance.now() + offset;
+      // JIT compilations under way: they finish only when the worker lets its event loop run
+      let compiling = 0;
       const table = new WebAssembly.Table({ element: "anyfunc", initial: msg.table_size });
       let exports = null;
       const jit_imports = { m: memory };
@@ -174,15 +185,22 @@
         __indirect_function_table: table,
         microtick: now,
         wall_clock_ms: () => Date.now(),
-        host_notify: () => post({ t: "events" }),
+        // When it was posted: the page counts how long such a message takes to reach it
+        host_notify: () => { stat[5]++; post({ t: "events", at: now() }); },
         // A browser cannot give back the pages of a shared memory: the heap keeps them.
         heap_release: () => {},
         jit_compile: (slot, ptr, len) => {
           const code = new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice();
+          compiling++;
+          stat[7]++;
           WebAssembly.instantiate(code, { e: jit_imports }).then((r) => {
+            compiling--;
             table.set(slot, r.instance.exports.f);
             exports.armless_jit_ready(slot);
-          }, (err) => post({ t: "log", msg: `armless: JIT module failed on CPU ${index}: ${err}` }));
+          }, (err) => {
+            compiling--;
+            post({ t: "log", msg: `armless: JIT module failed on CPU ${index}: ${err}` });
+          });
           return 1;
         },
       };
@@ -212,16 +230,30 @@
           continue;
         }
         const woken = Atomics.load(mem32, wake);
+        const t0 = now();
         const result = exports.armless_run(msg.budget);
+        const t1 = now();
+        stat[0] += t1 - t0;
+        stat[3]++;
         if (result === 0 || result === 1) {
           if (result === 1) {
             const w = exports.armless_wake_ms();
-            const timeout = w < 0 ? 20 : Math.min(20, Math.max(0, w - now()));
-            if (timeout > 0) Atomics.wait(mem32, wake, woken, timeout);
+            const timeout = w < 0 ? 20 : Math.min(20, Math.max(0, w - t1));
+            if (timeout > 0) {
+              Atomics.wait(mem32, wake, woken, timeout);
+              stat[1] += now() - t1;
+              stat[4]++;
+            }
           }
-          // Let JIT compilations complete now and then.
-          if (now() - last_yield > 4) {
+          // Let JIT compilations under way complete now and then. Only then: a turn of the
+          // worker's event loop costs well under a millisecond in Chrome but tens in Safari,
+          // where a CPU yielding every few ms spent most of its time there (and the other CPU
+          // waited for it)
+          if (compiling > 0 && now() - last_yield > 4) {
+            const t2 = now();
             await yield_now();
+            stat[2] += now() - t2;
+            stat[6]++;
             last_yield = now();
           }
           continue;
@@ -363,6 +395,9 @@
       this._conns = new Map();
       this._blobs_in_flight = new Set();
       this._workers = [];
+      // With several CPUs: what each worker's time went on, and how late their events reached this thread
+      this._stats = null;
+      this._event_delay = { count: 0, ms: 0, max_ms: 0 };
       this._timer = null;
       this._interval = null;
       this._draining = false;
@@ -433,6 +468,7 @@
       if (o.jit_sync) e.armless_jit_sync(1);
       this._jit_pending = new Set();
       if (smp) e.armless_smp_host_cores(typeof navigator !== "undefined" && navigator.hardwareConcurrency || 0);
+      if (smp && o.smp_policy != null) this.set_smp_policy(o.smp_policy);
 
       if (o.filesystem) {
         const fsj = o.filesystem.json ?? o.filesystem.basefs;
@@ -515,7 +551,53 @@
         const at = Math.min(r.guest_ram_at, r.memory), end = Math.min(r.guest_ram_at + r.guest_ram, r.memory);
         r.pages = { before_ram: count(0, at), guest_ram: count(at, end), after_ram: count(end, r.memory) };
       }
+      if (r.smp) Object.assign(r.smp, this._smp_js());
       return r;
+    }
+
+    /**
+     * With several CPUs, what they did and what their waits for one another cost: the CPUs'
+     * instructions, each kind of wait (a TLB invalidation, the guest's WFE, a lock), how waiting
+     * CPUs behave (`policy`) and what was learned (`slow_waits`), and, from the workers, where their
+     * time went and how late their device events reached this thread. null with one CPU.
+     */
+    smp_report() {
+      if (this.cpus < 2) return null;
+      return this.memory_report({ scan: false }).smp ?? null;
+    }
+
+    _smp_js() {
+      const s = this._stats;
+      const workers = [];
+      for (let i = 0; s && i < this.cpus; i++) {
+        const w = s.subarray(i * STAT_WORDS, (i + 1) * STAT_WORDS);
+        const round = (x) => Math.round(x * 10) / 10;
+        workers.push({
+          run_ms: round(w[STAT_RUN_MS]), idle_ms: round(w[STAT_IDLE_MS]), yield_ms: round(w[STAT_YIELD_MS]),
+          slices: w[STAT_SLICES], idle_waits: w[STAT_IDLE_WAITS], events: w[STAT_EVENTS],
+          yields: w[STAT_YIELDS], compiles: w[STAT_COMPILES],
+        });
+      }
+      const d = this._event_delay;
+      return {
+        workers,
+        event_delay: { count: d.count, ms: Math.round(d.ms * 10) / 10, max_ms: Math.round(d.max_ms * 10) / 10 },
+      };
+    }
+
+    /**
+     * How waiting CPUs behave: "adaptive" (the default: they spin a little, then give up their
+     * thread now and then, and learn when the host has fewer cores free than it says) or
+     * "spin-count" (as armless 0.12: spin a set number of times, more when the host reports more
+     * cores than CPUs). Returns the policy before. Also the `smp_policy` option.
+     */
+    set_smp_policy(policy) {
+      const e = this.exports;
+      const n = SMP_POLICIES[policy];
+      if (n === undefined) throw new Error(`armless: smp_policy is "adaptive" or "spin-count", not ${JSON.stringify(policy)}`);
+      if (!e.armless_smp_policy || this.cpus < 2) return null;
+      const before = e.armless_smp_policy(n);
+      return Object.keys(SMP_POLICIES).find((k) => SMP_POLICIES[k] === before) ?? null;
     }
 
     /** A sample of the memory without the scan (cheap), when `debug` is on: kept in `this.debug.samples`, the last 400. */
@@ -799,6 +881,7 @@
         return;
       }
       this._ctrl = new Int32Array(new SharedArrayBuffer(CTRL_WORDS * 4));
+      this._stats = new Float64Array(new SharedArrayBuffer(this.cpus * STAT_WORDS * 8));
       for (let i = 0; i < this.cpus; i++) {
         const stack = e.armless_alloc_aligned(STACK_SIZE, 16);
         const tls = e.armless_alloc_aligned(e.__tls_size.value, e.__tls_align.value);
@@ -806,7 +889,7 @@
         this._workers.push(w);
         w.post({
           module: this.module, memory: this.memory, index: i,
-          stack_top: stack + STACK_SIZE, tls, ctrl: this._ctrl.buffer,
+          stack_top: stack + STACK_SIZE, tls, ctrl: this._ctrl.buffer, stats: this._stats.buffer,
           time_origin: performance.timeOrigin, table_size: TABLE_SIZE,
           jit: this.options.jit, jit_threshold: this.options.jit_threshold | 0, budget: BUDGET,
         });
@@ -815,7 +898,18 @@
 
     _worker_message(i, msg) {
       switch (msg.t) {
-        case "events": this._drain(); break;
+        case "events": {
+          // How long the message took to reach this thread: a device request waits that long
+          if (msg.at != null) {
+            const late = Math.max(0, performance.now() - msg.at);
+            const d = this._event_delay;
+            d.count++;
+            d.ms += late;
+            if (late > d.max_ms) d.max_ms = late;
+          }
+          this._drain();
+          break;
+        }
         case "log": console.warn(msg.msg); break;
         case "error": this.emit("error", new Error(msg.msg)); break;
         case "stop":

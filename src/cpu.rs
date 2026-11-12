@@ -135,6 +135,48 @@ pub struct SysRegs {
     pub other: std::collections::BTreeMap<u32, u64>,
 }
 
+/// A guest's wait in WFE, over the many WFEs of its loop: since when, until when it last waited,
+/// and what it took.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct WfeWait {
+    pub start_ns: u64,
+    pub last_ns: u64,
+    pub last_insn: u64,
+    pub spins: u64,
+    pub yields: u64,
+}
+
+/// More instructions than this between two WFEs that found nothing changed: the guest did other
+/// work, so the second begins another wait.
+const WFE_GAP_INSNS: u64 = 4096;
+
+/// When a CPU's wait began, and the clock as last read while it spins (read every 64 polls).
+#[derive(Default)]
+struct SpinWait {
+    start: u64,
+    last: u64,
+}
+
+impl SpinWait {
+    fn start<H: Host>(&mut self, host: &mut H) {
+        self.start = host.now_ns();
+        self.last = self.start;
+    }
+
+    fn elapsed<H: Host>(&mut self, host: &mut H) -> u64 {
+        self.last = host.now_ns();
+        self.last.saturating_sub(self.start)
+    }
+
+    /// Still within `limit` ns of the start.
+    fn within<H: Host>(&mut self, host: &mut H, spins: u64, limit: u64) -> bool {
+        if spins.is_multiple_of(64) {
+            self.last = host.now_ns();
+        }
+        self.last.saturating_sub(self.start) < limit
+    }
+}
+
 pub struct Cpu<H: Host> {
     /// X0..X30. Register 31 is SP or XZR depending on the instruction. Slot 31 is a zero that nothing
     /// writes and slot 32 a sink that nothing reads, which the pre-decoded loop (`interp`) reads and
@@ -181,6 +223,8 @@ pub struct Cpu<H: Host> {
     pub(crate) excl_value2: u64,
     /// TLB generation that a DSB must wait for every CPU to apply (0: none).
     pub(crate) tlb_sync_gen: u64,
+    /// The guest's wait in WFE that is going on, if any (`wfe`).
+    pub(crate) wfe_wait: Option<WfeWait>,
     /// Instruction-cache invalidations (Machine::code_inval) applied so far.
     pub(crate) code_seen: u64,
     /// Size of the last load-exclusive (what WFE watches), and the WFE event
@@ -450,6 +494,7 @@ impl<H: Host> Cpu<H> {
             excl_value: 0,
             excl_value2: 0,
             tlb_sync_gen: 0,
+            wfe_wait: None,
             code_seen: 0,
             excl_size: 8,
             event_register: false,
@@ -545,6 +590,7 @@ impl<H: Host> Cpu<H> {
         self.jit.flush_all();
         self.set_excl(None);
         self.tlb_sync_gen = 0;
+        self.wfe_wait = None;
         self.machine.cpus[self.index].tlb_seen.store(
             self.machine.tlb_gen.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -882,14 +928,24 @@ impl<H: Host> Cpu<H> {
     }
 
     /// Bookkeeping when `run` returns: an idle CPU holds no translations in
-    /// flight, so TLB shootdowns need not wait for it.
+    /// flight, so TLB shootdowns need not wait for it; and it waits in WFE no
+    /// more (whatever ended that wait, its idle time is no part of it).
     pub(crate) fn leave(&mut self, exit: Exit) -> Exit {
         if matches!(exit, Exit::Idle { .. }) {
             self.machine.cpus[self.index]
                 .run_state
                 .store(smp::RUN_IDLE, Ordering::SeqCst);
+            self.close_wfe_wait();
         }
         exit
+    }
+
+    /// The guest's WFE wait (if one is followed) ended when it last waited: count it so.
+    fn close_wfe_wait(&mut self) {
+        if let Some(w) = self.wfe_wait.take() {
+            self.machine
+                .waited(smp::WAIT_WFE, w.spins, w.yields, w.last_ns.saturating_sub(w.start_ns));
+        }
     }
 
     /// Act on what other CPUs asked of this one: machine stops, power
@@ -1020,7 +1076,9 @@ impl<H: Host> Cpu<H> {
             return;
         }
         let m = self.machine.clone();
-        let mut spins = 0u32;
+        let mut spins = 0u64;
+        let mut yields = 0u64;
+        let mut wait = SpinWait::default();
         loop {
             // Apply other CPUs' shootdowns too, so two waiting CPUs can't deadlock.
             self.apply_tlb_shootdowns();
@@ -1032,17 +1090,29 @@ impl<H: Host> Cpu<H> {
                     || c.tlb_seen.load(Ordering::SeqCst) >= gen
             });
             if done || m.stop.load(Ordering::SeqCst) != smp::STOP_NONE {
+                if spins > 0 {
+                    let ns = wait.elapsed(&mut self.host);
+                    m.waited(smp::WAIT_TLB, spins, yields, ns);
+                }
                 return;
             }
             // The CPUs we wait for may not have a host core right now.
             if spins == 0 {
                 m.stats[1].fetch_add(1, Ordering::Relaxed);
+                wait.start(&mut self.host);
             }
             spins += 1;
-            if spins < if m.oversubscribed() { 64 } else { 100_000 } {
+            let spin = if m.adaptive() {
+                // Spin for SPIN_NS (64 polls when oversubscribed), then give the thread up now and then
+                spins < 64 || !m.oversubscribed() && wait.within(&mut self.host, spins, smp::SPIN_NS)
+            } else {
+                spins < if m.oversubscribed() { 64 } else { 100_000 }
+            };
+            if spin {
                 std::hint::spin_loop();
             } else {
                 self.host.yield_now();
+                yields += 1;
             }
         }
     }
@@ -1384,8 +1454,14 @@ impl<H: Host> Cpu<H> {
     /// guest waits for (the location it load-exclusived was written, an
     /// interrupt or other request, SEV), polling briefly. Returning early is
     /// always allowed; the guest re-checks and waits again.
+    ///
+    /// A guest waits with WFE in a loop, so one wait is many WFEs: it is followed in `wfe_wait`
+    /// from the first WFE that found nothing changed to the one that did. With the adaptive policy
+    /// a wait that has spun for SPIN_NS gives up the host thread at each WFE, so the CPU it waits
+    /// for (holding a lock, say) can run if it shares the host core.
     pub(crate) fn wfe(&mut self) {
         if std::mem::take(&mut self.event_register) {
+            self.end_wfe_wait();
             return;
         }
         let m = self.machine.clone();
@@ -1397,17 +1473,49 @@ impl<H: Host> Cpu<H> {
         let spins = if oversubscribed { 32 } else { 4000 };
         for _ in 0..spins {
             if self.attn().load(Ordering::Relaxed) != 0 || m.sev.load(Ordering::Relaxed) != sev {
+                self.end_wfe_wait();
                 return;
             }
             if let Some(pa) = watch {
                 if self.ram_load(pa as usize, self.excl_size) != self.excl_value {
+                    self.end_wfe_wait();
                     return;
                 }
             }
             std::hint::spin_loop();
         }
-        if oversubscribed {
+        // Nothing changed: the wait goes on, or one begins (the guest did other work since the last)
+        let now = self.host.now_ns();
+        let insn = self.insn_count;
+        if self
+            .wfe_wait
+            .is_some_and(|w| insn.wrapping_sub(w.last_insn) > WFE_GAP_INSNS)
+        {
+            self.close_wfe_wait();
+        }
+        let w = self.wfe_wait.get_or_insert(WfeWait {
+            start_ns: now,
+            ..Default::default()
+        });
+        w.last_ns = now;
+        w.last_insn = insn;
+        w.spins += spins;
+        let give_up = if m.adaptive() {
+            oversubscribed || now.saturating_sub(w.start_ns) >= smp::SPIN_NS
+        } else {
+            oversubscribed
+        };
+        if give_up {
+            w.yields += 1;
             self.host.yield_now();
+        }
+    }
+
+    /// The guest's WFE wait (if one is followed) is over: count it.
+    fn end_wfe_wait(&mut self) {
+        if let Some(w) = self.wfe_wait.take() {
+            let ns = self.host.now_ns().saturating_sub(w.start_ns);
+            self.machine.waited(smp::WAIT_WFE, w.spins, w.yields, ns);
         }
     }
 
@@ -1769,5 +1877,155 @@ mod fast_tlb_tests {
         let slot = |p: u64| p as usize & (FAST_ENTRIES - 1);
         assert!(a.iter().all(|&p| f.write_tag[slot(p)] == u64::MAX && f.read_tag[slot(p)] == p));
         assert!(b.iter().all(|&p| f.write_tag[slot(p)] == p));
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// A host whose clock moves `step` ns each time it is read, and further when the CPU gives up
+    /// its thread; it counts those.
+    struct Clock {
+        now: Arc<AtomicU64>,
+        step: u64,
+        yields: Arc<AtomicU64>,
+    }
+
+    impl Host for Clock {
+        fn mmio_read(&mut self, _: u64, _: u32) -> Option<u64> {
+            None
+        }
+        fn mmio_write(&mut self, _: u64, _: u32, _: u64) -> bool {
+            false
+        }
+        fn now_ns(&mut self) -> u64 {
+            self.now.fetch_add(self.step, Ordering::Relaxed) + self.step
+        }
+        fn wall_clock_secs(&mut self) -> u64 {
+            0
+        }
+        fn yield_now(&mut self) {
+            self.yields.fetch_add(1, Ordering::Relaxed);
+            self.now.fetch_add(20_000, Ordering::Relaxed);
+        }
+    }
+
+    /// CPU 0 of a two-CPU machine on a host with `cores` cores, under `policy`, with nothing
+    /// asking for its attention (so WFE waits).
+    fn cpu0(cores: u32, policy: u32, step: u64) -> (Cpu<Clock>, Arc<Machine>, Arc<AtomicU64>) {
+        let m = Arc::new(Machine::new(1 << 20, 2));
+        m.host_cores.store(cores, Ordering::Relaxed);
+        m.policy.store(policy, Ordering::Relaxed);
+        let yields = Arc::new(AtomicU64::new(0));
+        let host = Clock {
+            now: Arc::new(AtomicU64::new(1_000_000)),
+            step,
+            yields: yields.clone(),
+        };
+        let cpu = Cpu::new_smp(m.clone(), 0, host);
+        m.cpus[0].attn.store(0, Ordering::Relaxed);
+        (cpu, m, yields)
+    }
+
+    /// A WFE wait that goes on: the adaptive policy gives up the host thread once it has spun for
+    /// SPIN_NS, even with cores to spare, and an interrupt ends the wait, which is counted once.
+    #[test]
+    fn a_long_wfe_wait_gives_up_the_thread_and_is_counted_once() {
+        let (mut cpu, m, yields) = cpu0(8, smp::POLICY_ADAPTIVE, 10_000);
+        for _ in 0..20 {
+            cpu.wfe();
+        }
+        // 10 µs a WFE: the first few spin, the rest give up the thread
+        let given = yields.load(Ordering::Relaxed);
+        assert!((10..20).contains(&given), "{given} yields");
+        assert_eq!(m.waits[smp::WAIT_WFE].waits.load(Ordering::Relaxed), 0, "still waiting");
+        // An interrupt (a kick) ends it
+        m.cpus[0].attn.store(1, Ordering::SeqCst);
+        cpu.wfe();
+        let w = &m.waits[smp::WAIT_WFE];
+        assert_eq!(w.waits.load(Ordering::Relaxed), 1);
+        assert_eq!(w.yields.load(Ordering::Relaxed), given);
+        assert_eq!(w.spins.load(Ordering::Relaxed), 20 * 4000);
+        assert!(w.ns.load(Ordering::Relaxed) >= smp::SPIN_NS);
+    }
+
+    /// The spin-count policy (armless 0.12) never gives up the thread while the host has cores
+    /// to spare, and does at each WFE when it hasn't.
+    #[test]
+    fn the_spin_count_policy_yields_only_when_oversubscribed() {
+        let (mut cpu, _, yields) = cpu0(8, smp::POLICY_SPIN_COUNT, 10_000);
+        for _ in 0..20 {
+            cpu.wfe();
+        }
+        assert_eq!(yields.load(Ordering::Relaxed), 0);
+        let (mut cpu, _, yields) = cpu0(2, smp::POLICY_SPIN_COUNT, 10_000);
+        for _ in 0..20 {
+            cpu.wfe();
+        }
+        assert_eq!(yields.load(Ordering::Relaxed), 20);
+    }
+
+    /// Work between two WFEs that found nothing changed ends one wait and begins another.
+    #[test]
+    fn work_between_wfes_begins_another_wait() {
+        let (mut cpu, m, _) = cpu0(8, smp::POLICY_ADAPTIVE, 1_000);
+        cpu.wfe();
+        cpu.wfe();
+        cpu.insn_count += WFE_GAP_INSNS + 1;
+        cpu.wfe();
+        assert_eq!(m.waits[smp::WAIT_WFE].waits.load(Ordering::Relaxed), 1);
+        cpu.event_register = true;
+        cpu.wfe();
+        assert_eq!(m.waits[smp::WAIT_WFE].waits.load(Ordering::Relaxed), 2);
+        assert!(cpu.wfe_wait.is_none());
+    }
+
+    /// A CPU that goes idle waits in WFE no more: its idle time is no part of the wait, and its
+    /// next WFE begins another (so a long sleep doesn't look like a slow wait).
+    #[test]
+    fn going_idle_ends_a_wfe_wait_without_its_idle_time() {
+        let (mut cpu, m, _) = cpu0(8, smp::POLICY_ADAPTIVE, 1_000);
+        cpu.wfe();
+        cpu.wfe();
+        cpu.leave(Exit::Idle { wake_ns: None });
+        let w = &m.waits[smp::WAIT_WFE];
+        assert_eq!(w.waits.load(Ordering::Relaxed), 1);
+        assert_eq!(w.ns.load(Ordering::Relaxed), 1_000, "from the first WFE to the second");
+        // Asleep for a second, then the next wait
+        cpu.host.now.fetch_add(1_000_000_000, Ordering::Relaxed);
+        cpu.wfe();
+        cpu.event_register = true;
+        cpu.wfe();
+        assert_eq!(w.waits.load(Ordering::Relaxed), 2);
+        assert!(w.max_ns.load(Ordering::Relaxed) < smp::SLOW_WAIT_NS);
+        assert_eq!(m.slow_waits.load(Ordering::Relaxed), 0);
+    }
+
+    /// A DSB waiting for another CPU to apply a broadcast TLBI is counted, and gives up the thread
+    /// after SPIN_NS; one that lasts SLOW_WAIT_NS or more is noted as slow.
+    #[test]
+    fn a_tlb_wait_is_counted_and_a_slow_one_noted() {
+        let (mut cpu, m, yields) = cpu0(8, smp::POLICY_ADAPTIVE, 1_000);
+        m.cpus[1].power.store(smp::POWER_ON, Ordering::SeqCst);
+        m.cpus[1].run_state.store(smp::RUN_RUNNING, Ordering::SeqCst);
+        cpu.tlbi_broadcast(0x1234);
+        let gen = cpu.tlb_sync_gen;
+        // CPU 1 applies it a while later
+        let other = m.clone();
+        let applier = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            other.cpus[1].tlb_seen.store(gen, Ordering::SeqCst);
+        });
+        cpu.tlb_sync();
+        applier.join().unwrap();
+        let w = &m.waits[smp::WAIT_TLB];
+        assert_eq!(w.waits.load(Ordering::Relaxed), 1);
+        assert!(yields.load(Ordering::Relaxed) > 0);
+        assert_eq!(w.yields.load(Ordering::Relaxed), yields.load(Ordering::Relaxed));
+        // Each yield moves this clock 20 µs: a 5 ms wait is a slow one
+        assert!(w.ns.load(Ordering::Relaxed) >= smp::SLOW_WAIT_NS, "{} ns", w.ns.load(Ordering::Relaxed));
+        assert_eq!(m.slow_waits.load(Ordering::Relaxed), 1);
     }
 }

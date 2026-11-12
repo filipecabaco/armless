@@ -167,6 +167,26 @@ alignment fault; the JIT leaves atomics and the crypto instructions to the inter
 For a snapshot every CPU is paused between instruction slices. A paused CPU counts
 as idle, so a running CPU waiting for TLB acknowledgements does not wait for it.
 
+### Waiting for another CPU
+
+A CPU waits for another in three places: a DSB after a broadcast TLBI (until every running CPU
+applied it), the guest's WFE (its spinlocks, and software polling), and a `SpinLock` of
+armless's own (the GIC, the RTC, the TLB and code rings). How it waits is `Machine::policy`:
+
+- **Adaptive** (the default): a TLB wait spins for `SPIN_NS` (50 µs), then gives up its host
+  thread now and then; a guest's WFE wait (followed over the many WFEs of its loop, and ended
+  when the CPU goes idle) does the same once it has lasted that long; a `SpinLock` gives up its
+  thread after 128 spins, on a thread that may block (a vCPU worker, not a page's own thread).
+  A TLB wait of `SLOW_WAIT_NS` (2 ms) or more means the CPU waited for had no host core, and
+  after three the machine counts as oversubscribed whatever the host reported, so waits give
+  up their thread almost at once. (Only TLB waits teach this: a guest may wait in WFE for
+  seconds on purpose.)
+- **Spin-count** (armless 0.12): spin a set number of times (100,000 for a TLB wait, 4,000 for
+  a WFE), fewer when the host reports no more cores than CPUs.
+
+What the waits cost is in the memory report's `smp` (below), with how many instructions each
+CPU ran.
+
 ## Snapshots (format 3)
 
 ```text
@@ -199,6 +219,18 @@ instance creates the machine and serves host calls. Each vCPU worker instantiate
 the same module on that memory, with its own stack, TLS and JIT function table, and
 calls `armless_run` in a loop. The workers raise `host_notify` when events are
 waiting. A shared control block parks every worker for `save_state`.
+
+A worker's JIT compilations (`WebAssembly.instantiate`) finish only when its event loop runs,
+which a worker waiting in `Atomics.wait` or running the guest doesn't do. So a worker with
+compilations under way lets its event loop run (a posted message to itself) every 4 ms, and one
+with none doesn't. A turn of a worker's event loop costs well under a millisecond in Chrome but
+around 25 ms in Safari on an iPhone, where workers that yielded every 4 ms whatever they did
+spent about 80% of their time there, and a 2-CPU Supabase couldn't create a table within 90 s.
+
+Each worker counts where its time went in a shared buffer: running the guest, waiting idle,
+yielding, slices, idle waits, events posted to the page, yields and compilations. The page
+counts how late the workers' event messages reach it (a device request waits that long).
+`memory_report().smp` and `smp_report()` give them with the waits above.
 
 ## User mode (experimental)
 
