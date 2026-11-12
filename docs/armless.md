@@ -220,12 +220,21 @@ the same module on that memory, with its own stack, TLS and JIT function table, 
 calls `armless_run` in a loop. The workers raise `host_notify` when events are
 waiting. A shared control block parks every worker for `save_state`.
 
-A worker's JIT compilations (`WebAssembly.instantiate`) finish only when its event loop runs,
-which a worker waiting in `Atomics.wait` or running the guest doesn't do. So a worker with
-compilations under way lets its event loop run (a posted message to itself) every 4 ms, and one
-with none doesn't. A turn of a worker's event loop costs well under a millisecond in Chrome but
-around 25 ms in Safari on an iPhone, where workers that yielded every 4 ms whatever they did
-spent about 80% of their time there, and a 2-CPU Supabase couldn't create a table within 90 s.
+A worker compiles a JIT block in place: `new WebAssembly.Module` and `new WebAssembly.Instance`,
+which a worker may do at any size (a page's own thread may only for small modules). The block
+is marked ready as soon as `armless_run` returns, with no turn of the event loop. A compilation
+the browser refuses that way goes through `WebAssembly.instantiate`, which finishes only when
+the worker's event loop runs; a worker waiting in `Atomics.wait` or running the guest doesn't
+run it. So a worker with such compilations under way lets its event loop run (a posted message
+to itself) every 4 ms, and one with none doesn't.
+
+Why it matters: a turn of a worker's event loop costs well under a millisecond in Chrome but
+around 25 ms in Safari on an iPhone. Workers that yielded every 4 ms whatever they did spent
+about 80% of their time there, and a 2-CPU Supabase couldn't create a table within 90 s. With
+yields only while compilations were under way, the same machine ran each step of its setup in
+1 to 2 s, and a 3-million-row query in 34 s (43 s with the fixed spin count); the 1-CPU site,
+which has no workers, ran it in 15 s. Compiling in place takes the remaining yields away: on a
+desktop, a boot and the same steps compiled about 3,000 blocks with no yield at all.
 
 Each worker counts where its time went in a shared buffer: running the guest, waiting idle,
 yielding, slices, idle waits, events posted to the page, yields and compilations. The page

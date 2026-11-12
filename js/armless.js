@@ -177,6 +177,8 @@
       const now = () => performance.now() + offset;
       // JIT compilations under way: they finish only when the worker lets its event loop run
       let compiling = 0;
+      // Blocks compiled at once, to be marked ready once armless_run returns (not within it)
+      const compiled = [];
       const table = new WebAssembly.Table({ element: "anyfunc", initial: msg.table_size });
       let exports = null;
       const jit_imports = { m: memory };
@@ -191,8 +193,19 @@
         heap_release: () => {},
         jit_compile: (slot, ptr, len) => {
           const code = new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice();
-          compiling++;
           stat[7]++;
+          // A worker may compile and instantiate at once (a page's own thread only small modules):
+          // the block is ready as soon as armless_run returns, with no turn of the event loop,
+          // which costs tens of ms in Safari
+          try {
+            const instance = new WebAssembly.Instance(new WebAssembly.Module(code), { e: jit_imports });
+            table.set(slot, instance.exports.f);
+            compiled.push(slot);
+            return 1;
+          } catch {
+            // Refused (or failed): compiled as a page's are, on the event loop
+          }
+          compiling++;
           WebAssembly.instantiate(code, { e: jit_imports }).then((r) => {
             compiling--;
             table.set(slot, r.instance.exports.f);
@@ -232,6 +245,7 @@
         const woken = Atomics.load(mem32, wake);
         const t0 = now();
         const result = exports.armless_run(msg.budget);
+        while (compiled.length) exports.armless_jit_ready(compiled.pop());
         const t1 = now();
         stat[0] += t1 - t0;
         stat[3]++;
