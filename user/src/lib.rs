@@ -115,6 +115,9 @@ impl Ctx {
     }
 }
 
+/// The `on_timeout` of a `Wait::Retry` whose call runs again at its deadline.
+pub(crate) const RETRY_AT_DEADLINE: i64 = i64::MIN;
+
 /// What a parked thread waits for.
 #[derive(Clone, Debug)]
 pub(crate) enum Wait {
@@ -124,6 +127,8 @@ pub(crate) enum Wait {
     Sleep,
     /// Anything that may let its call complete (input, a pipe, an eventfd, a close): the call,
     /// rewound to its svc, runs again. At its deadline it returns `on_timeout` instead.
+    /// With `RETRY_AT_DEADLINE` as `on_timeout` the call runs once more at its deadline (with
+    /// `resume_deadline` in the past), for one that gives what it has when its time is up.
     Retry { on_timeout: i64 },
     /// Blobs of the filesystem: the call runs again once they have all arrived
     Blobs(Vec<String>),
@@ -985,6 +990,10 @@ impl Process {
                 },
                 Wait::Sleep if expired => {
                     t.ctx.x[0] = 0;
+                    t.wait = None;
+                },
+                Wait::Retry { on_timeout } if expired && on_timeout == RETRY_AT_DEADLINE => {
+                    t.resume_deadline = deadline;
                     t.wait = None;
                 },
                 Wait::Retry { on_timeout } if expired => {

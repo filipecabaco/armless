@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 
 use crate::files::{Kind, EBADF, EINVAL};
 use crate::host::Instant;
-use crate::{Process, Ret, PAGE};
+use crate::{Process, Ret, PAGE, RETRY_AT_DEADLINE};
 
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
@@ -263,7 +263,7 @@ impl Process {
 
     /// io_getevents and io_pgetevents (whose signal mask is not applied): at least `min_nr` and
     /// at most `nr` completions into `events`, waiting for them up to `timeout` (a timespec, or
-    /// none to wait as long as it takes).
+    /// none to wait as long as it takes); when it passes, the completions there are (up to `nr`).
     pub(crate) fn sys_io_getevents(
         &mut self,
         id: u64,
@@ -279,7 +279,9 @@ impl Process {
             return Ret::Val(-EINVAL);
         }
         let take = (ctx.events.len() as u64).min(nr as u64);
-        let zero = timeout != 0 && self.timespec(timeout).is_some_and(|d| d.is_zero());
+        // A zero timeout, or the wait that has run out: what is there is the answer
+        let zero = (timeout != 0 && self.timespec(timeout).is_some_and(|d| d.is_zero()))
+            || self.resume_deadline.is_some_and(|d| d <= Instant::now());
         if take >= min_nr as u64 || zero {
             if take == 0 {
                 return Ret::Val(0);
@@ -308,7 +310,7 @@ impl Process {
         });
         Ret::Retry {
             deadline,
-            on_timeout: 0,
+            on_timeout: RETRY_AT_DEADLINE,
         }
     }
 

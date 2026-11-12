@@ -2301,6 +2301,36 @@ fn aio_getevents_with_nothing_queued_waits_its_timeout_and_returns_none() {
 }
 
 #[test]
+fn aio_getevents_returns_the_events_it_has_when_its_timeout_passes() {
+    let mut a = Asm::with_texts(vec![("f", b"f"), ("hello", b"hello")]);
+    a.big_room().create_f();
+    a.str_sp(31, 0).movz(0, 8).i(0x9100_03e1).svc(0).ret_is(0);
+    a.ldr_sp(20, 0);
+    // One completion queued
+    a.iocb(1, 3, Some("hello"), 5, 0, None).submit();
+    // io_getevents(ctx, 2, 2, ..., 10 ms): one is all there is, and it is given when time is up
+    a.str_sp(31, 320).mov32(9, 10_000_000).str_sp(9, 328);
+    a.i(mov(0, 20))
+        .movz(1, 2)
+        .movz(2, 2)
+        .sp_plus(3, 128)
+        .sp_plus(4, 320)
+        .svc(4)
+        .ret_is(1);
+    a.word_is(128, 0x111).word_is(144, 5);
+    // and it is consumed: nothing is left for a second wait
+    a.i(mov(0, 20))
+        .movz(1, 1)
+        .movz(2, 1)
+        .sp_plus(3, 128)
+        .sp_plus(4, 320)
+        .svc(4)
+        .ret_is(0);
+    a.ends();
+    a.run_checked(b"A");
+}
+
+#[test]
 fn pwritev2_and_preadv2_take_a_position_or_the_descriptors_and_their_flags() {
     let mut a = Asm::with_texts(vec![
         ("f", b"f"),
