@@ -150,8 +150,6 @@ fn link(l: &Tunnel) -> std::io::Result<TcpStream> {
 
 enum Msg {
     Wake,
-    /// The links, replaced.
-    Links(Vec<Tunnel>),
     /// A host socket to connect to the guest's port.
     Forward(TcpStream, u16),
     Quit,
@@ -159,6 +157,10 @@ enum Msg {
 
 pub struct NativeHost {
     tx: Sender<Msg>,
+    /// What `set_links` last gave. Shared with the event loop rather than sent to it, so that a
+    /// connection the guest opens after the call returns follows the new links (a message could
+    /// still be behind the guest's event in the loop).
+    links: Arc<Mutex<Vec<Tunnel>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -215,16 +217,19 @@ impl NativeHost {
                 let _ = tx.send(Msg::Wake);
             }));
         }
+        let links = Arc::new(Mutex::new(Vec::new()));
         let thread = {
             let board = board.clone();
             let tx = tx.clone();
+            let links = links.clone();
             std::thread::Builder::new()
                 .name("armless-host".into())
-                .spawn(move || event_loop(board, options, observer, rx, tx))
+                .spawn(move || event_loop(board, options, observer, rx, tx, links))
                 .expect("spawn host thread")
         };
         NativeHost {
             tx,
+            links,
             thread: Some(thread),
         }
     }
@@ -240,7 +245,7 @@ impl NativeHost {
     /// whatever the egress allows (a private address, `Egress::deny_all`). New connections
     /// follow the new links; open ones stay as they are.
     pub fn set_links(&self, links: Vec<Tunnel>) {
-        let _ = self.tx.send(Msg::Links(links));
+        *self.links.lock().unwrap() = links;
     }
 
     /// Look at the events again (after something was delivered elsewhere).
@@ -264,6 +269,7 @@ fn event_loop(
     mut observer: Observer,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
+    links: Arc<Mutex<Vec<Tunnel>>>,
 ) {
     let conns: Shared = Arc::default();
     let egress = Arc::new(options.egress.clone());
@@ -271,11 +277,9 @@ fn event_loop(
     let mut forwarding: HashMap<u32, TcpStream> = HashMap::new();
     let start = Instant::now();
     let mut last_tick = Instant::now();
-    let mut links: Vec<Tunnel> = Vec::new();
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Msg::Quit) => break,
-            Ok(Msg::Links(l)) => links = l,
             Ok(Msg::Forward(stream, port)) => match board.tcp_connect(port) {
                 Some(id) => {
                     forwarding.insert(id, stream);
@@ -362,12 +366,14 @@ fn event_loop(
                     }
                     // A link: a direct connection to its address (a Unix socket or a TCP
                     // one), the host's own choice
-                    if let Some(l) = links
+                    let found = links
+                        .lock()
+                        .unwrap()
                         .iter()
                         .find(|t| t.matches(&host, port))
                         .filter(|t| t.unix_path().is_some() || t.tcp_address().is_some())
-                        .cloned()
-                    {
+                        .cloned();
+                    if let Some(l) = found {
                         let (board, conns, tx) = (board.clone(), conns.clone(), tx.clone());
                         std::thread::spawn(move || {
                             match link(&l) {
