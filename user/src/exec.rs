@@ -179,8 +179,10 @@ impl Process {
             };
             name = interp;
         };
-        let Ok(layout) = Layout::of(image.head()) else {
-            return v(-ENOEXEC);
+        let layout = match Layout::of(&image, Some(&*board)) {
+            Ok(l) => l,
+            Err(ExecError::Need(b)) => return Ret::Need(b),
+            Err(ExecError::Fail(_)) => return v(-ENOEXEC),
         };
         let strings = |a: &[Vec<u8>]| -> Vec<String> {
             a.iter()

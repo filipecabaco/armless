@@ -293,11 +293,11 @@ struct Layout {
 }
 
 impl Layout {
-    fn of(head: &[u8]) -> Result<Layout, ExecError> {
-        let fail = ExecError::Fail;
-        let main = elf::header(head).map_err(fail)?;
-        let base = if main.dyn_ { PIE_BASE } else { 0 };
-        let (loaded, segs) = elf::plan(head, mm::VA_END, base).map_err(ExecError::Fail)?;
+    /// `image`'s layout: its headers are read from wherever they are in its file (`board`'s).
+    fn of(image: &mm::Image, board: Option<&Board>) -> Result<Layout, ExecError> {
+        let main = elf::parse(image, board)?;
+        let base = if main.header().dyn_ { PIE_BASE } else { 0 };
+        let (loaded, segs) = elf::plan(&main, mm::VA_END, base).map_err(ExecError::Fail)?;
         let stack_top = mm::VA_END - PAGE;
         let brk_start = page_up(loaded.end);
         let mmap_top = stack_top - STACK_SIZE - PAGE;
@@ -509,7 +509,7 @@ impl Process {
     ) -> Result<Process, ExecError> {
         let ram = cpu.mem.alias();
         let ram_size = ram.len() as u64;
-        let layout = Layout::of(image.head())?;
+        let layout = Layout::of(&image, board.as_deref())?;
         // What the CPUs decoded from a page of RAM is dropped when its frame is freed or the host
         // writes it
         let machine = cpu.machine.clone();
@@ -630,14 +630,14 @@ impl Process {
         let (entry, interp_base) = match ld {
             None => (loaded.entry, 0),
             Some(ld) => {
-                let h = elf::header(ld.head()).map_err(fail)?;
+                let parsed = elf::parse(&ld, self.board.as_deref())?;
                 let at = self
                     .p
                     .mm
                     .borrow_mut()
-                    .alloc(h.span)
+                    .alloc(parsed.header().span)
                     .ok_or_else(|| fail("no room for the loader".into()))?;
-                let (l, segs) = elf::plan(ld.head(), mm::VA_END, at).map_err(fail)?;
+                let (l, segs) = elf::plan(&parsed, mm::VA_END, at).map_err(fail)?;
                 self.place(&ld, &segs)?;
                 (l.entry, at)
             },
