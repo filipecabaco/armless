@@ -435,6 +435,27 @@ fn nonblocking_sockets_fail_with_eagain_and_report_readiness() {
 }
 
 #[test]
+fn a_socket_takes_async_io_and_an_owner_though_no_sigio_comes() {
+    // nginx makes the channel between its processes asynchronous and owned before it forks a
+    // worker, and a failure of either ends the master
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x300, &1u32.to_le_bytes());
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0); // fds 3 and 4
+    p.sys(29, &[W(0x100), I(0x5452), D(0x300)]).expect(0); // ioctl(FIOASYNC) on
+    p.sys(25, &[W(0x100), I(8), I(1)]).expect(0); // F_SETOWN
+    p.sys(25, &[W(0x100), I(3), I(0)]).save(0x110); // F_GETFL
+    p.out(0x110, 2);
+    p.sys(29, &[W(0x100), I(0x5452), D(0x304)]).expect(0); // off
+    p.sys(25, &[W(0x100), I(3), I(0)]).save(0x110);
+    p.out(0x110, 2);
+    let mut p = start(&mut vm, p);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, [2, 0x20, 2, 0], "O_RDWR, with O_ASYNC while it is on");
+}
+
+#[test]
 fn an_edge_triggered_watch_reports_each_write_to_an_eventfd_that_nobody_reads() {
     let mut vm = machine();
     let mut p = Prog::default();

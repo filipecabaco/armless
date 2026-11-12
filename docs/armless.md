@@ -233,7 +233,8 @@ x0–x5, answers it in x0, and resumes at ELR.
   `getsockname`, `getpeername`, `getsockopt` and `setsockopt`; a socket is a descriptor like a
   pipe's, and read, write, readv, writev, fcntl, poll, select and epoll take it. Blocking and
   non-blocking (`SOCK_NONBLOCK`, `EAGAIN`, `EINPROGRESS`) as for pipes: a call that can't finish
-  parks its thread and runs again when something changed.
+  parks its thread and runs again when something changed. `FIOASYNC` (`O_ASYNC`) and `F_SETOWN`
+  are accepted, and SIGIO is never sent.
   - *In memory:* AF_UNIX stream and datagram sockets (paths, which are entries of the
     filesystem, and abstract names, and `socketpair`), and AF_INET and AF_INET6 TCP and UDP to
     the loopback (127/8, `::1`, the machine's own address, an unspecified one), through a table of

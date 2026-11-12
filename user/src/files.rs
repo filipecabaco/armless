@@ -21,6 +21,7 @@ pub(crate) const O_EXCL: u32 = 0o200;
 pub(crate) const O_TRUNC: u32 = 0o1000;
 pub(crate) const O_APPEND: u32 = 0o2000;
 pub(crate) const O_NONBLOCK: u32 = 0o4000;
+pub(crate) const O_ASYNC: u32 = 0o20000;
 pub(crate) const O_DIRECTORY: u32 = 0o40000;
 pub(crate) const O_NOFOLLOW: u32 = 0o100000;
 pub(crate) const O_CLOEXEC: u32 = 0o2000000;

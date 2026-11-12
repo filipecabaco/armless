@@ -9,8 +9,8 @@ use armless::Host;
 use crate::files::{self, device, got, Desc, Got, Kind, Stat, PIPE_BUF_MAX, S_IFIFO};
 use crate::files::{EACCES, EBADF, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR};
 use crate::files::{
-    O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_TRUNC,
-    O_WRONLY,
+    O_ACCMODE, O_APPEND, O_ASYNC, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_NONBLOCK,
+    O_TRUNC, O_WRONLY,
 };
 use crate::host::{self, Instant};
 use crate::proc::CloneArgs;
@@ -1171,8 +1171,8 @@ impl Process {
                     3 => v(self.files.descs[&d].flags as i64),
                     4 => {
                         let desc = self.files.descs.get_mut(&d).unwrap();
-                        desc.flags = (desc.flags & !(O_APPEND | O_NONBLOCK))
-                            | (a[2] as u32 & (O_APPEND | O_NONBLOCK));
+                        desc.flags = (desc.flags & !(O_APPEND | O_NONBLOCK | O_ASYNC))
+                            | (a[2] as u32 & (O_APPEND | O_NONBLOCK | O_ASYNC));
                         v(0)
                     },
                     // F_GETLK: unlocked; F_SETLK(W), OFD locks: granted
@@ -1181,6 +1181,9 @@ impl Process {
                         v(0)
                     },
                     6 | 7 | 37 | 38 => v(0),
+                    // F_SETOWN, F_SETSIG: who gets SIGIO, which isn't sent; F_GETOWN, F_GETSIG
+                    8 | 10 => v(0),
+                    9 | 11 => v(0),
                     // F_SETPIPE_SZ, F_GETPIPE_SZ
                     1031 | 1032 => v(PIPE_BUF_MAX as i64),
                     _ => v(-EINVAL),
@@ -1544,6 +1547,14 @@ impl Process {
                 let on = self.u32_at(arg).unwrap_or(0) != 0;
                 let desc = self.files.descs.get_mut(&d).unwrap();
                 desc.flags = if on { desc.flags | O_NONBLOCK } else { desc.flags & !O_NONBLOCK };
+                return v(0);
+            },
+            // FIOASYNC: the flag is kept, but SIGIO isn't sent: a program that asks for it
+            // (nginx does, for the channel between its processes) reads with its event loop
+            0x5452 => {
+                let on = self.u32_at(arg).unwrap_or(0) != 0;
+                let desc = self.files.descs.get_mut(&d).unwrap();
+                desc.flags = if on { desc.flags | O_ASYNC } else { desc.flags & !O_ASYNC };
                 return v(0);
             },
             // FIOCLEX, FIONCLEX
