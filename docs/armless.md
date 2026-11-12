@@ -276,11 +276,13 @@ x0–x5, answers it in x0, and resumes at ELR.
   FSYNC and FDSYNC run as they are submitted and their completions wait in the context's queue;
   IOCB_FLAG_RESFD adds 1 to the eventfd. A context is named by the address of one zeroed page
   (no ring header for a library to read, so libaio asks the kernel), belongs to its process and
-  is dropped by exec; it is not inherited. Not done: IOCB_CMD_POLL, the signal mask of
-  `io_pgetevents`, and a timeout that ends with fewer than min_nr completions returns 0 and
-  leaves them queued. `preadv2` and `pwritev2` take RWF_HIPRI, DSYNC and SYNC (no-ops: the
-  filesystem is in memory), NOWAIT (EAGAIN for a call that would wait) and APPEND; a position
-  of -1 is the descriptor's own; other flags are EOPNOTSUPP.
+  is dropped by exec; it is not inherited. A timeout that passes with fewer than min_nr
+  completions returns the ones there are. Not done: IOCB_CMD_POLL and the signal mask of
+  `io_pgetevents`. `preadv2` and `pwritev2` take RWF_HIPRI, DSYNC, SYNC and DONTCACHE (no-ops:
+  the filesystem is in memory), NOWAIT (EAGAIN for a call that would wait), APPEND and NOAPPEND;
+  a position of -1 is the descriptor's own; other flags (RWF_ATOMIC) are EOPNOTSUPP. A
+  positioned write (`pwrite64`, `pwritev`, `pwritev2`, AIO) on a descriptor opened with
+  O_APPEND writes at the end of the file, as on Linux, unless RWF_NOAPPEND is given.
 - **Sockets** (user/src/net.rs): `socket`, `socketpair`, `bind`, `listen`, `accept` and `accept4`,
   `connect`, `sendto` and `recvfrom`, `sendmsg` and `recvmsg` (and the `mmsg` pair), `shutdown`,
   `getsockname`, `getpeername`, `getsockopt` and `setsockopt`; a socket is a descriptor like a
