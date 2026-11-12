@@ -39,6 +39,7 @@ use armless::{Host, Ram};
 use crate::elf::Seg;
 use crate::files::{got, Desc, Got, Kind};
 use crate::ser::{R, W};
+use crate::signal::SIGILL;
 use crate::{page_up, ExecError, Process, Ret, Wait, PAGE};
 
 pub(crate) const PROT_READ: u8 = 1;
@@ -1294,6 +1295,11 @@ impl Process {
                 false
             },
             Err(Miss::Segv) => {
+                // An undefined instruction (EC 0) is SIGILL: a program probing for a CPU
+                // feature (OpenSSL's, for SVE or SM3) sets a handler and goes on without it
+                if ec == 0 && self.raise_fault(SIGILL, ILL_ILLOPC) {
+                    return false;
+                }
                 self.crash(format!(
                     "exception class {ec:#x} (esr {esr:#x}) at pc {elr:#x}, far {far:#x}"
                 ));
@@ -1547,6 +1553,9 @@ impl Process {
 /// How much of an executable exec reads to load it lazily: its headers and its loader's path
 /// are in there.
 const HEAD: usize = 64 << 10;
+
+/// si_code of SIGILL: an illegal opcode
+const ILL_ILLOPC: i32 = 1;
 
 /// An executable to load: its bytes, or a file of the filesystem (and its first bytes) whose
 /// segments are mapped lazily.

@@ -286,7 +286,7 @@ static void test_exceptions(void) {
 // ARMv8.1 atomics and CRC32 (the crypto instructions need SIMD registers: see the difftest).
 static void test_extensions(void) {
     puts_("extensions:\n");
-    check("ID_AA64ISAR0_EL1", SYSREG_READ(id_aa64isar0_el1), 0x211120);
+    check("ID_AA64ISAR0_EL1", SYSREG_READ(id_aa64isar0_el1), 0x11100212120ULL);
     static volatile uint64_t m[2] __attribute__((aligned(16)));
     m[0] = 40;
     uint64_t old;
