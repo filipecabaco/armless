@@ -321,7 +321,7 @@ impl Process {
     fn proc_file(&self, path: &[u8]) -> Option<Vec<u8>> {
         Some(match path {
             b"/proc/cpuinfo" => (0..NCPUS_REPORTED)
-                .map(|i| format!("processor\t: {i}\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd aes pmull sha1 sha2 crc32 atomics\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n"))
+                .map(|i| format!("processor\t: {i}\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd aes pmull sha1 sha2 crc32 atomics sha3 sm3 sm4 sha512\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n"))
                 .collect::<String>()
                 .into_bytes(),
             b"/proc/meminfo" => {
