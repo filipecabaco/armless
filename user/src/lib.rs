@@ -287,16 +287,18 @@ struct Layout {
 }
 
 impl Layout {
-    fn of(head: &[u8], ram_size: u64) -> Result<Layout, ExecError> {
+    fn of(head: &[u8]) -> Result<Layout, ExecError> {
         let fail = ExecError::Fail;
         let main = elf::header(head).map_err(fail)?;
         let base = if main.dyn_ { PIE_BASE } else { 0 };
-        let (loaded, segs) = elf::plan(head, ram_size, base).map_err(ExecError::Fail)?;
-        let stack_top = ram_size - PAGE;
+        let (loaded, segs) = elf::plan(head, mm::VA_END, base).map_err(ExecError::Fail)?;
+        let stack_top = mm::VA_END - PAGE;
         let brk_start = page_up(loaded.end);
         let mmap_top = stack_top - STACK_SIZE - PAGE;
         if brk_start + BRK_SIZE >= mmap_top {
-            return Err(ExecError::Fail("RAM too small for the program".into()));
+            return Err(ExecError::Fail(
+                "the program is too big for the address space".into(),
+            ));
         }
         Ok(Layout {
             loaded,
@@ -501,7 +503,7 @@ impl Process {
     ) -> Result<Process, ExecError> {
         let ram = cpu.mem.alias();
         let ram_size = ram.len() as u64;
-        let layout = Layout::of(image.head(), ram_size)?;
+        let layout = Layout::of(image.head())?;
         // What the CPUs decoded from a page of RAM is dropped when its frame is freed or the host
         // writes it
         let machine = cpu.machine.clone();
@@ -628,7 +630,7 @@ impl Process {
                     .borrow_mut()
                     .alloc(h.span)
                     .ok_or_else(|| fail("no room for the loader".into()))?;
-                let (l, segs) = elf::plan(ld.head(), self.ram_size, at).map_err(fail)?;
+                let (l, segs) = elf::plan(ld.head(), mm::VA_END, at).map_err(fail)?;
                 self.place(&ld, &segs)?;
                 (l.entry, at)
             },
@@ -750,6 +752,11 @@ impl Process {
                     && matches!(t.wait, Some((Wait::Retry { .. }, _)))
                     && !matches!(t.ctx.x[8], 260 | 95)
             })
+    }
+
+    /// Frames of RAM in use: the pages of every process that has one, and their page tables.
+    pub fn frames_in_use(&self) -> u64 {
+        self.frames.borrow().live
     }
 
     /// Guest pages that hold anything: what of RAM a snapshot carries. (Reads all of RAM.)

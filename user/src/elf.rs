@@ -98,7 +98,7 @@ pub(crate) struct Seg {
 /// Where the PT_LOAD segments go at `base` plus their addresses, from the ELF's first bytes (its
 /// headers, and the loader's path PT_INTERP names, are there): what loading it gives, and the
 /// segments to copy or map.
-pub(crate) fn plan(elf: &[u8], ram_size: u64, base: u64) -> Result<(Loaded, Vec<Seg>), String> {
+pub(crate) fn plan(elf: &[u8], limit: u64, base: u64) -> Result<(Loaded, Vec<Seg>), String> {
     let all = segments(elf)?;
     let phoff = u64_at(elf, 32);
     let mut phdr = 0;
@@ -116,8 +116,8 @@ pub(crate) fn plan(elf: &[u8], ram_size: u64, base: u64) -> Result<(Loaded, Vec<
             6 => phdr = base + vaddr,
             1 => {
                 let at = base + vaddr;
-                if at.checked_add(memsz).is_none_or(|e| e > ram_size) || filesz > memsz {
-                    return Err(format!("segment at {at:#x} is past RAM"));
+                if at.checked_add(memsz).is_none_or(|e| e > limit) || filesz > memsz {
+                    return Err(format!("segment at {at:#x} is past the address space"));
                 }
                 // PF_X, PF_W, PF_R as PROT_EXEC, PROT_WRITE, PROT_READ
                 let prot = (flags & 4 != 0) as u8 | (flags & 2) as u8 | ((flags & 1) as u8) << 2;

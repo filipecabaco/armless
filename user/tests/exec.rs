@@ -1114,6 +1114,123 @@ fn mremap_moves_pages_without_copying_them() {
     assert!(matches!(status, Status::Exited(7)), "{status:?}");
 }
 
+// ------------------------------------------------------------ the address space is not the RAM
+
+/// movz xd, #imm, lsl #32
+fn movz_hi(rd: u32, imm: u32) -> u32 {
+    0xd2c0_0000 | imm << 5 | rd
+}
+
+impl Asm {
+    /// x`rd` = mmap(0, `gib` GiB, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
+    fn reserve(&mut self, rd: u32, gib: u32) -> &mut Self {
+        self.movz(0, 0)
+            .i(movz_hi(1, gib / 4))
+            .movz(2, 0)
+            .movz(3, 0x4022)
+            .i(0x9280_0004) // movn x4, #0
+            .movz(5, 0)
+            .svc(222)
+            .i(mov(rd, 0))
+    }
+}
+
+#[test]
+fn a_reservation_larger_than_ram_costs_frames_only_where_it_is_touched() {
+    // The machine has 128 MiB. The program reserves 8 GiB (a JavaScript engine's heap cage, a
+    // WebAssembly memory's guard region): that costs no frame. Three pages 4 GiB into it (past
+    // the end of RAM: a virtual address is not a physical one) are made writable and written:
+    // they and their tables cost frames, and nothing else does. madvise(DONTNEED) gives two of
+    // them back; they read as zeros again, which takes frames again, and munmap gives back
+    // everything, tables too.
+    let mut a = Asm::default();
+    a.room().read_byte(31); // (x31 reads as 0: stdin) wait: nothing mapped yet
+    a.reserve(19, 8);
+    a.i(movz_hi(22, 1)).i(add(22, 19, 22)); // x22 = x19 + 4 GiB
+    a.i(mov(0, 22))
+        .movz(1, 3 * 4096)
+        .movz(2, 3)
+        .svc(226)
+        .cbnz_fail(0);
+    a.read_byte(31); // wait: reserved, and nothing touched
+    for page in 0..3 {
+        a.i(add_imm(23, 22, page, true))
+            .movz(21, 7 + page as u16)
+            .i(strb(21, 23));
+    }
+    a.read_byte(31); // wait: three pages written
+    a.i(mov(0, 22))
+        .movz(1, 2 * 4096)
+        .movz(2, 4)
+        .svc(233)
+        .cbnz_fail(0); // MADV_DONTNEED
+    a.read_byte(31); // wait: two pages given back
+    a.i(ldrb(20, 22));
+    a.i(add_imm(23, 22, 1, true))
+        .i(ldrb(21, 23))
+        .i(add(20, 20, 21));
+    a.cbnz_fail(20); // both read as zero
+    a.i(add_imm(23, 22, 2, true))
+        .i(ldrb(21, 23))
+        .cmp_imm(21, 9)
+        .bcond(COND_NE, "fail");
+    a.i(mov(0, 19)).i(movz_hi(1, 2)).svc(215).cbnz_fail(0); // munmap all 8 GiB
+    a.read_byte(31); // wait: nothing left
+    a.ends();
+    let (mut vm, mut p) = start(&a.elf());
+    let mut frames = Vec::new();
+    for _ in 0..5 {
+        let (_, status) = run(&mut p, &mut vm.cpus[0]);
+        assert!(
+            matches!(status, Status::Idle(None)),
+            "waits for input: {status:?}"
+        );
+        frames.push(p.frames_in_use());
+        p.input(b"\n");
+    }
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(out.ends_with(b"A"), "{out:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    let [before, reserved, touched, advised, unmapped] = frames[..] else {
+        unreachable!()
+    };
+    assert_eq!(
+        reserved, before,
+        "8 GiB reserved, and no frame taken for it"
+    );
+    // three pages, a table of the second level and one or two of the third (the pages are in
+    // one range of 2 MiB or straddle two)
+    assert!((5..=6).contains(&(touched - reserved)), "{frames:?}");
+    assert_eq!(advised, touched - 2, "{frames:?}");
+    assert_eq!(unmapped, before, "{frames:?}");
+}
+
+#[test]
+fn the_address_space_holds_many_reservations_and_ends_where_it_ends() {
+    // Sixteen reservations of 8 GiB (128 GiB, a thousand times the RAM) all succeed, and are not
+    // the same range; a terabyte is more than the space and is ENOMEM
+    let mut a = Asm::default();
+    a.room().movz(19, 0);
+    for _ in 0..16 {
+        a.i(mov(20, 19)).reserve(19, 8);
+        a.cmn_imm(19, 4095).bcond(2, "fail"); // not an errno
+        a.cmp(19, 20).bcond(COND_EQ, "fail");
+    }
+    a.movz(0, 0)
+        .i(movz_hi(1, 256))
+        .movz(2, 0)
+        .movz(3, 0x4022)
+        .i(0x9280_0004)
+        .movz(5, 0)
+        .svc(222);
+    a.cmn_imm(0, 12).bcond(COND_NE, "fail"); // ENOMEM
+    a.ends();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
 // ------------------------------------------------------------ processes
 
 const CLONE_VM: u32 = 0x100;

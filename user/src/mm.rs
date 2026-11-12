@@ -4,7 +4,12 @@
 //! from if any) and the page tables the CPU walks to reach them (4 KiB pages, one root per space,
 //! tagged with an ASID of its own so a switch between processes flushes nothing). The tables live
 //! in frames of the pool like the pages do, and no page of any process maps them. VA is not PA:
-//! a page has a frame when something first touches it. The touch is a translation fault, which
+//! a page has a frame when something first touches it, so what a program maps costs nothing until
+//! it uses it: a reservation (PROT_NONE, or MAP_NORESERVE) of far more than the RAM there is
+//! (a JavaScript engine's heap cage, a WebAssembly memory's guard region) costs the tables of the
+//! pages touched and those pages, and munmap or madvise(MADV_DONTNEED) gives them back. There is
+//! no overcommit check: a program that touches more than the RAM has is stopped when the pool
+//! runs dry, not when it maps. The touch is a translation fault, which
 //! stops the CPU (`stop_on_exceptions`): the area says what the page is (zeros, or a part of a
 //! file, read now, or its thread waits for the blobs that needs and touches it again once they
 //! arrived), a frame is taken and mapped, and the instruction runs again. A snapshot therefore
@@ -24,7 +29,7 @@
 //! went away or lost permissions, the pages of a break of sharing otherwise.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 use armless::cpu::Cpu;
@@ -53,8 +58,9 @@ const ADDR: u64 = 0x0000_ffff_ffff_f000;
 /// granule, 16-bit ASIDs, no walks from TTBR1 (EPD1), 40-bit physical addresses.
 const TCR: u64 = 25 | (1 << 8) | (1 << 10) | (3 << 12) | (1 << 23) | (1 << 36) | (2 << 32);
 const MAIR: u64 = 0xff;
-/// The end of the space a 39-bit table reaches
-const VA_END: u64 = 1 << 39;
+/// The end of the space a 39-bit table reaches: 512 GiB of address space for each process, far
+/// more than there is RAM, since a page has a frame only when something touches it.
+pub(crate) const VA_END: u64 = 1 << 39;
 
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
@@ -518,14 +524,47 @@ impl Mm {
         self.merge(a, b);
     }
 
-    /// `a..b` unmapped: its areas gone, its frames given back.
+    /// The tables `a..b` reaches that have no page left in them, given back.
+    fn trim(&mut self, f: &mut Frames, a: u64, b: u64) {
+        let b = b.min(VA_END);
+        if a >= b {
+            return;
+        }
+        let (first, last) = (idx(a, 1), idx(b - 1, 1));
+        for i1 in first..=last {
+            let at1 = self.root + 8 * i1;
+            let d1 = f.get(at1);
+            if d1 & 1 == 0 {
+                continue;
+            }
+            let t2 = d1 & ADDR;
+            let lo = if i1 == first { idx(a, 2) } else { 0 };
+            let hi = if i1 == last { idx(b - 1, 2) } else { 511 };
+            for i2 in lo..=hi {
+                let at2 = t2 + 8 * i2;
+                let d2 = f.get(at2);
+                if d2 & 1 != 0 && (0..512).all(|i| f.get((d2 & ADDR) + 8 * i) & 1 == 0) {
+                    f.put(at2, 0);
+                    f.decref(d2 & ADDR);
+                }
+            }
+            if (0..512).all(|i| f.get(t2 + 8 * i) & 1 == 0) {
+                f.put(at1, 0);
+                f.decref(t2);
+            }
+        }
+    }
+
+    /// `a..b` unmapped: its areas gone, its frames given back, and the tables left with nothing.
     pub(crate) fn unmap(&mut self, f: &mut Frames, a: u64, b: u64) {
+        let mut taken = false;
         for (s, v) in self.cut(a, b) {
             let data_end = v.file.map_or(0, |b| page_up(b.data_end));
             let mut filled = 0;
             for (va, slot, d) in self.leaves(f, s, v.end) {
                 f.put(slot, 0);
                 f.decref(d & ADDR);
+                taken = true;
                 if va < data_end {
                     filled += 1;
                 }
@@ -533,6 +572,9 @@ impl Mm {
             if let Some(bk) = v.file {
                 self.lazy_less(bk.ino, Mm::data_pages(&v, s).saturating_sub(filled));
             }
+        }
+        if taken {
+            self.trim(f, a, b);
         }
         self.stale = true;
         f.reap();
@@ -717,14 +759,15 @@ impl Mm {
             refs: self.per_file.keys().map(|&i| (i, true)).collect(),
         };
         // What is shared has all its pages first, for both sides to see the same ones
+        // (a PROT_NONE one, a reservation, has none to share and costs nothing)
         let shared: Vec<(u64, u64)> = self
             .vmas
             .iter()
-            .filter(|(_, v)| v.shared)
+            .filter(|(_, v)| v.shared && v.prot != 0)
             .map(|(&s, v)| (s, v.end))
             .collect();
         for (s, e) in shared {
-            let have: Vec<u64> = self.leaves(f, s, e).iter().map(|l| l.0).collect();
+            let have: HashSet<u64> = self.leaves(f, s, e).iter().map(|l| l.0).collect();
             let mut at = s;
             while at < e {
                 if !have.contains(&at) {
@@ -852,12 +895,12 @@ impl Mm {
             per_file: BTreeMap::new(),
             refs: Vec::new(),
         };
-        if root >= ram_size || mmap_top > ram_size || mmap_floor > mmap_top {
+        if root >= ram_size || mmap_top > VA_END || mmap_floor > mmap_top {
             return Err(bad());
         }
         for _ in 0..r.u()? {
             let (s, end, flags) = (r.u()?, r.u()?, r.u()?);
-            if s >= end || end > ram_size {
+            if s >= end || end > VA_END {
                 return Err(bad());
             }
             let file = if flags & 1 << 9 != 0 {
@@ -881,7 +924,7 @@ impl Mm {
         }
         for _ in 0..r.u()? {
             let (s, e) = (r.u()?, r.u()?);
-            if s >= e || e > ram_size {
+            if s >= e || e > VA_END {
                 return Err(bad());
             }
             m.free.insert(s, e);
@@ -1048,13 +1091,14 @@ impl Process {
         }
     }
 
-    fn in_ram(&self, addr: u64, len: usize) -> bool {
+    /// Whether `addr..addr + len` is inside the address space (its pages may not be there)
+    fn in_space(addr: u64, len: usize) -> bool {
         addr.checked_add(len as u64)
-            .is_some_and(|end| end <= self.ram_size)
+            .is_some_and(|end| end <= VA_END)
     }
 
     pub(crate) fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        if !self.in_ram(addr, buf.len()) {
+        if !Process::in_space(addr, buf.len()) {
             return false;
         }
         let mut done = 0;
@@ -1082,7 +1126,7 @@ impl Process {
     }
 
     fn write_as(&self, addr: u64, data: &[u8], acc: Acc) -> bool {
-        if !self.in_ram(addr, data.len()) {
+        if !Process::in_space(addr, data.len()) {
             return false;
         }
         let mut done = 0;
@@ -1108,7 +1152,7 @@ impl Process {
         if len == 0 {
             return true;
         }
-        let Some(end) = addr.checked_add(len).filter(|&e| e <= self.ram_size) else {
+        let Some(end) = addr.checked_add(len).filter(|&e| e <= VA_END) else {
             return false;
         };
         let mut at = addr & !(PAGE - 1);
@@ -1330,7 +1374,7 @@ impl Process {
         if len == 0 {
             return v(-EINVAL);
         }
-        if len > self.ram_size {
+        if len > VA_END {
             return v(-ENOMEM);
         }
         let len = page_up(len);
@@ -1339,7 +1383,7 @@ impl Process {
         if fixed
             && (!addr.is_multiple_of(PAGE)
                 || addr < PAGE
-                || addr.checked_add(len).is_none_or(|e| e > self.ram_size))
+                || addr.checked_add(len).is_none_or(|e| e > VA_END))
         {
             return v(-EINVAL);
         }
@@ -1393,7 +1437,7 @@ impl Process {
             return -EINVAL;
         }
         let a = addr & !(PAGE - 1);
-        let b = page_up(addr.saturating_add(len)).min(self.ram_size);
+        let b = page_up(addr.saturating_add(len).min(VA_END));
         if a >= b {
             return 0;
         }
@@ -1408,7 +1452,7 @@ impl Process {
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
-        if !addr.is_multiple_of(PAGE) || addr.saturating_add(len) > self.ram_size {
+        if !addr.is_multiple_of(PAGE) || addr.saturating_add(len) > VA_END {
             return -EINVAL;
         }
         let b = page_up(addr + len);
@@ -1426,7 +1470,7 @@ impl Process {
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
         if advice == 4 || advice == 8 {
             let a = addr & !(PAGE - 1);
-            let b = page_up(addr.saturating_add(len)).min(self.ram_size);
+            let b = page_up(addr.saturating_add(len).min(VA_END));
             self.p
                 .mm
                 .borrow_mut()
@@ -1436,7 +1480,13 @@ impl Process {
     }
 
     pub(crate) fn sys_mremap(&mut self, old: u64, old_len: u64, new_len: u64, flags: u64) -> i64 {
-        if !old.is_multiple_of(PAGE) || old_len == 0 || new_len == 0 || new_len > self.ram_size {
+        if !old.is_multiple_of(PAGE)
+            || old_len == 0
+            || new_len == 0
+            || new_len > VA_END
+            || old >= VA_END
+            || old_len > VA_END
+        {
             return -EINVAL;
         }
         let mut mm = self.p.mm.borrow_mut();

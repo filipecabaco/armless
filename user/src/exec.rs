@@ -179,7 +179,7 @@ impl Process {
             };
             name = interp;
         };
-        let Ok(layout) = Layout::of(image.head(), self.ram_size) else {
+        let Ok(layout) = Layout::of(image.head()) else {
             return v(-ENOEXEC);
         };
         let strings = |a: &[Vec<u8>]| -> Vec<String> {
