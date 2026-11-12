@@ -1318,8 +1318,8 @@ impl Process {
             94 => Ret::GroupExit(a[0] as i32),
             260 => self.sys_wait4(&a),
             95 => self.sys_waitid(&a),
-            // execve, fork-like: not yet
-            221 | 281 => v(-ENOSYS),
+            221 => self.sys_execve(cpu, cur, AT_FDCWD, [a[0], a[1], a[2], 0]),
+            281 => self.sys_execve(cpu, cur, a[0] as i32, [a[1], a[2], a[3], a[4]]),
 
             // ---------------------------------------------------- ids
             178 => v(tid),

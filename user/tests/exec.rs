@@ -289,6 +289,8 @@ struct Asm {
     labels: std::collections::HashMap<&'static str, usize>,
     /// (instruction index, label, how to patch it)
     fixups: Vec<(usize, &'static str, Fix)>,
+    /// Strings of its own after the standard ones, NUL-terminated and padded to a word
+    texts: Vec<(&'static str, &'static [u8])>,
 }
 
 #[derive(Clone, Copy)]
@@ -305,6 +307,12 @@ const COND_EQ: u32 = 0;
 const COND_NE: u32 = 1;
 
 impl Asm {
+    fn with_texts(texts: Vec<(&'static str, &'static [u8])>) -> Asm {
+        Asm {
+            texts,
+            ..Asm::default()
+        }
+    }
     fn i(&mut self, w: u32) -> &mut Self {
         self.code.push(w);
         self
@@ -411,10 +419,15 @@ impl Asm {
         for (i, s) in strings.iter().enumerate() {
             self.labels.insert(s, at + i);
         }
-        let data: Vec<u8> = strings
+        let mut data: Vec<u8> = strings
             .iter()
             .flat_map(|s| [s.as_bytes()[0], 0, 0, 0])
             .collect();
+        for &(l, text) in &self.texts {
+            self.labels.insert(l, at + data.len() / 4);
+            data.extend_from_slice(text);
+            data.resize((data.len() / 4 + 1) * 4, 0);
+        }
         let mut code = self.code.clone();
         for &(i, l, f) in &self.fixups {
             let off = (self.labels[l] as i64 - i as i64) * 4;
@@ -1359,5 +1372,288 @@ fn processes_survive_a_snapshot_with_their_shared_pages() {
     p.input(b"x\n");
     let (out, status) = run(&mut p, &mut vm.cpus[0]);
     assert_eq!(out, b"x\r\nA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+// ------------------------------------------------------------ exec
+
+/// ldr xt, [xn, #off]
+fn ldr(rt: u32, rn: u32, off: u32) -> u32 {
+    0xf940_0000 | (off / 8) << 10 | rn << 5 | rt
+}
+
+/// A machine whose filesystem has these files (name, mode, contents). The contents of those not in
+/// `now` come as blobs when asked for: `run_with_files` gives them.
+fn machine_with(
+    files: &[(&str, u32, &[u8])],
+    now: &[&str],
+) -> Vm<armless::platform::NativePlatform> {
+    let config = Config {
+        memory_size: 128 << 20,
+        cpus: 1,
+        devices: armless::dev::DeviceConfig {
+            console: false,
+            fs_tag: Some("host9p".into()),
+            ..Default::default()
+        },
+    };
+    let vm = armless::runner::new_vm(config).unwrap().0;
+    let entries: Vec<String> = files
+        .iter()
+        .map(|(n, mode, data)| format!(r#"["{n}",{},0,{mode},0,0,"{n}-blob"]"#, data.len()))
+        .collect();
+    let json = format!(r#"{{"version":3,"fsroot":[{}]}}"#, entries.join(","));
+    vm.board.load_filesystem(json.as_bytes()).unwrap();
+    for (n, _, data) in files {
+        if now.contains(n) {
+            vm.board
+                .provide_raw_blob(&format!("{n}-blob"), data.to_vec())
+                .unwrap();
+        }
+    }
+    vm
+}
+
+/// Runs to the end, giving the files' blobs when the machine asks for them: what it printed, how
+/// it ended, and the blobs it asked for.
+fn run_with_files(
+    p: &mut Process,
+    vm: &mut Vm<armless::platform::NativePlatform>,
+    files: &[(&str, u32, &[u8])],
+) -> (Vec<u8>, Status, Vec<String>) {
+    let mut out = Vec::new();
+    let mut asked = Vec::new();
+    loop {
+        let (o, status) = run(p, &mut vm.cpus[0]);
+        out.extend(o);
+        let wanted: Vec<String> = vm
+            .board
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                armless::Event::Blob(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        if !p.waiting_on_blobs() {
+            return (out, status, asked);
+        }
+        assert!(!wanted.is_empty(), "waits on blobs it didn't ask for");
+        for n in wanted {
+            let (_, _, data) = files
+                .iter()
+                .find(|(f, _, _)| n == format!("{f}-blob"))
+                .unwrap_or_else(|| panic!("asked for {n}"));
+            vm.board.provide_raw_blob(&n, data.to_vec()).unwrap();
+            asked.push(n);
+        }
+    }
+}
+
+const EXE: u32 = 0o100755;
+const PLAIN: u32 = 0o100644;
+
+/// The first process of a machine with these files, from /prog.
+fn exec_prog(vm: &mut Vm<armless::platform::NativePlatform>) -> Process {
+    let board = vm.board.clone();
+    Process::exec(&mut vm.cpus[0], board, &["/prog".into()], &[], "/").unwrap()
+}
+
+impl Asm {
+    /// execve(label, NULL, NULL) into x0
+    fn execve(&mut self, path: &'static str) -> &mut Self {
+        self.adr(0, path).movz(1, 0).movz(2, 0).svc(221)
+    }
+    /// execve(path, {path, arg, NULL}, envp) with the arrays built on the stack: envp is
+    /// {env, NULL} when `env` is given, else empty
+    fn execve_with(
+        &mut self,
+        path: &'static str,
+        arg: &'static str,
+        env: Option<&'static str>,
+    ) -> &mut Self {
+        self.i(0xd100_c3ff) // sub sp, sp, #48
+            .adr(9, path)
+            .str_sp(9, 0)
+            .adr(9, arg)
+            .str_sp(9, 8)
+            .str_sp(31, 16);
+        if let Some(env) = env {
+            self.adr(9, env).str_sp(9, 24);
+        } else {
+            self.str_sp(31, 24);
+        }
+        self.str_sp(31, 32)
+            .adr(0, path)
+            .i(0x9100_03e1) // mov x1, sp
+            .i(add_imm(2, 31, 24, false))
+            .svc(221)
+    }
+}
+
+/// What /prog execs in the exec tests: argc must be 2, argv[1] start with "a", envp[0] with "K";
+/// descriptor 5 is open and 4 closed (the pipe's write end, dup'ed without close-on-exec and not);
+/// it prints "B" and sends itself SIGUSR1.
+fn exec_target() -> Vec<u8> {
+    let mut a = Asm::default();
+    a.i(ldr(19, 31, 0)).cmp_imm(19, 2).bcond(COND_NE, "fail");
+    a.i(ldr(1, 31, 16))
+        .i(ldrb(2, 1))
+        .cmp_imm(2, b'a' as u32)
+        .bcond(COND_NE, "fail");
+    a.i(ldr(1, 31, 32))
+        .i(ldrb(2, 1))
+        .cmp_imm(2, b'K' as u32)
+        .bcond(COND_NE, "fail");
+    a.movz(21, 5)
+        .write_w(21)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    a.movz(21, 4)
+        .write_w(21)
+        .cmn_imm(0, 9)
+        .bcond(COND_NE, "fail"); // EBADF
+    a.print("B", 1);
+    a.svc(172).movz(1, SIGUSR1).svc(129); // kill(getpid(), SIGUSR1)
+    a.exit(0);
+    a.label("fail").print("E", 1).exit(1);
+    a.elf()
+}
+
+#[test]
+fn exec_runs_another_program_in_the_same_process() {
+    // The process forks and its child execs /child, whose blob comes only when asked for (the
+    // call waits and runs again). The child's pid is still the one wait4 was given; the pipe end
+    // that was close-on-exec is closed in it and the dup'ed one is not; its SIGUSR1 handler from
+    // before is the default again, so the signal ends it (status 10) with no "H".
+    let mut a = Asm::with_texts(vec![
+        ("target", b"/child"),
+        ("arg", b"arg"),
+        ("env", b"K=V"),
+    ]);
+    a.room().sigaction(SIGUSR1, "handler", SA_RESTORER);
+    a.i(add_imm(0, 31, 8, false))
+        .mov32(1, 0x80000)
+        .svc(59)
+        .cbnz_fail(0); // pipe2(O_CLOEXEC)
+    a.ldr_w(23, 31, 8).ldr_w(24, 31, 12);
+    a.i(mov(0, 24)).svc(23).cmp_imm(0, 5).bcond(COND_NE, "fail"); // dup of the write end: fd 5
+    a.fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(SIGUSR1 as u32);
+    a.read_byte(23).cmp_imm(0, 1).bcond(COND_NE, "fail"); // what the new program wrote to fd 5
+    a.ends();
+    a.label("child")
+        .execve_with("target", "arg", Some("env"))
+        .b("fail");
+    a.common();
+    let prog = a.elf();
+    let target = exec_target();
+    let files: [(&str, u32, &[u8]); 2] = [("prog", EXE, &prog), ("child", EXE, &target)];
+    let mut vm = machine_with(&files, &["prog"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, asked) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"BA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    assert_eq!(asked, ["child-blob"]);
+}
+
+#[test]
+fn a_script_runs_its_interpreter_with_the_scripts_path() {
+    // /script is "#!/args -v": the interpreter gets {"/args", "-v", "/script", "arg"}: it prints
+    // the first byte of argv[1] and exits with argc
+    let mut args = Asm::default();
+    args.i(ldr(19, 31, 0))
+        .i(ldr(1, 31, 16))
+        .movz(0, 1)
+        .movz(2, 1)
+        .svc(64);
+    args.i(mov(0, 19)).svc(94);
+    let args = args.elf();
+    let mut a = Asm::with_texts(vec![("script", b"/script"), ("arg", b"arg")]);
+    a.room().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(4 << 8).ends();
+    a.label("child")
+        .execve_with("script", "arg", None)
+        .b("fail");
+    let prog = a.elf();
+    let files: [(&str, u32, &[u8]); 3] = [
+        ("prog", EXE, &prog),
+        ("args", EXE, &args),
+        ("script", EXE, b"#!/args -v\nignored\n"),
+    ];
+    let mut vm = machine_with(&files, &["prog", "args", "script"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"-A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_vfork_parent_goes_on_when_its_child_execs() {
+    // The child writes in the shared page and execs a program that waits for input forever; the
+    // parent runs again then, and the page it has is intact and has the child's write
+    let mut waits = Asm::default();
+    waits
+        .i(0xd100_43ff)
+        .i(0x9100_03e1)
+        .movz(0, 0)
+        .movz(2, 1)
+        .svc(63)
+        .exit(0); // read(0, sp, 1)
+    let waits = waits.elf();
+    let mut a = Asm::with_texts(vec![("wait", b"/wait")]);
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 1).i(strb(21, 19));
+    a.clone(CLONE_VM | CLONE_VFORK | SIGCHLD as u32)
+        .cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.i(ldrb(22, 19)).cmp_imm(22, 9).bcond(COND_NE, "fail");
+    a.wait4(Some(20), WNOHANG).cbnz_fail(0); // the child lives on, as the new program
+    a.ends();
+    a.label("child")
+        .movz(21, 9)
+        .i(strb(21, 19))
+        .execve("wait")
+        .b("fail");
+    let prog = a.elf();
+    let files: [(&str, u32, &[u8]); 2] = [("prog", EXE, &prog), ("wait", EXE, &waits)];
+    let mut vm = machine_with(&files, &["prog", "wait"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_failed_exec_returns_the_error_and_leaves_the_program_as_it_was() {
+    let mut a = Asm::with_texts(vec![
+        ("missing", b"/missing"),
+        ("plain", b"/plain"),
+        ("text", b"/text"),
+        ("root", b"/"),
+    ]);
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.movz(21, 7).i(strb(21, 19));
+    a.execve("missing").cmn_imm(0, 2).bcond(COND_NE, "fail"); // ENOENT
+    a.execve("plain").cmn_imm(0, 13).bcond(COND_NE, "fail"); // EACCES: not executable
+    a.execve("root").cmn_imm(0, 13).bcond(COND_NE, "fail"); // EACCES: a directory
+    a.execve("text").cmn_imm(0, 8).bcond(COND_NE, "fail"); // ENOEXEC: not an ELF
+    a.i(ldrb(22, 19)).cmp_imm(22, 7).bcond(COND_NE, "fail");
+    a.ends();
+    let prog = a.elf();
+    let target = exec_target();
+    let files: [(&str, u32, &[u8]); 3] = [
+        ("prog", EXE, &prog),
+        ("plain", PLAIN, &target),
+        ("text", EXE, b"hello\n"),
+    ];
+    let mut vm = machine_with(&files, &["prog", "plain", "text"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }

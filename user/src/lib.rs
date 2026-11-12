@@ -28,6 +28,7 @@
 #![deny(unsafe_code)]
 
 mod elf;
+mod exec;
 mod files;
 pub mod host;
 mod mm;

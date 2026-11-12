@@ -225,6 +225,18 @@ impl Signals {
         }
     }
 
+    /// What execve leaves: handled signals go back to the default (ignored ones stay ignored),
+    /// and the trampoline is gone with the old address space
+    pub fn exec(&mut self) {
+        for a in &mut self.actions {
+            *a = Action {
+                handler: if a.handler == SIG_IGN { SIG_IGN } else { SIG_DFL },
+                ..Action::default()
+            };
+        }
+        self.trampoline = 0;
+    }
+
     /// Whether the process's children vanish when they end, with no one to wait for them
     /// (SIGCHLD ignored, or SA_NOCLDWAIT)
     pub fn children_vanish(&self) -> bool {
