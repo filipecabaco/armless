@@ -8,8 +8,9 @@
 //! from the filesystem, as execve has it), the machine's filesystem (armless's, the one the 9p
 //! device serves a Linux guest), a terminal (termios, the window size, a line discipline), pipes,
 //! sockets (net.rs: AF_UNIX, and TCP and UDP on the loopback in memory, a network at the host for
-//! the rest), threads (clone, futexes), epoll, poll and select, clocks and sleeps. Blocking calls park their
-//! thread and run again when something changes, so a snapshot can be taken whatever it waits on.
+//! the rest), threads (clone, futexes), processes (fork, vfork, execve, wait4, kill: proc.rs,
+//! exec.rs), epoll, poll and select, clocks and sleeps. Blocking calls park their thread and run
+//! again when something changes, so a snapshot can be taken whatever it waits on.
 //!
 //! Signals are delivered as Linux delivers them (`signal`): handlers on the frame the kernel
 //! builds, masks, alternate stacks, blocking calls interrupted (EINTR, or restarted with
@@ -20,9 +21,11 @@
 //! has a frame of RAM when the program first touches it. Files are mapped lazily: the
 //! executable's segments, its loader's, and mmap of a file get a page's contents when it is
 //! first touched, so a snapshot holds only the pages a program used. Protections hold
-//! (PROT_NONE, read-only and no-execute pages fault).
+//! (PROT_NONE, read-only and no-execute pages fault). The address space (512 GiB) has nothing to
+//! do with the RAM: what a program maps costs frames only where it touches, so a reservation far
+//! larger than the RAM is fine, and a fork shares its pages copy on write.
 //!
-//! Not yet: fork, and more than one vCPU (threads take turns on one CPU).
+//! Not yet: more than one vCPU (threads of all processes take turns on one CPU).
 
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]

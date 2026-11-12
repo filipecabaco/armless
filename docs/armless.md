@@ -256,33 +256,57 @@ x0–x5, answers it in x0, and resumes at ELR.
   - *Not supported:* `SCM_RIGHTS` and other ancillary data (`EOPNOTSUPP`), `SOCK_SEQPACKET`,
     raw and packet sockets, `socketpair` for anything but AF_UNIX, a separate `RDHUP`, backpressure
     from the guest to the host (a host stream's data is taken as it comes).
-- **Memory:** VA is PA. The ELF's segments go where they ask (a PIE, and the loader, at a base
-  of their own), `brk` after them, the stack at the top of RAM and `mmap` below it, from a free
-  list; `mremap` moves or grows. Freed ranges are given back to the host with `Ram::discard`
-  (fresh zero pages), so a program that reserves and releases large ranges (Go reserves about
-  600 MB of address space at start) costs only what it touches. RAM must still be large
-  enough for those reservations.
-- **Lazy file pages** (user/src/mm.rs): the executable's segments, its loader's, and every
-  `mmap` of a file are mapped, not read: a page gets its contents when something first touches
+- **Memory** (user/src/mm.rs): virtual. Each process has page tables of its own (4 KiB pages,
+  39 bits: 512 GiB of address space, an ASID per process so a switch flushes nothing) over one
+  pool of refcounted frames, the machine's RAM; the tables are in frames too, which no process
+  maps. A process's areas say what each range is: its protection, whether it is shared, and the
+  file its pages come from if any. The ELF's segments go where they ask (a PIE, and the loader,
+  at a base of their own), `brk` after them, the stack at the top of the space and `mmap` below
+  it, from a free list; `mremap` moves or grows by moving page table entries, not pages.
+  Protections hold: a store to a read-only page, a jump to one that is not executable and any
+  access to PROT_NONE are faults, and a system call cannot write where the program cannot
+  (EFAULT). The address space has nothing to do with the RAM: a page has a frame when something
+  first touches it (a translation fault stops the CPU, the host takes a frame, zeroed or filled
+  from its file, maps it, and resumes at the instruction). So a reservation costs nothing: a
+  PROT_NONE or MAP_NORESERVE mapping of 8 GiB on a machine of 128 MiB (what V8's heap cage and
+  WebAssembly memories ask for, and Go's 600 MB) takes no frame, `mprotect` and touches take
+  frames where the program uses them, and `munmap` and `madvise(MADV_DONTNEED)` give them back
+  (`munmap` the page tables with nothing left in them too; a frame's memory goes back to the
+  host with `Ram::discard`). There is no overcommit check: a program that touches more than the
+  RAM has is stopped when the pool runs dry, not when it maps.
+- **Lazy file pages:** the executable's segments, its loader's, and every `mmap` of a file are
+  areas with a file behind them, not read: a page gets its contents when something first touches
   it. So a snapshot holds the pages a program used, not every byte of every library it mapped,
-  and only their blobs are fetched. Once a process maps a file the MMU is on, still VA = PA:
-  identity page tables the process keeps in a 2 MiB block of the mmap area (the program can't
-  touch it, the host refuses it to system calls), 2 MiB blocks for all of RAM and a table of
-  4 KiB pages only for a block with lazy pages, those invalid. A touch of one is a translation
-  fault: the host fills the page from its file (or the thread waits for its blobs, as a read
-  does, and touches it again), makes it valid and resumes at the instruction. A system call
-  that reads or writes a lazy page (a `write` from a mapped page) fills it first; a block whose
-  pages are all filled is a block again. Making a page valid needs no TLB maintenance; a
-  mapping over pages flushes the TLB. A private write fills the page, then writes it. The lazy
-  mappings and the tables' bookkeeping are in the process state. With no room for the tables
-  (or RAM not whole 2 MiB blocks) files are read in at once as before; `ARMLESS_USER_EAGER=1`
-  does that always, for comparisons. The MMU costs nothing measurable: a pointer chase over 256
-  MB and CPU-bound Python run within noise of it off, interpreter and native JIT alike (a fast
-  table miss walks three levels instead of none, and a miss is already the slow path).
+  and only their blobs are fetched. The fault the touch is stops the CPU; the host fills the page
+  from its file (or the thread waits for its blobs, as a read does, and touches it again), maps
+  it and resumes. A system call that reads or writes a lazy page (a `write` from a mapped page)
+  fills it first. File mappings are private copies: a write gets the page a frame of its own and
+  the file keeps its contents. The areas' bookkeeping is in the process state.
+  `ARMLESS_USER_EAGER=1` reads every mapped page at once, for comparisons.
 - **Threads:** every guest thread is a saved register context, and they take turns on one
   CPU in slices of instructions; a syscall answered on the way counts against the slice.
-  `clone` (threads only), futexes (with timeouts and bitsets), `set_tid_address` and
+  `clone` (threads, CLONE_THREAD), futexes (with timeouts and bitsets), `set_tid_address` and
   `CLONE_CHILD_CLEARTID`.
+- **Processes** (user/src/proc.rs, exec.rs): a process is an address space, a descriptor table,
+  a working directory, signal actions and its threads; the descriptions the descriptors refer
+  to, the pipes, the terminal and the clock are the machine's, shared by all, so a pipe joins a
+  parent and its child. `clone` makes one with `fork`'s flags, as `vfork` (the parent waits until
+  the child execs or ends) or with CLONE_VM, and `clone3` too; the address space is copied on
+  write (the tables are copied, not the pages: both sides map the frames read-only, and the
+  first write by either takes a frame of its own, or makes the page writable again when the
+  other side is gone). `execve` and `execveat` (an fd, AT_EMPTY_PATH) run another program in the
+  same process: a new address space, the descriptors that are not close-on-exec, handled
+  signals back to the default, the other threads gone, and a `#!` script runs its interpreter; a
+  failure (ENOENT, EACCES, ENOEXEC, E2BIG, ELOOP) leaves the program as it was, and one whose
+  file hasn't arrived waits for it and runs again. `wait4` and `waitid` (WNOHANG, a pid, a
+  group or any child; a zombie keeps its status), `kill` of a pid, and SIGCHLD when a child
+  ends (a parent that ignores it leaves no zombies). A process's `exit_group` ends only it; its
+  children go to the first process, and the machine ends when that one does. Not yet: the
+  descriptor table, signal actions and working directory shared by CLONE_FILES, CLONE_SIGHAND
+  and CLONE_FS (copied instead), futexes across processes (those of a MAP_SHARED page, or of
+  CLONE_VM processes, wake only within a process), the siginfo of SIGCHLD (its pid and status),
+  job control (stop and continue), CLONE_PIDFD, namespaces, and a MAP_SHARED area that was
+  PROT_NONE at a fork shares nothing (the others have their untouched pages made at the fork).
 - **Blocking:** a call that can't complete (a read of the terminal or a pipe, a poll, a wait
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
@@ -304,11 +328,11 @@ x0–x5, answers it in x0, and resumes at ELR.
   Not yet: queued real-time signals, the masks of ppoll, pselect6 and epoll_pwait, and
   signals for faults.
 - **Snapshots:** the machine's own snapshot holds RAM and the filesystem; `Process::save` holds
-  the rest (threads, their waits, the memory map and lazy mappings, descriptors and pipes, the
-  terminal, the clock, signals), a few tens of KB. `Process::restore` takes it on a machine that
-  loaded the snapshot, and a state from 0.11 too (`ARMLUSR2`: nothing in it is lazy, and its
-  threads' alternate stacks weren't kept, so a thread's first SA_ONSTACK handler gets one of
-  its own).
+  the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
+  and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
+  are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
+  A state from before 0.14 does not load (`ARMLUSR4`: addresses are virtual, and there are
+  processes).
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,
@@ -348,15 +372,14 @@ too. A snapshot is the pair a native host makes: the machine's state, the bytes 
 (`state.bin.zst` and `user.bin`) restores in a page, and a pair saved in a page restores
 natively.
 
-Not yet: protections (no PROT_NONE, no nil-pointer faults, though the page tables could give
-them as invalid pages with no file), processes (`fork`, `execve`, `wait4`), more than
-one vCPU, and the hypervisor backends (an SVC at EL0 traps to EL1 in hardware there, not to the
-host).
+Not yet: signals for faults (a fault ends the process, SIGSEGV is not delivered to a
+handler), more than one vCPU, and the hypervisor backends (an SVC at EL0 traps to EL1 in
+hardware there, not to the host).
 
 What runs: snowglobe's `go` (Bubble Tea, static), `python` (the 3.14 REPL, 122 shared
 libraries) and `duckdb` (C++) examples, from their own images' filesystems; a Python REPL saved
 with its state and restored in 120 ms. `user/corpus/survey.exs` traces what each of snowglobe's
-examples asks of a kernel, for what comes next (processes).
+examples asks of a kernel, for what comes next.
 
 Measured as a snowglobe site (a Go program with eight goroutines, macOS, the same
 `snowglobe-vm` for each): the snapshot is 2.5 MB raw and 0.6 MB compressed, against 22.1 and
