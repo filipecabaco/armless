@@ -1,17 +1,20 @@
 //! Sockets, with no kernel: AF_UNIX (stream and datagram, paths and abstract names, socketpair)
-//! and AF_INET and AF_INET6 (TCP and UDP) are objects of the process (`Net`, in its `Files`),
-//! the way pipes are, and two sockets of the process meet in memory.
+//! and AF_INET and AF_INET6 (TCP and UDP) are objects of the machine's state (`Net`, in its
+//! `Files`), the way pipes are: a descriptor refers to a socket through its description, so a
+//! fork's child and a program execve runs have the sockets their parent's descriptors do (one
+//! with close-on-exec not), a listener is the one socket for every process that holds it, and a
+//! blocked call of any process runs again when something changes. Two sockets meet in memory.
 //!
-//! What is not the process's goes to the host, as the guest's TCP connections do (`Board::
+//! What is not the machine's goes to the host, as the guest's TCP connections do (`Board::
 //! local_*`, the network's stream calls: `Event::TcpOpen` out, `tcp_accept` or `tcp_refuse` back,
 //! `tcp_send`, `tcp_close`): a `connect` to an address that is not loopback opens a stream there,
-//! a host's `Board::tcp_connect(port)` reaches a socket the process listens on, and a datagram
+//! a host's `Board::tcp_connect(port)` reaches a socket a process listens on, and a datagram
 //! to port 53 is answered by the network's name service. Without a network (a machine built with
-//! `net: false`) only the process's own sockets exist.
+//! `net: false`) only the processes' own sockets exist.
 //!
 //! Not here: SCM_RIGHTS and other ancillary data (EOPNOTSUPP), UDP to the outside (but DNS),
 //! IPv6 to the outside, raw and packet sockets, SOCK_SEQPACKET, MSG_OOB, and a stream's
-//! backpressure towards the host (what the process writes waits in the network's outbox).
+//! backpressure towards the host (what a process writes waits in the network's outbox).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -70,7 +73,7 @@ fn e(errno: i64) -> Ret {
     Ret::Val(-errno)
 }
 
-/// A socket of the process.
+/// A socket.
 #[derive(Default)]
 pub(crate) struct Sock {
     domain: u8,
@@ -91,7 +94,7 @@ pub(crate) struct Sock {
     ino: Option<u64>,
     /// The sockaddr of the other end
     peer_name: Vec<u8>,
-    /// The other end, a socket of the process (a datagram socket of a pair too)
+    /// The other end, a socket in memory (a datagram socket of a pair too)
     peer: Option<u32>,
     /// The stream at the host
     host: Option<u32>,
@@ -145,7 +148,7 @@ pub(crate) enum Op {
     FsDrop(u64),
 }
 
-/// Every socket of the process, and the names they are bound to.
+/// Every socket, and the names they are bound to.
 #[derive(Default)]
 pub(crate) struct Net {
     socks: BTreeMap<u32, Sock>,
@@ -231,7 +234,7 @@ fn v4(a: &Addr) -> Option<([u8; 4], u16)> {
     }
 }
 
-/// Whether the address is the process's own (loopback, unspecified, its address)
+/// Whether the address is the machine's own (loopback, unspecified, its address)
 fn is_local(a: &Addr) -> bool {
     match a {
         Addr::Unix(_) => true,
@@ -483,7 +486,7 @@ impl Net {
 type Recvd = (Vec<u8>, Vec<u8>, bool);
 
 impl Process {
-    /// The ports the process listens on are the network's to forward to, and a network it
+    /// The ports the processes listen on are the network's to forward to, and a network it
     /// shares with a guest hands it the host's connections: at the start, and after a restore.
     pub(crate) fn net_attach(&self) {
         let Some(b) = &self.board else { return };
@@ -521,22 +524,20 @@ impl Process {
         }
     }
 
-    /// The process is done: its descriptors close, the host's side of its sockets goes.
+    /// The machine is done: every socket closes, whichever process had it, and the host's side
+    /// of them goes.
     pub(crate) fn net_exit(&mut self) {
-        let fds: Vec<i32> = self
+        let socks: Vec<u32> = self
             .files
-            .fds
-            .iter()
-            .filter(|(_, (d, _))| {
-                matches!(
-                    self.files.descs.get(d).map(|d| &d.kind),
-                    Some(Kind::Sock(_))
-                )
+            .descs
+            .values()
+            .filter_map(|d| match d.kind {
+                Kind::Sock(id) => Some(id),
+                _ => None,
             })
-            .map(|(&fd, _)| fd)
             .collect();
-        for fd in fds {
-            self.files.close(fd);
+        for id in socks {
+            self.files.net.close(id);
         }
         self.flush_net();
     }
@@ -1298,7 +1299,7 @@ impl Process {
         Ret::Val(0)
     }
 
-    /// Connects stream `id` to an address that is not the process's: at the host.
+    /// Connects stream `id` to an address that is not the machine's: at the host.
     fn connect_host(&mut self, id: u32, a: &Addr, sa: Vec<u8>, nonblock: bool) -> Ret {
         let (Some((ip, port)), Some(b)) = (v4(a), self.board.clone()) else {
             return e(ENETUNREACH);

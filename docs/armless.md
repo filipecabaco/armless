@@ -250,8 +250,12 @@ x0–x5, answers it in x0, and resumes at ELR.
     non-local address is a DNS query the network stack answers (`Board::local_dns`), so
     resolv.conf's nameserver works; other UDP to the outside and all IPv6 to the outside fail
     with ENETUNREACH.
-  - *Snapshots:* a socket's state is in the process's, streams and queues with their bytes
-    (`ARMLUSR4`; 0.12's state still loads). A connection to the host can't survive a restore:
+  - *Processes:* the sockets are the machine's, like the pipes: a descriptor refers to one
+    through its description, so a fork's child has its parent's sockets (a connected one, a
+    listener it can `accept` on too), `execve` keeps them unless they are close-on-exec, and a
+    call that waits on one (of any process) runs again when it changes.
+  - *Snapshots:* the sockets' state is in the machine's, streams and queues with their bytes,
+    whatever process holds them. A connection to the host can't survive a restore:
     it reads as closed, and one that was connecting as reset.
   - *Not supported:* `SCM_RIGHTS` and other ancillary data (`EOPNOTSUPP`), `SOCK_SEQPACKET`,
     raw and packet sockets, `socketpair` for anything but AF_UNIX, a separate `RDHUP`, backpressure
@@ -331,8 +335,8 @@ x0–x5, answers it in x0, and resumes at ELR.
   the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
   and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
   are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
-  A state from before 0.14 does not load (`ARMLUSR4`: addresses are virtual, and there are
-  processes).
+  A state from before 0.14 does not load (`ARMLUSR5`: addresses are virtual, there are
+  processes, and the sockets are in the machine's state).
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,

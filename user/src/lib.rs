@@ -791,6 +791,8 @@ impl Process {
                 continue;
             }
             self.compact();
+            // (What a process that ended left for the host's side: its sockets)
+            self.flush_net();
             self.wake();
             // The next runnable thread, round robin, starting with the current one
             let n = self.threads.len();
@@ -1264,7 +1266,7 @@ impl Process {
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);
         setup_cpu(cpu);
-        let mut p = Process {
+        let p = Process {
             ram,
             ram_size,
             board,
@@ -1321,4 +1323,4 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-const MAGIC: &[u8; 8] = b"ARMLUSR4";
+const MAGIC: &[u8; 8] = b"ARMLUSR5";

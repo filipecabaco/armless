@@ -103,6 +103,23 @@ impl Prog {
         self
     }
 
+    /// clone(SIGCHLD), a fork: what follows is the child's, up to `parent`. Gives what `parent`
+    /// needs.
+    fn fork(&mut self) -> usize {
+        self.sys(220, &[I(17), I(0), I(0), I(0), I(0)]);
+        // A cbnz x0 over the child's part, once it is known
+        self.code.push(0);
+        self.code.len() - 1
+    }
+
+    /// The child exits (its checks passed: 0) and the parent's part begins
+    fn parent(&mut self, at: usize) -> &mut Self {
+        self.sys(94, &[I(0)]);
+        let skip = (self.code.len() - at) as u32;
+        self.code[at] = 0xb500_0000 | skip << 5;
+        self
+    }
+
     /// The executable: exit_group(0) after what it does
     fn elf(mut self) -> Vec<u8> {
         self.sys(94, &[I(0)]);
@@ -579,6 +596,76 @@ fn sockets_survive_a_snapshot() {
     let (out, status) = run(&mut p, &mut vm);
     ok(&status);
     assert!(out.ends_with(b"kept"), "{out:?}");
+}
+
+/// The program of the fork tests: a listener and a connected pair, then a fork. The child
+/// accepts on the listener and answers over the pair's end; the parent connects, sends "ping" and
+/// reads what comes back, then the end of the stream when the child has ended (the child's
+/// descriptors close with it, and the parent closed its own).
+fn forked_sockets(wait_for_a_key: bool) -> Prog {
+    let mut p = Prog::default();
+    p.put(0x200, &sa_in([127, 0, 0, 1], 8080))
+        .put(0x240, b"ping");
+    p.sys(198, &[I(2), I(1), I(0)]).expect(3).save(0x100);
+    p.sys(200, &[W(0x100), D(0x200), I(16)]).expect(0);
+    p.sys(201, &[W(0x100), I(5)]).expect(0);
+    p.sys(199, &[I(1), I(1), I(0), D(0x108)]).expect(0); // fds 4 and 5
+    let child = p.fork();
+    // The child accepts the connection on the listener it inherited and sends what it reads
+    // over the pair's other end, which it inherited too
+    p.sys(202, &[I(3), I(0), I(0)]).expect(6);
+    p.sys(63, &[I(6), D(0x300), I(16)]).expect(4);
+    p.sys(64, &[I(5), D(0x300), I(4)]).expect(4);
+    p.parent(child);
+    p.sys(57, &[I(5)]).expect(0);
+    if wait_for_a_key {
+        p.sys(63, &[I(0), D(0x380), I(1)]).expect(1);
+    }
+    p.sys(198, &[I(2), I(1), I(0)]).expect(5);
+    p.sys(203, &[I(5), D(0x200), I(16)]).expect(0);
+    p.sys(64, &[I(5), D(0x240), I(4)]).expect(4);
+    p.sys(63, &[I(4), D(0x340), I(16)]).expect(4);
+    p.out(0x340, 4);
+    p.sys(63, &[I(4), D(0x340), I(16)]).expect(0);
+    // The child ended with a status of 0
+    p.sys(260, &[I(0xffff_ffff), D(0x180), I(0), I(0)]);
+    p.out(0x180, 4);
+    p
+}
+
+#[test]
+fn a_forked_child_has_the_sockets_of_its_parent_and_the_parent_sees_what_it_writes() {
+    let mut vm = machine();
+    let mut p = start(&mut vm, forked_sockets(false));
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"ping\0\0\0\0");
+}
+
+#[test]
+fn processes_with_sockets_survive_a_snapshot() {
+    // The child waits to accept and the parent for a key; the machine is saved there and goes on
+    // in another one
+    let mut vm = machine();
+    let mut p = start(&mut vm, forked_sockets(true));
+    let status = loop {
+        let status = p.run(&mut vm.cpus[0], Duration::from_millis(20));
+        if !matches!(status, Status::Running) {
+            break status;
+        }
+    };
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    p.input(b"\n");
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert!(out.ends_with(b"ping\0\0\0\0"), "{out:?}");
 }
 
 #[test]
