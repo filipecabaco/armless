@@ -316,7 +316,7 @@ x0–x5, answers it in x0, and resumes at ELR.
 - **Blocking:** a call that can't complete (a read of the terminal or a pipe, a poll, a wait
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
-- **Clocks:** `clock_gettime`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
+- **Clocks:** `clock_gettime`, `gettimeofday`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
   across a snapshot and its restores.
 - **Signals** (signal.rs): actions per process, a mask, a pending set and an alternate stack
   per thread, a pending set for the process (given to its first thread that doesn't block the

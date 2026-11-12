@@ -1452,6 +1452,15 @@ impl Process {
                     && self.put_u64(a[1] + 8, ns % 1_000_000_000);
                 v(if ok { 0 } else { -EFAULT })
             },
+            // gettimeofday: V8 reads its Date.now() with it, and keeps what was there when it fails
+            169 => {
+                let ns = self.now_ns(0);
+                let ok = (a[0] == 0
+                    || self.put_u64(a[0], ns / 1_000_000_000)
+                        && self.put_u64(a[0] + 8, ns % 1_000_000_000 / 1000))
+                    && (a[1] == 0 || self.put_u64(a[1], 0));
+                v(if ok { 0 } else { -EFAULT })
+            },
             114 => {
                 if a[1] != 0 {
                     self.put_u64(a[1], 0);

@@ -456,6 +456,30 @@ fn a_socket_takes_async_io_and_an_owner_though_no_sigio_comes() {
 }
 
 #[test]
+fn gettimeofday_gives_the_wall_clock_in_microseconds_and_a_zero_timezone() {
+    // V8's Date.now() is gettimeofday, and when it fails the date is whatever was in the stack
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x120, &[0xff; 8]);
+    p.sys(169, &[D(0x100), D(0x120)]).expect(0);
+    p.out(0x100, 16);
+    p.out(0x120, 8);
+    p.sys(169, &[I(0), I(0)]).expect(0);
+    let mut p = start(&mut vm, p);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    let sec = u64::from_le_bytes(out[..8].try_into().unwrap());
+    let usec = u64::from_le_bytes(out[8..16].try_into().unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(sec.abs_diff(now) <= 5, "{sec} is not near {now}");
+    assert!(usec < 1_000_000, "{usec}");
+    assert_eq!(out[16..], [0; 8], "the timezone is zero");
+}
+
+#[test]
 fn an_edge_triggered_watch_reports_each_write_to_an_eventfd_that_nobody_reads() {
     let mut vm = machine();
     let mut p = Prog::default();
