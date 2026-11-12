@@ -289,7 +289,8 @@ x0–x5, answers it in x0, and resumes at ELR.
   `ARMLESS_USER_EAGER=1` reads every mapped page at once, for comparisons.
 - **Threads:** every guest thread is a saved register context, and they take turns on one
   CPU in slices of instructions; a syscall answered on the way counts against the slice.
-  `clone` (threads, CLONE_THREAD), futexes (with timeouts and bitsets), `set_tid_address` and
+  `clone` (threads, CLONE_THREAD), futexes (wait and wake, with timeouts and bitsets; requeue and
+  wake-op, which musl's condition variables use), `set_tid_address` and
   `CLONE_CHILD_CLEARTID`.
 - **Processes** (user/src/proc.rs, exec.rs): a process is an address space, a descriptor table,
   a working directory, signal actions and its threads; the descriptions the descriptors refer

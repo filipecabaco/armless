@@ -1831,3 +1831,88 @@ fn a_symlink_to_a_device_opens_the_device_as_the_images_log_files_do() {
     assert_eq!(out, b"HRA");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
+
+const CLONE_SIGHAND: u32 = 0x800;
+const CLONE_THREAD: u32 = 0x10000;
+
+impl Asm {
+    /// A thread that waits on the futex word at x19 + `at` and, when woken, prints "B" and ends
+    /// alone: it goes on at the label "waiter", which each call that follows `spawn_waiter` can
+    /// reuse with its own address in x20
+    fn spawn_waiter(&mut self, at: u32) -> &mut Self {
+        self.i(add_imm(20, 19, at, false))
+            .clone(CLONE_VM | CLONE_SIGHAND | CLONE_THREAD)
+            .cbz_to(0, "waiter")
+    }
+    /// The thread's body: futex(x20, FUTEX_WAIT, 0, NULL), print "B", exit(0)
+    fn waiter(&mut self) -> &mut Self {
+        self.label("waiter")
+            .i(mov(0, 20))
+            .movz(1, 0)
+            .movz(2, 0)
+            .movz(3, 0)
+            .svc(98)
+            .print("B", 1)
+            .movz(0, 0)
+            .svc(93)
+    }
+    /// futex(x19 + `at`, op, val, val2, x19 + `at2`, val3) into x0
+    fn futex(&mut self, at: u32, op: u16, val: u32, val2: u32, at2: u32, val3: u32) -> &mut Self {
+        self.i(add_imm(0, 19, at, false))
+            .movz(1, op)
+            .mov32(2, val)
+            .mov32(3, val2)
+            .i(add_imm(4, 19, at2, false))
+            .mov32(5, val3)
+            .svc(98)
+    }
+}
+
+fn run_threads(a: &mut Asm) {
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"BBA", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_futex_requeue_moves_waiters_to_another_word_and_wakes_the_rest_there() {
+    // FUTEX_CMP_REQUEUE: of two waiters on the first word, one wakes and one moves to the
+    // second; waking the first word finds nobody, waking the second finds the one it got
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.spawn_waiter(0).spawn_waiter(0);
+    a.movz(0, 0).svc(124); // sched_yield: both threads run to their waits
+    a.futex(0, 4, 1, 0x7fff_ffff, 8, 0) // wake 1, requeue all the rest
+        .cmp_imm(0, 2)
+        .bcond(COND_NE, "fail");
+    a.futex(0, 4, 1, 0, 8, 1) // the word is not 1: EAGAIN, nothing moves or wakes
+        .cmn_imm(0, 11)
+        .bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124); // the woken thread prints "B"
+    a.futex(0, 1, 10, 0, 0, 0) // nobody waits on the first word any more
+        .cbnz_fail(0);
+    a.futex(8, 1, 10, 0, 0, 0) // one waits on the second
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124).ends();
+    a.waiter();
+    run_threads(&mut a);
+}
+
+#[test]
+fn a_futex_wake_op_changes_a_word_and_wakes_by_its_old_value() {
+    // FUTEX_WAKE_OP (word2 += 1, wake word2's waiter if its old value was 0): one waiter on
+    // each word, both wake, and the second word holds 1
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.spawn_waiter(0).spawn_waiter(8);
+    a.movz(0, 0).svc(124);
+    a.futex(0, 5, 1, 1, 8, 0x1000_1000) // op ADD 1, cmp EQ 0
+        .cmp_imm(0, 2)
+        .bcond(COND_NE, "fail");
+    a.ldr_w(22, 19, 8).cmp_imm(22, 1).bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124).movz(0, 0).svc(124).ends();
+    a.waiter();
+    run_threads(&mut a);
+}

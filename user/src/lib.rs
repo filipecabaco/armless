@@ -1020,6 +1020,36 @@ impl Process {
         woken as i64
     }
 
+    /// FUTEX_REQUEUE: wakes up to `nwake` threads waiting on `addr`, then moves up to `nrequeue`
+    /// of the rest to wait on `addr2` (a thread keeps its deadline and mask). Returns the number
+    /// of threads woken and the number moved.
+    pub(crate) fn futex_requeue(
+        &mut self,
+        addr: u64,
+        nwake: u64,
+        addr2: u64,
+        nrequeue: u64,
+    ) -> (u64, u64) {
+        let woken = self.futex_wake(addr, nwake, u32::MAX) as u64;
+        let pid = self.p.pid;
+        let mut moved = 0;
+        for t in self.threads.iter_mut() {
+            if moved >= nrequeue {
+                break;
+            }
+            if t.pid != pid {
+                continue;
+            }
+            if let Some((Wait::Futex { addr: a, .. }, _)) = &mut t.wait {
+                if *a == addr {
+                    *a = addr2;
+                    moved += 1;
+                }
+            }
+        }
+        (woken, moved)
+    }
+
     /// Takes the registers of the thread on the CPU back into the process, so that every thread
     /// is in the process's state and none in the CPU's.
     pub fn park<H: Host>(&mut self, cpu: &Cpu<H>) {

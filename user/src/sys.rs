@@ -35,6 +35,48 @@ const NCPUS_REPORTED: u64 = 4;
 type Ready = (bool, bool, bool);
 
 impl Process {
+    /// FUTEX_WAKE_OP: applies the operation `enc` (the kernel's encoded `op`, `oparg`, `cmp` and
+    /// `cmparg`) to the word at `addr2`, wakes up to `nwake` threads waiting on `addr`, and, if
+    /// the old value of the word satisfies the comparison, up to `nwake2` waiting on `addr2`.
+    fn futex_wake_op(&mut self, addr: u64, nwake: u64, addr2: u64, nwake2: u64, enc: u32) -> i64 {
+        let sign = |v: u32| ((v << 20) as i32) >> 20;
+        let (mut op, cmp) = ((enc >> 28) & 0xf, (enc >> 24) & 0xf);
+        let (mut oparg, cmparg) = (sign((enc >> 12) & 0xfff), sign(enc & 0xfff));
+        if op & 8 != 0 {
+            op &= 7;
+            oparg = 1i32.wrapping_shl(oparg as u32 & 31);
+        }
+        let Some(old) = self.u32_at(addr2) else {
+            return -EFAULT;
+        };
+        let old = old as i32;
+        let new = match op {
+            0 => oparg,
+            1 => old.wrapping_add(oparg),
+            2 => old | oparg,
+            3 => old & !oparg,
+            4 => old ^ oparg,
+            _ => return -ENOSYS,
+        };
+        let hit = match cmp {
+            0 => old == cmparg,
+            1 => old != cmparg,
+            2 => old < cmparg,
+            3 => old <= cmparg,
+            4 => old > cmparg,
+            5 => old >= cmparg,
+            _ => return -ENOSYS,
+        };
+        if !self.put_u32(addr2, new as u32) {
+            return -EFAULT;
+        }
+        let mut woken = self.futex_wake(addr, nwake, u32::MAX);
+        if hit {
+            woken += self.futex_wake(addr2, nwake2, u32::MAX);
+        }
+        woken
+    }
+
     // ------------------------------------------------------------ descriptors
 
     fn ready(&self, fd: i32) -> Option<Ready> {
@@ -1312,6 +1354,16 @@ impl Process {
                     },
                     1 => v(self.futex_wake(addr, val, u32::MAX)),
                     10 => v(self.futex_wake(addr, val, a[5] as u32)),
+                    // FUTEX_REQUEUE and FUTEX_CMP_REQUEUE (a[5] is the value to compare with):
+                    // musl's condition variables broadcast with them.
+                    3 | 4 => {
+                        if op & 0x7f == 4 && self.u32_at(addr) != Some(a[5] as u32) {
+                            return v(-EAGAIN);
+                        }
+                        let (woken, moved) = self.futex_requeue(addr, val, a[4], a[3]);
+                        v((woken + moved) as i64)
+                    },
+                    5 => v(self.futex_wake_op(addr, val, a[4], a[3], a[5] as u32)),
                     _ => v(-ENOSYS),
                 }
             },
