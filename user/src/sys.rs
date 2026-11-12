@@ -1375,8 +1375,11 @@ impl Process {
                 self.threads[cur].clear_tid = a[0];
                 v(tid)
             },
-            // set_robust_list, prctl, membarrier, sched_setaffinity, setpriority, sched_setscheduler...
-            99 | 167 | 283 | 122 | 140 | 119 | 118 | 121 => v(0),
+            // set_robust_list, prctl, membarrier, sched_setaffinity
+            99 | 167 | 283 | 122 => v(0),
+            // sched_set/getparam, sched_set/getscheduler, sched_get_priority_max/min,
+            // sched_rr_get_interval, set/getpriority, sched_set/getattr
+            118..=121 | 125..=127 | 140 | 141 | 274 | 275 => self.sys_sched(nr, cur, &a),
             // rseq: glibc and others fall back when it is missing
             293 => v(-ENOSYS),
             // sched_yield

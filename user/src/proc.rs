@@ -500,6 +500,7 @@ impl Process {
                 resume_deadline: None,
                 exited: false,
                 sig: self.threads[cur].sig.inherit(),
+                sched: self.threads[cur].sched.fork(),
             });
             return v(id);
         }
@@ -550,6 +551,7 @@ impl Process {
             resume_deadline: None,
             exited: false,
             sig,
+            sched: self.threads[cur].sched.fork(),
         });
         if f & CLONE_PARENT_SETTID != 0 {
             self.put_u32(c.ptid, id as u32);

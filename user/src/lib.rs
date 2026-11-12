@@ -37,6 +37,7 @@ pub mod host;
 mod mm;
 mod net;
 mod proc;
+mod sched;
 mod ser;
 mod signal;
 mod sys;
@@ -141,6 +142,7 @@ pub(crate) struct Thread {
     pub resume_deadline: Option<Instant>,
     pub exited: bool,
     pub sig: ThreadSig,
+    pub sched: sched::Sched,
 }
 
 /// What a syscall does to the thread that made it.
@@ -590,6 +592,7 @@ impl Process {
             resume_deadline: None,
             exited: false,
             sig: ThreadSig::default(),
+            sched: Default::default(),
         });
         Ok(p)
     }
@@ -1164,6 +1167,7 @@ impl Process {
             w.u(left(t.wait.as_ref().and_then(|(_, d)| *d)));
             w.u(left(t.resume_deadline));
             t.sig.save(&mut w);
+            t.sched.save(&mut w);
         }
         w.0
     }
@@ -1303,6 +1307,7 @@ impl Process {
                 resume_deadline,
                 exited,
                 sig: ThreadSig::load(&mut r)?,
+                sched: sched::Sched::load(&mut r)?,
             });
         }
         // The first process is the one that runs
@@ -1367,4 +1372,4 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-const MAGIC: &[u8; 8] = b"ARMLUSR5";
+const MAGIC: &[u8; 8] = b"ARMLUSR6";

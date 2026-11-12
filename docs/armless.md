@@ -334,6 +334,16 @@ x0–x5, answers it in x0, and resumes at ELR.
   `clone` (threads, CLONE_THREAD), futexes (wait and wake, with timeouts and bitsets; requeue and
   wake-op, which musl's condition variables use), `set_tid_address` and
   `CLONE_CHILD_CLEARTID`.
+- **Scheduler calls** (user/src/sched.rs): `sched_setscheduler`, `sched_getscheduler`,
+  `sched_setparam`, `sched_getparam`, `sched_setattr`, `sched_getattr`, `sched_get_priority_max`
+  and `_min`, `sched_rr_get_interval`, `setpriority` and `getpriority` answer as Linux does for a
+  process that may do them. Policy, priority and nice are kept per thread (PRIO_PROCESS acts on a
+  tid, PRIO_PGRP and PRIO_USER on every matching thread), inherited by `clone` (SCHED_RESET_ON_FORK
+  resets the child to SCHED_OTHER and a nonnegative nice) and kept by exec, and they are in the
+  process state. SCHED_OTHER, BATCH and IDLE take priority 0, FIFO and RR 1 to 99; they are only
+  kept and reported, the CPU is still shared by round robin. SCHED_DEADLINE is refused (EINVAL
+  from `sched_setscheduler`, EPERM from `sched_setattr`). `sched_rr_get_interval` says 100 ms for
+  SCHED_RR and 0 for the others. `getpriority` returns `20 - nice`, the raw call's convention.
 - **Processes** (user/src/proc.rs, exec.rs): a process is an address space, a descriptor table,
   a working directory, signal actions and its threads; the descriptions the descriptors refer
   to, the pipes, the terminal and the clock are the machine's, shared by all, so a pipe joins a
@@ -378,8 +388,8 @@ x0–x5, answers it in x0, and resumes at ELR.
   the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
   and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
   are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
-  A state from before 0.14 does not load (`ARMLUSR5`: addresses are virtual, there are
-  processes, and the sockets are in the machine's state).
+  A state from before 0.14.5 does not load (`ARMLUSR6`: the threads' scheduling is in it; 0.14
+  made addresses virtual, added processes, and put the sockets in the machine's state).
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,
