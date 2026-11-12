@@ -21,6 +21,7 @@
 //! (CLONE_FILES), and so are the signal actions and the working directory.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use armless::cpu::Cpu;
@@ -539,6 +540,8 @@ impl Process {
             umask: self.p.umask,
             exe: self.p.exe.clone(),
             sig: self.p.sig.fork(),
+            groups: self.p.groups.clone(),
+            aio: BTreeMap::new(),
         };
         self.procs.insert(id, child);
         self.threads.push(Thread {

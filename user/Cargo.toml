@@ -1,6 +1,6 @@
 [package]
 name = "armless-user"
-version = "0.14.0"
+version = "0.14.2"
 edition = "2021"
 publish = false
 description = "User mode for armless: run a static aarch64 Linux ELF with no guest kernel, its syscalls answered by the host"

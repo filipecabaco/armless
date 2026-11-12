@@ -2064,3 +2064,275 @@ fn the_program_headers_and_the_loaders_path_are_read_from_wherever_they_are_in_t
     assert_eq!(out, b"hello\r\n", "the loader the far PT_INTERP names ran");
     assert!(matches!(status, Status::Exited(3)), "{status:?}");
 }
+
+// ------------------------------------------------------------ groups, AIO, preadv2 and pwritev2
+
+impl Asm {
+    /// movk x`rd`, #imm, lsl 32
+    fn movk32(&mut self, rd: u32, imm: u16) -> &mut Self {
+        self.i(0xf2c0_0000 | (imm as u32) << 5 | rd)
+    }
+    /// ldr xt, [sp, #off]
+    fn ldr_sp(&mut self, rt: u32, off: u32) -> &mut Self {
+        self.i(0xf940_0000 | (off / 8) << 10 | 31 << 5 | rt)
+    }
+    /// sub sp, sp, #1024
+    fn big_room(&mut self) -> &mut Self {
+        self.i(0xd110_03ff)
+    }
+    /// x`rd` = sp + off
+    fn sp_plus(&mut self, rd: u32, off: u32) -> &mut Self {
+        self.i(add_imm(rd, 31, off, false))
+    }
+    /// preadv2 or pwritev2 on x19 with the iovec at [sp + iov]; no position (-1) is the
+    /// descriptor's own
+    fn rwv2(&mut self, write: bool, iov: u32, cnt: u16, pos: Option<u16>, flags: u16) -> &mut Self {
+        self.i(mov(0, 19)).sp_plus(1, iov).movz(2, cnt);
+        match pos {
+            Some(p) => self.movz(3, p),
+            None => self.i(0x9280_0003), // movn x3, #0: -1
+        };
+        self.movz(4, 0)
+            .movz(5, flags)
+            .svc(if write { 287 } else { 286 })
+    }
+    /// write(1, [sp + off], n)
+    fn print_sp(&mut self, off: u32, n: u16) -> &mut Self {
+        self.movz(0, 1).sp_plus(1, off).movz(2, n).svc(64)
+    }
+    /// The word at [sp + off] must be `v`
+    fn word_is(&mut self, off: u32, v: u32) -> &mut Self {
+        self.ldr_sp(10, off).cmp_imm(10, v).bcond(COND_NE, "fail")
+    }
+    /// x0 must be `v`
+    fn ret_is(&mut self, v: u32) -> &mut Self {
+        self.cmp_imm(0, v).bcond(COND_NE, "fail")
+    }
+    /// x0 must be -`e`
+    fn ret_err(&mut self, e: u32) -> &mut Self {
+        self.cmn_imm(0, e).bcond(COND_NE, "fail")
+    }
+    /// An iocb at [sp + 64] (buffer: the label, or the stack at 256 when None)
+    fn iocb(
+        &mut self,
+        op: u16,
+        fd: u16,
+        buf: Option<&'static str>,
+        n: u16,
+        off: u16,
+        resfd: Option<u16>,
+    ) -> &mut Self {
+        self.movz(9, 0x111).str_sp(9, 64).str_sp(31, 72);
+        self.movz(9, op).movk32(9, fd).str_sp(9, 80);
+        match buf {
+            Some(l) => self.adr(9, l),
+            None => self.sp_plus(9, 256),
+        };
+        self.str_sp(9, 88);
+        self.movz(9, n).str_sp(9, 96);
+        self.movz(9, off).str_sp(9, 104);
+        self.str_sp(31, 112);
+        match resfd {
+            Some(r) => self.movz(9, 1).movk32(9, r),
+            None => self.movz(9, 0),
+        };
+        self.str_sp(9, 120)
+    }
+    /// io_submit(x20, 1, [the iocb at sp + 64]) must give 1
+    fn submit(&mut self) -> &mut Self {
+        self.sp_plus(9, 64).str_sp(9, 8);
+        self.i(mov(0, 20)).movz(1, 1).sp_plus(2, 8).svc(2).ret_is(1)
+    }
+    /// io_getevents(x20, 1, 1, [sp + 128], none) must give 1, and the event: its data, the
+    /// iocb's address and `res`
+    fn reap(&mut self, res: u32) -> &mut Self {
+        self.i(mov(0, 20))
+            .movz(1, 1)
+            .movz(2, 1)
+            .sp_plus(3, 128)
+            .movz(4, 0)
+            .svc(4)
+            .ret_is(1);
+        self.word_is(128, 0x111).word_is(144, res)
+    }
+    fn run_checked(&mut self, expect: &[u8]) {
+        let prog = self.elf();
+        let files: [(&str, u32, &[u8]); 1] = [("prog", EXE, &prog)];
+        let mut vm = machine_with(&files, &["prog"]);
+        let mut p = exec_prog(&mut vm);
+        p.trace = std::env::var("TRACE").is_ok();
+        let mut out = Vec::new();
+        let mut status;
+        loop {
+            let (o, s, _) = run_with_files(&mut p, &mut vm, &files);
+            out.extend(o);
+            status = s;
+            // A timed wait: let its time pass
+            if !matches!(status, Status::Idle(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(out, expect);
+        assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    }
+    /// x19 = openat(AT_FDCWD, "f", O_RDWR | O_CREAT, 0644)
+    fn create_f(&mut self) -> &mut Self {
+        self.i(0x9280_0c60)
+            .adr(1, "f")
+            .movz(2, 0x42)
+            .movz(3, 0o644)
+            .svc(56)
+            .i(mov(19, 0))
+            .cmp_imm(19, 3)
+            .bcond(COND_NE, "fail")
+    }
+}
+
+#[test]
+fn setgroups_and_getgroups_round_trip_and_a_child_inherits_the_list() {
+    let mut a = Asm::default();
+    a.big_room();
+    // The list {5, 7} at [sp + 64]
+    a.movz(9, 5).movk32(9, 7).str_sp(9, 64);
+    a.movz(0, 0).movz(1, 0).svc(158).ret_is(0);
+    a.movz(0, 2).sp_plus(1, 64).svc(159).ret_is(0);
+    a.movz(0, 0).movz(1, 0).svc(158).ret_is(2); // its size
+    a.movz(0, 1).sp_plus(1, 80).svc(158).ret_err(22); // too small
+    a.movz(0, 2).sp_plus(1, 80).svc(158).ret_is(2);
+    // 5 then 7 (a word each, 4 bytes apart)
+    a.ldr_w(10, 31, 80).cmp_imm(10, 5).bcond(COND_NE, "fail");
+    a.ldr_w(10, 31, 84).cmp_imm(10, 7).bcond(COND_NE, "fail");
+    a.mov32(0, 65537).sp_plus(1, 64).svc(159).ret_err(22); // more than NGROUPS_MAX
+    a.movz(0, 1).movz(1, 0).svc(159).ret_err(14); // a bad pointer
+    a.movz(0, 2).sp_plus(1, 64).svc(158); // unchanged by the failures: still 2
+    a.cmp_imm(0, 2).bcond(COND_NE, "fail");
+    a.fork().cbz_to(0, "child");
+    a.i(mov(19, 0));
+    a.wait4(Some(19), 0).status_is(0);
+    a.ends();
+    a.label("child")
+        .movz(0, 0)
+        .movz(1, 0)
+        .svc(158)
+        .cmp_imm(0, 2)
+        .bcond(COND_NE, "fail");
+    a.movz(0, 0).movz(1, 0).movz(2, 0).svc(159); // size 0 sets the list empty in the child alone
+    a.movz(0, 0)
+        .movz(1, 0)
+        .svc(158)
+        .cmp_imm(0, 0)
+        .bcond(COND_NE, "fail");
+    a.exit(0);
+    a.run_checked(b"A");
+}
+
+#[test]
+fn aio_writes_and_reads_a_file_and_signals_the_eventfd() {
+    let mut a = Asm::with_texts(vec![("f", b"f"), ("hello", b"hello")]);
+    a.big_room().create_f();
+    // io_setup(8, [sp]) into x20
+    a.str_sp(31, 0).movz(0, 8).i(0x9100_03e1).svc(0).ret_is(0);
+    a.ldr_sp(20, 0);
+    // eventfd2(0, 0) is fd 4
+    a.movz(0, 0).movz(1, 0).svc(19).ret_is(4);
+    // PWRITE "hello" at 0, then the event, with the eventfd
+    a.iocb(1, 3, Some("hello"), 5, 0, Some(4)).submit().reap(5);
+    // the eventfd counted the one completion
+    a.movz(0, 4).sp_plus(1, 320).movz(2, 8).svc(63).ret_is(8);
+    a.word_is(320, 1);
+    // PREAD it back at 0, without the eventfd; print it
+    a.iocb(0, 3, None, 5, 0, None).submit().reap(5);
+    a.print_sp(256, 5);
+    // PREAD at 3: 2 bytes left
+    a.iocb(0, 3, None, 5, 3, None).submit().reap(2);
+    // io_cancel finds nothing to cancel
+    a.i(mov(0, 20))
+        .sp_plus(1, 64)
+        .sp_plus(2, 128)
+        .svc(3)
+        .ret_err(22);
+    // nothing is queued: a zero timeout returns 0
+    a.str_sp(31, 320).str_sp(31, 328);
+    a.i(mov(0, 20))
+        .movz(1, 1)
+        .movz(2, 1)
+        .sp_plus(3, 128)
+        .sp_plus(4, 320)
+        .svc(4)
+        .ret_is(0);
+    // a bad opcode, a bad fd
+    a.iocb(9, 3, None, 5, 0, None);
+    a.sp_plus(9, 64).str_sp(9, 8);
+    a.i(mov(0, 20)).movz(1, 1).sp_plus(2, 8).svc(2).ret_err(22);
+    a.iocb(0, 40, None, 5, 0, None);
+    a.i(mov(0, 20)).movz(1, 1).sp_plus(2, 8).svc(2).ret_err(9);
+    // io_destroy, and the context is gone
+    a.i(mov(0, 20)).svc(1).ret_is(0);
+    a.i(mov(0, 20)).svc(1).ret_err(22);
+    a.i(mov(0, 20))
+        .movz(1, 0)
+        .movz(2, 1)
+        .sp_plus(3, 128)
+        .movz(4, 0)
+        .svc(4)
+        .ret_err(22);
+    a.ends();
+    a.run_checked(b"helloA");
+}
+
+#[test]
+fn aio_getevents_with_nothing_queued_waits_its_timeout_and_returns_none() {
+    let mut a = Asm::default();
+    a.big_room();
+    a.str_sp(31, 0).movz(0, 8).i(0x9100_03e1).svc(0).ret_is(0);
+    a.ldr_sp(20, 0);
+    // a 10 ms timeout: 0 events
+    a.str_sp(31, 320).mov32(9, 10_000_000).str_sp(9, 328);
+    a.i(mov(0, 20))
+        .movz(1, 1)
+        .movz(2, 1)
+        .sp_plus(3, 128)
+        .sp_plus(4, 320)
+        .svc(4)
+        .ret_is(0);
+    a.ends();
+    a.run_checked(b"A");
+}
+
+#[test]
+fn pwritev2_and_preadv2_take_a_position_or_the_descriptors_and_their_flags() {
+    let mut a = Asm::with_texts(vec![
+        ("f", b"f"),
+        ("abc", b"abc"),
+        ("def", b"def"),
+        ("XY", b"XY"),
+        ("Z", b"Z"),
+    ]);
+    a.big_room().create_f();
+    for (slot, l, n) in [(0, "abc", 3), (1, "def", 3), (2, "XY", 2), (3, "Z", 1)] {
+        a.adr(9, l).str_sp(9, 64 + 16 * slot);
+        a.movz(9, n).str_sp(9, 72 + 16 * slot);
+    }
+    // The stack buffer for reads
+    a.sp_plus(9, 256).str_sp(9, 192);
+    a.movz(9, 16).str_sp(9, 200);
+    // "abc" "def" at the descriptor's position (0): 6 bytes
+    a.rwv2(true, 64, 2, None, 0).ret_is(6);
+    // "XY" at 1 leaves the position where it was (6)
+    a.rwv2(true, 96, 1, Some(1), 0).ret_is(2);
+    // a read at the position, the end: nothing
+    a.rwv2(false, 192, 1, None, 0).ret_is(0);
+    // a flag it cannot take: EOPNOTSUPP
+    a.rwv2(true, 96, 1, Some(0), 0x20).ret_err(95);
+    // RWF_DSYNC is as a plain write, RWF_APPEND with a position goes to the end anyway
+    a.rwv2(true, 96, 1, Some(0), 2).ret_is(2);
+    a.rwv2(true, 112, 1, Some(0), 0x10).ret_is(1);
+    // RWF_APPEND on a read is not supported
+    a.rwv2(false, 192, 1, Some(0), 0x10).ret_err(95);
+    // all of it from 0: "abc" "def", "XY" at 1, "XY" at 0 (DSYNC), "Z" at the end
+    a.rwv2(false, 192, 1, Some(0), 0).ret_is(7);
+    a.print_sp(256, 7);
+    a.ends();
+    a.run_checked(b"XYYdefZA");
+}

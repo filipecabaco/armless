@@ -30,6 +30,7 @@
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
 
+mod aio;
 mod elf;
 mod exec;
 mod files;
@@ -201,6 +202,10 @@ pub(crate) struct Proc {
     /// The executable's path, for /proc/self/exe
     pub exe: Vec<u8>,
     pub sig: Signals,
+    /// Supplementary groups (setgroups)
+    pub groups: Vec<u32>,
+    /// AIO contexts by id (aio.rs)
+    pub aio: BTreeMap<u64, aio::Aio>,
 }
 
 /// A program's process: its threads, memory map, descriptors, terminal and clock. A snapshot
@@ -544,6 +549,8 @@ impl Process {
                 umask: 0o022,
                 exe: exe.to_vec(),
                 sig: Signals::default(),
+                groups: Vec::new(),
+                aio: BTreeMap::new(),
             },
             procs: BTreeMap::new(),
             threads: Vec::new(),
@@ -1111,6 +1118,15 @@ impl Process {
             w.u(p.umask as u64);
             w.b(&p.exe);
             p.sig.save(&mut w);
+            w.u(p.groups.len() as u64);
+            p.groups.iter().for_each(|&g| w.u(g as u64));
+            w.u(p.aio.len() as u64);
+            for (id, c) in &p.aio {
+                w.u(*id);
+                w.u(c.cap);
+                w.u(c.events.len() as u64);
+                c.events.iter().flatten().for_each(|&x| w.u(x));
+            }
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1221,6 +1237,19 @@ impl Process {
             let (cwd, umask) = (r.u()?, r.u()? as u32);
             let exe = r.b()?.to_vec();
             let sig = Signals::load(&mut r)?;
+            let mut groups = Vec::new();
+            for _ in 0..r.u()? {
+                groups.push(r.u()? as u32);
+            }
+            let mut aio = BTreeMap::new();
+            for _ in 0..r.u()? {
+                let (id, cap) = (r.u()?, r.u()?);
+                let mut events = std::collections::VecDeque::new();
+                for _ in 0..r.u()? {
+                    events.push_back([r.u()?, r.u()?, r.u()?, r.u()?]);
+                }
+                aio.insert(id, aio::Aio { cap, events });
+            }
             all.insert(
                 pid,
                 Proc {
@@ -1237,6 +1266,8 @@ impl Process {
                     umask,
                     exe,
                     sig,
+                    groups,
+                    aio,
                 },
             );
         }
@@ -1367,4 +1398,4 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-const MAGIC: &[u8; 8] = b"ARMLUSR5";
+const MAGIC: &[u8; 8] = b"ARMLUSR6";

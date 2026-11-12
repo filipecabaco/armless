@@ -224,6 +224,7 @@ impl Process {
         let pid = self.p.pid;
         self.p.exe = exe;
         self.p.sig.exec();
+        self.p.aio.clear();
         for (i, t) in self.threads.iter_mut().enumerate() {
             if t.pid == pid && i != cur {
                 t.exited = true;
