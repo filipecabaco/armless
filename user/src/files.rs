@@ -11,6 +11,7 @@ use crate::ser::{R, W};
 
 pub(crate) const S_IFCHR: u32 = 0o020000;
 pub(crate) const S_IFIFO: u32 = 0o010000;
+pub(crate) const S_IFSOCK: u32 = 0o140000;
 
 pub(crate) const O_ACCMODE: u32 = 3;
 pub(crate) const O_WRONLY: u32 = 1;
@@ -73,6 +74,13 @@ pub(crate) enum Kind {
     },
     PipeRead(u32),
     PipeWrite(u32),
+    /// One end of a socketpair (AF_UNIX): it reads pipe `rx` and writes pipe `tx`, the other end
+    /// the other way round. `shut`: SHUT_RD (1) and SHUT_WR (2) done, whose pipe ends it holds no more.
+    Sock {
+        rx: u32,
+        tx: u32,
+        shut: u8,
+    },
     Event {
         count: u64,
     },
@@ -109,6 +117,10 @@ pub(crate) struct Pipe {
     pub writers: u32,
 }
 
+/// `shutdown`'s directions, as bits of `Kind::Sock::shut`
+pub(crate) const SHUT_RD: u8 = 1;
+pub(crate) const SHUT_WR: u8 = 2;
+
 /// A pipe holds at most this before a write waits.
 pub(crate) const PIPE_BUF_MAX: usize = 64 << 10;
 
@@ -144,6 +156,10 @@ impl Files {
         }
         if let Kind::PipeWrite(p) = kind {
             self.pipes.entry(p).or_default().writers += 1;
+        }
+        if let Kind::Sock { rx, tx, .. } = kind {
+            self.pipes.entry(rx).or_default().readers += 1;
+            self.pipes.entry(tx).or_default().writers += 1;
         }
         self.descs.insert(
             id,
@@ -206,10 +222,38 @@ impl Files {
         match desc.kind {
             Kind::PipeRead(p) => self.pipe_end(p, true),
             Kind::PipeWrite(p) => self.pipe_end(p, false),
+            Kind::Sock { rx, tx, shut } => {
+                if shut & SHUT_RD == 0 {
+                    self.pipe_end(rx, true);
+                }
+                if shut & SHUT_WR == 0 {
+                    self.pipe_end(tx, false);
+                }
+            },
             Kind::File { ino, .. } | Kind::Dir { ino, .. } => return Some(Some(ino)),
             _ => {},
         }
         Some(None)
+    }
+
+    /// `shutdown` of description `d`, a socket's (`how`: SHUT_RD, SHUT_WR, or both): the pipe ends it
+    /// gives up, so the other end reads the end of input (SHUT_WR) or writes get EPIPE (SHUT_RD).
+    pub fn shutdown(&mut self, d: u32, how: u8) {
+        let Some(Desc {
+            kind: Kind::Sock { rx, tx, shut },
+            ..
+        }) = self.descs.get_mut(&d)
+        else {
+            return;
+        };
+        let (rx, tx, new) = (*rx, *tx, how & !*shut);
+        *shut |= how;
+        if new & SHUT_RD != 0 {
+            self.pipe_end(rx, true);
+        }
+        if new & SHUT_WR != 0 {
+            self.pipe_end(tx, false);
+        }
     }
 
     fn pipe_end(&mut self, p: u32, reader: bool) {
@@ -277,6 +321,12 @@ impl Files {
                 Kind::Event { count } => {
                     w.u(9);
                     w.u(*count);
+                },
+                Kind::Sock { rx, tx, shut } => {
+                    w.u(11);
+                    w.u(*rx as u64);
+                    w.u(*tx as u64);
+                    w.u(*shut as u64);
                 },
                 Kind::Epoll { watch } => {
                     w.u(10);
@@ -350,6 +400,11 @@ impl Files {
                         );
                     }
                     Kind::Epoll { watch }
+                },
+                11 => Kind::Sock {
+                    rx: r.u()? as u32,
+                    tx: r.u()? as u32,
+                    shut: r.u()? as u8,
                 },
                 t => return Err(format!("unknown description {t}")),
             };

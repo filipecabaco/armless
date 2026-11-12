@@ -6,7 +6,9 @@ use armless::cpu::Cpu;
 use armless::dev::fs::{Fs, Ino, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 use armless::Host;
 
-use crate::files::{self, device, got, Desc, Got, Kind, Stat, PIPE_BUF_MAX, S_IFIFO};
+use crate::files::{
+    self, device, got, Desc, Got, Kind, Stat, PIPE_BUF_MAX, SHUT_RD, SHUT_WR, S_IFIFO, S_IFSOCK,
+};
 use crate::files::{EACCES, EBADF, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR};
 use crate::files::{
     O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_TRUNC,
@@ -39,24 +41,92 @@ type Ready = (bool, bool, bool);
 impl Process {
     // ------------------------------------------------------------ descriptors
 
+    /// Pipe `p` from its reading end: (readable, every writer gone).
+    fn pipe_readable(&self, p: u32) -> (bool, bool) {
+        let p = self.files.pipes.get(&p);
+        (
+            p.is_none_or(|p| !p.buf.is_empty() || p.writers == 0),
+            p.is_none_or(|p| p.writers == 0),
+        )
+    }
+
+    /// Pipe `p` from its writing end: (writable, every reader gone).
+    fn pipe_writable(&self, p: u32) -> (bool, bool) {
+        let p = self.files.pipes.get(&p);
+        (
+            p.is_none_or(|p| p.buf.len() < PIPE_BUF_MAX || p.readers == 0),
+            p.is_none_or(|p| p.readers == 0),
+        )
+    }
+
+    /// Up to `max` bytes from pipe `p`: none at its end of input, or a wait (EAGAIN if `nonblock`).
+    fn pipe_read(&mut self, p: u32, max: usize, nonblock: bool) -> Result<Vec<u8>, Ret> {
+        let Some(pipe) = self.files.pipes.get_mut(&p) else {
+            return Ok(Vec::new());
+        };
+        if pipe.buf.is_empty() {
+            return if pipe.writers == 0 {
+                Ok(Vec::new())
+            } else if nonblock {
+                Err(Ret::Val(-EAGAIN))
+            } else {
+                Err(Ret::Retry {
+                    deadline: None,
+                    on_timeout: 0,
+                })
+            };
+        }
+        let n = pipe.buf.len().min(max);
+        let out = pipe.buf.drain(..n).collect();
+        self.poked = true;
+        Ok(out)
+    }
+
+    /// What of `data` pipe `p` takes: EPIPE with no reader left, or a wait while it is full.
+    fn pipe_write(&mut self, p: u32, data: &[u8], nonblock: bool) -> Result<usize, Ret> {
+        let Some(pipe) = self.files.pipes.get_mut(&p) else {
+            return Err(Ret::Val(-EPIPE));
+        };
+        if pipe.readers == 0 {
+            return Err(Ret::Val(-EPIPE));
+        }
+        let room = PIPE_BUF_MAX.saturating_sub(pipe.buf.len());
+        if room == 0 {
+            return Err(if nonblock {
+                Ret::Val(-EAGAIN)
+            } else {
+                Ret::Retry {
+                    deadline: None,
+                    on_timeout: 0,
+                }
+            });
+        }
+        let n = room.min(data.len());
+        pipe.buf.extend(&data[..n]);
+        self.poked = true;
+        Ok(n)
+    }
+
     fn ready(&self, fd: i32) -> Option<Ready> {
         let d = self.files.get(fd)?;
         Some(match &d.kind {
             Kind::Tty => (self.tty.readable(), true, self.tty.closed),
             Kind::PipeRead(p) => {
-                let p = self.files.pipes.get(p);
-                (
-                    p.is_none_or(|p| !p.buf.is_empty() || p.writers == 0),
-                    false,
-                    p.is_none_or(|p| p.writers == 0),
-                )
+                let (r, hup) = self.pipe_readable(*p);
+                (r, false, hup)
             },
             Kind::PipeWrite(p) => {
-                let p = self.files.pipes.get(p);
+                let (w, hup) = self.pipe_writable(*p);
+                (false, w, hup)
+            },
+            // Hung up once the other end is gone both ways (POLLHUP); readable at its end of input
+            Kind::Sock { rx, tx, shut } => {
+                let (r, rx_done) = self.pipe_readable(*rx);
+                let (w, tx_done) = self.pipe_writable(*tx);
                 (
-                    false,
-                    p.is_none_or(|p| p.buf.len() < PIPE_BUF_MAX || p.readers == 0),
-                    p.is_none_or(|p| p.readers == 0),
+                    r || shut & SHUT_RD != 0,
+                    w || shut & SHUT_WR != 0,
+                    rx_done && tx_done,
                 )
             },
             Kind::Event { count } => (*count > 0, true, false),
@@ -72,14 +142,14 @@ impl Process {
         })
     }
 
-    fn nonblock(&self, fd: i32) -> bool {
+    pub(crate) fn nonblock(&self, fd: i32) -> bool {
         self.files
             .get(fd)
             .is_some_and(|d| d.flags & O_NONBLOCK != 0)
     }
 
     /// Up to `max` bytes from `fd` (at `at`, for pread), or what the call must do instead.
-    fn read_fd(&mut self, fd: i32, max: usize, at: Option<u64>) -> Result<Vec<u8>, Ret> {
+    pub(crate) fn read_fd(&mut self, fd: i32, max: usize, at: Option<u64>) -> Result<Vec<u8>, Ret> {
         let nonblock = self.nonblock(fd);
         let Some(d) = self.files.get(fd).cloned() else {
             return Err(Ret::Val(-EBADF));
@@ -141,27 +211,9 @@ impl Process {
                     None => Err(Ret::Val(-EBADF)),
                 }
             },
-            Kind::PipeRead(p) => {
-                let Some(pipe) = self.files.pipes.get_mut(&p) else {
-                    return Ok(Vec::new());
-                };
-                if pipe.buf.is_empty() {
-                    return if pipe.writers == 0 {
-                        Ok(Vec::new())
-                    } else if nonblock {
-                        Err(Ret::Val(-EAGAIN))
-                    } else {
-                        Err(Ret::Retry {
-                            deadline: None,
-                            on_timeout: 0,
-                        })
-                    };
-                }
-                let n = pipe.buf.len().min(max);
-                let out = pipe.buf.drain(..n).collect();
-                self.poked = true;
-                Ok(out)
-            },
+            Kind::PipeRead(p) => self.pipe_read(p, max, nonblock),
+            Kind::Sock { shut, .. } if shut & SHUT_RD != 0 => Ok(Vec::new()),
+            Kind::Sock { rx, .. } => self.pipe_read(rx, max, nonblock),
             Kind::Event { count } => {
                 if max < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -191,7 +243,7 @@ impl Process {
     }
 
     /// Writes `data` to `fd` (at `at`, for pwrite): how much it took, or what the call must do.
-    fn write_fd(&mut self, fd: i32, data: &[u8], at: Option<u64>) -> Result<usize, Ret> {
+    pub(crate) fn write_fd(&mut self, fd: i32, data: &[u8], at: Option<u64>) -> Result<usize, Ret> {
         let nonblock = self.nonblock(fd);
         let Some(d) = self.files.get(fd).cloned() else {
             return Err(Ret::Val(-EBADF));
@@ -234,29 +286,9 @@ impl Process {
                     None => Err(Ret::Val(-EBADF)),
                 }
             },
-            Kind::PipeWrite(p) => {
-                let Some(pipe) = self.files.pipes.get_mut(&p) else {
-                    return Err(Ret::Val(-EPIPE));
-                };
-                if pipe.readers == 0 {
-                    return Err(Ret::Val(-EPIPE));
-                }
-                let room = PIPE_BUF_MAX.saturating_sub(pipe.buf.len());
-                if room == 0 {
-                    return Err(if nonblock {
-                        Ret::Val(-EAGAIN)
-                    } else {
-                        Ret::Retry {
-                            deadline: None,
-                            on_timeout: 0,
-                        }
-                    });
-                }
-                let n = room.min(data.len());
-                pipe.buf.extend(&data[..n]);
-                self.poked = true;
-                Ok(n)
-            },
+            Kind::PipeWrite(p) => self.pipe_write(p, data, nonblock),
+            Kind::Sock { shut, .. } if shut & SHUT_WR != 0 => Err(Ret::Val(-EPIPE)),
+            Kind::Sock { tx, .. } => self.pipe_write(tx, data, nonblock),
             Kind::Event { .. } => {
                 if data.len() < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -427,6 +459,7 @@ impl Process {
                 ..Stat::device(S_IFREG | 0o444, 0)
             },
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
+            Kind::Sock { .. } => Stat::device(S_IFSOCK | 0o777, 0),
             Kind::Event { .. } | Kind::Epoll { .. } => Stat::device(0o600, 0),
         })
     }
@@ -1208,7 +1241,9 @@ impl Process {
             73 => self.ppoll(a[0], a[1], a[2]),
             // pselect6
             72 => self.pselect(a[0], a[1], a[2], a[3], a[4]),
-            // socket, socketpair and the rest of the network: not yet
+            // socketpair and the calls on its ends (sock.rs)
+            n if crate::sock::handles(n) => self.sock_call(n, &a),
+            // socket and the rest of a network: not yet
             198..=212 | 242 | 243 | 269 => v(-ENOSYS),
 
             // ---------------------------------------------------- memory
@@ -1305,6 +1340,19 @@ impl Process {
                     },
                     1 => v(self.futex_wake(addr, val, u32::MAX)),
                     10 => v(self.futex_wake(addr, val, a[5] as u32)),
+                    // FUTEX_REQUEUE(addr, wake, requeue, to), FUTEX_CMP_REQUEUE (only while *addr is
+                    // still a[5]): the woken, and with CMP the moved too
+                    3 | 4 => {
+                        if op & 0x7f == 4 {
+                            match self.u32_at(addr) {
+                                None => return v(-EFAULT),
+                                Some(x) if x != a[5] as u32 => return v(-EAGAIN),
+                                _ => {},
+                            }
+                        }
+                        let (woken, moved) = self.futex_requeue(addr, val, a[3], a[4]);
+                        v((woken + if op & 0x7f == 4 { moved } else { 0 }) as i64)
+                    },
                     _ => v(-ENOSYS),
                 }
             },

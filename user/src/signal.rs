@@ -14,9 +14,13 @@
 //!
 //! Default actions: SIGCHLD, SIGCONT, SIGURG and SIGWINCH are ignored, and so are the stop signals
 //! (no job control); every other one ends the process, with 128 + the signal as its exit code.
+//! An instruction the CPU doesn't have raises SIGILL on its thread, as on Linux, where programs
+//! probe for an extension by running one of its instructions under a handler (OpenSSL does, for
+//! SM3 and SM4); blocked or not handled, it ends the process (128 + 4).
+//!
 //! Not yet: queued real-time signals (one of each pending, as for the standard ones), the
-//! signal masks of ppoll, pselect6 and epoll_pwait, and signals for faults (a fault still stops
-//! the process).
+//! signal masks of ppoll, pselect6 and epoll_pwait, and signals for memory faults (SIGSEGV,
+//! SIGBUS: such a fault still stops the process).
 
 use crate::host::Instant;
 use std::collections::BTreeMap;
@@ -29,6 +33,7 @@ use crate::{Ctx, Process, Ret, Wait};
 
 pub(crate) const SIGINT: u32 = 2;
 pub(crate) const SIGQUIT: u32 = 3;
+pub(crate) const SIGILL: u32 = 4;
 pub(crate) const SIGKILL: u32 = 9;
 pub(crate) const SIGCHLD: u32 = 17;
 pub(crate) const SIGCONT: u32 = 18;
@@ -61,6 +66,8 @@ const LEGACY_ALTSTACK: u64 = 64 << 10;
 pub(crate) const SI_USER: i32 = 0;
 pub(crate) const SI_TKILL: i32 = -6;
 pub(crate) const SI_KERNEL: i32 = 0x80;
+/// si_code of SIGILL: an illegal opcode
+const ILL_ILLOPC: i32 = 1;
 
 const EINTR: i64 = 4;
 const EINVAL: i64 = 22;
@@ -311,6 +318,19 @@ impl Process {
         self.poked = true;
     }
 
+    /// The current thread ran an instruction the CPU doesn't have, at `pc`: SIGILL for it, which
+    /// its handler takes before it runs on (the handler's frame has `pc`, as on Linux). Blocked or
+    /// not handled, it ends the process, as Linux's force_sig does.
+    pub(crate) fn illegal_instruction<H: Host>(&mut self, cpu: &mut Cpu<H>, pc: u64) {
+        cpu.pc = pc;
+        let cur = self.cur;
+        let blocked = self.threads[cur].sig.mask & bit(SIGILL) != 0;
+        match self.sig.disposition(SIGILL) {
+            Disposition::Handle(_) if !blocked => self.raise(SIGILL, Some(cur), ILL_ILLOPC),
+            _ => self.exit_code = Some(128 + SIGILL as i32),
+        }
+    }
+
     /// Whether a thread has a signal it can take now, for the run loop to deliver it
     pub(crate) fn signal_ready(&self) -> bool {
         self.sig.dirty
@@ -384,9 +404,9 @@ impl Process {
         let nr = t.ctx.x[8];
         let restart = act.flags & SA_RESTART != 0;
         let how = match wait {
-            // Reads and writes of terminals and pipes (ERESTARTSYS), the rest EINTR
+            // Reads and writes of terminals, pipes and socket pairs (ERESTARTSYS), the rest EINTR
             Wait::Retry { .. } => match nr {
-                29 | 56 | 63..=70 if restart => Interrupted::Restarts,
+                29 | 56 | 63..=70 | 206 | 207 | 211 | 212 if restart => Interrupted::Restarts,
                 _ => Interrupted::Returns(-EINTR),
             },
             // A futex wait with no timeout restarts with SA_RESTART; with one, EINTR
@@ -463,6 +483,9 @@ impl Process {
         f[8..12].copy_from_slice(&code.to_le_bytes());
         if code <= 0 {
             f[16..20].copy_from_slice(&1000i32.to_le_bytes());
+        } else if sig == SIGILL {
+            // si_addr: the instruction
+            put(&mut f, 16, ctx.pc);
         }
         let uc = SIGINFO_SIZE;
         // uc_flags, uc_link: 0; uc_stack: the alternate stack as it was

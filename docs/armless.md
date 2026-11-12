@@ -228,6 +228,14 @@ x0–x5, answers it in x0, and resumes at ELR.
   output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
   newlines start a line (ONLCR).
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
+- **Socket pairs** (user/src/sock.rs): `socketpair(AF_UNIX)` gives two connected ends, each
+  reading one pipe and writing the other, so they block, poll and are saved as pipes are.
+  Python's asyncio and tokio (deno) make one at startup to wake their event loop. On their ends:
+  `sendto` and `recvfrom` (no address: a pair is connected), `sendmsg` and `recvmsg` (iovecs, no
+  control messages), `MSG_DONTWAIT`, `shutdown` (the other end reads its end of input),
+  `getsockopt` (SO_TYPE, SO_ERROR, SO_DOMAIN, the buffer sizes), `setsockopt` (taken),
+  `getsockname` and `getpeername` (unnamed). Every type is a byte stream here: datagram
+  boundaries aren't kept. `socket` and the rest of a network still return ENOSYS.
 - **Memory:** VA is PA. The ELF's segments go where they ask (a PIE, and the loader, at a base
   of their own), `brk` after them, the stack at the top of RAM and `mmap` below it, from a free
   list; `mremap` moves or grows. Freed ranges are given back to the host with `Ram::discard`
@@ -253,7 +261,9 @@ x0–x5, answers it in x0, and resumes at ELR.
   table miss walks three levels instead of none, and a miss is already the slow path).
 - **Threads:** every guest thread is a saved register context, and they take turns on one
   CPU in slices of instructions; a syscall answered on the way counts against the slice.
-  `clone` (threads only), futexes (with timeouts and bitsets), `set_tid_address` and
+  `clone` (threads only), futexes (with timeouts and bitsets, and FUTEX_REQUEUE and
+  FUTEX_CMP_REQUEUE, which musl's `pthread_cond_broadcast` uses: without them a program waiting
+  on a condition variable at exit, node say, never ends), `set_tid_address` and
   `CLONE_CHILD_CLEARTID`.
 - **Blocking:** a call that can't complete (a read of the terminal or a pipe, a poll, a wait
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
@@ -273,8 +283,11 @@ x0–x5, answers it in x0, and resumes at ELR.
   (a disk wait): its signal comes once it ends. SIGCHLD, SIGCONT, SIGURG, SIGWINCH and the
   stop signals are ignored by default (no job control), the rest end the process with 128 +
   the signal. `Process::kill` is a signal from the host. Go's SIGURG preemption is delivered.
-  Not yet: queued real-time signals, the masks of ppoll, pselect6 and epoll_pwait, and
-  signals for faults.
+  An instruction the CPU doesn't have is SIGILL (ILL_ILLOPC, `si_addr` the instruction) for its
+  thread, as on Linux: OpenSSL probes for SM3 and SM4 by running one under a SIGILL handler, so
+  node from an image whose OpenSSL does gets past it; blocked or not handled, SIGILL ends the
+  process (132). Not yet: queued real-time signals, the masks of ppoll, pselect6 and
+  epoll_pwait, and signals for memory faults (SIGSEGV, SIGBUS).
 - **Snapshots:** the machine's own snapshot holds RAM and the filesystem; `Process::save` holds
   the rest (threads, their waits, the memory map and lazy mappings, descriptors and pipes, the
   terminal, the clock, signals), a few tens of KB. `Process::restore` takes it on a machine that

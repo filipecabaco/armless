@@ -936,3 +936,299 @@ fn a_saved_process_keeps_its_untouched_pages_lazy() {
     assert!(matches!(status, Status::Exited(170)), "h + B: {status:?}");
     assert_eq!(asked, ["page-b"], "the first page came with the snapshot");
 }
+
+// ------------------------------------------------------------ SIGILL
+
+const SIGILL: u16 = 4;
+/// sm3partw1 v4.4s, v0.4s, v3.4s: OpenSSL's probe for SM3, which armless doesn't have
+const SM3_PROBE: u32 = 0xce63_c004;
+
+/// A program probes for an extension as OpenSSL does: it runs one of its instructions under a
+/// SIGILL handler, which gets the signal with ILL_ILLOPC and the instruction's address, and goes
+/// on without it (OpenSSL's siglongjmp: here, it exits 5).
+#[test]
+fn an_instruction_the_cpu_lacks_is_sigill_for_its_handler() {
+    let mut a = Asm::default();
+    a.sigaction(SIGILL, "ill", SA_SIGINFO | SA_RESTORER)
+        .label("probe")
+        .i(SM3_PROBE)
+        .print("B", 1) // the probe passed: it can't here
+        .exit(0)
+        .label("ill")
+        .cmp_imm(0, SIGILL as u32)
+        .bcond(COND_NE, "fail")
+        .i(0xb940_0029) // ldr w9, [x1]: si_signo
+        .cmp_imm(9, SIGILL as u32)
+        .bcond(COND_NE, "fail")
+        .i(0xb940_0829) // ldr w9, [x1, #8]: si_code
+        .cmp_imm(9, 1) // ILL_ILLOPC
+        .bcond(COND_NE, "fail")
+        .i(0xf940_082b) // ldr x11, [x1, #16]: si_addr
+        .adr(10, "probe")
+        .cmp(11, 10)
+        .bcond(COND_NE, "fail")
+        .print("E", 1)
+        .exit(5)
+        .label("fail")
+        .exit(1)
+        .common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"E", "{status:?}");
+    assert!(matches!(status, Status::Exited(5)), "{status:?}");
+    assert_eq!(p.stats.signals_delivered, 1);
+}
+
+/// With no handler, an instruction the CPU lacks ends the program as SIGILL does on Linux.
+#[test]
+fn an_instruction_the_cpu_lacks_ends_a_program_without_a_handler() {
+    let mut a = Asm::default();
+    a.i(SM3_PROBE).print("B", 1).exit(0).common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"");
+    assert!(
+        matches!(status, Status::Exited(132)),
+        "128 + SIGILL: {status:?}"
+    );
+}
+
+// ------------------------------------------------------------ socket pairs
+
+/// socketpair(AF_UNIX, SOCK_STREAM, 0, sp): the ends in w19 and w20, the pair at sp (64 bytes
+/// of stack: the ends, then room for what is read).
+fn socketpair(a: &mut Asm) -> &mut Asm {
+    a.i(0xd101_03ff) // sub sp, sp, #64
+        .movz(0, 1) // AF_UNIX
+        .movz(1, 1) // SOCK_STREAM
+        .movz(2, 0)
+        .i(0x9100_03e3) // mov x3, sp
+        .svc(199)
+        .cbnz_fail(0)
+        .i(0xb940_03f3) // ldr w19, [sp]
+        .i(0xb940_07f4) // ldr w20, [sp, #4]
+}
+
+/// read(fd, sp + 16, 64) into x0
+fn read_into_stack(a: &mut Asm, fd: u32) -> &mut Asm {
+    a.i(mov(0, fd)).i(0x9100_43e1).movz(2, 64).svc(63) // add x1, sp, #16
+}
+
+/// write(1, sp + 16, 1): the byte read
+fn print_read(a: &mut Asm) -> &mut Asm {
+    a.movz(0, 1).i(0x9100_43e1).movz(2, 1).svc(64)
+}
+
+/// What one end writes the other reads, with write and read, sendto and recvfrom; a read that
+/// would wait is EAGAIN with MSG_DONTWAIT; after shutdown(SHUT_WR) the other end reads its end;
+/// getsockopt says it's a stream.
+#[test]
+fn a_socketpair_carries_bytes_between_its_ends() {
+    let mut a = Asm::default();
+    socketpair(&mut a);
+    // write(end 0, "B") and read it at end 1
+    a.i(mov(0, 19)).adr(1, "B").movz(2, 1).svc(64);
+    read_into_stack(&mut a, 20)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    print_read(&mut a);
+    // sendto(end 1, "R", 1, 0, NULL, 0) and recvfrom it at end 0
+    a.i(mov(0, 20))
+        .adr(1, "R")
+        .movz(2, 1)
+        .movz(3, 0)
+        .movz(4, 0)
+        .movz(5, 0)
+        .svc(206)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail")
+        .i(mov(0, 19))
+        .i(0x9100_43e1)
+        .movz(2, 64)
+        .movz(3, 0)
+        .movz(4, 0)
+        .movz(5, 0)
+        .svc(207)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    print_read(&mut a);
+    // Nothing more: recvfrom(end 0, MSG_DONTWAIT) is EAGAIN
+    a.i(mov(0, 19))
+        .i(0x9100_43e1)
+        .movz(2, 64)
+        .movz(3, 0x40)
+        .movz(4, 0)
+        .svc(207)
+        .cmn_imm(0, 11)
+        .bcond(COND_NE, "fail")
+        // shutdown(end 0, SHUT_WR): end 1 reads its end of input
+        .i(mov(0, 19))
+        .movz(1, 1)
+        .svc(210)
+        .cbnz_fail(0);
+    read_into_stack(&mut a, 20).cbnz_fail(0);
+    // getsockopt(end 0, SOL_SOCKET, SO_TYPE, sp + 16, sp + 24): SOCK_STREAM
+    a.movz(9, 4)
+        .i(0xb900_1be9) // str w9, [sp, #24]
+        .i(mov(0, 19))
+        .movz(1, 1)
+        .movz(2, 3)
+        .i(0x9100_43e3) // add x3, sp, #16
+        .i(0x9100_63e4) // add x4, sp, #24
+        .svc(209)
+        .cbnz_fail(0)
+        .i(0xb940_13e9) // ldr w9, [sp, #16]
+        .cmp_imm(9, 1)
+        .bcond(COND_NE, "fail")
+        .print("E", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        .common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"BRE", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+/// What a socketpair holds is kept with the process: written before a snapshot, it is read after
+/// the process goes on in another machine.
+#[test]
+fn a_socketpairs_bytes_survive_a_snapshot() {
+    let mut a = Asm::default();
+    socketpair(&mut a);
+    a.i(mov(0, 19)).adr(1, "W").movz(2, 1).svc(64);
+    // read(0, sp + 32, 32): waits for input, the snapshot's moment
+    a.movz(0, 0).i(0x9100_83e1).movz(2, 32).svc(63);
+    read_into_stack(&mut a, 20)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    print_read(&mut a).exit(0).label("fail").exit(1).common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"");
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    p.input(b"x\n");
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"x\r\nW");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+/// An end with bytes waiting is readable to poll (as asyncio and tokio wait on theirs), and the
+/// other end, with room, writable.
+#[test]
+fn poll_sees_a_socketpair_end_readable() {
+    let mut a = Asm::default();
+    socketpair(&mut a);
+    a.i(mov(0, 19)).adr(1, "W").movz(2, 1).svc(64);
+    // struct pollfd at sp + 16: { end 1, POLLIN }, then { end 0, POLLOUT } at sp + 24
+    a.i(0xb900_13f4) // str w20, [sp, #16]
+        .movz(9, 1)
+        .i(0x7900_2be9) // strh w9, [sp, #20]
+        .i(0xb900_1bf3) // str w19, [sp, #24]
+        .movz(9, 4)
+        .i(0x7900_3be9) // strh w9, [sp, #28]
+        .i(0x9100_43e0) // add x0, sp, #16
+        .movz(1, 2)
+        .movz(2, 0)
+        .movz(3, 0)
+        .movz(4, 8)
+        .svc(73) // ppoll(fds, 2, NULL, NULL, 8): both ready
+        .cmp_imm(0, 2)
+        .bcond(COND_NE, "fail")
+        .i(0x7940_2fe9) // ldrh w9, [sp, #22]: revents
+        .cmp_imm(9, 1)
+        .bcond(COND_NE, "fail")
+        .i(0x7940_3fe9) // ldrh w9, [sp, #30]
+        .cmp_imm(9, 4)
+        .bcond(COND_NE, "fail")
+        .print("E", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        .common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"E", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+// ------------------------------------------------------------ futex requeue
+
+/// A thread waiting at futex A is moved by FUTEX_CMP_REQUEUE to wait at B (as musl's condition
+/// variables hand their waiters to the mutex), so a wake of B wakes it: "R" once it's moved, "B"
+/// once B's wake took it, "W" from the thread itself.
+#[test]
+fn futex_requeue_moves_a_waiter_to_another_address() {
+    let mut a = Asm::default();
+    a.i(0xd101_03ff) // sub sp, sp, #64: A at sp, B at sp + 8
+        .i(0xf900_03ff) // str xzr, [sp]
+        .i(0xf900_07ff) // str xzr, [sp, #8]
+        .i(0x9100_03f5) // mov x21, sp: A
+        .i(0x9100_23f6) // add x22, sp, #8: B
+        // clone(CLONE_VM | FS | FILES | SIGHAND | THREAD, sp - 4096, 0, 0, 0)
+        .movz(0, 0x0f00)
+        .i(0xf2a0_0020) // movk x0, #1, lsl #16
+        .i(0xd140_07e1) // sub x1, sp, #4096
+        .movz(2, 0)
+        .movz(3, 0)
+        .movz(4, 0)
+        .svc(220)
+        .cmp_imm(0, 0)
+        .bcond(COND_EQ, "child")
+        // FUTEX_CMP_REQUEUE_PRIVATE(A, wake 0, requeue 1, B, while *A == 0): once the thread waits
+        .label("requeue")
+        .i(mov(0, 21))
+        .movz(1, 0x84)
+        .movz(2, 0)
+        .movz(3, 1)
+        .i(mov(4, 22))
+        .movz(5, 0)
+        .svc(98)
+        .cmp_imm(0, 1)
+        .bcond(COND_EQ, "moved")
+        .svc(124) // sched_yield: let the thread run to its wait
+        .b("requeue")
+        .label("moved")
+        .print("R", 1)
+        // FUTEX_WAKE_PRIVATE(B, 1): the moved thread
+        .i(mov(0, 22))
+        .movz(1, 0x81)
+        .movz(2, 1)
+        .svc(98)
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail")
+        .print("B", 1)
+        .movz(19, 20)
+        .label("yield")
+        .svc(124)
+        .i(0xd100_0673) // sub x19, x19, #1
+        .cmp_imm(19, 0)
+        .bcond(COND_NE, "yield")
+        .exit(0)
+        // The thread: FUTEX_WAIT_PRIVATE(A, 0), then "W" and its own exit
+        .label("child")
+        .i(mov(0, 21))
+        .movz(1, 0x80)
+        .movz(2, 0)
+        .movz(3, 0)
+        .svc(98)
+        .cbnz_fail(0)
+        .print("W", 1)
+        .movz(0, 0)
+        .svc(93)
+        .label("fail")
+        .exit(1)
+        .common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"RBW", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}

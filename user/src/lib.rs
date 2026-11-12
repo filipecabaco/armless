@@ -1,13 +1,14 @@
 //! User mode for armless: a Linux program on an armless CPU with no guest kernel. The CPU runs it
 //! at EL0 with no vector table, and every exception it takes stops the CPU
 //! (`StopReason::UnhandledException`, `Cpu::stop_on_exceptions`) and is answered here: system
-//! calls by a Linux personality, a touch of a lazily mapped page by filling it (mm.rs), other
-//! faults by stopping the process.
+//! calls by a Linux personality, a touch of a lazily mapped page by filling it (mm.rs), an
+//! instruction the CPU doesn't have by SIGILL, other faults by stopping the process.
 //!
 //! What it gives a program: static or dynamically linked executables (the dynamic loader comes
 //! from the filesystem, as execve has it), the machine's filesystem (armless's, the one the 9p
 //! device serves a Linux guest), a terminal (termios, the window size, a line discipline), pipes,
-//! threads (clone, futexes), epoll, poll and select, clocks and sleeps. Blocking calls park their
+//! socket pairs (sock.rs), threads (clone, futexes with requeue), epoll, poll and select, clocks
+//! and sleeps. Blocking calls park their
 //! thread and run again when something changes, so a snapshot can be taken whatever it waits on.
 //!
 //! Signals are delivered as Linux delivers them (`signal`): handlers on the frame the kernel
@@ -21,7 +22,8 @@
 //! in RAM, once a process maps a file; a program with none runs with it off.
 //!
 //! Not yet: protections (no PROT_NONE, no nil-pointer faults, though the page tables could give
-//! them), fork, sockets, and more than one vCPU (threads take turns on one CPU).
+//! them), fork and exec of another program, sockets other than a pair (`socket`: a network), and
+//! more than one vCPU (threads take turns on one CPU).
 
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
@@ -32,6 +34,7 @@ pub mod host;
 mod mm;
 mod ser;
 mod signal;
+mod sock;
 mod sys;
 mod tty;
 #[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
@@ -745,6 +748,11 @@ impl Process {
                         continue 'run;
                     },
                     Exit::Stop(StopReason::UnhandledException { esr, elr, far }) => {
+                        if esr >> 26 == 0 {
+                            // An instruction the CPU doesn't have: SIGILL (or the end)
+                            self.illegal_instruction(cpu, elr);
+                            continue 'run;
+                        }
                         if esr >> 26 != 0x15 {
                             // A lazy page (filled: on), or a fault
                             if self.abort(cpu, esr, elr, far) {
@@ -908,6 +916,32 @@ impl Process {
             }
         }
         woken as i64
+    }
+
+    /// FUTEX_REQUEUE: wakes up to `wake` threads waiting at `addr`, and moves up to `requeue` more
+    /// to wait at `to` instead (musl's condition variables hand their waiters to the mutex so).
+    /// Returns (woken, moved).
+    pub(crate) fn futex_requeue(
+        &mut self,
+        addr: u64,
+        wake: u64,
+        requeue: u64,
+        to: u64,
+    ) -> (u64, u64) {
+        let woken = self.futex_wake(addr, wake, u32::MAX) as u64;
+        let mut moved = 0;
+        for t in self.threads.iter_mut() {
+            if moved >= requeue {
+                break;
+            }
+            if let Some((Wait::Futex { addr: a, mask }, d)) = t.wait {
+                if a == addr {
+                    t.wait = Some((Wait::Futex { addr: to, mask }, d));
+                    moved += 1;
+                }
+            }
+        }
+        (woken, moved)
     }
 
     /// Takes the registers of the thread on the CPU back into the process, so that every thread
