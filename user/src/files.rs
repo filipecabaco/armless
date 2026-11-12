@@ -81,12 +81,51 @@ pub(crate) enum Kind {
         tx: u32,
         shut: u8,
     },
+    /// A TCP socket (sock.rs)
+    Tcp(Tcp),
+    /// A UDP socket: what DNS answered it, waiting to be read (sock.rs)
+    Udp(Udp),
     Event {
         count: u64,
     },
     Epoll {
         watch: BTreeMap<i32, Watch>,
     },
+}
+
+/// A TCP socket: its local port (0 until bound), the peer it connected to, and where it is.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Tcp {
+    pub port: u16,
+    pub peer: ([u8; 4], u16),
+    pub state: TcpState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TcpState {
+    /// Made (and maybe bound): neither connected nor listening
+    Idle,
+    /// Listening on `port`: connections through the host wait in the network stack; ones from
+    /// the program itself (to 127.0.0.1) here, as descriptions to accept
+    Listening { local: VecDeque<u32> },
+    /// Connecting or connected through the network stack: its connection
+    Conn { id: u32, shut: u8 },
+    /// Connected to the program's own listener: a socket pair's two pipes
+    Local { rx: u32, tx: u32, shut: u8 },
+    /// It failed: the errno SO_ERROR and its next call give
+    Failed(i64),
+}
+
+/// An IPv4 address and port.
+pub(crate) type Addr = ([u8; 4], u16);
+
+/// A UDP socket: its port, its default peer (connect), and datagrams waiting to be read (with
+/// where each came from).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Udp {
+    pub port: u16,
+    pub peer: Option<Addr>,
+    pub rx: VecDeque<(Addr, Vec<u8>)>,
 }
 
 /// What an epoll instance watches on a descriptor: the events asked for (EPOLLET: only as the
@@ -97,6 +136,10 @@ pub(crate) struct Watch {
     pub events: u32,
     pub data: u64,
     pub last: u32,
+    /// The process's activity when it was last reported (`Files::activity`): an edge-triggered
+    /// watch fires again for something new even if it never stopped being ready, as Linux's does
+    /// for each arrival (a listener with connections coming in a burst, say). Not saved.
+    pub seen: u64,
 }
 
 /// An open file description: what it is of, its status flags (O_NONBLOCK, O_APPEND, the access
@@ -133,6 +176,11 @@ pub(crate) struct Files {
     pub pipes: BTreeMap<u32, Pipe>,
     next_desc: u32,
     next_pipe: u32,
+    /// Sockets whose last description went: the network stack hears of it (`Process::sockets_gone`)
+    pub gone: Vec<Kind>,
+    /// Bumped when something arrives that a reader may wait for (bytes into a pipe or a socket
+    /// pair, a connection to the program's own listener, a DNS answer): see `Watch::seen`
+    pub activity: u64,
 }
 
 impl Files {
@@ -157,7 +205,12 @@ impl Files {
         if let Kind::PipeWrite(p) = kind {
             self.pipes.entry(p).or_default().writers += 1;
         }
-        if let Kind::Sock { rx, tx, .. } = kind {
+        if let Kind::Sock { rx, tx, .. }
+        | Kind::Tcp(Tcp {
+            state: TcpState::Local { rx, tx, .. },
+            ..
+        }) = kind
+        {
             self.pipes.entry(rx).or_default().readers += 1;
             self.pipes.entry(tx).or_default().writers += 1;
         }
@@ -219,7 +272,44 @@ impl Files {
             return Some(None);
         }
         let desc = self.descs.remove(&d)?;
-        match desc.kind {
+        self.release(desc.kind)
+    }
+
+    /// A description no descriptor refers to any more is gone: its pipe ends with it, a socket's
+    /// connection told to the stack (`gone`), descriptions waiting at a listener with it. Returns
+    /// the inode of a file, for its reference.
+    pub fn release(&mut self, kind: Kind) -> Option<Option<Ino>> {
+        match kind {
+            Kind::Tcp(Tcp {
+                state: TcpState::Local { rx, tx, shut },
+                ..
+            }) => {
+                if shut & SHUT_RD == 0 {
+                    self.pipe_end(rx, true);
+                }
+                if shut & SHUT_WR == 0 {
+                    self.pipe_end(tx, false);
+                }
+            },
+            Kind::Tcp(Tcp {
+                state: TcpState::Listening { ref local },
+                ..
+            }) => {
+                for d in local.clone() {
+                    if let Some(w) = self.descs.remove(&d) {
+                        self.release(w.kind);
+                    }
+                }
+                self.gone.push(kind);
+            },
+            k @ (Kind::Tcp(_) | Kind::Udp(_)) => self.gone.push(k),
+            other => return self.release_other(other),
+        }
+        Some(None)
+    }
+
+    fn release_other(&mut self, kind: Kind) -> Option<Option<Ino>> {
+        match kind {
             Kind::PipeRead(p) => self.pipe_end(p, true),
             Kind::PipeWrite(p) => self.pipe_end(p, false),
             Kind::Sock { rx, tx, shut } => {
@@ -240,7 +330,12 @@ impl Files {
     /// gives up, so the other end reads the end of input (SHUT_WR) or writes get EPIPE (SHUT_RD).
     pub fn shutdown(&mut self, d: u32, how: u8) {
         let Some(Desc {
-            kind: Kind::Sock { rx, tx, shut },
+            kind:
+                Kind::Sock { rx, tx, shut }
+                | Kind::Tcp(Tcp {
+                    state: TcpState::Local { rx, tx, shut },
+                    ..
+                }),
             ..
         }) = self.descs.get_mut(&d)
         else {
@@ -328,6 +423,55 @@ impl Files {
                     w.u(*tx as u64);
                     w.u(*shut as u64);
                 },
+                Kind::Tcp(t) => {
+                    w.u(12);
+                    w.u(t.port as u64);
+                    w.u(u32::from_be_bytes(t.peer.0) as u64);
+                    w.u(t.peer.1 as u64);
+                    match &t.state {
+                        TcpState::Idle => w.u(0),
+                        TcpState::Listening { local } => {
+                            w.u(1);
+                            w.u(local.len() as u64);
+                            for &d in local {
+                                w.u(d as u64);
+                            }
+                        },
+                        TcpState::Conn { id, shut } => {
+                            w.u(2);
+                            w.u(*id as u64);
+                            w.u(*shut as u64);
+                        },
+                        TcpState::Local { rx, tx, shut } => {
+                            w.u(3);
+                            w.u(*rx as u64);
+                            w.u(*tx as u64);
+                            w.u(*shut as u64);
+                        },
+                        TcpState::Failed(e) => {
+                            w.u(4);
+                            w.u(*e as u64);
+                        },
+                    }
+                },
+                Kind::Udp(u) => {
+                    w.u(13);
+                    w.u(u.port as u64);
+                    match u.peer {
+                        Some((ip, port)) => {
+                            w.u(1);
+                            w.u(u32::from_be_bytes(ip) as u64);
+                            w.u(port as u64);
+                        },
+                        None => w.u(0),
+                    }
+                    w.u(u.rx.len() as u64);
+                    for ((ip, port), data) in &u.rx {
+                        w.u(u32::from_be_bytes(*ip) as u64);
+                        w.u(*port as u64);
+                        w.b(data);
+                    }
+                },
                 Kind::Epoll { watch } => {
                     w.u(10);
                     w.u(watch.len() as u64);
@@ -396,6 +540,7 @@ impl Files {
                                 events: r.u()? as u32,
                                 data: r.u()?,
                                 last: r.u()? as u32,
+                                seen: 0,
                             },
                         );
                     }
@@ -405,6 +550,44 @@ impl Files {
                     rx: r.u()? as u32,
                     tx: r.u()? as u32,
                     shut: r.u()? as u8,
+                },
+                12 => {
+                    let port = r.u()? as u16;
+                    let peer = ((r.u()? as u32).to_be_bytes(), r.u()? as u16);
+                    let state = match r.u()? {
+                        0 => TcpState::Idle,
+                        1 => TcpState::Listening {
+                            local: (0..r.u()?)
+                                .map(|_| r.u().map(|d| d as u32))
+                                .collect::<Result<_, _>>()?,
+                        },
+                        2 => TcpState::Conn {
+                            id: r.u()? as u32,
+                            shut: r.u()? as u8,
+                        },
+                        3 => TcpState::Local {
+                            rx: r.u()? as u32,
+                            tx: r.u()? as u32,
+                            shut: r.u()? as u8,
+                        },
+                        4 => TcpState::Failed(r.u()? as i64),
+                        t => return Err(format!("unknown TCP state {t}")),
+                    };
+                    Kind::Tcp(Tcp { port, peer, state })
+                },
+                13 => {
+                    let port = r.u()? as u16;
+                    let peer = match r.u()? {
+                        0 => None,
+                        _ => Some(((r.u()? as u32).to_be_bytes(), r.u()? as u16)),
+                    };
+                    let mut rx = VecDeque::new();
+                    for _ in 0..r.u()? {
+                        let ip = (r.u()? as u32).to_be_bytes();
+                        let port = r.u()? as u16;
+                        rx.push_back(((ip, port), r.b()?.to_vec()));
+                    }
+                    Kind::Udp(Udp { port, peer, rx })
                 },
                 t => return Err(format!("unknown description {t}")),
             };

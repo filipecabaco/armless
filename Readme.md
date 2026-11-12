@@ -34,10 +34,11 @@ armless started as a fork of [v86](https://github.com/copy/v86).
 - **User mode (experimental):** a Linux program runs with no guest kernel at all
   ([`user/`](user)): the CPU runs it at EL0 and its system calls are answered by the host.
   Static and dynamically linked programs, the machine's filesystem, a terminal, threads, pipes,
-  socket pairs, epoll, poll and select, signals (SIGILL for an instruction the CPU lacks, too),
-  and snapshots of the running process work; processes (fork, exec) and network sockets do not
-  yet. Go, Python 3.14 (asyncio too), node and DuckDB run this way from their own images,
-  natively and in the browser (a snapshot made on one restores on the other).
+  socket pairs, TCP and UDP sockets (clients through the machine's network, servers the host
+  connects to, DNS), epoll, poll and select, signals (SIGILL for an instruction the CPU lacks,
+  too), and snapshots of the running process work; processes (fork, exec) do not yet. Go,
+  Python 3.14 (asyncio too), node and DuckDB run this way from their own images, servers
+  included, natively and in the browser (a snapshot made on one restores on the other).
 
 ## Quick start
 
@@ -65,6 +66,8 @@ cargo run --release --bin armless-exec -- ./my-static-binary arg1 arg2
 cargo run --release --bin armless-exec -- --fs site/system --keys 'print(6*7)\n' python3
 cargo run --release --bin armless-exec -- --stop-after "ready" --save snap ./server
 cargo run --release --bin armless-exec -- --restore snap --input "a line for its terminal"
+# A network: its clients reach out from here, and 127.0.0.1:8080 here is its port 8000
+cargo run --release --bin armless-exec -- --fs site/system --net --forward 8080:8000 python3 -m http.server 8000
 ```
 
 ### Browser
@@ -298,6 +301,7 @@ for armless 0.2.10 and older.
 | `node tests/js/flow.mjs DIR [CPUS]` | the same through `armless.js`, plus HTTP over fetch and port forwarding |
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
 | `node tests/js/user.mjs SITE` | user mode through `armless.js`: a `--kernel none` snowglobe site restored from its native snapshot, asked a question, saved and restored again; `--exec FSDIR PROGRAM ARGS` starts a program from a filesystem |
+| `node tests/js/user-net.mjs FSDIR` | user mode's sockets through `armless.js`: python3 (from FSDIR, a site's `system/`) fetches a URL through the web relay and the host's `fetch()`, and serves `http.server` to a connection the host opens |
 | `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node) |
 | `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands |
 | `cargo bench --bench machine` | host-side costs with criterion: an instruction interpreted and compiled, a page's compile, a snapshot |

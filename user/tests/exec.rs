@@ -1232,3 +1232,454 @@ fn futex_requeue_moves_a_waiter_to_another_address() {
     assert_eq!(out, b"RBW", "{status:?}");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
+
+// ------------------------------------------------------------ TCP and UDP sockets
+
+const COND_LT: u32 = 0xb;
+
+/// An argument of `call`: a number, a register, the address of a label, or sp + an offset.
+#[derive(Clone, Copy)]
+enum Arg {
+    Imm(u16),
+    Reg(u32),
+    Label(&'static str),
+    Sp(u32),
+}
+
+/// System call `nr` with `args` in x0, x1...
+fn call(a: &mut Asm, nr: u16, args: &[Arg]) {
+    for (i, arg) in args.iter().enumerate() {
+        let r = i as u32;
+        match *arg {
+            Arg::Imm(v) => a.movz(r, v),
+            Arg::Reg(x) => a.i(mov(r, x)),
+            Arg::Label(l) => a.adr(r, l),
+            Arg::Sp(off) => a.i(0x9100_03e0 | off << 10 | r), // add xr, sp, #off
+        };
+    }
+    a.svc(nr);
+}
+
+/// `bytes` at `label`: after the code's end, where nothing runs into them.
+fn data(a: &mut Asm, label: &'static str, bytes: &[u8]) {
+    a.label(label);
+    for c in bytes.chunks(4) {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        a.i(u32::from_le_bytes(w));
+    }
+}
+
+fn sockaddr(ip: [u8; 4], port: u16) -> Vec<u8> {
+    let mut b = vec![2, 0];
+    b.extend(port.to_be_bytes());
+    b.extend(ip);
+    b.extend([0; 8]);
+    b
+}
+
+/// Reads `fd` (a register) into the stack and prints it, until its end: then `then`.
+fn copy_out(a: &mut Asm, fd: u32, then: &'static str) {
+    a.label("copy");
+    call(a, 63, &[Arg::Reg(fd), Arg::Sp(0), Arg::Imm(256)]);
+    a.cmp_imm(0, 0)
+        .bcond(COND_LT, "fail")
+        .bcond(COND_EQ, then)
+        .i(mov(21, 0));
+    call(a, 64, &[Arg::Imm(1), Arg::Sp(0), Arg::Reg(21)]);
+    a.b("copy");
+}
+
+fn net_machine() -> Vm<armless::platform::NativePlatform> {
+    let config = Config {
+        memory_size: 128 << 20,
+        cpus: 1,
+        devices: armless::dev::DeviceConfig {
+            console: false,
+            net: true,
+            ..Default::default()
+        },
+    };
+    armless::runner::new_vm(config).unwrap().0
+}
+
+fn start_net(elf: &[u8]) -> (Vm<armless::platform::NativePlatform>, Process) {
+    let mut vm = net_machine();
+    let board = vm.board.clone();
+    let p = Process::exec_bytes(&mut vm.cpus[0], Some(board), elf, &["net".into()], &[]).unwrap();
+    (vm, p)
+}
+
+/// Runs the program, answering the board's events with `answer` whenever it waits, until it ends.
+fn run_net(
+    p: &mut Process,
+    vm: &mut Vm<armless::platform::NativePlatform>,
+    mut answer: impl FnMut(&armless::vm::Board, armless::Event),
+) -> (Vec<u8>, Status) {
+    let mut out = Vec::new();
+    for _ in 0..200 {
+        let (o, status) = run(p, &mut vm.cpus[0]);
+        out.extend(o);
+        let events = vm.board.events();
+        let waiting = matches!(status, Status::Idle(_));
+        for e in events.clone() {
+            answer(&vm.board, e);
+        }
+        if !waiting || events.is_empty() && !p.waiting_for_input() && out.ends_with(b"E") {
+            return (out, status);
+        }
+        if events.is_empty() {
+            return (out, status);
+        }
+    }
+    panic!("no end: {}", String::from_utf8_lossy(&out));
+}
+
+/// A request to port 80 goes to the web relay (HttpRequest), and its response comes back on the
+/// socket.
+#[test]
+fn a_socket_to_port_80_talks_http_through_the_relay() {
+    let mut a = Asm::default();
+    a.i(0xd108_03ff); // sub sp, sp, #512
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(1), Arg::Imm(0)]);
+    a.cmp_imm(0, 0).bcond(COND_LT, "fail").i(mov(19, 0));
+    call(&mut a, 203, &[Arg::Reg(19), Arg::Label("sa"), Arg::Imm(16)]);
+    a.cbnz_fail(0);
+    call(
+        &mut a,
+        64,
+        &[Arg::Reg(19), Arg::Label("req"), Arg::Imm(REQ.len() as u16)],
+    );
+    copy_out(&mut a, 19, "done");
+    a.label("done")
+        .print("E", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        .common();
+    data(&mut a, "sa", &sockaddr([10, 0, 0, 2], 80));
+    data(&mut a, "req", REQ);
+    let (mut vm, mut p) = start_net(&a.elf());
+    let mut url = String::new();
+    let (out, status) = run_net(&mut p, &mut vm, |b, e| {
+        if let armless::Event::HttpRequest {
+            id, url: u, method, ..
+        } = e
+        {
+            assert_eq!(method, "GET");
+            url = u;
+            b.http_respond(id, 200, "OK", &[("content-length".into(), "2".into())]);
+            b.http_body(id, b"hi");
+            b.http_end(id);
+        }
+    });
+    // The terminal adds a \r before each \n
+    let out = String::from_utf8_lossy(&out).replace("\r\r\n", "\n");
+    assert!(url.ends_with("/x"), "{url}");
+    assert!(
+        out.starts_with("HTTP/1.1 200 OK\n") && out.ends_with("\n\nhiE"),
+        "{out}"
+    );
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+const REQ: &[u8] = b"GET /x HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+
+/// A DNS query to port 53 is answered (each name an address of its own), and a connection to
+/// that address reaches the host by name (TcpOpen), which answers what the program sends.
+#[test]
+fn dns_names_a_connection_the_host_accepts_and_answers() {
+    let query: &[u8] =
+        b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x02db\x08internal\x00\x00\x01\x00\x01";
+    let mut a = Asm::default();
+    a.i(0xd108_03ff); // sub sp, sp, #512
+                      // UDP: the query, and its answer's address (its last 4 bytes) printed
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(2), Arg::Imm(0)]);
+    a.i(mov(19, 0));
+    call(
+        &mut a,
+        206,
+        &[
+            Arg::Reg(19),
+            Arg::Label("q"),
+            Arg::Imm(query.len() as u16),
+            Arg::Imm(0),
+            Arg::Label("dns"),
+            Arg::Imm(16),
+        ],
+    );
+    a.cmp_imm(0, query.len() as u32).bcond(COND_NE, "fail");
+    call(
+        &mut a,
+        207,
+        &[
+            Arg::Reg(19),
+            Arg::Sp(0),
+            Arg::Imm(512),
+            Arg::Imm(0),
+            Arg::Imm(0),
+            Arg::Imm(0),
+        ],
+    );
+    a.cmp_imm(0, 0)
+        .bcond(COND_LT, "fail")
+        .i(0x8b20_63e1) // add x1, sp, x0
+        .i(0xd100_1021) // sub x1, x1, #4
+        .movz(0, 1)
+        .movz(2, 4)
+        .svc(64);
+    // TCP to that address, port 5432: "ping", then what comes back
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(1), Arg::Imm(0)]);
+    a.i(mov(20, 0));
+    call(&mut a, 203, &[Arg::Reg(20), Arg::Label("sa"), Arg::Imm(16)]);
+    a.cbnz_fail(0);
+    call(&mut a, 64, &[Arg::Reg(20), Arg::Label("ping"), Arg::Imm(4)]);
+    copy_out(&mut a, 20, "done");
+    a.label("done")
+        .print("E", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        .common();
+    data(&mut a, "q", query);
+    data(&mut a, "dns", &sockaddr([127, 0, 0, 53], 53));
+    data(&mut a, "sa", &sockaddr([10, 0, 0, 2], 5432));
+    data(&mut a, "ping", b"ping");
+    let (mut vm, mut p) = start_net(&a.elf());
+    let mut seen = Vec::new();
+    let (out, status) = run_net(&mut p, &mut vm, |b, e| match e {
+        armless::Event::TcpOpen { id, host, port } => {
+            seen.push(format!("open {host}:{port}"));
+            b.tcp_accept(id);
+        },
+        armless::Event::TcpData { id, data } => {
+            seen.push(format!("data {}", String::from_utf8_lossy(&data)));
+            b.tcp_send(id, b"PONG");
+            b.tcp_close(id);
+        },
+        armless::Event::TcpEof { .. } => seen.push("eof".into()),
+        armless::Event::TcpClosed { .. } => seen.push("closed".into()),
+        _ => {},
+    });
+    // 10.0.0.2 (the terminal adds a \r before its first byte, a \n), then the host's answer
+    assert_eq!(out, b"\r\n\x00\x00\x02PONGE", "{status:?} {seen:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    assert_eq!(
+        seen[..2],
+        ["open db.internal:5432".to_string(), "data ping".into()]
+    );
+}
+
+/// A listening program takes the connections the host opens to its port (snowglobe's previews):
+/// it echoes what it reads and closes.
+#[test]
+fn a_listening_socket_accepts_what_the_host_connects() {
+    let mut a = Asm::default();
+    a.i(0xd108_03ff); // sub sp, sp, #512
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(1), Arg::Imm(0)]);
+    a.i(mov(19, 0));
+    call(&mut a, 200, &[Arg::Reg(19), Arg::Label("sa"), Arg::Imm(16)]);
+    a.cbnz_fail(0);
+    call(&mut a, 201, &[Arg::Reg(19), Arg::Imm(8)]);
+    a.cbnz_fail(0);
+    call(&mut a, 202, &[Arg::Reg(19), Arg::Imm(0), Arg::Imm(0)]);
+    a.cmp_imm(0, 0).bcond(COND_LT, "fail").i(mov(20, 0));
+    call(&mut a, 63, &[Arg::Reg(20), Arg::Sp(0), Arg::Imm(256)]);
+    a.cmp_imm(0, 0).bcond(COND_LT, "fail").i(mov(21, 0));
+    call(&mut a, 64, &[Arg::Reg(20), Arg::Sp(0), Arg::Reg(21)]);
+    call(&mut a, 57, &[Arg::Reg(20)]);
+    a.print("E", 1).exit(0).label("fail").exit(1).common();
+    data(&mut a, "sa", &sockaddr([0, 0, 0, 0], 8080));
+    let (mut vm, mut p) = start_net(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(
+        matches!(status, Status::Idle(None)),
+        "waiting in accept: {status:?}"
+    );
+    let id = vm.board.tcp_connect(8080).unwrap();
+    assert_eq!(vm.board.events(), [armless::Event::TcpConnected { id }]);
+    vm.board.tcp_send(id, b"hello");
+    let mut seen = Vec::new();
+    let (out, status) = run_net(&mut p, &mut vm, |_, e| seen.push(e));
+    assert_eq!(out, b"E", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    assert_eq!(
+        seen,
+        [
+            armless::Event::TcpData {
+                id,
+                data: b"hello".to_vec()
+            },
+            armless::Event::TcpEof { id },
+            armless::Event::TcpClosed { id },
+        ]
+    );
+    // Nobody listens on 8081: refused
+    let other = vm.board.tcp_connect(8081).unwrap();
+    assert_eq!(vm.board.events(), [armless::Event::TcpClosed { id: other }]);
+}
+
+/// A program connects to its own listener on 127.0.0.1 with no network at all.
+#[test]
+fn a_program_talks_to_itself_over_loopback() {
+    let mut a = Asm::default();
+    a.i(0xd108_03ff); // sub sp, sp, #512
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(1), Arg::Imm(0)]);
+    a.i(mov(19, 0));
+    call(&mut a, 200, &[Arg::Reg(19), Arg::Label("sa"), Arg::Imm(16)]);
+    a.cbnz_fail(0);
+    call(&mut a, 201, &[Arg::Reg(19), Arg::Imm(8)]);
+    a.cbnz_fail(0);
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(1), Arg::Imm(0)]);
+    a.i(mov(20, 0));
+    call(&mut a, 203, &[Arg::Reg(20), Arg::Label("sa"), Arg::Imm(16)]);
+    a.cbnz_fail(0);
+    call(&mut a, 202, &[Arg::Reg(19), Arg::Imm(0), Arg::Imm(0)]);
+    a.cmp_imm(0, 0).bcond(COND_LT, "fail").i(mov(21, 0));
+    call(&mut a, 64, &[Arg::Reg(20), Arg::Label("R"), Arg::Imm(1)]);
+    call(&mut a, 63, &[Arg::Reg(21), Arg::Sp(0), Arg::Imm(16)]);
+    a.cmp_imm(0, 1).bcond(COND_NE, "fail");
+    call(&mut a, 64, &[Arg::Imm(1), Arg::Sp(0), Arg::Imm(1)]);
+    // The client closes: the server reads its end
+    call(&mut a, 57, &[Arg::Reg(20)]);
+    call(&mut a, 63, &[Arg::Reg(21), Arg::Sp(0), Arg::Imm(16)]);
+    a.cbnz_fail(0)
+        .print("E", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        .common();
+    data(&mut a, "sa", &sockaddr([127, 0, 0, 1], 9000));
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"RE", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+/// A connection the host refuses is ECONNREFUSED for the program.
+#[test]
+fn a_refused_connection_is_econnrefused() {
+    let mut a = Asm::default();
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(1), Arg::Imm(0)]);
+    a.i(mov(19, 0));
+    call(&mut a, 203, &[Arg::Reg(19), Arg::Label("sa"), Arg::Imm(16)]);
+    a.cmn_imm(0, 111)
+        .bcond(COND_NE, "fail")
+        .print("E", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        .common();
+    data(&mut a, "sa", &sockaddr([10, 0, 0, 9], 5433));
+    let (mut vm, mut p) = start_net(&a.elf());
+    let (out, status) = run_net(&mut p, &mut vm, |b, e| {
+        if let armless::Event::TcpOpen { id, .. } = e {
+            b.tcp_refuse(id);
+        }
+    });
+    assert_eq!(out, b"E", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+/// A listening socket is kept in a snapshot: restored in another machine, it listens there.
+#[test]
+fn a_listener_survives_a_snapshot() {
+    let mut a = Asm::default();
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(1), Arg::Imm(0)]);
+    a.i(mov(19, 0));
+    call(&mut a, 200, &[Arg::Reg(19), Arg::Label("sa"), Arg::Imm(16)]);
+    call(&mut a, 201, &[Arg::Reg(19), Arg::Imm(8)]);
+    call(&mut a, 202, &[Arg::Reg(19), Arg::Imm(0), Arg::Imm(0)]);
+    a.cmp_imm(0, 0)
+        .bcond(COND_LT, "fail")
+        .print("A", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        .common();
+    data(&mut a, "sa", &sockaddr([0, 0, 0, 0], 8080));
+    let (mut vm, mut p) = start_net(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = net_machine();
+    vm.load_state(&state).unwrap();
+    let board = vm.board.clone();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(board), &process).unwrap();
+    let id = vm.board.tcp_connect(8080).unwrap();
+    assert_eq!(vm.board.events(), [armless::Event::TcpConnected { id }]);
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+/// Edge-triggered epoll on a listener reports connections that come while it is still ready
+/// (Go's netpoller): the program takes one per wait, and every one is reported. (It waited
+/// forever for the second when only a change from not ready to ready was an edge.)
+#[test]
+fn edge_triggered_epoll_reports_connections_in_a_burst() {
+    let mut a = Asm::default();
+    a.i(0xd108_03ff); // sub sp, sp, #512
+    call(&mut a, 198, &[Arg::Imm(2), Arg::Imm(1), Arg::Imm(0)]);
+    a.i(mov(19, 0));
+    call(&mut a, 200, &[Arg::Reg(19), Arg::Label("sa"), Arg::Imm(16)]);
+    call(&mut a, 201, &[Arg::Reg(19), Arg::Imm(8)]);
+    call(&mut a, 20, &[Arg::Imm(0)]); // epoll_create1
+    a.i(mov(20, 0))
+        .movz(9, 1)
+        .i(0x72b0_0009) // movk w9, #0x8000, lsl #16: EPOLLIN | EPOLLET
+        .i(0xb900_03e9) // str w9, [sp]
+        .i(0xf900_07ff); // str xzr, [sp, #8]
+    call(
+        &mut a,
+        21,
+        &[Arg::Reg(20), Arg::Imm(1), Arg::Reg(19), Arg::Sp(0)],
+    ); // EPOLL_CTL_ADD
+    a.cbnz_fail(0).movz(22, 3).label("next");
+    // epoll_pwait(ep, sp + 16, 4, -1, NULL, 8), then accept4(listener, NONBLOCK): one, and "A"
+    a.i(mov(0, 20))
+        .i(0x9100_43e1) // add x1, sp, #16
+        .movz(2, 4)
+        .i(0x9280_0003) // movn x3, #0: no timeout
+        .movz(4, 0)
+        .movz(5, 8)
+        .svc(22);
+    a.cmp_imm(0, 1).bcond(COND_LT, "fail");
+    call(
+        &mut a,
+        242,
+        &[Arg::Reg(19), Arg::Imm(0), Arg::Imm(0), Arg::Imm(0x800)],
+    );
+    a.cmp_imm(0, 0).bcond(COND_LT, "fail").print("A", 1);
+    a.i(0xd100_06d6) // sub x22, x22, #1
+        .cmp_imm(22, 0)
+        .bcond(COND_NE, "next")
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        .common();
+    data(&mut a, "sa", &sockaddr([0, 0, 0, 0], 8080));
+    let (mut vm, mut p) = start_net(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    vm.board.tcp_connect(8080).unwrap();
+    vm.board.tcp_connect(8080).unwrap();
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"AA", "both, one per wait: {status:?}");
+    vm.board.tcp_connect(8080).unwrap();
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+/// A machine with a network running a program is the program's from its start: a connection the
+/// host opens before the program listens is refused at once (not sent to a kernel that isn't there).
+#[test]
+fn a_connection_before_the_program_listens_is_refused() {
+    let (vm, _p) = start_net(&hello());
+    let id = vm.board.tcp_connect(9999).unwrap();
+    assert_eq!(vm.board.events(), [armless::Event::TcpClosed { id }]);
+}

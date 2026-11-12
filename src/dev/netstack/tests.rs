@@ -868,3 +868,97 @@ fn segments_with_options_and_frames_of_other_kinds_are_handled() {
         "the guest's MSS of 512"
     );
 }
+
+// ------------------------------------------------------------ programs in user mode
+
+fn stack() -> (Stack, Outbox) {
+    (Stack::new(GUEST_MAC), Outbox::default())
+}
+
+/// A program's connection carries its bytes both ways and ends with TcpClosed, with no packet
+/// at all; the host's refusal and reset read as such for the program.
+#[test]
+fn a_programs_connection_carries_bytes_without_packets() {
+    let (mut s, out) = stack();
+    let id = s.prog_open([10, 0, 0, 7], 5432, 40000, &out);
+    assert!(matches!(out.drain()[..], [Event::TcpOpen { id: i, ref host, port: 5432 }] if i == id && host == "10.0.0.7"));
+    assert_eq!(s.prog_status(id), ProgStatus::Connecting);
+    s.accept(id);
+    assert_eq!(s.prog_status(id), ProgStatus::Open);
+    assert_eq!(s.prog_write(id, b"ping", &out), 4);
+    assert_eq!(out.drain(), [Event::TcpData { id, data: b"ping".to_vec() }]);
+    let before = s.changes();
+    s.send(id, b"pong");
+    assert!(s.changes() > before, "the program is told");
+    assert_eq!(s.buffered(id), 4, "unread");
+    assert_eq!(s.prog_read(id, 2), (b"po".to_vec(), false));
+    s.close(id, &out);
+    assert_eq!(s.prog_read(id, 9), (b"ng".to_vec(), true), "then its end");
+    s.prog_close(id, &out);
+    assert_eq!(out.drain(), [Event::TcpEof { id }, Event::TcpClosed { id }]);
+    assert!(s.frames.is_empty(), "no packets");
+
+    let refused = s.prog_open([10, 0, 0, 7], 1, 40001, &out);
+    out.drain();
+    s.refuse(refused, &out);
+    assert_eq!(out.drain(), [Event::TcpClosed { id: refused }]);
+    assert_eq!(s.prog_status(refused), ProgStatus::Ended(ProgEnd::Refused));
+    let reset = s.prog_open([10, 0, 0, 7], 2, 40002, &out);
+    s.accept(reset);
+    s.abort(reset);
+    assert_eq!(s.prog_status(reset), ProgStatus::Ended(ProgEnd::Reset));
+    assert!(s.frames.is_empty());
+}
+
+/// Ports 80 and 443 (with a CA) are the web relay's, open at once: the program's request is an
+/// HttpRequest, the response its bytes to read.
+#[test]
+fn a_programs_port_80_goes_to_the_web_relay() {
+    let (mut s, out) = stack();
+    let id = s.prog_open([10, 0, 0, 2], 80, 40000, &out);
+    assert_eq!(s.prog_status(id), ProgStatus::Open);
+    assert!(out.drain().is_empty(), "no TcpOpen");
+    s.prog_write(id, b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n", &out);
+    assert!(matches!(&out.drain()[..], [Event::HttpRequest { method, .. }] if method == "GET"));
+    s.with_web(id, &out, |w, _, _| {
+        let mut o = w.respond(200, "OK", &[("content-length".into(), "1".into())]);
+        o.to_guest.extend(w.body(b"x").to_guest);
+        o.to_guest.extend(w.end().to_guest);
+        o
+    });
+    let (b, _) = s.prog_read(id, 4096);
+    let text = String::from_utf8_lossy(&b);
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n") && text.ends_with("\r\n\r\nx"), "{text}");
+    assert!(s.frames.is_empty());
+}
+
+/// In user mode a connection the host opens reaches the program's listener, or is refused; a
+/// kernel guest's still gets a SYN.
+#[test]
+fn a_connection_into_user_mode_reaches_its_listener_or_is_refused() {
+    let (mut s, out) = stack();
+    let kernel = s.connect_into(8080, &out);
+    assert!(!s.frames.is_empty(), "a SYN for a kernel guest");
+    assert!(out.drain().is_empty());
+    s.abort(kernel);
+    s.frames.clear();
+
+    s.user = true;
+    let refused = s.connect_into(8080, &out);
+    assert_eq!(out.drain(), [Event::TcpClosed { id: refused }]);
+    assert!(s.prog_listen(8080));
+    assert!(!s.prog_listen(8080), "taken");
+    let id = s.connect_into(8080, &out);
+    assert_eq!(out.drain(), [Event::TcpConnected { id }]);
+    assert_eq!(s.prog_backlog(8080), 1);
+    assert_eq!(s.prog_accept(8080), Some(id));
+    assert_eq!(s.prog_peer(id).map(|p| p.0), Some(ROUTER_IP));
+    s.send(id, b"hi");
+    assert_eq!(s.prog_read(id, 9), (b"hi".to_vec(), false));
+    // One waiting when the program stops listening: closed
+    let waiting = s.connect_into(8080, &out);
+    out.drain();
+    s.prog_unlisten(8080, &out);
+    assert_eq!(out.drain(), [Event::TcpClosed { id: waiting }]);
+    assert!(s.frames.is_empty());
+}

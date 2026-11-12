@@ -235,7 +235,33 @@ x0–x5, answers it in x0, and resumes at ELR.
   control messages), `MSG_DONTWAIT`, `shutdown` (the other end reads its end of input),
   `getsockopt` (SO_TYPE, SO_ERROR, SO_DOMAIN, the buffer sizes), `setsockopt` (taken),
   `getsockname` and `getpeername` (unnamed). Every type is a byte stream here: datagram
-  boundaries aren't kept. `socket` and the rest of a network still return ENOSYS.
+  boundaries aren't kept.
+- **TCP and UDP sockets** (user/src/inet.rs, AF_INET): with no kernel there are no packets, so a
+  program's connection is the network stack's own (`netstack`'s programs: the same ids, host
+  calls and events as a kernel guest's TCP, its bytes in a buffer the program reads instead of
+  frames). The host serves both alike.
+  - *Out:* `connect` to port 80, or 443 with the site's CA, goes to the web relay (HTTP,
+    WebSocket, TLS terminated in the machine) and is open at once; another port reaches the
+    host as `TcpOpen` (a tunnel, the native egress) and is open once it accepts:
+    `EINPROGRESS` for a non-blocking socket, then writable and `SO_ERROR`.
+  - *DNS:* what a UDP socket sends to port 53, wherever, is answered as the router answers a
+    kernel guest (each name an address of its own), so `getaddrinfo` and Go's resolver work,
+    and the host sees names, not addresses. Other UDP goes nowhere.
+  - *In:* `bind`, `listen`, `accept`/`accept4`: a connection the host opens to the port
+    (`Board::tcp_connect`: snowglobe's previews and links) waits there for `accept`; one to a
+    port nobody listens on is refused at once. From the program's start its machine's network
+    is its own (`Stack::user`).
+  - *Itself:* `connect` to 127.0.0.1 (or the machine's address) on a port it listens on needs
+    no host: the two ends are a socket pair's pipes.
+  - Read, write, `poll`, `epoll` and `select` on them as on pipes; `sendto`/`recvfrom`,
+    `sendmsg`/`recvmsg`, `shutdown`, `getsockname`/`getpeername`, `getsockopt` (SO_ERROR, the
+    type, `SO_ACCEPTCONN`...), `setsockopt` (taken). Edge-triggered epoll reports what arrives
+    even on a descriptor that never stopped being ready, as Linux does for each arrival (Go's
+    netpoller waits for that: a listener with connections coming in a burst hung it).
+  - Snapshots: a listening socket is kept and listens again after a restore; a connection is
+    the saving host's, so after a restore it reads ECONNRESET (as a kernel guest's gets a reset).
+  - IPv6 sockets are refused (EAFNOSUPPORT): Go, node and Python use IPv4 then. Not yet:
+    `recvmmsg`/`sendmmsg`, UDP other than DNS, socket options that change anything.
 - **Memory:** VA is PA. The ELF's segments go where they ask (a PIE, and the loader, at a base
   of their own), `brk` after them, the stack at the top of RAM and `mmap` below it, from a free
   list; `mremap` moves or grows. Freed ranges are given back to the host with `Ram::discard`

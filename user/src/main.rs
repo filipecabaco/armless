@@ -26,6 +26,13 @@ fn usage() -> ! {
   --restore DIR      start from what --save wrote instead of an ELF
   --input LINE       type LINE (and a newline) into its stdin, and stop at the next line it prints
   --timeout SECS     stop after SECS of wall time
+  --net              a network: the program's sockets reach out from here (HTTP and HTTPS
+                     through armless's relay and this host's egress, other TCP directly)
+  --tunnel [H:]P=URL carry the program's TCP to H:P over a WebSocket or tcp:// URL instead
+                     (repeatable; needs --net)
+  --allow-private    let it reach loopback and private addresses
+  --forward H:G      connections to 127.0.0.1:H here reach the program's listener on port G
+                     (repeatable; needs --net)
   ARMLESS_EXEC_TRACE=1 prints every syscall"
     );
     std::process::exit(2)
@@ -48,6 +55,10 @@ fn main() {
     let mut cwd = "/".to_string();
     let mut env: Vec<String> = Vec::new();
     let mut keys: Option<String> = None;
+    let mut net = false;
+    let mut tunnels = Vec::new();
+    let mut allow_private = false;
+    let mut forwards: Vec<(u16, u16)> = Vec::new();
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.peek().cloned() {
         if !a.starts_with('-') {
@@ -64,6 +75,19 @@ fn main() {
             "--timeout" => timeout = Duration::from_secs(val().parse().unwrap_or_else(|_| usage())),
             "--fs" => fs_dir = Some(PathBuf::from(val())),
             "--cwd" => cwd = val(),
+            "--net" => net = true,
+            "--tunnel" => {
+                tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
+            },
+            "--allow-private" => allow_private = true,
+            "--forward" => {
+                let v = val();
+                let (h, g) = v.split_once(':').unwrap_or_else(|| usage());
+                forwards.push((
+                    h.parse().unwrap_or_else(|_| usage()),
+                    g.parse().unwrap_or_else(|_| usage()),
+                ));
+            },
             "--env" => env.push(val()),
             "--keys" => {
                 keys = Some(
@@ -89,6 +113,7 @@ fn main() {
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: fs_dir.as_ref().map(|_| "host9p".to_string()),
+            net,
             ..Default::default()
         },
     };
@@ -105,8 +130,9 @@ fn main() {
     let ram = Ram::from_image(&file, (mem_mb << 20) as usize).unwrap_or_else(|e| die(e));
     let (mut vm, _clock) = armless::runner::new_vm_on(config, Some(ram)).unwrap_or_else(|e| die(e));
 
-    // The filesystem, its blobs served from the directory by armless's native host
-    let mut _host = None;
+    // The filesystem, its blobs served from the directory by armless's native host, and the
+    // network's connections made from here
+    let mut blobs = None;
     if let Some(dir) = &fs_dir {
         let json = ["fs.json", "filesystem.json"]
             .iter()
@@ -116,20 +142,40 @@ fn main() {
         vm.board
             .load_filesystem(&std::fs::read(&json).unwrap_or_else(|e| die(e)))
             .unwrap_or_else(|e| die(e));
-        let blobs = ["blobs", "filesystem"]
+        blobs = ["blobs", "filesystem"]
             .iter()
             .map(|n| dir.join(n))
             .find(|p| p.is_dir());
-        _host = Some(armless::native::NativeHost::spawn(
+    }
+    let host = (fs_dir.is_some() || net).then(|| {
+        std::sync::Arc::new(armless::native::NativeHost::spawn(
             vm.board.clone(),
             armless::native::HostOptions {
                 blobs,
-                ..Default::default()
+                blob_source: None,
+                network: net,
+                egress: armless::native::Egress {
+                    allow_private,
+                    ..armless::native::Egress::from_env()
+                },
+                tunnels,
             },
             Box::new(|_| {}),
-        ));
+        ))
+    });
+    // A port here for each of the program's: what connects to it, connects to the program
+    for (here, port) in forwards {
+        let Some(host) = host.clone().filter(|_| net) else {
+            die("--forward needs --net");
+        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", here)).unwrap_or_else(|e| die(e));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                host.forward(stream, port);
+            }
+        });
     }
-    let board = fs_dir.as_ref().map(|_| vm.board.clone());
+    let board = (fs_dir.is_some() || net).then(|| vm.board.clone());
     if env.is_empty() {
         env = [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -148,7 +194,7 @@ fn main() {
             let process = std::fs::read(dir.join("process.bin")).unwrap_or_else(|e| die(e));
             Process::restore(&mut vm.cpus[0], board, &process).unwrap_or_else(|e| die(e))
         },
-        None => match board {
+        None => match board.clone().filter(|_| fs_dir.is_some()) {
             // Found in the filesystem; its blobs (and its loader's) come from the host meanwhile
             Some(board) => loop {
                 match Process::exec(&mut vm.cpus[0], board.clone(), &guest_args, &env, &cwd) {
@@ -162,7 +208,8 @@ fn main() {
             None => {
                 let elf = std::fs::read(&guest_args[0])
                     .unwrap_or_else(|e| die(format!("{}: {e}", guest_args[0])));
-                Process::exec_bytes(&mut vm.cpus[0], None, &elf, &guest_args, &env)
+                // A static executable of this host's, with the network if there is one
+                Process::exec_bytes(&mut vm.cpus[0], board, &elf, &guest_args, &env)
                     .unwrap_or_else(|e| die(e))
             },
         },

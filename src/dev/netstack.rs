@@ -7,6 +7,12 @@
 //! The link never drops frames (they wait for receive buffers), so TCP
 //! towards the guest only has to respect its window; a retransmit timer
 //! (`tick`) covers what the guest's stack drops on its own.
+//!
+//! A program in user mode (no guest kernel, so no packets) has connections here too, through its
+//! sockets (`prog_*`): the same ids, the same host calls (`accept`, `send`, `close`, the web
+//! relay's) and the same events, with its bytes in a buffer it reads instead of frames. Ports 80
+//! and 443 go to the web relay as a kernel guest's do; a connection the host opens (`connect_into`)
+//! reaches the program's listener on that port.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -50,6 +56,37 @@ enum State {
     Established,
 }
 
+/// A program's side of a connection in user mode: what the host (or the web relay) sent it,
+/// waiting to be read, and whether either side has finished sending.
+#[derive(Default)]
+struct Prog {
+    rx: VecDeque<u8>,
+    /// The host has finished sending (`close`): reads past `rx` are its end
+    eof: bool,
+    /// The program has finished sending (shutdown or close)
+    sent_eof: bool,
+}
+
+/// How a program's connection ended, for its next call on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProgEnd {
+    /// Both sides finished sending: reads are its end, writes EPIPE
+    Closed,
+    /// The host refused it (ECONNREFUSED)
+    Refused,
+    /// The host reset it, or it is gone (ECONNRESET)
+    Reset,
+}
+
+/// Where a program's connection is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProgStatus {
+    /// Waiting for the host to accept it
+    Connecting,
+    Open,
+    Ended(ProgEnd),
+}
+
 struct Conn {
     id: u32,
     guest_port: u16,
@@ -72,6 +109,8 @@ struct Conn {
     guest_fin: bool,
     /// Ports 80 and 443: relayed as HTTP inside the machine
     web: Option<Box<Web>>,
+    /// A program's connection in user mode: no packets
+    prog: Option<Prog>,
     dup_acks: u32,
     last_progress: u64,
     rto: u64,
@@ -106,6 +145,15 @@ pub struct Stack {
     /// The site's CA: with it, port 443 is HTTPS terminated here
     pub tls: Option<TlsKeys>,
     pub rng: Rng,
+    /// A program in user mode uses the network: a connection the host opens goes to its listener
+    pub user: bool,
+    /// Its listening ports, and the connections waiting there for accept
+    listeners: BTreeMap<u16, VecDeque<u32>>,
+    /// Its connections that ended, until it looks
+    ends: BTreeMap<u32, ProgEnd>,
+    /// Bumped whenever something a program waits on changes (bytes in, a connection opened or
+    /// ended, one waiting at a listener)
+    changes: u64,
 }
 
 fn checksum(parts: &[&[u8]]) -> u16 {
@@ -150,6 +198,10 @@ impl Stack {
             frames: VecDeque::new(),
             tls: None,
             rng: Rng::default(),
+            user: false,
+            listeners: BTreeMap::new(),
+            ends: BTreeMap::new(),
+            changes: 0,
         }
     }
 
@@ -332,6 +384,14 @@ impl Stack {
     // ------------------------------------------------------------ host API
 
     pub fn accept(&mut self, id: u32) {
+        if let Some(c) = self.conns.get_mut(&id).filter(|c| c.prog.is_some()) {
+            if c.state == State::SynReceived {
+                c.state = State::Established;
+                c.accepted = true;
+                self.changes += 1;
+            }
+            return;
+        }
         let isn = self.next_isn();
         let Some(c) = self.conns.get_mut(&id) else {
             return;
@@ -348,6 +408,10 @@ impl Stack {
 
     /// Refuse a connection the guest opened (TcpClosed follows, like for every TcpOpen).
     pub fn refuse(&mut self, id: u32, out: &Outbox) {
+        if self.conns.get(&id).is_some_and(|c| c.prog.is_some()) {
+            self.end_prog(id, ProgEnd::Refused, out);
+            return;
+        }
         if let Some(c) = self.conns.get(&id) {
             let ack = c.rcv_nxt;
             let (ip, sport, dport) = (c.remote_ip, c.remote_port, c.guest_port);
@@ -360,6 +424,11 @@ impl Stack {
     pub fn send(&mut self, id: u32, data: &[u8]) {
         if let Some(c) = self.conns.get_mut(&id) {
             if !c.closing {
+                if let Some(p) = c.prog.as_mut() {
+                    p.rx.extend(data);
+                    self.changes += 1;
+                    return;
+                }
                 c.buf.extend(data);
             }
         }
@@ -369,6 +438,17 @@ impl Stack {
     pub fn close(&mut self, id: u32, out: &Outbox) {
         if let Some(c) = self.conns.get_mut(&id) {
             c.closing = true;
+            if let Some(p) = c.prog.as_mut() {
+                p.eof = true;
+                self.changes += 1;
+                let done = p.sent_eof;
+                if done {
+                    self.conns.remove(&id);
+                    self.ends.insert(id, ProgEnd::Closed);
+                    out.push(Event::TcpClosed { id });
+                }
+                return;
+            }
         }
         self.pump(id);
         self.finish_if_done(id, out);
@@ -376,6 +456,13 @@ impl Stack {
 
     /// Reset a connection (no TcpClosed: the host knows).
     pub fn abort(&mut self, id: u32) {
+        if self.conns.get(&id).is_some_and(|c| c.prog.is_some()) {
+            self.conns.remove(&id);
+            self.unqueue(id);
+            self.ends.insert(id, ProgEnd::Reset);
+            self.changes += 1;
+            return;
+        }
         if let Some(c) = self.conns.get(&id) {
             let seq = c.snd_nxt;
             self.segment(id, RST, seq, &[], &[]);
@@ -399,15 +486,213 @@ impl Stack {
         id
     }
 
-    /// Bytes the host gave a connection that the guest has not acknowledged.
+    /// Bytes the host gave a connection that the guest has not acknowledged (in user mode: not
+    /// read yet).
     pub fn buffered(&self, id: u32) -> usize {
-        self.conns.get(&id).map_or(0, |c| c.buf.len())
+        self.conns.get(&id).map_or(0, |c| c.prog.as_ref().map_or(c.buf.len(), |p| p.rx.len()))
     }
 
     /// Whether `id`'s connection is open (tests).
     #[cfg(test)]
     fn remote_port(&self, id: u32) -> Option<u16> {
         self.conns.get(&id).map(|c| c.remote_port)
+    }
+
+    // ------------------------------------------------------------ programs (user mode)
+
+    /// What changed for programs so far: a program waiting on its sockets looks again when it moves.
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
+    /// The address DNS gives `name` (as the router's DNS does), for a program's lookup.
+    pub fn prog_dns(&mut self, query: &[u8]) -> Option<Vec<u8>> {
+        self.dns(query)
+    }
+
+    /// The name behind an address DNS gave out (or the dotted address).
+    pub fn prog_host_of(&self, ip: [u8; 4]) -> String {
+        self.host_of(ip)
+    }
+
+    /// A program connects to `ip` port `port` (an address DNS gave it, or any other): ports 80
+    /// and 443 (with the site's CA) go to the web relay and are open at once; others reach the
+    /// host as `TcpOpen`, and are open once it accepts.
+    pub fn prog_open(&mut self, ip: [u8; 4], port: u16, local_port: u16, out: &Outbox) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let mut c = self.new_conn(id, local_port, ip, port, State::SynReceived, 0);
+        c.prog = Some(Prog::default());
+        let host = self.host_of(ip);
+        self.changes += 1;
+        if port == 80 || (port == 443 && self.tls.is_some()) {
+            c.web = Some(Box::new(Web::new(id, port == 443, host)));
+            c.state = State::Established;
+            c.accepted = true;
+            self.conns.insert(id, c);
+            return id;
+        }
+        self.conns.insert(id, c);
+        out.push(Event::TcpOpen { id, host, port });
+        id
+    }
+
+    /// Where the program's connection `id` is.
+    pub fn prog_status(&self, id: u32) -> ProgStatus {
+        match self.conns.get(&id) {
+            Some(c) if c.state == State::Established => ProgStatus::Open,
+            Some(_) => ProgStatus::Connecting,
+            None => ProgStatus::Ended(self.ends.get(&id).copied().unwrap_or(ProgEnd::Reset)),
+        }
+    }
+
+    /// Up to `max` bytes for the program: (bytes, the host has finished sending). Nothing and
+    /// not finished: it waits.
+    pub fn prog_read(&mut self, id: u32, max: usize) -> (Vec<u8>, bool) {
+        let Some(p) = self.conns.get_mut(&id).and_then(|c| c.prog.as_mut()) else {
+            return (Vec::new(), true);
+        };
+        let n = p.rx.len().min(max);
+        (p.rx.drain(..n).collect(), p.eof && p.rx.is_empty())
+    }
+
+    /// Bytes waiting for the program, and whether the host has finished sending.
+    pub fn prog_pending(&self, id: u32) -> (usize, bool) {
+        self.conns
+            .get(&id)
+            .and_then(|c| c.prog.as_ref())
+            .map_or((0, true), |p| (p.rx.len(), p.eof))
+    }
+
+    /// What the program sends: to the web relay, or to the host as `TcpData`. It takes it all
+    /// (the host keeps up with what it is given, as with a guest's).
+    pub fn prog_write(&mut self, id: u32, data: &[u8], out: &Outbox) -> usize {
+        let Some(c) = self.conns.get(&id) else {
+            return 0;
+        };
+        if c.prog.as_ref().is_none_or(|p| p.sent_eof) {
+            return 0;
+        }
+        if c.web.is_some() {
+            let data = data.to_vec();
+            self.with_web(id, out, |w, tls, rng| w.from_guest(&data, tls, rng));
+        } else {
+            out.push(Event::TcpData {
+                id,
+                data: data.to_vec(),
+            });
+        }
+        data.len()
+    }
+
+    /// The program has finished sending (shutdown(SHUT_WR)).
+    pub fn prog_shutdown(&mut self, id: u32, out: &Outbox) {
+        let Some(p) = self.conns.get_mut(&id).and_then(|c| c.prog.as_mut()) else {
+            return;
+        };
+        if std::mem::replace(&mut p.sent_eof, true) {
+            return;
+        }
+        let done = p.eof;
+        if self.conns.get(&id).is_some_and(|c| c.web.is_some()) {
+            self.with_web(id, out, |w, _, _| w.guest_eof());
+        } else {
+            out.push(Event::TcpEof { id });
+        }
+        if done && self.conns.remove(&id).is_some() {
+            self.ends.insert(id, ProgEnd::Closed);
+            self.changes += 1;
+            out.push(Event::TcpClosed { id });
+        }
+    }
+
+    /// The program closed its socket: what it hadn't finished sending ends, and so does the
+    /// connection (`TcpClosed`).
+    pub fn prog_close(&mut self, id: u32, out: &Outbox) {
+        self.ends.remove(&id);
+        if !self.conns.contains_key(&id) {
+            return;
+        }
+        self.prog_shutdown(id, out);
+        self.unqueue(id);
+        if self.conns.remove(&id).is_some() {
+            out.push(Event::TcpClosed { id });
+        }
+    }
+
+    /// The program listens on `port`: false if it already does.
+    pub fn prog_listen(&mut self, port: u16) -> bool {
+        if self.listeners.contains_key(&port) {
+            return false;
+        }
+        self.listeners.insert(port, VecDeque::new());
+        true
+    }
+
+    /// The program stops listening on `port`: connections waiting there are closed.
+    pub fn prog_unlisten(&mut self, port: u16, out: &Outbox) {
+        for id in self.listeners.remove(&port).unwrap_or_default() {
+            if self.conns.remove(&id).is_some() {
+                out.push(Event::TcpClosed { id });
+            }
+        }
+    }
+
+    /// The next connection waiting at the program's listener on `port`, now the program's.
+    pub fn prog_accept(&mut self, port: u16) -> Option<u32> {
+        let id = self.listeners.get_mut(&port)?.pop_front()?;
+        self.changes += 1;
+        Some(id)
+    }
+
+    /// Connections waiting at the listener on `port`.
+    pub fn prog_backlog(&self, port: u16) -> usize {
+        self.listeners.get(&port).map_or(0, |q| q.len())
+    }
+
+    /// The host opens a connection into the guest's `port`. In user mode it reaches the program's
+    /// listener there at once (`TcpConnected`), or is refused (`TcpClosed`); otherwise it is a
+    /// TCP connection to a kernel guest (`connect`).
+    pub fn connect_into(&mut self, port: u16, out: &Outbox) -> u32 {
+        if !self.user {
+            return self.connect(port);
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let Some(queue) = self.listeners.get_mut(&port) else {
+            out.push(Event::TcpClosed { id });
+            return id;
+        };
+        queue.push_back(id);
+        let mut c = self.new_conn(id, port, ROUTER_IP, router_port(id), State::Established, 0);
+        c.prog = Some(Prog::default());
+        c.accepted = true;
+        self.conns.insert(id, c);
+        self.changes += 1;
+        out.push(Event::TcpConnected { id });
+        id
+    }
+
+    /// The router's port of a connection the host opened (what the program's peer address says).
+    pub fn prog_peer(&self, id: u32) -> Option<([u8; 4], u16)> {
+        self.conns.get(&id).map(|c| (c.remote_ip, c.remote_port))
+    }
+
+    /// A program's connection ended: the host's refusal or reset, kept until the program looks.
+    fn end_prog(&mut self, id: u32, how: ProgEnd, out: &Outbox) {
+        if self.conns.remove(&id).is_some() {
+            out.push(Event::TcpClosed { id });
+        }
+        self.unqueue(id);
+        self.ends.insert(id, how);
+        self.changes += 1;
+    }
+
+    /// `id` no longer waits at a listener.
+    fn unqueue(&mut self, id: u32) {
+        for q in self.listeners.values_mut() {
+            q.retain(|&x| x != id);
+        }
     }
 
     fn next_isn(&mut self) -> u32 {
@@ -445,6 +730,7 @@ impl Stack {
             rto: RTO_MS,
             retries: 0,
             web: None,
+            prog: None,
         }
     }
 
@@ -456,6 +742,9 @@ impl Stack {
             let Some(c) = self.conns.get_mut(&id) else {
                 continue;
             };
+            if c.prog.is_some() {
+                continue;
+            }
             let waiting = match c.state {
                 State::SynReceived => c.accepted,
                 State::SynSent => true,
@@ -907,6 +1196,9 @@ impl Stack {
         // Connections belonged to the host that saved the state.
         self.conns.clear();
         self.frames.clear();
+        self.listeners.clear();
+        self.ends.clear();
+        self.changes += 1;
         Some(())
     }
 }

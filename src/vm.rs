@@ -335,9 +335,22 @@ impl Board {
     pub fn tcp_abort(&self, id: u32) {
         self.with_net(|s, _| s.abort(id));
     }
-    /// Connect to the guest's TCP `port`; `TcpConnected` or `TcpClosed` follows.
+    /// Connect to the guest's TCP `port`; `TcpConnected` or `TcpClosed` follows. In user mode
+    /// it reaches the program's listener on `port` (`netstack`'s programs).
     pub fn tcp_connect(&self, port: u16) -> Option<u32> {
-        self.with_net(|s, _| s.connect(port))
+        self.with_net(|s, io| s.connect_into(port, &io.out))
+    }
+
+    /// A program in user mode uses the network: `f` on the stack (its sockets' `prog_*` calls),
+    /// with the outbox the host's events go to. None without a network.
+    pub fn with_prog_net<T>(
+        &self,
+        f: impl FnOnce(&mut crate::dev::netstack::Stack, &crate::dev::Outbox) -> T,
+    ) -> Option<T> {
+        self.with_net(|s, io| {
+            s.user = true;
+            f(s, &io.out)
+        })
     }
     /// Timers of the network (retransmissions): call every ~100-500 ms.
     pub fn tick(&self, now_ms: u64) {

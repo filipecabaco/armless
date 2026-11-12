@@ -6,8 +6,8 @@
 //! getpeername answer as Linux does for such a pair.
 //!
 //! Every type (stream, datagram, seqpacket) is a byte stream here: datagram boundaries aren't
-//! kept. Not yet: `socket` and the rest of a network (bind, listen, accept, connect), passing
-//! descriptors (SCM_RIGHTS), MSG_PEEK.
+//! kept. TCP and UDP sockets are inet.rs's. Not yet: passing descriptors (SCM_RIGHTS), MSG_PEEK,
+//! recvmmsg and sendmmsg.
 
 use crate::files::{Kind, O_CLOEXEC, O_NONBLOCK, SHUT_RD, SHUT_WR};
 use crate::{Process, Ret};
@@ -37,9 +37,9 @@ const EOPNOTSUPP: i64 = 95;
 const EAFNOSUPPORT: i64 = 97;
 const EISCONN: i64 = 106;
 
-/// The socket system calls user mode answers (the rest are ENOSYS).
+/// The socket system calls user mode answers (recvmmsg and sendmmsg are ENOSYS).
 pub(crate) fn handles(nr: u64) -> bool {
-    matches!(nr, 199 | 204..=212)
+    matches!(nr, 198..=212 | 242)
 }
 
 impl Process {
@@ -47,17 +47,24 @@ impl Process {
     /// sendmsg, recvmsg (see `handles`).
     pub(crate) fn sock_call(&mut self, nr: u64, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
-        if nr == 199 {
-            return self.socketpair(a[0], a[1], a[2], a[3]);
+        match nr {
+            198 => return self.inet_socket(a[0], a[1], a[2]),
+            199 => return self.socketpair(a[0], a[1], a[2], a[3]),
+            _ => {},
         }
         let fd = a[0] as i32;
         let Some(d) = self.files.get(fd) else {
             return v(-EBADF);
         };
-        let Kind::Sock { shut, .. } = d.kind else {
-            return v(-ENOTSOCK);
+        let shut = match d.kind {
+            Kind::Sock { shut, .. } => shut,
+            // TCP and UDP (inet.rs)
+            Kind::Tcp(_) | Kind::Udp(_) => return self.inet_call(nr, a),
+            _ => return v(-ENOTSOCK),
         };
         match nr {
+            // bind, listen, accept, connect: a pair is connected already
+            200..=203 | 242 => v(-EINVAL),
             // getsockname, getpeername: an unnamed AF_UNIX socket (just its family)
             204 | 205 => v(if self.sockaddr_unnamed(a[1], a[2]) { 0 } else { -EFAULT }),
             // sendto(fd, buf, len, flags, addr, addrlen): a pair is connected, so no address

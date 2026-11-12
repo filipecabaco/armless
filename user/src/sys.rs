@@ -42,7 +42,7 @@ impl Process {
     // ------------------------------------------------------------ descriptors
 
     /// Pipe `p` from its reading end: (readable, every writer gone).
-    fn pipe_readable(&self, p: u32) -> (bool, bool) {
+    pub(crate) fn pipe_readable(&self, p: u32) -> (bool, bool) {
         let p = self.files.pipes.get(&p);
         (
             p.is_none_or(|p| !p.buf.is_empty() || p.writers == 0),
@@ -51,7 +51,7 @@ impl Process {
     }
 
     /// Pipe `p` from its writing end: (writable, every reader gone).
-    fn pipe_writable(&self, p: u32) -> (bool, bool) {
+    pub(crate) fn pipe_writable(&self, p: u32) -> (bool, bool) {
         let p = self.files.pipes.get(&p);
         (
             p.is_none_or(|p| p.buf.len() < PIPE_BUF_MAX || p.readers == 0),
@@ -60,7 +60,7 @@ impl Process {
     }
 
     /// Up to `max` bytes from pipe `p`: none at its end of input, or a wait (EAGAIN if `nonblock`).
-    fn pipe_read(&mut self, p: u32, max: usize, nonblock: bool) -> Result<Vec<u8>, Ret> {
+    pub(crate) fn pipe_read(&mut self, p: u32, max: usize, nonblock: bool) -> Result<Vec<u8>, Ret> {
         let Some(pipe) = self.files.pipes.get_mut(&p) else {
             return Ok(Vec::new());
         };
@@ -83,7 +83,7 @@ impl Process {
     }
 
     /// What of `data` pipe `p` takes: EPIPE with no reader left, or a wait while it is full.
-    fn pipe_write(&mut self, p: u32, data: &[u8], nonblock: bool) -> Result<usize, Ret> {
+    pub(crate) fn pipe_write(&mut self, p: u32, data: &[u8], nonblock: bool) -> Result<usize, Ret> {
         let Some(pipe) = self.files.pipes.get_mut(&p) else {
             return Err(Ret::Val(-EPIPE));
         };
@@ -103,6 +103,7 @@ impl Process {
         }
         let n = room.min(data.len());
         pipe.buf.extend(&data[..n]);
+        self.files.activity += 1;
         self.poked = true;
         Ok(n)
     }
@@ -130,6 +131,8 @@ impl Process {
                 )
             },
             Kind::Event { count } => (*count > 0, true, false),
+            Kind::Tcp(t) => self.tcp_ready(t),
+            Kind::Udp(u) => (!u.rx.is_empty(), true, false),
             Kind::Epoll { watch } => (
                 watch.iter().any(|(&f, w)| {
                     self.ready(f)
@@ -214,6 +217,8 @@ impl Process {
             Kind::PipeRead(p) => self.pipe_read(p, max, nonblock),
             Kind::Sock { shut, .. } if shut & SHUT_RD != 0 => Ok(Vec::new()),
             Kind::Sock { rx, .. } => self.pipe_read(rx, max, nonblock),
+            Kind::Tcp(_) => self.tcp_read(fd, max, nonblock),
+            Kind::Udp(_) => self.udp_recv(fd, max, nonblock).map(|(_, data)| data),
             Kind::Event { count } => {
                 if max < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -289,6 +294,8 @@ impl Process {
             Kind::PipeWrite(p) => self.pipe_write(p, data, nonblock),
             Kind::Sock { shut, .. } if shut & SHUT_WR != 0 => Err(Ret::Val(-EPIPE)),
             Kind::Sock { tx, .. } => self.pipe_write(tx, data, nonblock),
+            Kind::Tcp(_) => self.tcp_write(fd, data, nonblock),
+            Kind::Udp(_) => self.udp_send(fd, None, data),
             Kind::Event { .. } => {
                 if data.len() < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -321,6 +328,10 @@ impl Process {
             Some(ino) => {
                 if let Some(ino) = ino {
                     self.fs(|fs| fs.drop_ref(ino));
+                }
+                // A socket's last descriptor: its connection ends now, not at the next wait
+                if !self.files.gone.is_empty() {
+                    self.sockets_gone();
                 }
                 self.poked = true;
                 true
@@ -459,7 +470,7 @@ impl Process {
                 ..Stat::device(S_IFREG | 0o444, 0)
             },
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
-            Kind::Sock { .. } => Stat::device(S_IFSOCK | 0o777, 0),
+            Kind::Sock { .. } | Kind::Tcp(_) | Kind::Udp(_) => Stat::device(S_IFSOCK | 0o777, 0),
             Kind::Event { .. } | Kind::Epoll { .. } => Stat::device(0o600, 0),
         })
     }
@@ -616,6 +627,7 @@ impl Process {
         else {
             return Vec::new();
         };
+        let activity = self.activity();
         let mut now: Vec<(i32, u32)> = Vec::new();
         for (&fd, w) in watch {
             let Some((r, wr, hup)) = self.ready(fd) else {
@@ -643,8 +655,10 @@ impl Process {
         let mut ready = Vec::new();
         for (fd, got) in now {
             let w = watch.get_mut(&fd).unwrap();
-            // Edge-triggered: only what it became ready for since it was last reported
-            let report = if w.events & EPOLLET != 0 { got & !w.last } else { got };
+            // Edge-triggered: what it became ready for since it was last reported, or all of it
+            // once something new arrived (the process's activity moved)
+            let report =
+                if w.events & EPOLLET != 0 && w.seen == activity { got & !w.last } else { got };
             if take {
                 // What it is no longer ready for may be reported again once it is
                 w.last &= got;
@@ -654,6 +668,7 @@ impl Process {
             }
             if take {
                 w.last |= report;
+                w.seen = activity;
                 if w.events & EPOLLONESHOT != 0 {
                     w.events &= !0x3fff;
                 }
@@ -1196,6 +1211,7 @@ impl Process {
                                 events: ev,
                                 data,
                                 last: 0,
+                                seen: 0,
                             },
                         );
                     },

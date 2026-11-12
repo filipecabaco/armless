@@ -7,8 +7,8 @@
 //! What it gives a program: static or dynamically linked executables (the dynamic loader comes
 //! from the filesystem, as execve has it), the machine's filesystem (armless's, the one the 9p
 //! device serves a Linux guest), a terminal (termios, the window size, a line discipline), pipes,
-//! socket pairs (sock.rs), threads (clone, futexes with requeue), epoll, poll and select, clocks
-//! and sleeps. Blocking calls park their
+//! socket pairs (sock.rs), TCP and UDP sockets over the machine's network (inet.rs), threads
+//! (clone, futexes with requeue), epoll, poll and select, clocks and sleeps. Blocking calls park their
 //! thread and run again when something changes, so a snapshot can be taken whatever it waits on.
 //!
 //! Signals are delivered as Linux delivers them (`signal`): handlers on the frame the kernel
@@ -22,8 +22,8 @@
 //! in RAM, once a process maps a file; a program with none runs with it off.
 //!
 //! Not yet: protections (no PROT_NONE, no nil-pointer faults, though the page tables could give
-//! them), fork and exec of another program, sockets other than a pair (`socket`: a network), and
-//! more than one vCPU (threads take turns on one CPU).
+//! them), fork and exec of another program, and more than one vCPU (threads take turns on one
+//! CPU).
 
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
@@ -31,6 +31,7 @@
 mod elf;
 mod files;
 pub mod host;
+mod inet;
 mod mm;
 mod ser;
 mod signal;
@@ -199,6 +200,8 @@ pub struct Process {
     pub(crate) fault: Option<String>,
     /// Something changed that parked calls may wait on: they run again
     pub(crate) poked: bool,
+    /// The network stack's changes for programs as last seen (`Process::net_changed`)
+    pub(crate) net_seen: u64,
     /// The thread whose turn it is, and the one whose registers are on the CPU.
     pub(crate) cur: usize,
     pub(crate) loaded: Option<usize>,
@@ -530,6 +533,7 @@ impl Process {
             exit_code: None,
             fault: None,
             poked: false,
+            net_seen: 0,
             cur: 0,
             loaded: None,
             resume_deadline: None,
@@ -601,6 +605,9 @@ impl Process {
             exited: false,
             sig: ThreadSig::default(),
         });
+        // The machine's network is a program's from now on: a connection the host opens goes to
+        // its listener, or is refused, not to a kernel that isn't there
+        p.claim_network();
         Ok(p)
     }
 
@@ -692,6 +699,10 @@ impl Process {
     pub fn run<H: Host>(&mut self, cpu: &mut Cpu<H>, budget: Duration) -> Status {
         let until = Instant::now() + budget;
         'run: loop {
+            if self.exit_code.is_some() || self.fault.is_some() {
+                // Its sockets close as it ends: the host's connections end too
+                self.close_sockets();
+            }
             if let Some(c) = self.exit_code {
                 return Status::Exited(c);
             }
@@ -860,6 +871,13 @@ impl Process {
     /// something changed) the calls that retry.
     fn wake(&mut self) {
         let now = Instant::now();
+        // Sockets closed since: their connections end; the network changed: waits look again
+        if !self.files.gone.is_empty() {
+            self.sockets_gone();
+        }
+        if self.net_changed() {
+            self.poked = true;
+        }
         let poked = std::mem::take(&mut self.poked);
         let blobs_in: Vec<bool> = self
             .threads
@@ -1161,6 +1179,7 @@ impl Process {
             fault: None,
             // Whatever waited on blobs asks for them again: the host that restores may not have them
             poked: true,
+            net_seen: 0,
             cur,
             loaded: None,
             resume_deadline: None,
@@ -1185,6 +1204,9 @@ impl Process {
             .collect();
         p.want_blobs(&wanted);
         p.sync_mmu(cpu);
+        // Listeners listen again in this machine; connections were the saving host's
+        p.claim_network();
+        p.sockets_restored();
         Ok(p)
     }
 }
