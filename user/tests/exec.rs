@@ -936,3 +936,97 @@ fn a_saved_process_keeps_its_untouched_pages_lazy() {
     assert!(matches!(status, Status::Exited(170)), "h + B: {status:?}");
     assert_eq!(asked, ["page-b"], "the first page came with the snapshot");
 }
+
+// ------------------------------------------------------ headers past the first bytes
+
+/// An executable of `ty` whose first bytes are only its ELF header and its code: its program
+/// headers are at 0x20000 and the path of its loader, if it asks for one, at 0x30000, both past
+/// what exec reads of a file up front. One PT_LOAD maps all of it at `vaddr`.
+fn far_elf(ty: u16, vaddr: u64, code: &[u32], data: &[u8], interp: Option<&[u8]>) -> Vec<u8> {
+    const PHOFF: u64 = 0x2_0000;
+    const INTERP: u64 = 0x3_0000;
+    let phnum = 1 + interp.is_some() as u16;
+    let size = INTERP + interp.map_or(0, |p| p.len() as u64 + 1);
+    let mut e = Vec::new();
+    e.extend_from_slice(b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0");
+    e.extend_from_slice(&ty.to_le_bytes());
+    e.extend_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+    e.extend_from_slice(&1u32.to_le_bytes());
+    e.extend_from_slice(&(vaddr + 64).to_le_bytes()); // entry
+    e.extend_from_slice(&PHOFF.to_le_bytes());
+    e.extend_from_slice(&0u64.to_le_bytes()); // shoff
+    e.extend_from_slice(&0u32.to_le_bytes());
+    for v in [64u16, 56, phnum, 64, 0, 0] {
+        e.extend_from_slice(&v.to_le_bytes());
+    }
+    e.extend(code.iter().flat_map(|w| w.to_le_bytes()));
+    e.extend_from_slice(data);
+    e.resize(PHOFF as usize, 0);
+    e.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    e.extend_from_slice(&5u32.to_le_bytes()); // R X
+    for v in [0, vaddr, vaddr, size, size, 0x1000] {
+        e.extend_from_slice(&v.to_le_bytes());
+    }
+    if let Some(path) = interp {
+        e.extend_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        e.extend_from_slice(&4u32.to_le_bytes()); // R
+        let len = path.len() as u64 + 1;
+        for v in [INTERP, vaddr + INTERP, vaddr + INTERP, len, len, 1] {
+            e.extend_from_slice(&v.to_le_bytes());
+        }
+        e.resize(INTERP as usize, 0);
+        e.extend_from_slice(path);
+        e.push(0);
+    }
+    e
+}
+
+#[test]
+fn the_program_headers_and_the_loaders_path_are_read_from_wherever_they_are_in_the_file() {
+    // The loader (ET_DYN) writes "hello" and exits 3; the program (ET_EXEC) would exit 9
+    let loader = far_elf(
+        3,
+        0,
+        &[
+            movz(0, 1),
+            adr(1, 7 * 4),
+            movz(2, 6),
+            movz(8, 64),
+            SVC,
+            movz(0, 3),
+            movz(8, 94),
+            SVC,
+        ],
+        b"hello\n",
+        None,
+    );
+    let prog = far_elf(
+        2,
+        BASE,
+        &[movz(0, 9), movz(8, 94), SVC],
+        &[],
+        Some(b"/lib/ld.so"),
+    );
+    let config = Config {
+        memory_size: 128 << 20,
+        cpus: 1,
+        devices: armless::dev::DeviceConfig {
+            console: false,
+            fs_tag: Some("host9p".into()),
+            ..Default::default()
+        },
+    };
+    let mut vm = armless::runner::new_vm(config).unwrap().0;
+    let json = format!(
+        r#"{{"version":3,"fsroot":[["prog",{},0,33261,0,0,"prog-blob"],["lib",0,0,16877,0,0,[["ld.so",{},0,33261,0,0,"ld-blob"]]]]}}"#,
+        prog.len(),
+        loader.len()
+    );
+    vm.board.load_filesystem(json.as_bytes()).unwrap();
+    vm.board.provide_raw_blob("prog-blob", prog).unwrap();
+    vm.board.provide_raw_blob("ld-blob", loader).unwrap();
+    let mut p = exec_lazy(&mut vm);
+    let (out, status, _) = run_serving(&mut p, &mut vm);
+    assert_eq!(out, b"hello\r\n", "the loader the far PT_INTERP names ran");
+    assert!(matches!(status, Status::Exited(3)), "{status:?}");
+}

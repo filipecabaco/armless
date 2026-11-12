@@ -565,8 +565,8 @@ impl Process {
     }
 }
 
-/// How much of an executable exec reads to load it lazily: its headers and its loader's path
-/// are in there.
+/// How much of an executable exec reads up front to load it lazily: usually its headers and its
+/// loader's path are in there (when they are not, they are read where they are).
 const HEAD: usize = 64 << 10;
 
 /// An executable to load: its bytes, or a file of the filesystem (and its first bytes) whose
@@ -581,6 +581,37 @@ impl Image<'_> {
         match self {
             Image::Bytes(b) => b,
             Image::File(_, h) => h,
+        }
+    }
+
+    /// `len` bytes of the image from `off`: from its first bytes when they are there, else read
+    /// from the file (a program header table or a loader's path can be anywhere in it).
+    pub(crate) fn read(
+        &self,
+        board: Option<&armless::Board>,
+        off: u64,
+        len: usize,
+    ) -> Result<std::borrow::Cow<'_, [u8]>, ExecError> {
+        let truncated = || ExecError::Fail("truncated ELF".into());
+        let head = self.head();
+        let end = off.checked_add(len as u64).ok_or_else(truncated)?;
+        if end <= head.len() as u64 {
+            return Ok(std::borrow::Cow::Borrowed(
+                &head[off as usize..end as usize],
+            ));
+        }
+        let (Image::File(ino, _), Some(board)) = (self, board) else {
+            return Err(truncated());
+        };
+        match board.with_fs(|fs| got(fs.read(*ino, off, len))) {
+            Some(Got::Ok(d)) if d.len() == len => Ok(std::borrow::Cow::Owned(d)),
+            Some(Got::Ok(_)) => Err(truncated()),
+            Some(Got::Need(blobs)) => {
+                board.want_blobs(&blobs);
+                Err(ExecError::Need(blobs))
+            },
+            Some(Got::Err(e)) => Err(ExecError::Fail(format!("reading it: errno {}", -e))),
+            None => Err(ExecError::Fail("the machine has no filesystem".into())),
         }
     }
 

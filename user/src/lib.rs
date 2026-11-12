@@ -494,9 +494,9 @@ impl Process {
         let fail = ExecError::Fail;
         let ram = cpu.mem.alias();
         let ram_size = ram.len() as u64;
-        let main = elf::header(image.head()).map_err(fail)?;
-        let base = if main.dyn_ { PIE_BASE } else { 0 };
-        let (loaded, segs) = elf::plan(image.head(), ram_size, base).map_err(fail)?;
+        let parsed = elf::parse(&image, board.as_deref())?;
+        let base = if parsed.header().dyn_ { PIE_BASE } else { 0 };
+        let (loaded, segs) = elf::plan(&parsed, ram_size, base).map_err(fail)?;
         let stack_top = ram_size - PAGE;
         let brk_start = page_up(loaded.end);
         let mmap_top = stack_top - STACK_SIZE - PAGE;
@@ -557,11 +557,11 @@ impl Process {
         let (entry, interp_base) = match ld {
             None => (loaded.entry, 0),
             Some(ld) => {
-                let h = elf::header(ld.head()).map_err(fail)?;
+                let parsed = elf::parse(&ld, p.board.as_deref())?;
                 let at = p
-                    .alloc(h.span)
+                    .alloc(parsed.header().span)
                     .ok_or_else(|| fail("no room for the loader".into()))?;
-                let (l, segs) = elf::plan(ld.head(), ram_size, at).map_err(fail)?;
+                let (l, segs) = elf::plan(&parsed, ram_size, at).map_err(fail)?;
                 p.place(&ld, &segs)?;
                 (l.entry, at)
             },
