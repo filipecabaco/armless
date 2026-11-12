@@ -23,8 +23,11 @@ const AIO_MAX_NR: u64 = 65536;
 
 const RWF_APPEND: u64 = 0x10;
 const RWF_NOWAIT: u64 = 8;
-/// HIPRI, DSYNC, SYNC, NOWAIT, APPEND
-const RWF_SUPPORTED: u64 = 0x1f;
+/// A write goes where it is told, whatever the description's O_APPEND says
+const RWF_NOAPPEND: u64 = 0x20;
+/// HIPRI, DSYNC, SYNC, NOWAIT, APPEND, NOAPPEND, DONTCACHE (RWF_ATOMIC, 0x40, is for file
+/// systems that can write atomically: none of this one's can)
+const RWF_SUPPORTED: u64 = 0x1f | RWF_NOAPPEND | 0x80;
 
 const IOCB_CMD_PREAD: u16 = 0;
 const IOCB_CMD_PWRITE: u16 = 1;
@@ -67,7 +70,17 @@ impl Process {
                 };
                 all.extend_from_slice(&b);
             }
-            if flags & RWF_APPEND != 0 {
+            // At the descriptor's position and not the end, though it appends: the position is
+            // given to the write, and moved on by what it wrote
+            let mut moves = None;
+            if flags & RWF_NOAPPEND != 0 {
+                if let (None, Some(Kind::File { pos, .. })) =
+                    (at, self.files.get(fd).map(|d| d.kind.clone()))
+                {
+                    at = Some(pos);
+                    moves = Some(pos);
+                }
+            } else if flags & RWF_APPEND != 0 {
                 if let Some(Kind::File { ino, .. }) = self.files.get(fd).map(|d| d.kind.clone()) {
                     let size = self.fs(|fs| fs.get(ino).map_or(0, |i| i.size)).unwrap_or(0);
                     match at {
@@ -84,7 +97,13 @@ impl Process {
                     }
                 }
             }
-            self.write_fd(fd, &all, at)
+            let r = self.write_fd(fd, &all, at);
+            if let (Some(from), Ok(n), Some(Kind::File { pos, .. })) =
+                (moves, &r, self.files.get_mut(fd).map(|d| &mut d.kind))
+            {
+                *pos = from + *n as u64;
+            }
+            r
         } else {
             let total: u64 = iov.iter().map(|&(_, l)| l).sum();
             self.read_fd(fd, total as usize, at).map(|b| {

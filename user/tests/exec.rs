@@ -2331,6 +2331,52 @@ fn aio_getevents_returns_the_events_it_has_when_its_timeout_passes() {
 }
 
 #[test]
+fn pwritev2_takes_noappend_and_dontcache_and_not_atomic() {
+    let mut a = Asm::with_texts(vec![
+        ("f", b"f"),
+        ("abc", b"abc"),
+        ("def", b"def"),
+        ("XY", b"XY"),
+        ("Z", b"Z"),
+    ]);
+    a.big_room();
+    // x19 = openat(AT_FDCWD, "f", O_RDWR | O_CREAT | O_APPEND, 0644)
+    a.i(0x9280_0c60)
+        .adr(1, "f")
+        .movz(2, 0x442)
+        .movz(3, 0o644)
+        .svc(56)
+        .i(mov(19, 0))
+        .cmp_imm(19, 3)
+        .bcond(COND_NE, "fail");
+    for (slot, l, n) in [(0, "abc", 3), (1, "def", 3), (2, "XY", 2), (3, "Z", 1)] {
+        a.adr(9, l).str_sp(9, 64 + 16 * slot);
+        a.movz(9, n).str_sp(9, 72 + 16 * slot);
+    }
+    a.sp_plus(9, 256).str_sp(9, 192);
+    a.movz(9, 16).str_sp(9, 200);
+    // "abc" appended, then back to the start
+    a.rwv2(true, 64, 1, None, 0).ret_is(3);
+    a.i(mov(0, 19)).movz(1, 0).movz(2, 0).svc(62).ret_is(0);
+    // RWF_NOAPPEND at the descriptor's position (0): "XY" over "ab", and the position moves on
+    a.rwv2(true, 96, 1, None, 0x20).ret_is(2);
+    a.i(mov(0, 19)).movz(1, 0).movz(2, 1).svc(62).ret_is(2);
+    // RWF_NOAPPEND at 1: "Z" over "Y", the position stays
+    a.rwv2(true, 112, 1, Some(1), 0x20).ret_is(1);
+    a.i(mov(0, 19)).movz(1, 0).movz(2, 1).svc(62).ret_is(2);
+    // without it the description's O_APPEND sends the write to the end
+    a.rwv2(true, 80, 1, None, 0).ret_is(3);
+    // RWF_DONTCACHE changes nothing, on a write or on a read
+    a.rwv2(true, 112, 1, Some(0), 0x80).ret_is(1);
+    a.rwv2(false, 192, 1, Some(0), 0x80).ret_is(6);
+    a.print_sp(256, 6);
+    // RWF_ATOMIC is not for this file system
+    a.rwv2(true, 112, 1, Some(0), 0x40).ret_err(95);
+    a.ends();
+    a.run_checked(b"ZZcdefA");
+}
+
+#[test]
 fn pwritev2_and_preadv2_take_a_position_or_the_descriptors_and_their_flags() {
     let mut a = Asm::with_texts(vec![
         ("f", b"f"),
@@ -2354,7 +2400,7 @@ fn pwritev2_and_preadv2_take_a_position_or_the_descriptors_and_their_flags() {
     // a read at the position, the end: nothing
     a.rwv2(false, 192, 1, None, 0).ret_is(0);
     // a flag it cannot take: EOPNOTSUPP
-    a.rwv2(true, 96, 1, Some(0), 0x20).ret_err(95);
+    a.rwv2(true, 96, 1, Some(0), 0x100).ret_err(95);
     // RWF_DSYNC is as a plain write, RWF_APPEND with a position goes to the end anyway
     a.rwv2(true, 96, 1, Some(0), 2).ret_is(2);
     a.rwv2(true, 112, 1, Some(0), 0x10).ret_is(1);
