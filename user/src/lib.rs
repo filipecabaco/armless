@@ -38,6 +38,7 @@ pub mod host;
 mod mm;
 mod net;
 mod proc;
+mod sched;
 mod ser;
 mod itimer;
 mod shm;
@@ -144,6 +145,7 @@ pub(crate) struct Thread {
     pub resume_deadline: Option<Instant>,
     pub exited: bool,
     pub sig: ThreadSig,
+    pub sched: sched::Sched,
 }
 
 /// What a syscall does to the thread that made it.
@@ -647,6 +649,7 @@ impl Process {
             resume_deadline: None,
             exited: false,
             sig: ThreadSig::default(),
+            sched: Default::default(),
         });
         Ok(p)
     }
@@ -1234,6 +1237,7 @@ impl Process {
             w.u(left(t.wait.as_ref().and_then(|(_, d)| *d)));
             w.u(left(t.resume_deadline));
             t.sig.save(&mut w);
+            t.sched.save(&mut w);
         }
         self.shm.save(&mut w);
         let pages = self.file_pages.borrow();
@@ -1255,12 +1259,15 @@ impl Process {
         board: Option<Arc<Board>>,
         data: &[u8],
     ) -> Result<Process, String> {
-        // ARMLUSR5 (0.14.0) is ARMLUSR6 without each process's ids
-        let (rest, v6) = match (data.strip_prefix(MAGIC), data.strip_prefix(MAGIC_V5)) {
-            (Some(rest), _) => (rest, true),
-            (None, Some(rest)) => (rest, false),
-            (None, None) => return Err("not a process state".into()),
+        // Which format it is (MAGIC says what each adds): 5, 6 or 7
+        let Some((ver, rest)) = MAGICS
+            .iter()
+            .enumerate()
+            .find_map(|(i, m)| data.strip_prefix(&m[..]).map(|rest| (5 + i, rest)))
+        else {
+            return Err("not a process state".into());
         };
+        let v6 = ver >= 6;
         let mut r = R(rest);
         let ram = cpu.mem.alias();
         let ram_size = r.u()?;
@@ -1400,6 +1407,7 @@ impl Process {
                 resume_deadline,
                 exited,
                 sig: ThreadSig::load(&mut r)?,
+                sched: if ver >= 7 { sched::Sched::load(&mut r)? } else { sched::Sched::default() },
             });
         }
         // Before ARMLUSR6 there was no System V shared memory
@@ -1476,5 +1484,8 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-const MAGIC: &[u8; 8] = b"ARMLUSR6";
-const MAGIC_V5: &[u8; 8] = b"ARMLUSR5";
+/// The process state's format: ARMLUSR7 (0.16) has each thread's scheduling (sched.rs); ARMLUSR6
+/// (0.15) has none of that; ARMLUSR5 (0.14) has neither the ids, timers, shared memory, shared
+/// file pages nor descriptors in flight of 0.15. Each still loads.
+const MAGIC: &[u8; 8] = b"ARMLUSR7";
+const MAGICS: [&[u8; 8]; 3] = [b"ARMLUSR5", b"ARMLUSR6", MAGIC];

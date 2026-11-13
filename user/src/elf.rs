@@ -101,7 +101,7 @@ pub(crate) fn parse(image: &Image, board: Option<&Board>) -> Result<Elf, ExecErr
         })
         .collect();
     let mut interp = None;
-    if let Some(&(_, off, _, filesz, _, _)) =segs.iter().find(|s| s.0 == 3) {
+    if let Some(&(_, off, _, filesz, _, _)) = segs.iter().find(|s| s.0 == 3) {
         if filesz > INTERP_MAX {
             return Err(ExecError::Fail("its loader's path is too long".into()));
         }
