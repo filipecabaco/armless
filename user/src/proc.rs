@@ -354,24 +354,31 @@ impl Process {
         if flags & !PIDFD_NONBLOCK != 0 || pid <= 0 {
             return Ret::Val(-EINVAL);
         }
+        // A thread of a process has no pidfd of its own (Linux: a thread group's leader only)
+        if self.threads.iter().any(|t| t.tid == pid && t.pid != pid) {
+            return Ret::Val(-EINVAL);
+        }
         if self.proc_ref(pid).is_none_or(|p| p.zombie.is_some()) {
-            return Ret::Val(-3); // ESRCH
+            return Ret::Val(-ESRCH);
         }
         let d = self
             .files
-            .add(crate::files::Kind::Pidfd { pid }, flags as u32 & PIDFD_NONBLOCK as u32);
+            .add(crate::files::Kind::Pidfd { pid }, 2 | (flags as u32 & PIDFD_NONBLOCK as u32));
         Ret::Val(self.files.install(d, 0, true) as i64)
     }
 
-    /// pidfd_send_signal(pidfd, sig, info, flags): kill for the process a pidfd is of
-    pub(crate) fn sys_pidfd_send_signal(&mut self, fd: i32, sig: u32) -> Ret {
+    /// pidfd_send_signal(pidfd, sig, info, flags): kill for the process a pidfd is of (no flags;
+    /// a descriptor that isn't a pidfd is EBADF, as Linux's)
+    pub(crate) fn sys_pidfd_send_signal(&mut self, fd: i32, sig: u32, flags: u64) -> Ret {
+        if flags != 0 {
+            return Ret::Val(-EINVAL);
+        }
         let pid = match self.files.get(fd).map(|d| &d.kind) {
             Some(crate::files::Kind::Pidfd { pid }) => *pid,
-            Some(_) => return Ret::Val(-EINVAL),
-            None => return Ret::Val(-9), // EBADF
+            _ => return Ret::Val(-EBADF),
         };
         if self.proc_ref(pid).is_none_or(|p| p.zombie.is_some()) {
-            return Ret::Val(-3); // ESRCH
+            return Ret::Val(-ESRCH);
         }
         if sig > 64 {
             return Ret::Val(-EINVAL);
@@ -390,8 +397,7 @@ impl Process {
         }
         let pid = match self.files.get(fd).map(|d| &d.kind) {
             Some(crate::files::Kind::Pidfd { pid }) => *pid,
-            Some(_) => return Ret::Val(-EINVAL),
-            None => return Ret::Val(-EBADF),
+            _ => return Ret::Val(-EBADF),
         };
         let Some(p) = self.proc_ref(pid).filter(|p| p.zombie.is_none()) else {
             return Ret::Val(-ESRCH);
@@ -429,8 +435,7 @@ impl Process {
             // P_PIDFD: the process a pidfd is of
             3 => match self.files.get(id as i32).map(|d| &d.kind) {
                 Some(crate::files::Kind::Pidfd { pid }) => Pick::Pid(*pid),
-                Some(_) => return Ret::Val(-EINVAL),
-                None => return Ret::Val(-EBADF),
+                _ => return Ret::Val(-EBADF),
             },
             _ => return Ret::Val(-EINVAL),
         };

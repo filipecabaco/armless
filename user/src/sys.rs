@@ -394,6 +394,26 @@ impl Process {
 
     /// Contents made here for the /proc files programs read
     fn proc_file(&self, path: &[u8]) -> Option<Vec<u8>> {
+        // /proc/self/fdinfo/N: its position, flags (O_CLOEXEC with them, in octal), and for a
+        // pidfd its process (-1 once it was waited for), as Linux says them
+        if let Some(fd) = path
+            .strip_prefix(b"/proc/self/fdinfo/")
+            .and_then(|n| std::str::from_utf8(n).ok()?.parse::<i32>().ok())
+        {
+            let d = self.files.get(fd)?;
+            let cloexec = self.files.fds.get(&fd).is_some_and(|&(_, c)| c);
+            let pos = match d.kind {
+                Kind::File { pos, .. } | Kind::Dir { pos, .. } | Kind::Mem { pos, .. } => pos,
+                _ => 0,
+            };
+            let flags = d.flags | if cloexec { O_CLOEXEC } else { 0 };
+            let mut s = format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t0\nino:\t0\n");
+            if let Kind::Pidfd { pid } = d.kind {
+                let pid = if self.proc_ref(pid).is_some() { pid } else { -1 };
+                s += &format!("Pid:\t{pid}\nNSpid:\t{pid}\n");
+            }
+            return Some(s.into_bytes());
+        }
         Some(match path {
             b"/proc/cpuinfo" => (0..NCPUS_REPORTED)
                 .map(|i| format!("processor\t: {i}\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd aes pmull sha1 sha2 crc32 atomics sha3 sm3 sm4 sha512\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n"))
@@ -1330,7 +1350,7 @@ impl Process {
             197 => self.sys_shmdt(a[0]),
             // pidfd_open(pid, flags), pidfd_send_signal(pidfd, sig, info, flags) (proc.rs)
             434 => self.sys_pidfd_open(a[0] as i32 as i64, a[1]),
-            424 => self.sys_pidfd_send_signal(a[0] as i32, a[1] as u32),
+            424 => self.sys_pidfd_send_signal(a[0] as i32, a[1] as u32, a[3]),
             438 => self.sys_pidfd_getfd(a[0] as i32, a[1] as i32, a[2]),
             // signalfd4(fd, mask, sizemask, flags)
             74 => self.sys_signalfd(a[0] as i32, a[1], a[2], a[3]),
