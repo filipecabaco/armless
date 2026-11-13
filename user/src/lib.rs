@@ -9,8 +9,9 @@
 //! device serves a Linux guest), a terminal (termios, the window size, a line discipline), pipes,
 //! sockets (net.rs: AF_UNIX, and TCP and UDP on the loopback in memory, a network at the host for
 //! the rest), threads (clone, futexes), processes (fork, vfork, execve, wait4, kill: proc.rs,
-//! exec.rs), epoll, poll and select, clocks and sleeps. Blocking calls park their thread and run
-//! again when something changes, so a snapshot can be taken whatever it waits on.
+//! exec.rs), epoll, poll and select, clocks, sleeps and timers (timer.rs). Blocking calls park
+//! their thread and run again when something changes, so a snapshot can be taken whatever it
+//! waits on.
 //!
 //! Signals are delivered as Linux delivers them (`signal`): handlers on the frame the kernel
 //! builds, masks, alternate stacks, blocking calls interrupted (EINTR, or restarted with
@@ -40,10 +41,10 @@ mod net;
 mod proc;
 mod sched;
 mod ser;
-mod itimer;
 mod shm;
 mod signal;
 mod sys;
+mod timer;
 mod tty;
 #[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
 #[allow(unsafe_code)]
@@ -64,6 +65,7 @@ use files::Files;
 use host::Instant;
 use ser::{R, W};
 use signal::{Signals, ThreadSig};
+use timer::Timers;
 use tty::Tty;
 
 pub(crate) const PAGE: u64 = 4096;
@@ -207,8 +209,6 @@ pub(crate) struct Proc {
     pub exe: Vec<u8>,
     pub sig: Signals,
     pub creds: Creds,
-    /// ITIMER_REAL, when armed (itimer.rs): a child doesn't inherit it, exec keeps it
-    pub alarm: Option<itimer::Alarm>,
 }
 
 /// Who a process is: its real, effective and saved user and group ids. A program starts as root;
@@ -297,6 +297,8 @@ pub struct Process {
     /// Print every syscall to stderr.
     /// The machine's System V shared memory (shm.rs)
     pub(crate) shm: shm::Shm,
+    /// The interval and POSIX timers, and the CPU time they count (timer.rs)
+    pub(crate) timers: Timers,
     pub trace: bool,
     pub stats: Stats,
 }
@@ -455,8 +457,14 @@ impl Process {
 
     pub(crate) fn now_ns(&self, clock: u64) -> u64 {
         match clock {
-            // CLOCK_REALTIME, CLOCK_REALTIME_COARSE
-            0 | 5 => host::wall_ns(),
+            // CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_TAI (with no offset)
+            0 | 5 | 11 => host::wall_ns(),
+            // CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID: the host time they held the CPU
+            2 => self.timers.proc_cpu_ns(self.p.pid),
+            3 => self
+                .threads
+                .get(self.cur)
+                .map_or(0, |t| self.timers.thread_cpu_ns(t.tid)),
             // Monotonic: from a second before the program started, on across snapshots
             _ => self.mono_base + self.start.elapsed().as_nanos() as u64,
         }
@@ -601,7 +609,6 @@ impl Process {
                 exe: exe.to_vec(),
                 sig: Signals::default(),
                 creds: Creds::default(),
-                alarm: None,
             },
             procs: BTreeMap::new(),
             threads: Vec::new(),
@@ -622,6 +629,7 @@ impl Process {
             trace: false,
             stats: Stats::default(),
             shm: shm::Shm::default(),
+            timers: Timers::default(),
         };
         p.net_attach();
         let (entry, sp) = match p.load_image(&image, &layout, args, env, exe) {
@@ -846,6 +854,7 @@ impl Process {
     pub fn run<H: Host>(&mut self, cpu: &mut Cpu<H>, budget: Duration) -> Status {
         let until = Instant::now() + budget;
         'run: loop {
+            self.charge_cpu();
             if let Some(c) = self.exit_code {
                 self.net_exit();
                 return Status::Exited(c);
@@ -856,8 +865,8 @@ impl Process {
             if Instant::now() >= until {
                 return Status::Running;
             }
-            // Interval timers that are due raise SIGALRM
-            self.fire_alarms();
+            // Timers that are due signal (timer.rs)
+            self.fire_timers();
             // Signals first: a call a handler interrupts ends rather than runs again
             self.deliver_signals(cpu);
             if self.exit_code.is_some() || self.fault.is_some() {
@@ -884,7 +893,7 @@ impl Process {
                     self.threads
                         .iter()
                         .filter_map(|t| t.wait.as_ref().and_then(|(_, d)| *d))
-                        .chain(self.next_alarm())
+                        .chain(self.timer_wake())
                         .min(),
                 );
             };
@@ -899,6 +908,7 @@ impl Process {
             let pid = self.threads[next].pid;
             self.switch_to(pid);
             self.sync_mmu(cpu);
+            self.begin_slice(pid, self.threads[next].tid);
 
             // Run it until it blocks, faults, or its slice ends: syscalls answered on the way
             // count against the slice, so a thread that polls the clock cannot keep the CPU.
@@ -1177,13 +1187,7 @@ impl Process {
             w.b(&p.exe);
             p.sig.save(&mut w);
             p.creds.save(&mut w);
-            match p.alarm {
-                Some(a) => {
-                    w.u(a.at.saturating_duration_since(now).as_nanos() as u64);
-                    w.u(a.every.as_nanos() as u64);
-                },
-                None => w.u(u64::MAX),
-            }
+            self.timers.save_real(&mut w, p.pid, now);
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1249,6 +1253,7 @@ impl Process {
         }
         drop(pages);
         self.files.net.save_rights(&mut w);
+        self.timers.save(&mut w, now);
         w.0
     }
 
@@ -1299,6 +1304,7 @@ impl Process {
             spaces.push(Rc::new(RefCell::new(mm::Mm::load(&mut r, ram_size)?)));
         }
         let mut all = BTreeMap::new();
+        let mut timers = Timers::default();
         for _ in 0..r.u()? {
             let (pid, ppid, pgid, sid) =
                 (r.u()? as i64, r.u()? as i64, r.u()? as i64, r.u()? as i64);
@@ -1316,13 +1322,9 @@ impl Process {
             let sig = Signals::load(&mut r)?;
             // Before ARMLUSR6 every process was root
             let creds = if v6 { Creds::load(&mut r)? } else { Creds::default() };
-            let alarm = match v6.then(|| r.u()).transpose()? {
-                Some(left) if left != u64::MAX => Some(itimer::Alarm {
-                    at: Instant::now() + Duration::from_nanos(left),
-                    every: Duration::from_nanos(r.u()?),
-                }),
-                _ => None,
-            };
+            if v6 {
+                timers.load_real(&mut r, pid, Instant::now())?;
+            }
             all.insert(
                 pid,
                 Proc {
@@ -1340,7 +1342,6 @@ impl Process {
                     exe,
                     sig,
                     creds,
-                    alarm,
                 },
             );
         }
@@ -1420,6 +1421,10 @@ impl Process {
             }
             files.net.load_rights(&mut r)?;
         }
+        // Before ARMLUSR7 only ITIMER_REAL was kept
+        if ver >= 7 {
+            timers.load(&mut r, now)?;
+        }
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);
@@ -1454,6 +1459,7 @@ impl Process {
             trace: false,
             stats: Stats::default(),
             shm,
+            timers,
         };
         p.net_attach();
         let wanted: Vec<String> = p
@@ -1484,7 +1490,8 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-/// The process state's format: ARMLUSR7 (0.16) has each thread's scheduling (sched.rs); ARMLUSR6
+/// The process state's format: ARMLUSR7 (0.16) has each thread's scheduling (sched.rs) and the
+/// timers but ITIMER_REAL, with the CPU time they count (timer.rs, at the end); ARMLUSR6
 /// (0.15) has none of that; ARMLUSR5 (0.14) has neither the ids, timers, shared memory, shared
 /// file pages nor descriptors in flight of 0.15. Each still loads.
 const MAGIC: &[u8; 8] = b"ARMLUSR7";

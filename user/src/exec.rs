@@ -236,6 +236,8 @@ impl Process {
         // ../lib/jvm/.../bin/java, whose libjli.so is beside the real one
         self.p.exe = real.unwrap_or(exe);
         self.p.sig.exec();
+        // (Interval timers stay; POSIX timers go)
+        self.timers.exec(pid);
         for (i, t) in self.threads.iter_mut().enumerate() {
             if t.pid == pid && i != cur {
                 t.exited = true;

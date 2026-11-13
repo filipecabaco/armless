@@ -1317,9 +1317,9 @@ impl Process {
                     },
                 )
             },
-            // getitimer, setitimer (itimer.rs)
-            102 => self.sys_getitimer(a[0], a[1]),
-            103 => self.sys_setitimer(a[0], a[1], a[2]),
+            // getitimer, setitimer, timer_create, timer_gettime, timer_getoverrun,
+            // timer_settime, timer_delete (timer.rs)
+            102 | 103 | 107..=111 => self.sys_timer(nr, cur, &a),
             // shmget, shmctl, shmat, shmdt (shm.rs)
             194 => self.sys_shmget(a[0] as i32, a[1], a[2]),
             195 => self.sys_shmctl(a[0] as i32, a[1], a[2]),
