@@ -2,12 +2,18 @@
 //! starts as root (uid and gid 0): root may take any ids; a process that isn't root may only move
 //! among its real, effective and saved ones. su, runuser and pg_ctl's own su become another user
 //! this way, and Postgres refuses to start as root, so getuid and geteuid have to say what was
-//! set. The ids own the files a process makes; nothing here checks permissions by them.
+//! set. The ids own the files a process makes; nothing here checks permissions by them. So do a
+//! process's supplementary groups (setgroups, getgroups): a child has its parent's, exec keeps
+//! them.
 
+use crate::ser::{R, W};
 use crate::{Process, Ret};
 
 const EPERM: i64 = 1;
 const EFAULT: i64 = 14;
+const EINVAL: i64 = crate::files::EINVAL;
+/// How many supplementary groups a process may have
+const NGROUPS_MAX: u64 = 65536;
 /// -1: an id the call leaves as it is
 const KEEP: u32 = u32::MAX;
 
@@ -40,7 +46,7 @@ impl Process {
             146 => {
                 let u = id(a[0]);
                 if u == KEEP {
-                    return v(-(crate::files::EINVAL));
+                    return v(-EINVAL);
                 }
                 (true, if root { Some([u; 3]) } else if c.uid[0] == u || c.uid[2] == u {
                     Some([c.uid[0], u, c.uid[2]])
@@ -51,7 +57,7 @@ impl Process {
             144 => {
                 let g = id(a[0]);
                 if g == KEEP {
-                    return v(-(crate::files::EINVAL));
+                    return v(-EINVAL);
                 }
                 (false, if root { Some([g; 3]) } else if c.gid[0] == g || c.gid[2] == g {
                     Some([c.gid[0], g, c.gid[2]])
@@ -94,7 +100,7 @@ impl Process {
                 let ok = (0..3).all(|i| self.put_u32(a[i], ids[i]));
                 return v(if ok { 0 } else { -EFAULT });
             },
-            _ => return v(-(crate::files::EINVAL)),
+            _ => return v(-EINVAL),
         };
         let Some(new) = new else {
             return v(-EPERM);
@@ -106,6 +112,50 @@ impl Process {
         }
         v(0)
     }
+}
+
+impl Process {
+    /// getgroups(size, list): how many groups there are when `size` is 0, else them into `list`
+    pub(crate) fn sys_getgroups(&mut self, size: i32, list: u64) -> i64 {
+        let n = self.p.groups.len() as i64;
+        if size == 0 {
+            return n;
+        }
+        if (size as i64) < n {
+            return -EINVAL;
+        }
+        let b: Vec<u8> = self.p.groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+        if self.write(list, &b) {
+            n
+        } else {
+            -EFAULT
+        }
+    }
+
+    /// setgroups(size, list): root's alone (Linux wants CAP_SETGID; su calls it before setgid
+    /// and setuid)
+    pub(crate) fn sys_setgroups(&mut self, size: u64, list: u64) -> i64 {
+        if self.p.creds.euid() != 0 {
+            return -EPERM;
+        }
+        if size > NGROUPS_MAX {
+            return -EINVAL;
+        }
+        let Some(b) = self.bytes_at(list, 4 * size as usize) else {
+            return -EFAULT;
+        };
+        self.p.groups = b.as_chunks::<4>().0.iter().map(|g| u32::from_le_bytes(*g)).collect();
+        0
+    }
+}
+
+pub(crate) fn save_groups(groups: &[u32], w: &mut W) {
+    w.u(groups.len() as u64);
+    groups.iter().for_each(|&g| w.u(g as u64));
+}
+
+pub(crate) fn load_groups(r: &mut R) -> Result<Vec<u32>, String> {
+    (0..r.u()?).map(|_| Ok(r.u()? as u32)).collect()
 }
 
 #[cfg(test)]

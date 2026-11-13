@@ -236,6 +236,7 @@ impl Process {
         // ../lib/jvm/.../bin/java, whose libjli.so is beside the real one
         self.p.exe = real.unwrap_or(exe);
         self.p.sig.exec();
+        self.p.aio.clear();
         for (i, t) in self.threads.iter_mut().enumerate() {
             if t.pid == pid && i != cur {
                 t.exited = true;

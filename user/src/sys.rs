@@ -256,6 +256,19 @@ impl Process {
 
     /// Writes `data` to `fd` (at `at`, for pwrite): how much it took, or what the call must do.
     fn write_fd(&mut self, fd: i32, data: &[u8], at: Option<u64>) -> Result<usize, Ret> {
+        self.write_fd_as(fd, data, at, None)
+    }
+
+    /// `write_fd`, appending or not as `append` says (RWF_APPEND, RWF_NOAPPEND) whatever the
+    /// description's O_APPEND. A write that appends goes to the end of a file even at a position
+    /// (pwrite), as on Linux.
+    pub(crate) fn write_fd_as(
+        &mut self,
+        fd: i32,
+        data: &[u8],
+        at: Option<u64>,
+        append: Option<bool>,
+    ) -> Result<usize, Ret> {
         let nonblock = self.nonblock(fd);
         let Some(d) = self.files.get(fd).cloned() else {
             return Err(Ret::Val(-EBADF));
@@ -274,10 +287,13 @@ impl Process {
             Kind::Mem { .. } => Err(Ret::Val(-EBADF)),
             Kind::File { ino, pos } => {
                 let now = self.now_secs();
-                let append = d.flags & O_APPEND != 0;
+                let append = append.unwrap_or(d.flags & O_APPEND != 0);
                 let r = self.fs(|fs| {
-                    let off =
-                        at.unwrap_or(if append { fs.get(ino).map_or(0, |i| i.size) } else { pos });
+                    let off = if append {
+                        fs.get(ino).map_or(0, |i| i.size)
+                    } else {
+                        at.unwrap_or(pos)
+                    };
                     got(fs.write(ino, off, data, now)).map_ok(|n| (n, off))
                 });
                 match r {
@@ -345,6 +361,63 @@ impl Process {
                 self.sock_send(fd, id, data, 0, None, &[])
             },
             Kind::PipeRead(_) | Kind::Epoll { .. } => Err(Ret::Val(-EBADF)),
+        }
+    }
+
+    /// Reads into or writes from the program's `iov` (address, length pairs) on `fd`, at `at` or
+    /// at the descriptor's position, with preadv2's and pwritev2's RWF_ `flags` (AIO's requests
+    /// have them too). HIPRI, DSYNC, SYNC and DONTCACHE ask for what happens anyway (the
+    /// filesystem is in memory); NOWAIT makes a call that would wait EAGAIN; APPEND and NOAPPEND
+    /// override O_APPEND. ATOMIC is for filesystems that write atomically: none here does.
+    pub(crate) fn rw_iov(
+        &mut self,
+        fd: i32,
+        write: bool,
+        iov: &[(u64, u64)],
+        at: Option<u64>,
+        flags: u64,
+    ) -> Ret {
+        const RWF_NOWAIT: u64 = 0x8;
+        const RWF_APPEND: u64 = 0x10;
+        const RWF_NOAPPEND: u64 = 0x20;
+        const RWF_DONTCACHE: u64 = 0x80;
+        if flags & !(0x1f | RWF_NOAPPEND | RWF_DONTCACHE) != 0 {
+            return Ret::Val(-95); // EOPNOTSUPP
+        }
+        if flags & (RWF_APPEND | RWF_NOAPPEND) == RWF_APPEND | RWF_NOAPPEND {
+            return Ret::Val(-EINVAL);
+        }
+        let r = if write {
+            let mut all = Vec::new();
+            for &(base, len) in iov {
+                let Some(b) = self.bytes_at(base, len as usize) else {
+                    return Ret::Val(-EFAULT);
+                };
+                all.extend_from_slice(&b);
+            }
+            let append = match flags & (RWF_APPEND | RWF_NOAPPEND) {
+                RWF_APPEND => Some(true),
+                RWF_NOAPPEND => Some(false),
+                _ => None,
+            };
+            self.write_fd_as(fd, &all, at, append)
+        } else {
+            let total: u64 = iov.iter().map(|&(_, l)| l).sum();
+            self.read_fd(fd, total as usize, at).map(|b| {
+                let mut off = 0;
+                for &(base, len) in iov {
+                    let n = (len as usize).min(b.len() - off);
+                    self.write(base, &b[off..off + n]);
+                    off += n;
+                }
+                b.len()
+            })
+        };
+        match r {
+            Ok(n) => Ret::Val(n as i64),
+            // (A file's blobs still come: a disk read)
+            Err(Ret::Retry { .. }) if flags & RWF_NOWAIT != 0 => Ret::Val(-EAGAIN),
+            Err(r) => r,
         }
     }
 
@@ -759,12 +832,9 @@ impl Process {
                 Ok(b) => v(if self.write(a[1], &b) { b.len() as i64 } else { -EFAULT }),
                 Err(r) => r,
             },
-            // readv, preadv, preadv2 (whose offset -1 is the current position; its RWF_ flags only ask
-            // for what happens anyway). Postgres 18 reads and writes with them.
+            // readv, preadv, preadv2 (whose offset -1 is the current position). Postgres 18 reads
+            // and writes with them.
             65 | 69 | 286 => {
-                if nr == 286 && a[5] & !0x1f != 0 {
-                    return v(-95); // EOPNOTSUPP
-                }
                 let at = match nr {
                     69 => Some(a[3]),
                     286 => (a[3] != u64::MAX).then_some(a[3]),
@@ -773,19 +843,7 @@ impl Process {
                 let Some(iov) = self.iovecs(a[1], a[2]) else {
                     return v(-EFAULT);
                 };
-                let total: u64 = iov.iter().map(|&(_, l)| l).sum();
-                match self.read_fd(fd0, total as usize, at) {
-                    Ok(b) => {
-                        let mut off = 0;
-                        for (base, len) in iov {
-                            let n = (len as usize).min(b.len() - off);
-                            self.write(base, &b[off..off + n]);
-                            off += n;
-                        }
-                        v(b.len() as i64)
-                    },
-                    Err(r) => r,
-                }
+                self.rw_iov(fd0, false, &iov, at, if nr == 286 { a[5] } else { 0 })
             },
             // write
             64 => match self.bytes_at(a[1], a[2] as usize) {
@@ -803,9 +861,6 @@ impl Process {
             },
             // writev, pwritev, pwritev2 (as preadv2)
             66 | 70 | 287 => {
-                if nr == 287 && a[5] & !0x1f != 0 {
-                    return v(-95); // EOPNOTSUPP
-                }
                 let at = match nr {
                     70 => Some(a[3]),
                     287 => (a[3] != u64::MAX).then_some(a[3]),
@@ -814,15 +869,7 @@ impl Process {
                 let Some(iov) = self.iovecs(a[1], a[2]) else {
                     return v(-EFAULT);
                 };
-                let mut all = Vec::new();
-                for (base, len) in iov {
-                    let Some(b) = self.bytes_at(base, len as usize) else {
-                        return v(-EFAULT);
-                    };
-                    all.extend_from_slice(&b);
-                }
-                self.write_fd(fd0, &all, at)
-                    .map_or_else(|r| r, |n| v(n as i64))
+                self.rw_iov(fd0, true, &iov, at, if nr == 287 { a[5] } else { 0 })
             },
             // sendfile(out, in, offset*, count)
             71 => {
@@ -1550,22 +1597,15 @@ impl Process {
             155 | 156 => self.sys_getpgid(nr, a[0] as i32 as i64),
             157 => self.sys_setsid(),
             154 => self.sys_setpgid(a[0] as i32 as i64, a[1] as i32 as i64),
-            // getgroups: no supplementary groups
-            158 => v(0),
-            // setgroups(size, list): root may (su calls it before setgid and setuid). The groups
-            // aren't kept: nothing here checks permissions by them.
-            159 => {
-                const NGROUPS_MAX: u64 = 65536;
-                if self.p.creds.euid() != 0 {
-                    v(-1) // EPERM
-                } else if a[0] > NGROUPS_MAX {
-                    v(-(crate::files::EINVAL))
-                } else if a[0] > 0 && self.bytes_at(a[1], a[0] as usize * 4).is_none() {
-                    v(-EFAULT)
-                } else {
-                    v(0)
-                }
-            },
+            // getgroups, setgroups (creds.rs)
+            158 => v(self.sys_getgroups(a[0] as i32, a[1])),
+            159 => v(self.sys_setgroups(a[0], a[1])),
+            // io_setup, io_destroy, io_submit, io_cancel, io_getevents, io_pgetevents (aio.rs)
+            0 => v(self.sys_io_setup(a[0], a[1])),
+            1 => v(self.sys_io_destroy(a[0])),
+            2 => self.sys_io_submit(a[0], a[1] as i64, a[2]),
+            3 => v(self.sys_io_cancel(a[0], a[1])),
+            4 | 292 => self.sys_io_getevents(a[0], a[1] as i64, a[2] as i64, a[3], a[4]),
             // capget: no capabilities
             90 => {
                 if a[1] != 0 {
