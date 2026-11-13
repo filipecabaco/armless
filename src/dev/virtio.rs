@@ -432,8 +432,9 @@ impl Transport {
 
 /// The device behind a transport.
 // A handful made once at start-up and never moved: boxing the network's would only add a
-// pointer chase on its hot path
-#[expect(clippy::large_enum_variant, reason = "few, long-lived, never moved")]
+// pointer chase on its hot path. `allow`, not `expect`: on unix the file system's spill makes
+// the variants close enough in size that the lint does not fire, on wasm it does.
+#[allow(clippy::large_enum_variant, reason = "few, long-lived, never moved")]
 pub enum Device {
     Console(Console),
     P9(P9),

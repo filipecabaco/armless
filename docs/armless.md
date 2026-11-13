@@ -54,8 +54,14 @@ Input goes through `console_input`, `console_resize` and `serial_input`. Console
 input is queued until the guest posts receive buffers, so nothing is dropped.
 
 A 9p request that needs a blob that hasn't arrived waits (its descriptor chain is
-held) and is answered when the blobs it needs have all arrived. Fetched blobs are
-cached up to 256 MiB, oldest evicted first, except the chunks a waiting read covers.
+held) and is answered when the blobs it needs have all arrived. In the browser,
+fetched blobs are cached up to 256 MiB, oldest evicted first, except the chunks a
+waiting read covers. A native host decompresses each blob once into an unlinked
+temporary file (mode 0600, in the temporary directory) and reads it with pread, so
+the blobs take no heap and are never decompressed twice. When the temporary directory
+is tmpfs or ramfs, or its file system cannot be told, or the file cannot be made or
+fills up, the blobs stay in the cache above (the host prints one warning for a file
+that fills up).
 
 ## The filesystem
 
