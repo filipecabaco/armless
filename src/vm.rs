@@ -972,8 +972,12 @@ pub fn split_state(data: &mut dyn std::io::Read, image: &std::fs::File) -> Resul
     let mut out = head.to_vec();
     let cpus = u32::from_le_bytes(head[16..20].try_into().unwrap()) | ON_IMAGE;
     out[16..20].copy_from_slice(&cpus.to_le_bytes());
+    // A corrupt length is refused, not a capacity overflow or an abort for want of memory
+    let meta = usize::try_from(meta).map_err(|_| "corrupt snapshot")?;
+    out.try_reserve_exact(meta)
+        .map_err(|_| format!("no memory for the snapshot's {} MiB of state", meta >> 20))?;
     let at = out.len();
-    out.resize(at + meta as usize, 0);
+    out.resize(at + meta, 0);
     data.read_exact(&mut out[at..])
         .map_err(|_| "truncated snapshot")?;
     image.set_len(0).map_err(e)?;
@@ -1069,7 +1073,11 @@ impl StateLoader {
                             let cpus = u32::from_le_bytes(b[16..20].try_into().unwrap());
                             let on_image = cpus & ON_IMAGE != 0;
                             let ncpus = (cpus & !ON_IMAGE) as usize;
-                            let meta = u64::from_le_bytes(b[20..28].try_into().unwrap()) as usize;
+                            // More than the address space holds (on wasm32) is a corrupt header, not
+                            // a length to cut short
+                            let meta =
+                                usize::try_from(u64::from_le_bytes(b[20..28].try_into().unwrap()))
+                                    .map_err(|_| "corrupt snapshot".to_string())?;
                             if ram != mem.len() as u64 {
                                 return Err(format!(
                                     "the snapshot was saved with {} MiB of RAM, this machine has {} MiB",
