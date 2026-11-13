@@ -441,8 +441,11 @@ fn event_loop(
                         let _ = s.shutdown(Shutdown::Both);
                     }
                     let mut c = conns.lock().unwrap();
+                    // Stop reading at once. What the guest wrote before closing may still be queued
+                    // for the writer, which closes the socket once it has sent it: dropping the
+                    // sender ends its queue.
                     if let Some((_, s)) = c.sockets.remove(&id) {
-                        let _ = s.shutdown(Shutdown::Both);
+                        let _ = s.shutdown(Shutdown::Read);
                     }
                     c.websockets.remove(&id);
                     c.tunnels.remove(&id);
@@ -620,10 +623,8 @@ fn tunnel(
     let _ = conn.tcp().set_read_timeout(Some(Duration::from_millis(20)));
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
-        if is_closed(conns, id) {
-            let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(1000)));
-            return;
-        }
+        // What the guest wrote goes out before the close that may follow it
+        let mut gone = false;
         loop {
             match out.try_recv() {
                 Ok(Some(data)) => {
@@ -638,8 +639,16 @@ fn tunnel(
                     let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(1000)));
                 },
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                // The guest closed, after what is queued
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    gone = true;
+                    break;
+                },
             }
+        }
+        if gone || is_closed(conns, id) {
+            let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(1000)));
+            return;
         }
         let _ = conn.flush();
         match conn.read(&mut chunk) {
@@ -711,6 +720,8 @@ fn attach(board: &Arc<Board>, conns: &Shared, id: u32, stream: TcpStream) {
                 },
             }
         }
+        // The guest has closed, and everything it wrote is sent (or the socket is gone)
+        let _ = writer.shutdown(Shutdown::Both);
     });
     // socket -> guest
     let board = board.clone();

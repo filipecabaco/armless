@@ -245,7 +245,10 @@ fn gettimeofday_gives_the_wall_clock_in_microseconds_and_a_zero_timezone() {
     // V8's Date.now() is gettimeofday, and when it fails the date is whatever was in the stack
     let mut vm = machine();
     let mut p = Prog::default();
-    p.put(0x120, &[0xff; 8]);
+    // The output is a terminal: without raw output (c_oflag 0) it turns a 0x0a in the time into
+    // 0x0d 0x0a, and the test fails one run in ten
+    p.put(0x120, &[0xff; 8]).put(0x140, &[0; 36]);
+    p.sys(29, &[I(1), I(0x5402), D(0x140)]).expect(0);
     p.sys(169, &[D(0x100), D(0x120)]).expect(0);
     p.out(0x100, 16);
     p.out(0x120, 8);

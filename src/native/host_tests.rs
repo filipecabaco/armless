@@ -427,3 +427,153 @@ fn a_unix_link_reaches_its_socket_and_nothing_else_leaves_with_egress_denied() {
     assert_eq!(d.payload, b"over unix");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// How the guest ends a connection it has just written to.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// The outside has said it is done writing (the host's FIN is acknowledged), then the guest
+    /// sends its FIN: the host sees the close the moment the FIN arrives.
+    Fin,
+    /// A reset, as when a process closes a socket with unread data.
+    Reset,
+}
+
+/// The guest has the connection to `outside` up (`dst`, `sport` and `dport` address its segments,
+/// `theirs` is the host's next sequence number). It sends `payload` and ends the connection at
+/// once, so the data and the close reach the host together. The outside reads nothing until the
+/// host has seen the close: a writer still busy then must still deliver everything.
+fn guest_sends_then_closes(
+    mut g: Guest,
+    seen: &Mutex<Vec<Event>>,
+    mut outside: TcpStream,
+    (dst, sport, dport, mut theirs): ([u8; 4], u16, u16, u32),
+    payload: &[u8],
+    ending: Ending,
+) {
+    outside
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    if let Ending::Fin = ending {
+        outside.shutdown(Shutdown::Write).unwrap();
+        let fin = seg(&mut g, "the FIN for the outside's EOF", |s| s.has(FIN));
+        theirs = fin.seq.wrapping_add(1);
+        g.ack(dst, sport, dport, theirs);
+    }
+    for chunk in payload.chunks(1400) {
+        g.data(dst, sport, dport, theirs, chunk);
+    }
+    match ending {
+        Ending::Fin => g.fin(dst, sport, dport, theirs),
+        Ending::Reset => g.rst(dst, sport, dport, theirs),
+    }
+    until("the close", || {
+        let seen = seen.lock().unwrap();
+        seen.iter()
+            .any(|e| matches!(e, Event::TcpClosed { .. }))
+            .then_some(())
+    });
+    // The host handles the close right after the observer saw it
+    thread::sleep(Duration::from_millis(300));
+    let mut got = Vec::new();
+    let read = outside.read_to_end(&mut got);
+    assert!(
+        got == payload,
+        "{ending:?}: the outside got {} of the guest's {} bytes ({read:?})",
+        got.len(),
+        payload.len()
+    );
+}
+
+/// Bytes that tell where they are, so a hole or a repeat shows.
+fn pattern(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8 ^ (i / 251) as u8).collect()
+}
+
+/// Payloads for the tests below: a small one, and one that outlasts the socket buffers, so the
+/// host's writer is still busy when it handles the close.
+fn payloads() -> [Vec<u8>; 2] {
+    [pattern(100), pattern(32 << 20)]
+}
+
+#[test]
+fn what_the_guest_wrote_before_closing_reaches_a_forwarded_socket() {
+    for payload in payloads() {
+        for ending in [Ending::Fin, Ending::Reset] {
+            let b = board(true);
+            let (obs, seen) = observer();
+            let host = NativeHost::spawn(b.clone(), options(true), obs);
+            let mut g = Guest::on_board(b.clone());
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let outside = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (inside, _) = l.accept().unwrap();
+            host.forward(inside, 8080);
+            let syn = seg(&mut g, "the SYN into the guest", |s| {
+                s.has(SYN) && s.dport == 8080
+            });
+            g.accept(&syn, 0x1000);
+            let to = (syn.src, syn.dport, syn.sport, syn.seq.wrapping_add(1));
+            guest_sends_then_closes(g, &seen, outside, to, &payload, ending);
+        }
+    }
+}
+
+#[test]
+fn what_the_guest_wrote_before_closing_reaches_the_host_server_it_connected_to() {
+    for payload in payloads() {
+        for ending in [Ending::Fin, Ending::Reset] {
+            let b = board(true);
+            let (obs, seen) = observer();
+            let _host = NativeHost::spawn(b.clone(), options(true), obs);
+            let mut g = Guest::on_board(b.clone());
+            let ip = g.resolve("localhost", 1).unwrap();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let accepted = thread::spawn(move || l.accept().unwrap().0);
+            g.syn(ip, 40000, port);
+            let sa = seg(&mut g, "the SYN-ACK once the host connected", |s| {
+                s.has(SYN | ACK)
+            });
+            let theirs = sa.seq.wrapping_add(1);
+            g.ack(ip, 40000, port, theirs);
+            let outside = accepted.join().unwrap();
+            guest_sends_then_closes(
+                g,
+                &seen,
+                outside,
+                (ip, 40000, port, theirs),
+                &payload,
+                ending,
+            );
+        }
+    }
+}
+
+#[test]
+fn what_the_guest_wrote_before_closing_reaches_a_tunnels_far_side() {
+    let (port, frames) = ws_server(b"server says hi");
+    let b = board(true);
+    let (obs, _) = observer();
+    let opts = HostOptions {
+        tunnels: vec![Tunnel::parse(&format!("db.internal:5432=ws://127.0.0.1:{port}/t")).unwrap()],
+        ..options(true)
+    };
+    let _host = NativeHost::spawn(b.clone(), opts, obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("db.internal", 1).unwrap();
+    g.syn(ip, 40000, 5432);
+    let sa = seg(&mut g, "the SYN-ACK once the WebSocket is open", |s| {
+        s.has(SYN | ACK)
+    });
+    let theirs = sa.seq.wrapping_add(1);
+    g.ack(ip, 40000, 5432, theirs);
+    let d = seg(&mut g, "the server's message as bytes", |s| {
+        !s.payload.is_empty()
+    });
+    let theirs = theirs.wrapping_add(d.payload.len() as u32);
+    // The guest writes and resets at once
+    g.data(ip, 40000, 5432, theirs, b"the last words");
+    g.rst(ip, 40000, 5432, theirs);
+    let next = || frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(next(), (ws::BINARY, b"the last words".to_vec()));
+    assert_eq!(next().0, ws::CLOSE);
+}
