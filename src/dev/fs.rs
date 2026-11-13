@@ -5,12 +5,16 @@
 //!
 //! A large file can be a list of chunks instead of one blob: reads fetch only
 //! the chunks they cover, and writes copy only the chunks they touch.
+//!
+//! A native host keeps the decompressed blobs in an unlinked temporary file (`crate::spill`) and
+//! reads them with pread; elsewhere they are in the heap, up to the cache budget.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use super::json::{self, Json};
 use crate::ser::{R, W};
+use crate::spill::{Extent, Spill, Spilled};
 
 pub type Ino = u64;
 pub const ROOT: Ino = 1;
@@ -122,15 +126,86 @@ impl From<u32> for Fail {
 
 pub type Res<T> = Result<T, Fail>;
 
-/// What a file system holds in host memory: the decompressed blobs it fetched (at most `cache_limit` bytes), and the
-/// contents of the files the guest wrote, which stay until the file is removed (`written_capacity` is what the buffers
-/// were made at, `written_bytes` what is in them).
+/// The most bytes read from the spill file at once for a sink that wants slices.
+const EACH: u64 = 64 << 10;
+
+/// The bytes of a blob or of a file: in memory, or in the spill file. A read of the spill file that fails is EIO.
+enum Bytes<'a> {
+    Mem(&'a [u8]),
+    Spilled(&'a Spill, Extent),
+}
+
+impl Bytes<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Bytes::Mem(d) => d.len() as u64,
+            Bytes::Spilled(_, e) => e.len,
+        }
+    }
+
+    /// The first `n` bytes of it (`n` is at most its length).
+    fn prefix(self, n: u64) -> Self {
+        match self {
+            Bytes::Mem(d) => Bytes::Mem(&d[..n as usize]),
+            Bytes::Spilled(s, e) => Bytes::Spilled(s, Extent { len: n, ..e }),
+        }
+    }
+
+    /// Bytes `a..b` of it, appended to `out`.
+    fn append_to(&self, a: u64, b: u64, out: &mut Vec<u8>) -> Res<()> {
+        match self {
+            Bytes::Mem(d) => out.extend_from_slice(d.get(a as usize..b as usize).ok_or(EIO)?),
+            Bytes::Spilled(s, e) => {
+                let at = out.len();
+                out.resize(at + (b - a) as usize, 0);
+                if s.read_at(*e, a, &mut out[at..]).is_err() {
+                    out.truncate(at);
+                    return Err(EIO.into());
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// All of it.
+    fn to_vec(&self) -> Res<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.len() as usize);
+        self.append_to(0, self.len(), &mut out)?;
+        Ok(out)
+    }
+
+    /// Bytes `a..b` of it given to `f` as they lie (the position of each piece from `a`, and the piece): at
+    /// once if in memory, in pieces of at most `EACH` bytes from the file.
+    fn each(&self, a: u64, b: u64, mut f: impl FnMut(usize, &[u8])) -> Res<()> {
+        match self {
+            Bytes::Mem(d) => f(0, d.get(a as usize..b as usize).ok_or(EIO)?),
+            Bytes::Spilled(s, e) => {
+                let mut buf = vec![0u8; (b - a).min(EACH) as usize];
+                let mut at = a;
+                while at < b {
+                    let n = (b - at).min(EACH) as usize;
+                    s.read_at(*e, at, &mut buf[..n]).map_err(|_| EIO)?;
+                    f((at - a) as usize, &buf[..n]);
+                    at += n as u64;
+                }
+            },
+        }
+        Ok(())
+    }
+}
+
+/// What a file system holds in host memory: the decompressed blobs it fetched and did not spill (at most `cache_limit`
+/// bytes), and the contents of the files the guest wrote, which stay until the file is removed (`written_capacity` is
+/// what the buffers were made at, `written_bytes` what is in them). The blobs in the spill file are not in memory:
+/// `spilled_blobs` and `spilled_bytes` count them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stats {
     pub inodes: usize,
     pub cached_blobs: usize,
     pub cached_bytes: usize,
     pub cache_limit: usize,
+    pub spilled_blobs: usize,
+    pub spilled_bytes: u64,
     pub written_buffers: usize,
     pub written_bytes: usize,
     pub written_capacity: usize,
@@ -139,9 +214,12 @@ pub struct Stats {
 pub struct Fs {
     inodes: Vec<Option<Inode>>,
     free: Vec<Ino>,
-    /// Decompressed blobs fetched so far (not saved: fetched again), oldest
+    /// Decompressed blobs fetched so far and kept in memory (not saved: fetched again), oldest
     /// first in `order`, at most `max_cached` bytes.
     blobs: HashMap<String, Arc<Vec<u8>>>,
+    /// Decompressed blobs fetched so far and written to `spill`: never evicted, and not in the heap.
+    spilled: HashMap<String, Extent>,
+    spill: Spill,
     order: VecDeque<String>,
     cached: usize,
     max_cached: usize,
@@ -159,6 +237,8 @@ impl Fs {
             inodes: vec![None],
             free: Vec::new(),
             blobs: HashMap::new(),
+            spilled: HashMap::new(),
+            spill: Spill::new(),
             order: VecDeque::new(),
             cached: 0,
             max_cached: DEFAULT_CACHE,
@@ -596,15 +676,24 @@ impl Fs {
         Ok(())
     }
 
+    /// A blob's bytes, if it is here.
+    fn blob_bytes(&self, name: &str) -> Option<Bytes<'_>> {
+        if let Some(b) = self.blobs.get(name) {
+            return Some(Bytes::Mem(b));
+        }
+        let e = *self.spilled.get(name)?;
+        Some(Bytes::Spilled(&self.spill, e))
+    }
+
     /// The contents of a regular file, fetching its blob first if needed.
-    fn data(&mut self, ino: Ino) -> Res<&[u8]> {
+    fn data(&mut self, ino: Ino) -> Res<Bytes<'_>> {
         let name = match &self.inode(ino)?.content {
             Content::Blob(name) => name.clone(),
             Content::Mem(_) => {
                 let Content::Mem(d) = &self.inode(ino)?.content else {
                     unreachable!()
                 };
-                return Ok(d);
+                return Ok(Bytes::Mem(d));
             },
             Content::Dir { .. } => return Err(EISDIR.into()),
             _ => return Err(EINVAL.into()),
@@ -612,19 +701,19 @@ impl Fs {
         if self.failed.contains(&name) {
             return Err(EIO.into());
         }
-        match self.blobs.get(&name) {
-            Some(b) => Ok(b.as_slice()),
+        match self.blob_bytes(&name) {
+            Some(b) => Ok(b),
             None => Err(Fail::Need(vec![name])),
         }
     }
 
     /// A chunk's contents, if fetched (EIO if the host failed it, or it is short).
-    fn piece<'a>(&'a self, c: &'a Chunk) -> Res<Option<&'a [u8]>> {
+    fn piece<'a>(&'a self, c: &'a Chunk) -> Res<Option<Bytes<'a>>> {
         match &c.data {
-            Piece::Mem(d) => Ok(Some(d)),
+            Piece::Mem(d) => Ok(Some(Bytes::Mem(d))),
             Piece::Blob(n) if self.failed.contains(n) => Err(EIO.into()),
-            Piece::Blob(n) => match self.blobs.get(n) {
-                Some(b) if b.len() as u64 >= c.len => Ok(Some(&b[..c.len as usize])),
+            Piece::Blob(n) => match self.blob_bytes(n) {
+                Some(b) if b.len() >= c.len => Ok(Some(b.prefix(c.len))),
                 Some(_) => Err(EIO.into()),
                 None => Ok(None),
             },
@@ -689,7 +778,7 @@ impl Fs {
             let d = self.piece(c)?.ok_or(Fail::Errno(EIO))?;
             let a = offset.max(pos) - pos;
             let b = end.min(pos + c.len) - pos;
-            out.extend_from_slice(&d[a as usize..b as usize]);
+            d.append_to(a, b, &mut out)?;
         }
         Ok(out)
     }
@@ -704,7 +793,7 @@ impl Fs {
         for (k, _) in Self::chunks_in(chunks, start, end) {
             if let Piece::Blob(_) = chunks[k].data {
                 let d = self.piece(&chunks[k])?.ok_or(Fail::Errno(EIO))?;
-                copies.push((k, d.to_vec()));
+                copies.push((k, d.to_vec()?));
             }
         }
         let Content::Chunks(chunks) = &mut self.inode_mut(ino)?.content else {
@@ -737,7 +826,7 @@ impl Fs {
             return Ok(());
         }
         let chunks = match &self.inode(ino)?.content {
-            Content::Blob(_) => Self::into_chunks(self.data(ino)?),
+            Content::Blob(_) => Self::into_chunks(&self.data(ino)?.to_vec()?),
             Content::Mem(d) => Self::into_chunks(d),
             _ => return Ok(()),
         };
@@ -830,15 +919,17 @@ impl Fs {
             return self.read_chunks(ino, offset, end);
         }
         let data = self.data(ino)?;
-        let end = (offset as usize).saturating_add(count).min(data.len());
-        let start = (offset as usize).min(end);
-        Ok(data[start..end].to_vec())
+        let end = offset.saturating_add(count as u64).min(data.len());
+        let start = offset.min(end);
+        let mut out = Vec::with_capacity((end - start) as usize);
+        data.append_to(start, end, &mut out)?;
+        Ok(out)
     }
 
     /// Make a file's contents writable (a private copy).
     fn materialize(&mut self, ino: Ino) -> Res<&mut Vec<u8>> {
         if let Content::Blob(_) = self.inode(ino)?.content {
-            let data = self.data(ino)?.to_vec();
+            let data = self.data(ino)?.to_vec()?;
             self.inode_mut(ino)?.content = Content::Mem(data);
         }
         match &mut self.inode_mut(ino)?.content {
@@ -910,12 +1001,26 @@ impl Fs {
     // ------------------------------------------------------------ blobs
 
     pub fn has_blob(&self, name: &str) -> bool {
-        self.blobs.contains_key(name)
+        self.blobs.contains_key(name) || self.spilled.contains_key(name)
     }
 
-    /// The host delivered a blob (zstd-compressed, or raw).
+    /// The host delivered a blob (zstd-compressed, or raw). A zstd blob is decompressed once, into the spill
+    /// file if the host has one, a piece at a time.
     pub fn provide_blob(&mut self, name: &str, data: Vec<u8>) -> Result<(), String> {
-        let raw = if data.len() >= 4 && data[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+        let raw = if crate::zstd::is_zstd(&data) {
+            if self.has_blob(name) {
+                self.failed.remove(name);
+                return Ok(());
+            }
+            match self.spill.keep_zstd(&data) {
+                Spilled::Held(e) => {
+                    self.failed.remove(name);
+                    self.spilled.insert(name.to_string(), e);
+                    return Ok(());
+                },
+                Spilled::Corrupt => return Err(format!("{name}: corrupt zstd data")),
+                Spilled::Memory => {},
+            }
             crate::zstd::decompress(&data).ok_or_else(|| format!("{name}: corrupt zstd data"))?
         } else {
             data
@@ -926,7 +1031,11 @@ impl Fs {
     /// The host delivered a blob that is already decompressed: kept as it is, whatever its first bytes are.
     pub fn provide_raw(&mut self, name: &str, raw: Vec<u8>) -> Result<(), String> {
         self.failed.remove(name);
-        if self.blobs.contains_key(name) {
+        if self.has_blob(name) {
+            return Ok(());
+        }
+        if let Some(e) = self.spill.keep(&raw) {
+            self.spilled.insert(name.to_string(), e);
             return Ok(());
         }
         self.cached += raw.len();
@@ -954,6 +1063,8 @@ impl Fs {
             cache_limit: self.max_cached,
             cached_bytes: self.cached,
             cached_blobs: self.blobs.len(),
+            spilled_blobs: self.spilled.len(),
+            spilled_bytes: self.spilled.values().map(|e| e.len).sum(),
             ..Stats::default()
         };
         let mut mem = |d: &Vec<u8>| {
@@ -1006,6 +1117,8 @@ impl Fs {
 
     /// Drop every fetched blob (they are fetched again when needed).
     pub fn forget_blobs(&mut self) {
+        self.spilled.clear();
+        self.spill.clear();
         self.blobs.clear();
         self.order.clear();
         self.cached = 0;
@@ -1026,7 +1139,7 @@ impl Fs {
             let size = self.inode(ino)?.size;
             return self.read_chunks(ino, 0, size);
         }
-        Ok(self.data(ino)?.to_vec())
+        self.data(ino)?.to_vec()
     }
 
     /// `dst.len()` bytes of a file from `offset`, copied straight into `dst` (as `read`, without a buffer of
@@ -1063,19 +1176,21 @@ impl Fs {
                 let a = offset.max(pos) - pos;
                 let b = end.min(pos + c.len) - pos;
                 let at = (pos + a - offset) as usize;
-                sink(at, &d[a as usize..b as usize]);
+                d.each(a, b, |i, s| sink(at + i, s))?;
             }
             return Ok(());
         }
         let data = self.data(ino)?;
-        let src = data.get(offset as usize..end as usize).ok_or(EIO)?;
-        sink(0, src);
-        Ok(())
+        if end > data.len() {
+            return Err(EIO.into());
+        }
+        data.each(offset, end, |i, s| sink(i, s))
     }
 
-    /// Forget the blobs of the part of a file that ends at or before `end` (they are fetched again if it is
-    /// read again). A host that has copied that part elsewhere does not keep it in the heap, which a wasm
-    /// module never gives back.
+    /// Forget the blobs in memory of the part of a file that ends at or before `end` (they are fetched again if
+    /// it is read again). A host that has copied that part elsewhere does not keep it in the heap, which a wasm
+    /// module never gives back. A blob in the spill file is not in the heap, and forgetting it would only write
+    /// it to the file again.
     pub fn forget_file_before(&mut self, ino: Ino, end: u64) {
         let mut names = Vec::new();
         if let Some(i) = self.get(ino) {
@@ -1300,6 +1415,9 @@ impl Fs {
     }
 }
 
+#[cfg(all(test, unix))]
+mod spill_tests;
+
 #[cfg(test)]
 mod cache_tests {
     use super::Fs;
@@ -1307,6 +1425,7 @@ mod cache_tests {
     #[test]
     fn the_cache_stays_within_its_budget() {
         let mut fs = Fs::empty();
+        fs.spill = crate::spill::Spill::off();
         fs.set_cache_limit(20);
         for name in ["a", "b", "c"] {
             fs.provide_blob(name, vec![1; 8]).unwrap();
@@ -1327,6 +1446,7 @@ mod cache_tests {
         // The bytes of a zstd frame that are a file's content: `provide_blob` would decompress them
         let frame = vec![0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3, 4];
         let mut fs = Fs::empty();
+        fs.spill = crate::spill::Spill::off();
         fs.provide_raw("a", frame.clone()).unwrap();
         assert_eq!(fs.blobs.get("a").map(|b| b.as_slice()), Some(&frame[..]));
         assert_eq!(fs.cached, frame.len());
@@ -1342,7 +1462,10 @@ mod chunk_tests {
         let json = br#"{"version":3,"fsroot":[
             ["big",10,0,33188,0,0,[["a",4],["b",4],["c",2]]],
             ["old",3,0,33188,0,0,"o"]]}"#;
-        Fs::from_json(json).unwrap()
+        let mut fs = Fs::from_json(json).unwrap();
+        // These tests look into the heap cache; the spill has its own (spill_tests)
+        fs.spill = crate::spill::Spill::off();
+        fs
     }
 
     fn provide_all(fs: &mut Fs) {

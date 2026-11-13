@@ -152,6 +152,40 @@ mod imp {
         Some(out)
     }
 
+    /// How `decompress_each` ended.
+    #[derive(Debug, PartialEq)]
+    pub enum Ended {
+        Done,
+        /// `data` is not valid zstd (what `sink` was given before that is of no use)
+        Corrupt,
+        /// `sink` returned false
+        Stopped,
+    }
+
+    /// Bytes decompressed before each call of the sink of `decompress_each`, at most.
+    const EACH: usize = 128 << 10;
+
+    /// Every frame of `data`, decompressed, given to `sink` in pieces of at most `EACH` bytes: the
+    /// decompressed contents are never all in memory (as `decompress` has them).
+    pub fn decompress_each(data: &[u8], sink: &mut dyn FnMut(&[u8]) -> bool) -> Ended {
+        let mut buf = vec![0u8; EACH];
+        let mut rest = data;
+        while !rest.is_empty() {
+            let Ok(mut d) = ruzstd::decoding::StreamingDecoder::new(&mut rest) else {
+                return Ended::Corrupt;
+            };
+            loop {
+                match d.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) if sink(&buf[..n]) => {},
+                    Ok(_) => return Ended::Stopped,
+                    Err(_) => return Ended::Corrupt,
+                }
+            }
+        }
+        Ended::Done
+    }
+
     /// Native stand-in for the wasm streaming decoder: each `feed` must hold
     /// whole frames (only the wasm exports, type-checked natively, use it).
     #[derive(Default)]

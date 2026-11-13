@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use armless::cpu::Cpu;
-use armless::dev::fs::Ino;
+use armless::dev::fs::{Ino, EIO};
 use armless::{Host, Ram};
 
 use crate::elf::Seg;
@@ -973,6 +973,9 @@ pub(crate) enum Miss {
     Oom,
     /// Blobs of the filesystem it needs, which haven't arrived
     Need(Vec<String>),
+    /// Its file could not be read (EIO: the host's spill file lost the contents): a page of zeros
+    /// would be taken for the file's
+    Io,
 }
 
 impl Process {
@@ -1066,7 +1069,8 @@ impl Process {
                 match self.fs(|fs| got(fs.read(b.ino, off, n as usize))) {
                     Some(Got::Ok(d)) => data = d,
                     Some(Got::Need(blobs)) => return Err(Miss::Need(blobs)),
-                    // A file that fails or is gone reads as zeros
+                    Some(Got::Err(e)) if e == -(EIO as i64) => return Err(Miss::Io),
+                    // A file that is gone, or fails otherwise, reads as zeros
                     Some(Got::Err(_)) | None => {},
                 }
             }
@@ -1385,6 +1389,10 @@ impl Process {
             },
             Err(Miss::Oom) => {
                 self.crash(format!("out of memory at pc {elr:#x}, far {far:#x}"));
+                false
+            },
+            Err(Miss::Io) => {
+                self.crash(format!("I/O error reading a file page at pc {elr:#x}, far {far:#x}"));
                 false
             },
             Err(Miss::Segv) => {
