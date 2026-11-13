@@ -110,11 +110,13 @@ impl Process {
             },
             Kind::Event { count } => (*count > 0, true, false),
             Kind::Signal { mask } => (self.signal_pending(*mask), false, false),
+            // Readable once its process has ended; hung up too once it was waited for
             Kind::Pidfd { pid } => (
                 self.proc_ref(*pid).is_none_or(|p| p.zombie.is_some()),
                 false,
-                false,
+                self.proc_ref(*pid).is_none(),
             ),
+            Kind::TimerFd(t) => (t.readable(Instant::now()), false, false),
             Kind::Sock(id) => self.sock_ready(*id),
             Kind::Epoll { watch } => (
                 watch.iter().any(|(&f, w)| {
@@ -220,6 +222,7 @@ impl Process {
             },
             Kind::Signal { mask } => self.read_signalfd(mask, max, nonblock),
             Kind::Pidfd { .. } => Err(Ret::Val(-EINVAL)),
+            Kind::TimerFd(_) => self.read_timerfd(fd, max, nonblock),
             Kind::Event { count } => {
                 if max < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -248,7 +251,9 @@ impl Process {
                 if at.is_some() {
                     return Err(Ret::Val(-ESPIPE));
                 }
-                self.sock_recv(fd, id, max, 0).map(|r| r.0)
+                let got = self.sock_recv(fd, id, max, 0).map(|r| r.0);
+                self.drop_taken();
+                got
             },
             Kind::PipeWrite(_) | Kind::Epoll { .. } => Err(Ret::Val(-EINVAL)),
         }
@@ -256,6 +261,19 @@ impl Process {
 
     /// Writes `data` to `fd` (at `at`, for pwrite): how much it took, or what the call must do.
     fn write_fd(&mut self, fd: i32, data: &[u8], at: Option<u64>) -> Result<usize, Ret> {
+        self.write_fd_as(fd, data, at, None)
+    }
+
+    /// `write_fd`, appending or not as `append` says (RWF_APPEND, RWF_NOAPPEND) whatever the
+    /// description's O_APPEND. A write that appends goes to the end of a file even at a position
+    /// (pwrite), as on Linux.
+    pub(crate) fn write_fd_as(
+        &mut self,
+        fd: i32,
+        data: &[u8],
+        at: Option<u64>,
+        append: Option<bool>,
+    ) -> Result<usize, Ret> {
         let nonblock = self.nonblock(fd);
         let Some(d) = self.files.get(fd).cloned() else {
             return Err(Ret::Val(-EBADF));
@@ -274,10 +292,13 @@ impl Process {
             Kind::Mem { .. } => Err(Ret::Val(-EBADF)),
             Kind::File { ino, pos } => {
                 let now = self.now_secs();
-                let append = d.flags & O_APPEND != 0;
+                let append = append.unwrap_or(d.flags & O_APPEND != 0);
                 let r = self.fs(|fs| {
-                    let off =
-                        at.unwrap_or(if append { fs.get(ino).map_or(0, |i| i.size) } else { pos });
+                    let off = if append {
+                        fs.get(ino).map_or(0, |i| i.size)
+                    } else {
+                        at.unwrap_or(pos)
+                    };
                     got(fs.write(ino, off, data, now)).map_ok(|n| (n, off))
                 });
                 match r {
@@ -322,7 +343,7 @@ impl Process {
                 Ok(n)
             },
             Kind::Signal { .. } => Err(Ret::Val(-EINVAL)),
-            Kind::Pidfd { .. } => Err(Ret::Val(-EINVAL)),
+            Kind::Pidfd { .. } | Kind::TimerFd(_) => Err(Ret::Val(-EINVAL)),
             Kind::Event { .. } => {
                 if data.len() < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -342,9 +363,66 @@ impl Process {
                 if at.is_some() {
                     return Err(Ret::Val(-ESPIPE));
                 }
-                self.sock_send(fd, id, data, 0, None, &[])
+                self.sock_send(fd, id, data, 0, None, &Default::default())
             },
             Kind::PipeRead(_) | Kind::Epoll { .. } => Err(Ret::Val(-EBADF)),
+        }
+    }
+
+    /// Reads into or writes from the program's `iov` (address, length pairs) on `fd`, at `at` or
+    /// at the descriptor's position, with preadv2's and pwritev2's RWF_ `flags` (AIO's requests
+    /// have them too). HIPRI, DSYNC, SYNC and DONTCACHE ask for what happens anyway (the
+    /// filesystem is in memory); NOWAIT makes a call that would wait EAGAIN; APPEND and NOAPPEND
+    /// override O_APPEND. ATOMIC is for filesystems that write atomically: none here does.
+    pub(crate) fn rw_iov(
+        &mut self,
+        fd: i32,
+        write: bool,
+        iov: &[(u64, u64)],
+        at: Option<u64>,
+        flags: u64,
+    ) -> Ret {
+        const RWF_NOWAIT: u64 = 0x8;
+        const RWF_APPEND: u64 = 0x10;
+        const RWF_NOAPPEND: u64 = 0x20;
+        const RWF_DONTCACHE: u64 = 0x80;
+        if flags & !(0x1f | RWF_NOAPPEND | RWF_DONTCACHE) != 0 {
+            return Ret::Val(-95); // EOPNOTSUPP
+        }
+        if flags & (RWF_APPEND | RWF_NOAPPEND) == RWF_APPEND | RWF_NOAPPEND {
+            return Ret::Val(-EINVAL);
+        }
+        let r = if write {
+            let mut all = Vec::new();
+            for &(base, len) in iov {
+                let Some(b) = self.bytes_at(base, len as usize) else {
+                    return Ret::Val(-EFAULT);
+                };
+                all.extend_from_slice(&b);
+            }
+            let append = match flags & (RWF_APPEND | RWF_NOAPPEND) {
+                RWF_APPEND => Some(true),
+                RWF_NOAPPEND => Some(false),
+                _ => None,
+            };
+            self.write_fd_as(fd, &all, at, append)
+        } else {
+            let total: u64 = iov.iter().map(|&(_, l)| l).sum();
+            self.read_fd(fd, total as usize, at).map(|b| {
+                let mut off = 0;
+                for &(base, len) in iov {
+                    let n = (len as usize).min(b.len() - off);
+                    self.write(base, &b[off..off + n]);
+                    off += n;
+                }
+                b.len()
+            })
+        };
+        match r {
+            Ok(n) => Ret::Val(n as i64),
+            // (A file's blobs still come: a disk read)
+            Err(Ret::Retry { .. }) if flags & RWF_NOWAIT != 0 => Ret::Val(-EAGAIN),
+            Err(r) => r,
         }
     }
 
@@ -391,6 +469,26 @@ impl Process {
 
     /// Contents made here for the /proc files programs read
     fn proc_file(&self, path: &[u8]) -> Option<Vec<u8>> {
+        // /proc/self/fdinfo/N: its position, flags (O_CLOEXEC with them, in octal), and for a
+        // pidfd its process (-1 once it was waited for), as Linux says them
+        if let Some(fd) = path
+            .strip_prefix(b"/proc/self/fdinfo/")
+            .and_then(|n| std::str::from_utf8(n).ok()?.parse::<i32>().ok())
+        {
+            let d = self.files.get(fd)?;
+            let cloexec = self.files.fds.get(&fd).is_some_and(|&(_, c)| c);
+            let pos = match d.kind {
+                Kind::File { pos, .. } | Kind::Dir { pos, .. } | Kind::Mem { pos, .. } => pos,
+                _ => 0,
+            };
+            let flags = d.flags | if cloexec { O_CLOEXEC } else { 0 };
+            let mut s = format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t0\nino:\t0\n");
+            if let Kind::Pidfd { pid } = d.kind {
+                let pid = if self.proc_ref(pid).is_some() { pid } else { -1 };
+                s += &format!("Pid:\t{pid}\nNSpid:\t{pid}\n");
+            }
+            return Some(s.into_bytes());
+        }
         Some(match path {
             b"/proc/cpuinfo" => (0..NCPUS_REPORTED)
                 .map(|i| format!("processor\t: {i}\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd aes pmull sha1 sha2 crc32 atomics sha3 sm3 sm4 sha512\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n"))
@@ -406,6 +504,15 @@ impl Process {
             },
             b"/proc/self/cmdline" => self.p.exe.iter().copied().chain([0]).collect(),
             b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
+            // The interfaces netlink.rs has, with nothing counted (ifconfig reads their list here)
+            b"/proc/net/dev" | b"/proc/self/net/dev" => {
+                let mut s = String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+                let network = self.board.as_ref().is_some_and(|b| b.has_network());
+                for name in ["lo"].into_iter().chain(network.then_some("eth0")) {
+                    s += &format!("{name:>6}:{}\n", "       0".repeat(16));
+                }
+                s.into_bytes()
+            },
             b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
             b"/sys/fs/cgroup/cpu.max" => b"max 100000\n".to_vec(),
             _ => return None,
@@ -438,6 +545,9 @@ impl Process {
             if path.starts_with(b"/proc/")
                 || path.starts_with(b"/sys/")
                 || path.starts_with(b"/dev/")
+                    // POSIX shared memory's files (shm_open) are made in /dev/shm, a directory
+                    // of the machine's filesystem here (Process::exec makes it)
+                    && !path.starts_with(b"/dev/shm/")
                     && !self
                         .fs(|fs| fs.lookup_path(&String::from_utf8_lossy(path)).is_some())
                         .unwrap_or(false)
@@ -519,7 +629,11 @@ impl Process {
             },
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
             Kind::Sock(_) => Stat::device(files::S_IFSOCK | 0o777, 0),
-            Kind::Event { .. } | Kind::Signal { .. } | Kind::Pidfd { .. } | Kind::Epoll { .. } => {
+            Kind::Event { .. }
+            | Kind::Signal { .. }
+            | Kind::Pidfd { .. }
+            | Kind::TimerFd(_)
+            | Kind::Epoll { .. } => {
                 Stat::device(0o600, 0)
             },
         })
@@ -759,12 +873,9 @@ impl Process {
                 Ok(b) => v(if self.write(a[1], &b) { b.len() as i64 } else { -EFAULT }),
                 Err(r) => r,
             },
-            // readv, preadv, preadv2 (whose offset -1 is the current position; its RWF_ flags only ask
-            // for what happens anyway). Postgres 18 reads and writes with them.
+            // readv, preadv, preadv2 (whose offset -1 is the current position). Postgres 18 reads
+            // and writes with them.
             65 | 69 | 286 => {
-                if nr == 286 && a[5] & !0x1f != 0 {
-                    return v(-95); // EOPNOTSUPP
-                }
                 let at = match nr {
                     69 => Some(a[3]),
                     286 => (a[3] != u64::MAX).then_some(a[3]),
@@ -773,19 +884,7 @@ impl Process {
                 let Some(iov) = self.iovecs(a[1], a[2]) else {
                     return v(-EFAULT);
                 };
-                let total: u64 = iov.iter().map(|&(_, l)| l).sum();
-                match self.read_fd(fd0, total as usize, at) {
-                    Ok(b) => {
-                        let mut off = 0;
-                        for (base, len) in iov {
-                            let n = (len as usize).min(b.len() - off);
-                            self.write(base, &b[off..off + n]);
-                            off += n;
-                        }
-                        v(b.len() as i64)
-                    },
-                    Err(r) => r,
-                }
+                self.rw_iov(fd0, false, &iov, at, if nr == 286 { a[5] } else { 0 })
             },
             // write
             64 => match self.bytes_at(a[1], a[2] as usize) {
@@ -803,9 +902,6 @@ impl Process {
             },
             // writev, pwritev, pwritev2 (as preadv2)
             66 | 70 | 287 => {
-                if nr == 287 && a[5] & !0x1f != 0 {
-                    return v(-95); // EOPNOTSUPP
-                }
                 let at = match nr {
                     70 => Some(a[3]),
                     287 => (a[3] != u64::MAX).then_some(a[3]),
@@ -814,15 +910,7 @@ impl Process {
                 let Some(iov) = self.iovecs(a[1], a[2]) else {
                     return v(-EFAULT);
                 };
-                let mut all = Vec::new();
-                for (base, len) in iov {
-                    let Some(b) = self.bytes_at(base, len as usize) else {
-                        return v(-EFAULT);
-                    };
-                    all.extend_from_slice(&b);
-                }
-                self.write_fd(fd0, &all, at)
-                    .map_or_else(|r| r, |n| v(n as i64))
+                self.rw_iov(fd0, true, &iov, at, if nr == 287 { a[5] } else { 0 })
             },
             // sendfile(out, in, offset*, count)
             71 => {
@@ -967,6 +1055,7 @@ impl Process {
                         Some(Kind::Event { .. }) => Ok(b"anon_inode:[eventfd]".to_vec()),
                         Some(Kind::Signal { .. }) => Ok(b"anon_inode:[signalfd]".to_vec()),
                         Some(Kind::Pidfd { .. }) => Ok(b"anon_inode:[pidfd]".to_vec()),
+                        Some(Kind::TimerFd(_)) => Ok(b"anon_inode:[timerfd]".to_vec()),
                         Some(Kind::Epoll { .. }) => Ok(b"anon_inode:[eventpoll]".to_vec()),
                         Some(Kind::Mem { .. }) => Ok(format!("/dev/fd/{fd}").into_bytes()),
                         None => Err(-ENOENT),
@@ -1145,6 +1234,42 @@ impl Process {
                 Some(_) => v(-EINVAL),
                 None => v(-EBADF),
             },
+            // fallocate(fd, mode, offset, len): with mode 0 (posix_fallocate) the file is at least
+            // offset + len long, its new bytes zero (Postgres sizes a POSIX shared memory segment
+            // so); FALLOC_FL_KEEP_SIZE leaves it as it is, as space here is never reserved
+            47 => {
+                const FALLOC_FL_KEEP_SIZE: u64 = 1;
+                let (mode, off, len) = (a[1], a[2] as i64, a[3] as i64);
+                if off < 0 || len <= 0 {
+                    return v(-EINVAL);
+                }
+                if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+                    return v(-95); // EOPNOTSUPP: punching holes, zeroing and collapsing ranges
+                }
+                let Some(end) = off.checked_add(len) else {
+                    return v(-27); // EFBIG
+                };
+                match self.files.get(fd0).map(|d| (d.kind.clone(), d.flags)) {
+                    Some((Kind::File { ino, .. }, flags)) if flags & O_ACCMODE != 0 => {
+                        if mode & FALLOC_FL_KEEP_SIZE != 0 {
+                            return v(0);
+                        }
+                        v(self
+                            .fs(|fs| {
+                                let size = fs.get(ino).map_or(0, |i| i.size);
+                                if (end as u64) <= size {
+                                    return 0;
+                                }
+                                fs.truncate(ino, end as u64).map(|_| 0).unwrap_or_else(errno)
+                            })
+                            .unwrap_or(-EBADF))
+                    },
+                    Some((Kind::File { .. }, _)) => v(-EBADF),
+                    Some((Kind::PipeRead(_) | Kind::PipeWrite(_), _)) => v(-29), // ESPIPE
+                    Some(_) => v(-19), // ENODEV
+                    None => v(-EBADF),
+                }
+            },
             // truncate
             45 => match self.lookup(AT_FDCWD, &self.cstr(a[0]), true) {
                 Ok(ino) => v(self
@@ -1317,17 +1442,22 @@ impl Process {
                     },
                 )
             },
-            // getitimer, setitimer (itimer.rs)
-            102 => self.sys_getitimer(a[0], a[1]),
-            103 => self.sys_setitimer(a[0], a[1], a[2]),
+            // getitimer, setitimer, timer_create, timer_gettime, timer_getoverrun,
+            // timer_settime, timer_delete (timer.rs)
+            102 | 103 | 107..=111 => self.sys_timer(nr, cur, &a),
             // shmget, shmctl, shmat, shmdt (shm.rs)
             194 => self.sys_shmget(a[0] as i32, a[1], a[2]),
             195 => self.sys_shmctl(a[0] as i32, a[1], a[2]),
             196 => self.sys_shmat(a[0] as i32, a[1], a[2]),
             197 => self.sys_shmdt(a[0]),
+            // timerfd_create, timerfd_settime, timerfd_gettime (timerfd.rs)
+            85 => self.sys_timerfd_create(a[0], a[1]),
+            86 => self.sys_timerfd_settime(a[0] as i32, a[1], a[2], a[3]),
+            87 => self.sys_timerfd_gettime(a[0] as i32, a[1]),
             // pidfd_open(pid, flags), pidfd_send_signal(pidfd, sig, info, flags) (proc.rs)
             434 => self.sys_pidfd_open(a[0] as i32 as i64, a[1]),
-            424 => self.sys_pidfd_send_signal(a[0] as i32, a[1] as u32),
+            424 => self.sys_pidfd_send_signal(a[0] as i32, a[1] as u32, a[3]),
+            438 => self.sys_pidfd_getfd(a[0] as i32, a[1] as i32, a[2]),
             // signalfd4(fd, mask, sizemask, flags)
             74 => self.sys_signalfd(a[0] as i32, a[1], a[2], a[3]),
             // eventfd2
@@ -1448,6 +1578,7 @@ impl Process {
                     ptid: a[2],
                     tls: a[3],
                     ctid: a[4],
+                    pidfd: a[2],
                 },
             ),
             435 => self.sys_clone3(cpu, cur, a[0], a[1]),
@@ -1500,8 +1631,11 @@ impl Process {
                 self.threads[cur].clear_tid = a[0];
                 v(tid)
             },
-            // set_robust_list, prctl, membarrier, sched_setaffinity, setpriority, sched_setscheduler...
-            99 | 167 | 283 | 122 | 140 | 119 | 118 | 121 => v(0),
+            // set_robust_list, prctl, membarrier, sched_setaffinity
+            99 | 167 | 283 | 122 => v(0),
+            // sched_set/getparam, sched_set/getscheduler, sched_get_priority_max/min,
+            // sched_rr_get_interval, set/getpriority, sched_set/getattr
+            118..=121 | 125..=127 | 140 | 141 | 274 | 275 => self.sys_sched(nr, cur, &a),
             // rseq: glibc and others fall back when it is missing
             293 => v(-ENOSYS),
             // sched_yield
@@ -1547,22 +1681,15 @@ impl Process {
             155 | 156 => self.sys_getpgid(nr, a[0] as i32 as i64),
             157 => self.sys_setsid(),
             154 => self.sys_setpgid(a[0] as i32 as i64, a[1] as i32 as i64),
-            // getgroups: no supplementary groups
-            158 => v(0),
-            // setgroups(size, list): root may (su calls it before setgid and setuid). The groups
-            // aren't kept: nothing here checks permissions by them.
-            159 => {
-                const NGROUPS_MAX: u64 = 65536;
-                if self.p.creds.euid() != 0 {
-                    v(-1) // EPERM
-                } else if a[0] > NGROUPS_MAX {
-                    v(-(crate::files::EINVAL))
-                } else if a[0] > 0 && self.bytes_at(a[1], a[0] as usize * 4).is_none() {
-                    v(-EFAULT)
-                } else {
-                    v(0)
-                }
-            },
+            // getgroups, setgroups (creds.rs)
+            158 => v(self.sys_getgroups(a[0] as i32, a[1])),
+            159 => v(self.sys_setgroups(a[0], a[1])),
+            // io_setup, io_destroy, io_submit, io_cancel, io_getevents, io_pgetevents (aio.rs)
+            0 => v(self.sys_io_setup(a[0], a[1])),
+            1 => v(self.sys_io_destroy(a[0])),
+            2 => self.sys_io_submit(a[0], a[1] as i64, a[2]),
+            3 => v(self.sys_io_cancel(a[0], a[1])),
+            4 | 292 => self.sys_io_getevents(a[0], a[1] as i64, a[2] as i64, a[3], a[4]),
             // capget: no capabilities
             90 => {
                 if a[1] != 0 {
@@ -1682,6 +1809,32 @@ impl Process {
         }
     }
 
+    /// A SIOCGIF* ioctl: struct ifreq at `arg` (SIOCGIFCONF: struct ifconf, a length and where)
+    fn ifreq_ioctl(&mut self, req: u32, arg: u64) -> i64 {
+        let network = self.board.as_ref().is_some_and(|b| b.has_network());
+        let guest = crate::net::GUEST_IP;
+        if req == 0x8912 {
+            // struct ifconf: ifc_len (int), pad, ifc_buf (pointer); a NULL buffer asks the length
+            let (Some(room), Some(buf)) = (self.u32_at(arg), self.u64_at(arg + 8)) else {
+                return -EFAULT;
+            };
+            let all = crate::netlink::ifconf(if buf == 0 { usize::MAX } else { room as usize }, network, guest);
+            if buf != 0 && !self.write(buf, &all) {
+                return -EFAULT;
+            }
+            return if self.put_u32(arg, all.len() as u32) { 0 } else { -EFAULT };
+        }
+        let Some(b) = self.bytes_at(arg, 40) else {
+            return -EFAULT;
+        };
+        let mut ifr: [u8; 40] = b.try_into().unwrap();
+        let r = crate::netlink::ifreq(req, &mut ifr, network, guest);
+        if r == 0 && !self.write(arg, &ifr) {
+            return -EFAULT;
+        }
+        r
+    }
+
     fn ioctl(&mut self, fd: i32, req: u32, arg: u64) -> Ret {
         let v = Ret::Val;
         let Some(d) = self.files.desc_of(fd) else {
@@ -1709,6 +1862,11 @@ impl Process {
                 return v(0);
             },
             _ => {},
+        }
+        // An interface's name, index, flags, addresses, MTU or queue, asked of any socket
+        // (SIOCGIF*: netlink.rs's table)
+        if (0x8910..=0x8950).contains(&req) && matches!(self.files.descs[&d].kind, Kind::Sock(_)) {
+            return v(self.ifreq_ioctl(req, arg));
         }
         let kind = self.files.descs[&d].kind.clone();
         match (kind, req) {

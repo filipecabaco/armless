@@ -38,12 +38,12 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const MAX_STRING: usize = 128 << 10;
 const MAX_ARGS: usize = 2 << 20;
 /// How many interpreters deep a script may go (a script whose interpreter is a script)
-const MAX_SCRIPT_DEPTH: usize = 5;
+pub(crate) const MAX_SCRIPT_DEPTH: usize = 5;
 /// An interpreter line is cut here
 const SHEBANG_MAX: usize = 255;
 
 /// The interpreter and the one optional argument of a script's `#!` line.
-fn shebang(head: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+pub(crate) fn shebang(head: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     let rest = head.strip_prefix(b"#!")?;
     let rest = &rest[..rest.len().min(SHEBANG_MAX)];
     let line = rest.split(|&c| c == b'\n').next()?.trim_ascii();
@@ -236,6 +236,9 @@ impl Process {
         // ../lib/jvm/.../bin/java, whose libjli.so is beside the real one
         self.p.exe = real.unwrap_or(exe);
         self.p.sig.exec();
+        self.p.aio.clear();
+        // (Interval timers stay; POSIX timers go)
+        self.timers.exec(pid);
         for (i, t) in self.threads.iter_mut().enumerate() {
             if t.pid == pid && i != cur {
                 t.exited = true;

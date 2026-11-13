@@ -72,8 +72,8 @@ impl Ram {
         let raw = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!raw.is_null(), "out of memory allocating guest RAM");
         Ram {
-            // SAFETY: at most PAGE - 1 bytes in, and the allocation has PAGE bytes to spare.
-            ptr: unsafe { raw.add(raw.align_offset(PAGE)) },
+            // At most PAGE - 1 bytes in: the allocation has PAGE bytes to spare.
+            ptr: raw.wrapping_add(raw.align_offset(PAGE)),
             len,
             alloc: Some((raw, layout)),
             mapped: false,
@@ -270,9 +270,10 @@ impl Ram {
             return false;
         }
         let words = n / 8;
-        // SAFETY: in bounds (above).
-        let p = unsafe { self.ptr.add(at) };
-        // SAFETY: words i < n / 8 lie within the n bytes; unaligned reads (`at` is usually a page)
+        // In bounds (above), so `add` would do; `wrapping_add` needs no promise
+        let p = self.ptr.wrapping_add(at);
+        // SAFETY: words i < n / 8 lie within the n bytes at `p` (in bounds, above); unaligned
+        // reads (`at` is usually a page)
         (0..words).all(|i| unsafe { (p as *const u64).add(i).read_unaligned() } == 0)
             // SAFETY: the bytes after the last word, below n
             && (words * 8..n).all(|i| unsafe { *p.add(i) } == 0)

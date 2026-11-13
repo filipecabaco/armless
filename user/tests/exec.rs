@@ -2064,3 +2064,753 @@ fn the_program_headers_and_the_loaders_path_are_read_from_wherever_they_are_in_t
     assert_eq!(out, b"hello\r\n", "the loader the far PT_INTERP names ran");
     assert!(matches!(status, Status::Exited(3)), "{status:?}");
 }
+
+// ------------------------------------------------------------ scheduler calls
+
+const SCHED_FIFO: u32 = 1;
+const SCHED_RR: u32 = 2;
+const RESET_ON_FORK: u32 = 0x4000_0000;
+/// The scratch the scheduler programs use, above `room`'s 64 bytes: a param or a sched_attr
+const BUF: u32 = 64;
+
+impl Asm {
+    /// A program with 128 bytes of scratch at sp + 64, and `room` below it
+    fn sched_room(&mut self) -> &mut Self {
+        self.i(0xd102_03ff).room()
+    }
+    /// str wt, [sp, #off] of a 32-bit value
+    fn sw(&mut self, off: u32, v: u32) -> &mut Self {
+        self.mov32(9, v)
+            .i(0xb900_0000 | (off / 4) << 10 | 31 << 5 | 9)
+    }
+    /// x`rd` = sp + off
+    fn sp_plus(&mut self, rd: u32, off: u32) -> &mut Self {
+        self.i(add_imm(rd, 31, off, false))
+    }
+    /// x0 must be this value (an errno as its negative)
+    fn is(&mut self, v: i64) -> &mut Self {
+        if v < 0 {
+            self.cmn_imm(0, -v as u32)
+        } else {
+            self.mov32(9, v as u32).cmp(0, 9)
+        };
+        self.bcond(COND_NE, "fail")
+    }
+    /// the 32-bit word at [sp + off] must be this value
+    fn word_is(&mut self, off: u32, v: u32) -> &mut Self {
+        self.ldr_w(1, 31, off)
+            .mov32(9, v)
+            .i(0x6b09_003f) // cmp w1, w9
+            .bcond(COND_NE, "fail")
+    }
+    /// sched_setscheduler(0, policy, &param) with the priority in the param
+    fn setscheduler(&mut self, policy: u32, prio: u32) -> &mut Self {
+        self.sw(BUF, prio)
+            .movz(0, 0)
+            .mov32(1, policy)
+            .sp_plus(2, BUF)
+            .svc(119)
+    }
+    /// x0 = sched_getscheduler(0)
+    fn getscheduler(&mut self) -> &mut Self {
+        self.movz(0, 0).svc(120)
+    }
+    /// sched_getparam(0, &param), the param zeroed first with a mark
+    fn getparam(&mut self) -> &mut Self {
+        self.sw(BUF, 0x7777).movz(0, 0).sp_plus(1, BUF).svc(121)
+    }
+    /// x0 = getpriority(PRIO_PROCESS, 0)
+    fn getpriority(&mut self) -> &mut Self {
+        self.movz(0, 0).movz(1, 0).svc(141)
+    }
+    /// setpriority(PRIO_PROCESS, 0, nice)
+    fn setpriority(&mut self, nice: i32) -> &mut Self {
+        self.movz(0, 0).movz(1, 0).mov32(2, nice as u32).svc(140)
+    }
+}
+
+fn run_ok(a: &mut Asm) {
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_thread_starts_as_a_normal_one_and_the_calls_say_so() {
+    let mut a = Asm::default();
+    a.sched_room();
+    a.getscheduler().is(0);
+    a.svc(178).i(mov(19, 0)); // x19 = my tid
+    a.i(mov(0, 19)).svc(120).is(0); // by tid
+    a.getparam().is(0).word_is(BUF, 0);
+    a.getpriority().is(20);
+    // the ranges of the policies
+    for (policy, min, max) in [
+        (0, 0, 0),
+        (SCHED_FIFO, 1, 99),
+        (SCHED_RR, 1, 99),
+        (3, 0, 0),
+        (5, 0, 0),
+    ] {
+        a.mov32(0, policy).svc(125).is(max);
+        a.mov32(0, policy).svc(126).is(min);
+    }
+    a.movz(0, 9).svc(125).is(-22);
+    a.movz(0, 9).svc(126).is(-22);
+    a.mov32(0, RESET_ON_FORK).svc(125).is(-22);
+    // a thread that isn't there, and a negative tid
+    a.mov32(0, 99_999).svc(120).is(-3);
+    a.mov32(0, 99_999).sp_plus(1, BUF).svc(121).is(-3);
+    a.mov32(0, 0xffff_ffff).svc(120).is(-22);
+    a.ends();
+    run_ok(&mut a);
+}
+
+#[test]
+fn setscheduler_is_checked_and_read_back_by_getscheduler_and_getparam() {
+    let mut a = Asm::default();
+    a.sched_room();
+    a.setscheduler(SCHED_FIFO, 10).is(0);
+    a.getscheduler().is(1);
+    a.getparam().is(0).word_is(BUF, 10);
+    // sched_setparam changes the priority and keeps the policy
+    a.sw(BUF, 42).movz(0, 0).sp_plus(1, BUF).svc(118).is(0);
+    a.getparam().is(0).word_is(BUF, 42);
+    a.getscheduler().is(1);
+    a.sw(BUF, 100).movz(0, 0).sp_plus(1, BUF).svc(118).is(-22);
+    // a priority a policy doesn't take, a policy that isn't one, deadline, bad pointers
+    a.setscheduler(SCHED_FIFO, 0).is(-22);
+    a.setscheduler(SCHED_FIFO, 100).is(-22);
+    a.setscheduler(0, 1).is(-22);
+    a.setscheduler(7, 0).is(-22);
+    a.setscheduler(6, 0).is(-22);
+    a.movz(0, 0).movz(1, 0).movz(2, 0).svc(119).is(-22);
+    a.movz(0, 0).movz(1, 0).movz(2, 8).svc(119).is(-14);
+    a.movz(0, 0).movz(1, 8).svc(121).is(-14);
+    a.movz(0, 0).movz(1, 0).sp_plus(2, BUF).svc(119).is(0); // back to SCHED_OTHER, priority 0
+    a.getscheduler().is(0);
+    a.setscheduler(2, 99).is(0);
+    a.getscheduler().is(2);
+    // the interval of a round robin is 100 ms, the others have none
+    a.movz(0, 0).sp_plus(1, BUF).svc(127).is(0);
+    a.word_is(BUF, 0).word_is(BUF + 8, 100_000_000);
+    a.setscheduler(SCHED_FIFO, 1).is(0);
+    a.movz(0, 0).sp_plus(1, BUF).svc(127).is(0);
+    a.word_is(BUF + 8, 0);
+    a.movz(0, 0).movz(1, 8).svc(127).is(-14);
+    a.mov32(0, 99_999).sp_plus(1, BUF).svc(127).is(-3);
+    a.ends();
+    run_ok(&mut a);
+}
+
+#[test]
+fn nice_goes_through_setpriority_and_getpriority_for_the_thread_the_group_and_the_user() {
+    let mut a = Asm::default();
+    a.sched_room();
+    a.setpriority(5).is(0);
+    a.getpriority().is(15);
+    a.setpriority(100).is(0); // clamped to 19
+    a.getpriority().is(1);
+    a.setpriority(-100).is(0); // clamped to -20
+    a.getpriority().is(40);
+    a.svc(178).i(mov(19, 0));
+    a.movz(0, 0).i(mov(1, 19)).movz(2, 3).svc(140).is(0); // PRIO_PROCESS with my tid
+    a.getpriority().is(17);
+    a.movz(0, 1).movz(1, 0).movz(2, 4).svc(140).is(0); // PRIO_PGRP 0
+    a.movz(0, 1).movz(1, 0).svc(141).is(16);
+    a.movz(0, 2).movz(1, 0).movz(2, 6).svc(140).is(0); // PRIO_USER 0
+    a.movz(0, 2).movz(1, 0).svc(141).is(14);
+    a.getpriority().is(14);
+    // no such thread, group or user, no such kind
+    a.movz(0, 0).mov32(1, 99_999).svc(141).is(-3);
+    a.movz(0, 0).mov32(1, 99_999).movz(2, 0).svc(140).is(-3);
+    a.movz(0, 1).mov32(1, 99_999).svc(141).is(-3);
+    a.movz(0, 2).mov32(1, 1234).svc(141).is(-3);
+    a.movz(0, 3).movz(1, 0).svc(141).is(-22);
+    a.ends();
+    run_ok(&mut a);
+}
+
+/// The child checks what it was given (its failure is its exit code 1), the parent that it ended 0.
+fn child_checks(a: &mut Asm, check: impl FnOnce(&mut Asm)) {
+    a.fork().cbz_to(0, "child");
+    a.i(mov(19, 0));
+    a.wait4(Some(19), 0).cmp(0, 19).bcond(COND_NE, "fail");
+    a.status_is(0);
+    let at = a.code.len();
+    a.b("after");
+    a.label("child");
+    check(a);
+    a.exit(0);
+    a.label("after");
+    let _ = at;
+}
+
+#[test]
+fn a_child_inherits_policy_priority_and_nice() {
+    let mut a = Asm::default();
+    a.sched_room();
+    a.setscheduler(SCHED_RR, 33).is(0);
+    a.setpriority(7).is(0);
+    child_checks(&mut a, |c| {
+        c.getscheduler().is(2);
+        c.getparam().is(0).word_is(BUF, 33);
+        c.getpriority().is(13);
+        c.setpriority(0).is(0); // its own
+    });
+    a.getpriority().is(13);
+    a.getscheduler().is(2);
+    a.ends();
+    run_ok(&mut a);
+}
+
+#[test]
+fn reset_on_fork_gives_the_child_a_normal_thread_and_clears_the_flag() {
+    let mut a = Asm::default();
+    a.sched_room();
+    a.setscheduler(SCHED_FIFO | RESET_ON_FORK, 10).is(0);
+    a.getscheduler().is((RESET_ON_FORK | SCHED_FIFO) as i64);
+    a.setpriority(-5).is(0);
+    child_checks(&mut a, |c| {
+        c.getscheduler().is(0);
+        c.getparam().is(0).word_is(BUF, 0);
+        c.getpriority().is(20); // a negative nice goes back to 0
+                                // and it doesn't pass the reset on: its own child is as it is
+        c.setscheduler(SCHED_RR, 5).is(0);
+    });
+    // the parent keeps its own
+    a.getscheduler().is((RESET_ON_FORK | SCHED_FIFO) as i64);
+    a.getpriority().is(25);
+    // setpriority's nice is also kept by a thread's policy change
+    a.setscheduler(0, 0).is(0);
+    a.getscheduler().is(0);
+    a.getpriority().is(25);
+    a.ends();
+    run_ok(&mut a);
+}
+
+#[test]
+fn sched_getattr_fills_what_fits_and_sched_setattr_takes_it_back() {
+    let mut a = Asm::default();
+    a.sched_room();
+    a.setscheduler(SCHED_RR, 7).is(0);
+    // size 56: size, policy, flags, nice, priority, the clamps' defaults
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 56)
+        .movz(3, 0)
+        .svc(275)
+        .is(0);
+    a.word_is(BUF, 56)
+        .word_is(BUF + 4, 2)
+        .word_is(BUF + 8, 0)
+        .word_is(BUF + 20, 7);
+    a.word_is(BUF + 52, 1024);
+    // the version 0 size: no clamps written
+    a.sw(BUF + 52, 0x5555);
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 48)
+        .movz(3, 0)
+        .svc(275)
+        .is(0);
+    a.word_is(BUF, 48).word_is(BUF + 52, 0x5555);
+    // too small, flags, a null pointer, no such thread
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 40)
+        .movz(3, 0)
+        .svc(275)
+        .is(-22);
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 56)
+        .movz(3, 1)
+        .svc(275)
+        .is(-22);
+    a.movz(0, 0)
+        .movz(1, 0)
+        .movz(2, 56)
+        .movz(3, 0)
+        .svc(275)
+        .is(-22);
+    a.mov32(0, 99_999)
+        .sp_plus(1, BUF)
+        .movz(2, 56)
+        .movz(3, 0)
+        .svc(275)
+        .is(-3);
+    a.movz(0, 0)
+        .movz(1, 8)
+        .movz(2, 56)
+        .movz(3, 0)
+        .svc(275)
+        .is(-14);
+    // setattr: SCHED_BATCH, nice 3 and reset on fork
+    for off in (0..56).step_by(4) {
+        a.sw(BUF + off, 0);
+    }
+    a.sw(BUF, 56).sw(BUF + 4, 3).sw(BUF + 8, 1).sw(BUF + 16, 3);
+    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).is(0);
+    a.getscheduler().is((RESET_ON_FORK | 3) as i64);
+    a.getpriority().is(17);
+    // getattr reports them
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 56)
+        .movz(3, 0)
+        .svc(275)
+        .is(0);
+    a.word_is(BUF + 4, 3)
+        .word_is(BUF + 8, 1)
+        .word_is(BUF + 16, 3)
+        .word_is(BUF + 20, 0);
+    // a real-time policy through setattr, with a version 0 struct
+    for off in (0..56).step_by(4) {
+        a.sw(BUF + off, 0);
+    }
+    a.sw(BUF, 48).sw(BUF + 4, 1).sw(BUF + 20, 20);
+    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).is(0);
+    a.getscheduler().is(1);
+    a.getparam().is(0).word_is(BUF, 20);
+    // a size too small, or too big with something in the extra, is E2BIG and the size it knows
+    a.sw(BUF, 20);
+    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).is(-7);
+    a.word_is(BUF, 56);
+    a.sw(BUF, 64).sw(BUF + 60, 1);
+    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).is(-7);
+    a.word_is(BUF, 56);
+    a.sw(BUF + 60, 0);
+    // flags nobody has, a priority the policy doesn't take, deadline, flags in the call
+    a.sw(BUF, 56)
+        .sw(BUF + 4, 1)
+        .sw(BUF + 8, 0x80)
+        .sw(BUF + 20, 5);
+    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).is(-22);
+    a.sw(BUF + 8, 0).sw(BUF + 20, 0);
+    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).is(-22);
+    a.sw(BUF + 4, 6);
+    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).is(-1);
+    a.sw(BUF + 4, 0);
+    a.movz(0, 0).sp_plus(1, BUF).movz(2, 1).svc(274).is(-22);
+    a.mov32(0, 99_999)
+        .sp_plus(1, BUF)
+        .movz(2, 0)
+        .svc(274)
+        .is(-3);
+    a.ends();
+    run_ok(&mut a);
+}
+
+#[test]
+fn scheduling_survives_a_snapshot() {
+    let mut a = Asm::default();
+    a.sched_room();
+    a.setscheduler(SCHED_RR | RESET_ON_FORK, 12).is(0);
+    a.setpriority(4).is(0);
+    // waits for a byte: that is where it is saved
+    a.movz(0, 0).sp_plus(1, 16).movz(2, 1).svc(63).is(1);
+    a.getscheduler().is((RESET_ON_FORK | SCHED_RR) as i64);
+    a.getparam().is(0).word_is(BUF, 12);
+    a.getpriority().is(16);
+    a.ends();
+    let (mut vm, mut p) = start(&a.elf());
+    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    p.input(b"x\n");
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert!(out.ends_with(b"A"), "{out:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+
+// ------------------------------------------------------------ process descriptors
+
+const SIGTERM: u16 = 15;
+const WEXITED: u16 = 4;
+
+/// ldrh wt, [sp, #off]
+fn ldrh_sp(rt: u32, off: u32) -> u32 {
+    0x7940_0000 | (off / 2) << 10 | 31 << 5 | rt
+}
+
+impl Asm {
+    /// sub sp, sp, #512: a wait status at [sp], pipe fds at [sp + 8], a byte at [sp + 16], a
+    /// pollfd at [sp + 32] (revents at [sp + 38]), a descriptor number at [sp + 48], epoll's
+    /// event at [sp + 64], a siginfo at [sp + 128], clone3's args at [sp + 256]
+    fn big_room(&mut self) -> &mut Self {
+        self.i(0xd108_03ff)
+    }
+    /// x0 = pidfd_open(x`pid`, flags)
+    fn pidfd_open(&mut self, pid: u32, flags: u16) -> &mut Self {
+        self.i(mov(0, pid)).movz(1, flags).svc(434)
+    }
+    /// x0 = pidfd_send_signal(x`fd`, sig, NULL, 0)
+    fn pidfd_kill(&mut self, fd: u32, sig: u16) -> &mut Self {
+        self.i(mov(0, fd))
+            .movz(1, sig)
+            .movz(2, 0)
+            .movz(3, 0)
+            .svc(424)
+    }
+    /// x0 = pidfd_getfd(x`fd`, x`target`, flags)
+    fn pidfd_getfd(&mut self, fd: u32, target: u32, flags: u16) -> &mut Self {
+        self.i(mov(0, fd)).i(mov(1, target)).movz(2, flags).svc(438)
+    }
+    /// x0 = waitid(P_PIDFD, x`fd`, &[sp + 128], options, 0)
+    fn waitid_pidfd(&mut self, fd: u32, options: u16) -> &mut Self {
+        self.movz(0, 3)
+            .i(mov(1, fd))
+            .i(add_imm(2, 31, 128, false))
+            .movz(3, options)
+            .movz(4, 0)
+            .svc(95)
+    }
+    /// ppoll({x`fd`, POLLIN}, 1, NULL): x0 is its result, w9 the revents
+    fn poll_in(&mut self, fd: u32) -> &mut Self {
+        self.i(movz_hi(9, 1))
+            .i(add(9, 9, fd))
+            .str_sp(9, 32)
+            .i(add_imm(0, 31, 32, false))
+            .movz(1, 1)
+            .movz(2, 0)
+            .movz(3, 0)
+            .movz(4, 0)
+            .svc(73)
+            .i(ldrh_sp(9, 38))
+    }
+    /// fcntl(x`fd`, F_GETFD) into x0
+    fn fd_flags(&mut self, fd: u32) -> &mut Self {
+        self.i(mov(0, fd)).movz(1, 1).svc(25)
+    }
+    /// x0 must be `v`
+    fn x0_is(&mut self, v: u32) -> &mut Self {
+        self.cmp_imm(0, v).bcond(COND_NE, "fail")
+    }
+    /// x0 must be -`errno`
+    fn fails_with(&mut self, errno: u32) -> &mut Self {
+        self.cmn_imm(0, errno).bcond(COND_NE, "fail")
+    }
+    /// The siginfo waitid stored: its si_code, si_pid (x`pid`) and si_status
+    fn exited(&mut self, pid: u32, status: u32) -> &mut Self {
+        self.ldr_w(1, 31, 128 + 8)
+            .cmp_imm(1, 1) // CLD_EXITED
+            .bcond(COND_NE, "fail")
+            .ldr_w(1, 31, 128 + 16)
+            .cmp(1, pid)
+            .bcond(COND_NE, "fail")
+            .ldr_w(1, 31, 128 + 24)
+            .cmp_imm(1, status)
+            .bcond(COND_NE, "fail")
+    }
+}
+
+#[test]
+fn a_process_descriptor_is_readable_when_its_process_ends_and_waitid_waits_for_it() {
+    // The child ends with 7 after the parent has begun to poll: POLLIN, and nothing else. waitid
+    // on the descriptor gives its status; once waited for, the process is gone: the descriptor
+    // is hung up as well, no new one can be made, and waitid has no child to wait for.
+    let mut a = Asm::default();
+    a.big_room().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.pidfd_open(20, 0).i(mov(19, 0)).x0_is(3);
+    a.fd_flags(19).x0_is(1); // close on exec
+    a.poll_in(19).x0_is(1);
+    a.cmp_imm(9, 1).bcond(COND_NE, "fail");
+    a.waitid_pidfd(19, WEXITED).x0_is(0);
+    a.exited(20, 7);
+    a.poll_in(19).x0_is(1);
+    a.cmp_imm(9, 0x11).bcond(COND_NE, "fail"); // POLLIN | POLLHUP
+    a.pidfd_open(20, 0).fails_with(3); // ESRCH
+    a.waitid_pidfd(19, WEXITED).fails_with(10); // ECHILD
+    a.ends();
+    a.label("child").exit(7);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_signal_through_a_process_descriptor_ends_a_sleeping_child() {
+    // The child tells its parent it is up and then waits for input; SIGTERM through the
+    // descriptor ends it with that signal. The signal 0 only looks, flags are none, and what
+    // isn't a process descriptor is EBADF.
+    let mut a = Asm::default();
+    a.big_room().pipe().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.pidfd_open(20, 0).i(mov(19, 0)).x0_is(5);
+    a.read_byte(23).x0_is(1); // the child is up, and about to wait
+    a.pidfd_kill(19, 0).x0_is(0);
+    a.i(mov(0, 19))
+        .movz(1, SIGTERM)
+        .movz(2, 0)
+        .movz(3, 1)
+        .svc(424)
+        .fails_with(22);
+    a.pidfd_kill(23, SIGTERM).fails_with(9); // a pipe
+    a.pidfd_kill(19, SIGTERM).x0_is(0);
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(SIGTERM as u32);
+    a.pidfd_kill(19, SIGTERM).fails_with(3); // gone
+    a.ends();
+    a.label("child").write_w(24).read_byte(0).b("fail");
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn clone3_and_clone_with_clone_pidfd_store_a_process_descriptor() {
+    // clone3 stores it where cl_args.pidfd says, clone at parent_tid (close on exec both); clone
+    // can't also have CLONE_PARENT_SETTID, which wants the same place
+    let mut a = Asm::default();
+    a.big_room();
+    a.mov32(9, 0x1000).str_sp(9, 256); // flags: CLONE_PIDFD
+    a.i(add_imm(9, 31, 48, false)).str_sp(9, 264); // pidfd
+    a.str_sp(31, 272).str_sp(31, 280); // child_tid, parent_tid
+    a.movz(9, SIGCHLD).str_sp(9, 288); // exit_signal
+    a.str_sp(31, 296).str_sp(31, 304).str_sp(31, 312); // stack, stack_size, tls
+    a.i(add_imm(0, 31, 256, false)).movz(1, 64).svc(435);
+    a.cbz_to(0, "child3");
+    a.i(mov(20, 0));
+    a.ldr_w(19, 31, 48).cmp_imm(19, 3).bcond(COND_NE, "fail");
+    a.fd_flags(19).x0_is(1);
+    a.waitid_pidfd(19, WEXITED).x0_is(0);
+    a.exited(20, 9);
+    // clone: the descriptor at parent_tid
+    a.mov32(0, 0x1000 | SIGCHLD as u32)
+        .movz(1, 0)
+        .i(add_imm(2, 31, 48, false))
+        .movz(3, 0)
+        .movz(4, 0)
+        .svc(220);
+    a.cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.ldr_w(19, 31, 48).cmp_imm(19, 4).bcond(COND_NE, "fail");
+    a.waitid_pidfd(19, WEXITED).x0_is(0);
+    a.exited(20, 5);
+    a.mov32(0, 0x1000 | 0x10_0000 | SIGCHLD as u32) // CLONE_PARENT_SETTID too
+        .movz(1, 0)
+        .i(add_imm(2, 31, 48, false))
+        .movz(3, 0)
+        .movz(4, 0)
+        .svc(220)
+        .fails_with(22);
+    a.ends();
+    a.label("child3").exit(9);
+    a.label("child").exit(5);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn pidfd_getfd_takes_a_description_from_another_process() {
+    // The child holds the only read end of a pipe (its parent closed its own); the parent takes
+    // that description through the child's descriptor, writes, and reads it back
+    let mut a = Asm::default();
+    a.big_room().pipe().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.pidfd_open(20, 0).i(mov(19, 0));
+    a.i(mov(0, 23)).svc(57).cbnz_fail(0); // the parent's read end
+    a.i(movz(21, 60)); // a descriptor the child hasn't
+    a.pidfd_getfd(19, 21, 0).fails_with(9);
+    a.pidfd_getfd(19, 23, 1).fails_with(22);
+    a.pidfd_getfd(23, 23, 0).fails_with(9); // not a process descriptor
+    a.pidfd_getfd(19, 23, 0).i(mov(25, 0)).x0_is(3);
+    a.fd_flags(25).x0_is(1);
+    a.write_w(24).x0_is(1);
+    a.read_byte(25).x0_is(1);
+    a.i(add_imm(10, 31, 16, false))
+        .i(ldrb(9, 10))
+        .cmp_imm(9, 87)
+        .bcond(COND_NE, "fail"); // 'W'
+    a.pidfd_kill(19, SIGKILL).x0_is(0);
+    a.wait4(Some(20), 0).cmp(0, 20).bcond(COND_NE, "fail");
+    a.status_is(9);
+    a.pidfd_getfd(19, 23, 0).fails_with(3); // the process is gone
+    a.ends();
+    a.label("child").read_byte(0).b("fail");
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn pidfd_open_refuses_what_is_not_a_process_and_waitid_what_is_not_a_child() {
+    let mut a = Asm::default();
+    a.big_room();
+    a.pidfd_open(31, 0).fails_with(22); // pid 0 (xzr)
+    a.i(0x9280_0000).i(mov(21, 0)); // -1
+    a.pidfd_open(21, 0).fails_with(22);
+    a.i(movz(21, 9999)).pidfd_open(21, 0).fails_with(3); // ESRCH
+    a.svc(172).i(mov(20, 0));
+    // flags that aren't PIDFD_NONBLOCK
+    a.pidfd_open(20, 1).fails_with(22);
+    // a thread has no descriptor of its own
+    a.clone(CLONE_VM | CLONE_SIGHAND | CLONE_THREAD)
+        .cbz_to(0, "thread");
+    a.i(mov(21, 0));
+    a.pidfd_open(21, 0).fails_with(22);
+    // this process is not its own child
+    a.pidfd_open(20, 0).i(mov(19, 0)).x0_is(3);
+    a.waitid_pidfd(19, WEXITED).fails_with(10);
+    a.waitid_pidfd(31, WEXITED).fails_with(9); // stdin is no process descriptor
+    a.movz(21, 40).waitid_pidfd(21, WEXITED).fails_with(9); // no such descriptor
+    a.ends();
+    a.label("thread").label("spin").b("spin");
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn waitid_on_a_non_blocking_process_descriptor_never_waits() {
+    // Nothing to report yet: with WNOHANG it says so (si_pid 0), without it EAGAIN
+    let mut a = Asm::default();
+    a.big_room().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.pidfd_open(20, 0x800).i(mov(19, 0)).x0_is(3); // PIDFD_NONBLOCK
+    a.waitid_pidfd(19, WEXITED).fails_with(11);
+    a.waitid_pidfd(19, WEXITED | WNOHANG).x0_is(0);
+    a.ldr_w(1, 31, 128 + 16).cbnz_fail(1);
+    a.pidfd_kill(19, SIGKILL).x0_is(0);
+    a.poll_in(19).x0_is(1);
+    a.waitid_pidfd(19, WEXITED).x0_is(0);
+    a.ldr_w(1, 31, 128 + 8)
+        .cmp_imm(1, 2) // CLD_KILLED
+        .bcond(COND_NE, "fail")
+        .ldr_w(1, 31, 128 + 24)
+        .cmp_imm(1, 9)
+        .bcond(COND_NE, "fail");
+    a.ends();
+    a.label("child").read_byte(0).b("fail");
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn epoll_reports_a_process_descriptor_when_its_process_ends() {
+    let mut a = Asm::default();
+    a.big_room().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.pidfd_open(20, 0).i(mov(19, 0));
+    a.movz(0, 0).svc(20).i(mov(21, 0)); // epoll_create1
+    a.movz(9, 1).str_sp(9, 64); // events: EPOLLIN
+    a.movz(9, 0x123).str_sp(9, 72); // data
+    a.i(mov(0, 21))
+        .movz(1, 1) // EPOLL_CTL_ADD
+        .i(mov(2, 19))
+        .i(add_imm(3, 31, 64, false))
+        .svc(21)
+        .cbnz_fail(0);
+    // epoll_pwait(ep, &[sp + 96], 1, -1, NULL)
+    a.i(mov(0, 21))
+        .i(add_imm(1, 31, 96, false))
+        .movz(2, 1)
+        .i(0x9280_0003) // movn x3, #0
+        .movz(4, 0)
+        .svc(22)
+        .x0_is(1);
+    a.ldr_w(1, 31, 96).cmp_imm(1, 1).bcond(COND_NE, "fail");
+    a.i(ldr(1, 31, 104))
+        .cmp_imm(1, 0x123)
+        .bcond(COND_NE, "fail");
+    a.waitid_pidfd(19, WEXITED).x0_is(0);
+    a.exited(20, 3);
+    a.ends();
+    a.label("child").exit(3);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"A");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_process_descriptor_survives_a_snapshot_and_its_poll_goes_on() {
+    // The parent polls a descriptor of a child that waits for input: the machine is saved with
+    // both waiting and goes on in another one, where the input ends the child and the poll
+    let mut a = Asm::default();
+    a.big_room().fork().cbz_to(0, "child");
+    a.i(mov(20, 0));
+    a.pidfd_open(20, 0).i(mov(19, 0));
+    a.poll_in(19).x0_is(1);
+    a.waitid_pidfd(19, WEXITED).x0_is(0);
+    a.exited(20, 4);
+    a.ends();
+    a.label("child").read_byte(0).exit(4);
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"");
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    p.input(b"x\n");
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"x\r\nA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_process_descriptor_has_a_proc_link_and_fdinfo() {
+    let mut a = Asm::with_texts(vec![
+        ("info", b"/proc/self/fdinfo/3"),
+        ("link", b"/proc/self/fd/3"),
+    ]);
+    a.big_room();
+    a.svc(172).i(mov(20, 0));
+    a.pidfd_open(20, 0).x0_is(3);
+    a.i(0x9280_0c60) // openat(AT_FDCWD, "/proc/self/fdinfo/3", O_RDONLY)
+        .adr(1, "info")
+        .movz(2, 0)
+        .movz(3, 0)
+        .svc(56)
+        .x0_is(4);
+    a.movz(0, 4)
+        .i(add_imm(1, 31, 256, false))
+        .movz(2, 200)
+        .svc(63)
+        .i(mov(21, 0)); // the text it holds
+    a.movz(0, 1)
+        .i(add_imm(1, 31, 256, false))
+        .i(mov(2, 21))
+        .svc(64);
+    // readlinkat(AT_FDCWD, "/proc/self/fd/3", buf, 64)
+    a.i(0x9280_0c60)
+        .adr(1, "link")
+        .i(add_imm(2, 31, 256, false))
+        .movz(3, 64)
+        .svc(78)
+        .x0_is(18);
+    a.movz(0, 1)
+        .i(add_imm(1, 31, 256, false))
+        .movz(2, 18)
+        .svc(64);
+    a.ends();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.contains("flags:\t02000002\r\n"), "{out:?}");
+    assert!(out.contains("\r\nPid:\t1000\r\n"), "{out:?}");
+    assert!(out.ends_with("anon_inode:[pidfd]A"), "{out:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}

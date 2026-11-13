@@ -1376,6 +1376,12 @@ impl Process {
                 false
             },
             Err(Miss::Segv) => {
+                // A read of an ID register, which EL0 can't make: Linux answers it for the
+                // program (HWCAP_CPUID), and so does this (Go's x/sys/cpu reads
+                // ID_AA64ISAR0_EL1 when it starts)
+                if matches!(ec, 0 | 0x18) && self.emulate_id_read(cpu, elr) {
+                    return true;
+                }
                 // An undefined instruction (EC 0) is SIGILL: a program probing for a CPU
                 // feature (OpenSSL's, for SVE or SM3) sets a handler and goes on without it
                 if ec == 0 && self.raise_fault(SIGILL, ILL_ILLOPC) {
@@ -1387,6 +1393,29 @@ impl Process {
                 false
             },
         }
+    }
+
+    /// The instruction at `elr` is `mrs Xt, <ID register>` (op0 3, op1 0, CRn 0: MIDR_EL1,
+    /// MPIDR_EL1, the ID_AA64* registers): Xt gets the CPU's value (0 for an ID register it
+    /// doesn't have, as Linux's emulation gives) and the program goes on after it.
+    fn emulate_id_read<H: Host>(&mut self, cpu: &mut Cpu<H>, elr: u64) -> bool {
+        let mut w = [0u8; 4];
+        if !self.read(elr, &mut w) {
+            return false;
+        }
+        let insn = u32::from_le_bytes(w);
+        // MRS (L = 1), op0 3, op1 0, CRn 0
+        let (op1, crn) = ((insn >> 16) & 7, (insn >> 12) & 0xf);
+        if insn & 0xfff8_0000 != 0xd538_0000 || op1 != 0 || crn != 0 {
+            return false;
+        }
+        let value = cpu.read_sysreg((insn >> 5) & 0xffff).unwrap_or(0);
+        let rt = (insn & 31) as usize;
+        if rt != 31 {
+            cpu.x[rt] = value;
+        }
+        cpu.pc = elr + 4;
+        true
     }
 
     // ------------------------------------------------------------ areas

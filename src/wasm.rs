@@ -107,8 +107,10 @@ pub type JsCpu = Cpu<BoardHost<JsPlatform>>;
 /// The size of a piece of `armless_save_next`
 const SAVE_PIECE: usize = 1 << 20;
 
-/// The machine. Shared by every instance on the same memory.
-static mut VM: Option<Vm<JsPlatform>> = None;
+/// The machine, shared by every instance on the same memory: null until `armless_create` leaks one
+/// into it.
+static VM: std::sync::atomic::AtomicPtr<Vm<JsPlatform>> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 std::thread_local! {
     /// The CPU this instance drives (`armless_smp_attach`); CPU 0 by default.
@@ -128,12 +130,14 @@ std::thread_local! {
     static WAKE_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
 }
 
-#[allow(static_mut_refs)]
 pub fn vm() -> &'static mut Vm<JsPlatform> {
-    // SAFETY: `armless_create` sets VM once, before any other export runs, and nothing replaces
-    // it. Each instance (a thread) uses its own CPU of it, and the main thread touches the rest
-    // only while the workers are paused (snapshots) or through the board's locks.
-    unsafe { VM.as_mut().expect("armless_create not called") }
+    let vm = VM.load(Ordering::Acquire);
+    assert!(!vm.is_null(), "armless_create not called");
+    // SAFETY: not null, so a leaked box (`armless_create`), never freed. `armless_create` sets
+    // it before any other export runs, and nothing replaces it. Each instance (a thread) uses its
+    // own CPU of it, and the main thread touches the rest only while the workers are paused
+    // (snapshots) or through the board's locks.
+    unsafe { &mut *vm }
 }
 
 fn cpu() -> &'static mut JsCpu {
@@ -204,8 +208,15 @@ pub unsafe extern "C" fn armless_create(
     if mac_ptr != 0 {
         devices.mac.copy_from_slice(slice(mac_ptr, 6));
     }
+    // On wasm32, 4096 MiB or more would wrap to a small size, not be refused
+    let Some(memory_size) = (memory_mb as usize).checked_mul(1 << 20) else {
+        set_error(format!(
+            "{memory_mb} MiB of RAM is more than a wasm memory holds"
+        ));
+        return -1;
+    };
     let config = Config {
-        memory_size: (memory_mb as usize) << 20,
+        memory_size,
         cpus: ncpus as usize,
         devices,
     };
@@ -224,7 +235,7 @@ pub unsafe extern "C" fn armless_create(
                 }));
             }
             v.board.set_notify(Box::new(|| host_notify()));
-            VM = Some(v);
+            VM.store(Box::into_raw(Box::new(v)), Ordering::Release);
             0
         },
         Err(e) => {
@@ -359,11 +370,15 @@ pub unsafe extern "C" fn armless_free(ptr: u32, len: u32) {
     )));
 }
 
-/// Aligned allocation that is never freed (vCPU worker stacks and TLS blocks).
+/// Aligned allocation that is never freed (vCPU worker stacks and TLS blocks): 0 if there is no
+/// memory, or `align` is not a power of two.
 #[no_mangle]
 pub extern "C" fn armless_alloc_aligned(len: u32, align: u32) -> u32 {
-    let layout =
-        std::alloc::Layout::from_size_align(len.max(1) as usize, align.max(1) as usize).unwrap();
+    let Ok(layout) =
+        std::alloc::Layout::from_size_align(len.max(1) as usize, align.max(1) as usize)
+    else {
+        return 0;
+    };
     // SAFETY: never zero-sized (`max(1)`); never freed.
     unsafe { std::alloc::alloc_zeroed(layout) as u32 }
 }
@@ -691,13 +706,10 @@ pub unsafe extern "C" fn armless_blob(name: u32, name_len: u32, data: u32, data_
 /// back with `armless_free`.
 #[no_mangle]
 pub extern "C" fn armless_blob_buf(len: u32) -> u32 {
-    let layout = std::alloc::Layout::from_size_align(len.max(1) as usize, 1).unwrap();
-    // SAFETY: the layout is not empty (its size is at least 1).
-    let ptr = unsafe { std::alloc::alloc(layout) };
-    if ptr.is_null() {
-        std::alloc::handle_alloc_error(layout);
-    }
-    ptr as u32
+    // A Vec of bytes has exactly the capacity asked for, so this is the block `Vec::from_raw_parts`
+    // takes back in `armless_blob_raw` (and `armless_free` frees: the same size, alignment 1).
+    let mut block = std::mem::ManuallyDrop::new(Vec::<u8>::with_capacity(len.max(1) as usize));
+    block.as_mut_ptr() as u32
 }
 
 /// Provide a blob that is already decompressed, in a block from `armless_blob_buf(data_cap)` of which the first

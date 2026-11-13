@@ -39,8 +39,11 @@ mod ffi {
 
     pub const MEMORY_RWX: u64 = 7;
 
+    // SAFETY: Hypervisor.framework's functions, with the signatures of its headers.
+    // `mach_absolute_time` only reads the clock.
     #[link(name = "Hypervisor", kind = "framework")]
-    extern "C" {
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
         pub fn hv_vm_create(config: *mut u8) -> hv_return_t;
         pub fn hv_vm_map(addr: *mut u8, ipa: u64, size: usize, flags: u64) -> hv_return_t;
         pub fn hv_vcpu_create(
@@ -63,7 +66,7 @@ mod ffi {
         pub fn hv_vcpu_set_vtimer_mask(vcpu: u64, masked: bool) -> hv_return_t;
         pub fn hv_vcpu_get_vtimer_offset(vcpu: u64, offset: *mut u64) -> hv_return_t;
         pub fn hv_vcpu_set_vtimer_offset(vcpu: u64, offset: u64) -> hv_return_t;
-        pub fn mach_absolute_time() -> u64;
+        pub safe fn mach_absolute_time() -> u64;
     }
 }
 
@@ -188,10 +191,8 @@ impl HwVcpu for Vcpu {
 
 /// The host's `mach_absolute_time`, the counter Hypervisor.framework's virtual timer offset is
 /// against.
-#[allow(unsafe_code)]
 pub(crate) fn mach_time() -> u64 {
-    // SAFETY: a plain call with no arguments
-    unsafe { ffi::mach_absolute_time() }
+    ffi::mach_absolute_time()
 }
 
 /// After this long in the guest, `run` returns to the runner (which pauses and stops CPUs between
@@ -400,12 +401,9 @@ impl<H: Host> Cpu<H> {
         }
         let cval = v.sys(sr::CNTV_CVAL_EL0);
         let mut offset = 0;
-        // SAFETY: this thread's vCPU, and the host's counter
-        let now = unsafe {
-            ffi::hv_vcpu_get_vtimer_offset(v.id, &mut offset);
-            ffi::mach_absolute_time()
-        }
-        .wrapping_sub(offset);
+        // SAFETY: this thread's vCPU
+        unsafe { ffi::hv_vcpu_get_vtimer_offset(v.id, &mut offset) };
+        let now = ffi::mach_absolute_time().wrapping_sub(offset);
         let ticks = cval.saturating_sub(now);
         let ns = (ticks as u128 * 1_000_000_000 / super::hw::host_counter_hz() as u128) as u64;
         Some(self.host.now_ns().saturating_add(ns))

@@ -245,7 +245,10 @@ fn gettimeofday_gives_the_wall_clock_in_microseconds_and_a_zero_timezone() {
     // V8's Date.now() is gettimeofday, and when it fails the date is whatever was in the stack
     let mut vm = machine();
     let mut p = Prog::default();
-    p.put(0x120, &[0xff; 8]);
+    // The output is a terminal: without raw output (c_oflag 0) it turns a 0x0a in the time into
+    // 0x0d 0x0a, and the test fails one run in ten
+    p.put(0x120, &[0xff; 8]).put(0x140, &[0; 36]);
+    p.sys(29, &[I(1), I(0x5402), D(0x140)]).expect(0);
     p.sys(169, &[D(0x100), D(0x120)]).expect(0);
     p.out(0x100, 16);
     p.out(0x120, 8);
@@ -621,4 +624,340 @@ fn an_unbound_unix_client_is_accepted_as_its_family_alone() {
     let mut proc = start(&mut vm, p);
     let (_, status) = run(&mut proc, &mut vm);
     ok(&status);
+}
+
+#[test]
+fn a_netlink_route_socket_lists_the_interfaces_and_their_addresses() {
+    // ip addr, getifaddrs, Node's os.networkInterfaces(): an RTM_GETADDR dump
+    let mut vm = machine();
+    let mut p = Prog::default();
+    // struct nlmsghdr (len 24, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, seq 1) + ifaddrmsg (AF_INET)
+    let mut req = 24u32.to_le_bytes().to_vec();
+    req.extend_from_slice(&22u16.to_le_bytes());
+    req.extend_from_slice(&0x301u16.to_le_bytes());
+    req.extend_from_slice(&1u32.to_le_bytes());
+    req.extend_from_slice(&0u32.to_le_bytes());
+    req.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
+    p.put(0x200, &req);
+    // struct ifreq for "lo"
+    p.put(0x300, b"lo\0");
+    p.sys(198, &[I(16), I(3), I(0)]).expect(3); // socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)
+    p.sys(206, &[I(3), D(0x200), I(24), I(0), I(0), I(0)]).expect(24);
+    p.sys(207, &[I(3), D(0x400), I(2048), I(0), I(0), I(0)]).save(0x100);
+    // The first message is an RTM_NEWADDR (its type, after the 4-byte length)
+    p.arg(0, W(0x404));
+    p.code.push(0x9240_3c00); // and x0, x0, #0xffff
+    p.expect(20);
+    // SIOCGIFINDEX of lo on any socket: 1
+    p.sys(29, &[I(3), I(0x8933), D(0x300)]).expect(0);
+    p.arg(0, W(0x310));
+    p.expect(1);
+    p.sys(29, &[I(3), I(0x8933), D(0x340)]).expect(-19); // ENODEV: no such interface (an empty name)
+    let mut p = start(&mut vm, p);
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+// ------------------------------------------------ descriptors and credentials over unix sockets
+
+/// A cmsghdr of SOL_SOCKET with its data, padded
+fn cmsg(ty: u32, data: &[u8]) -> Vec<u8> {
+    let mut b = ((16 + data.len()) as u64).to_le_bytes().to_vec();
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(&ty.to_le_bytes());
+    b.extend_from_slice(data);
+    b.resize(b.len().next_multiple_of(8), 0);
+    b
+}
+
+/// SCM_RIGHTS of descriptors
+fn rights(fds: &[u32]) -> Vec<u8> {
+    cmsg(
+        1,
+        &fds.iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
+}
+
+const MSG_PEEK: u64 = 2;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+
+/// Offsets for the descriptor tests: where a message's header (it takes 0x80), its data and the
+/// control data that comes back are
+const M1: u32 = 0x500;
+const M2: u32 = 0x600;
+const M3: u32 = 0x700;
+const CTL: u32 = 0x60;
+
+/// A pipe (fds 3 and 4) and a socketpair of `ty` (5 and 6)
+fn pipe_and_pair(p: &mut Prog, ty: u64) {
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    p.sys(199, &[I(1), I(ty), I(0), D(0x108)]).expect(0);
+}
+
+#[test]
+fn a_pipe_passed_over_a_socketpair_is_read_by_a_forked_child_through_it() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, b"x").put(0x210, b"pipe");
+    pipe_and_pair(&mut p, 1);
+    p.msg(M1, 0x200, 1, &rights(&[3]), 24);
+    p.msg(M2, 0x220, 1, &[], 24);
+    let child = p.fork();
+    // The child receives the read end: it is a descriptor of its own, past the ones it has
+    p.sys(212, &[I(6), D(M2), I(0)]).expect(1);
+    p.is(M2 + 40, 24);
+    p.sys(63, &[W(M2 + CTL + 16), D(0x300), I(16)]).expect(4);
+    p.out(0x300, 4);
+    p.parent(child);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    // The read end is closed here: it lives on in the child, and what is written reaches it
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x210), I(4)]).expect(4);
+    p.sys(260, &[I(0xffff_ffff), D(0x180), I(0), I(0)]);
+    p.is(0x180, 0);
+    let mut p = start(&mut vm, p);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"pipe");
+}
+
+#[test]
+fn received_descriptors_are_close_on_exec_when_asked_and_a_short_buffer_truncates() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, b"x");
+    pipe_and_pair(&mut p, 1);
+    // Both ends, with MSG_CMSG_CLOEXEC: fds 7 and 8, flagged, the control data 16 + 8 bytes
+    p.msg(M1, 0x200, 1, &rights(&[3, 4]), 32);
+    p.msg(M2, 0x210, 1, &[], 32);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    p.sys(212, &[I(6), D(M2), I(MSG_CMSG_CLOEXEC)]).expect(1);
+    p.is(M2 + 40, 24).is(M2 + 48, 0).is(M2 + CTL + 12, 1);
+    p.sys(25, &[W(M2 + CTL + 16), I(1)]).expect(1);
+    p.sys(25, &[W(M2 + CTL + 20), I(1)]).expect(1);
+    // Without it they are not: the lowest free descriptors, 9 and 10
+    p.msg(M3, 0x220, 1, &[], 32);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    p.sys(212, &[I(6), D(M3), I(0)]).expect(1);
+    p.sys(25, &[W(M3 + CTL + 16), I(1)]).expect(0);
+    p.sys(25, &[W(M3 + CTL + 20), I(1)]).expect(0);
+    // Room for one descriptor of two: it is installed (11), the other closed, MSG_CTRUNC
+    p.msg(0x800, 0x230, 1, &[], 20);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    p.sys(212, &[I(6), D(0x800), I(0)]).expect(1);
+    p.is(0x800 + 40, 20).is(0x800 + 48, 8);
+    p.sys(25, &[W(0x800 + CTL + 16), I(1)]).expect(0);
+    p.sys(25, &[I(12), I(1)]).expect(-9);
+    // No control buffer at all: nothing is installed
+    p.msg(0x880, 0x240, 1, &[], 0);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    p.sys(212, &[I(6), D(0x880), I(0)]).expect(1);
+    p.is(0x880 + 40, 0).is(0x880 + 48, 8);
+    p.sys(25, &[I(12), I(1)]).expect(-9);
+    let mut p = start(&mut vm, p);
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+
+#[test]
+fn a_description_in_flight_keeps_its_pipe_open_until_it_is_received_or_its_socket_closes() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, b"x");
+    pipe_and_pair(&mut p, 1);
+    p.msg(M1, 0x200, 1, &rights(&[3]), 24);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    // The only descriptor of the read end is closed, the pipe still has a reader: the message
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x200), I(1)]).expect(1);
+    // The socket that holds the message closes: the reader goes with it
+    p.sys(57, &[I(6)]).expect(0);
+    p.sys(64, &[I(4), D(0x200), I(1)]).expect(-32);
+    // A read that asks for no control data takes the descriptors and closes them
+    p.sys(59, &[D(0x120), I(0)]).expect(0); // 3 and 6
+    p.sys(199, &[I(1), I(1), I(0), D(0x128)]).expect(0); // 7 and 8
+    p.msg(0x800, 0x200, 1, &rights(&[3]), 24);
+    p.sys(211, &[I(7), D(0x800), I(0)]).expect(1);
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(6), D(0x200), I(1)]).expect(1);
+    p.sys(63, &[I(8), D(0x300), I(16)]).expect(1);
+    p.sys(64, &[I(6), D(0x200), I(1)]).expect(-32);
+    // A descriptor that was closed cannot be sent
+    p.sys(211, &[I(7), D(0x800), I(0)]).expect(-9);
+    let mut p = start(&mut vm, p);
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn datagrams_carry_descriptors_and_a_peek_gives_copies() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, b"dg").put(0x210, b"hi");
+    pipe_and_pair(&mut p, 2);
+    p.msg(M1, 0x200, 2, &rights(&[3]), 24);
+    p.msg(M2, 0x300, 1, &[], 24);
+    p.msg(M3, 0x320, 16, &[], 24);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(2);
+    p.sys(57, &[I(3)]).expect(0);
+    // The datagram is cut to 1 byte, which does not hold its descriptors back; a peek leaves
+    // it queued, with a descriptor of its own (7)
+    p.sys(212, &[I(6), D(M2), I(MSG_PEEK)]).expect(1);
+    p.is(M2 + 48, 0x20).is(M2 + 40, 24);
+    p.sys(212, &[I(6), D(M3), I(0)]).expect(2);
+    p.is(M3 + 48, 0).is(M3 + 40, 24);
+    p.sys(212, &[I(6), D(M3), I(MSG_DONTWAIT)]).expect(-11);
+    p.sys(64, &[I(4), D(0x210), I(2)]).expect(2);
+    p.sys(63, &[W(M3 + CTL + 16), D(0x340), I(16)]).expect(2);
+    p.out(0x340, 2);
+    // The peek's copy (7) and the received one (8) are both the read end: closing both lets
+    // the writer know
+    p.sys(57, &[W(M2 + CTL + 16)]).expect(0);
+    p.sys(64, &[I(4), D(0x210), I(2)]).expect(2);
+    p.sys(57, &[W(M3 + CTL + 16)]).expect(0);
+    p.sys(64, &[I(4), D(0x210), I(2)]).expect(-32);
+    let mut p = start(&mut vm, p);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"hi");
+}
+
+#[test]
+fn a_stream_read_that_takes_the_descriptors_ends_with_their_send() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, b"ab").put(0x210, b"cd").put(0x220, b"ef");
+    pipe_and_pair(&mut p, 1);
+    p.msg(M1, 0x200, 2, &rights(&[3]), 24);
+    p.msg(M2, 0x210, 2, &[], 0);
+    p.msg(0x800, 0x300, 16, &[], 24);
+    p.msg(0x880, 0x320, 16, &[], 24);
+    p.msg(0x900, 0x340, 16, &[], 24);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(2);
+    p.sys(211, &[I(5), D(M2), I(0)]).expect(2);
+    // "ab" with the descriptor, and no more of what follows
+    p.sys(212, &[I(6), D(0x800), I(0)]).expect(2);
+    p.is(0x800 + 40, 24);
+    // "cd" has none
+    p.sys(212, &[I(6), D(0x880), I(0)]).expect(2);
+    p.is(0x880 + 40, 0);
+    // Descriptors sent after plain bytes come with a read that reaches into their send: "cd" and
+    // "ab" are read together, with the rights of "ab"
+    p.sys(211, &[I(5), D(M2), I(0)]).expect(2);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(2);
+    p.sys(212, &[I(6), D(0x900), I(0)]).expect(4);
+    p.is(0x900 + 40, 24);
+    p.out(0x340, 4);
+    let mut p = start(&mut vm, p);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"cdab");
+}
+
+#[test]
+fn credentials_come_with_so_passcred() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, b"x").put(0x210, &1u32.to_le_bytes());
+    pipe_and_pair(&mut p, 1);
+    p.msg(M1, 0x200, 1, &[], 0);
+    p.msg(M2, 0x300, 1, &[], 32);
+    p.msg(M3, 0x320, 1, &[], 32);
+    // The receiving socket has not asked: no control data
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    p.sys(212, &[I(6), D(M2), I(0)]).expect(1);
+    p.is(M2 + 40, 0);
+    p.sys(208, &[I(6), I(1), I(16), D(0x210), I(4)]).expect(0);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    p.sys(212, &[I(6), D(M3), I(0)]).expect(1);
+    // SCM_CREDENTIALS: the process (the first has pid 1000; umask keeps 9 bits), uid 0, gid 0
+    p.is(M3 + 40, 32).is(M3 + CTL + 8, 1).is(M3 + CTL + 12, 2);
+    p.is(M3 + CTL + 16, 1000 & 0o777)
+        .is(M3 + CTL + 20, 0)
+        .is(M3 + CTL + 24, 0);
+    // What the sender gives is what arrives: root may give other ids, but a pid has to be a
+    // process's (Linux's __scm_send: ESRCH)
+    let creds = |pid: u32| {
+        let mut c = pid.to_le_bytes().to_vec();
+        c.extend_from_slice(&8u32.to_le_bytes());
+        c.extend_from_slice(&9u32.to_le_bytes());
+        cmsg(2, &c)
+    };
+    p.msg(0x980, 0x200, 1, &creds(7), 32);
+    p.sys(211, &[I(5), D(0x980), I(0)]).expect(-3);
+    p.msg(0x800, 0x200, 1, &creds(1000), 32);
+    p.msg(0x880, 0x340, 1, &[], 32);
+    p.sys(211, &[I(5), D(0x800), I(0)]).expect(1);
+    p.sys(212, &[I(6), D(0x880), I(0)]).expect(1);
+    p.is(0x880 + CTL + 16, 1000 & 0o777)
+        .is(0x880 + CTL + 20, 8)
+        .is(0x880 + CTL + 24, 9);
+    let mut p = start(&mut vm, p);
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn what_cannot_be_sent_as_control_data_fails() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, b"x");
+    pipe_and_pair(&mut p, 1);
+    // A descriptor that is not open
+    p.msg(M1, 0x200, 1, &rights(&[40]), 24);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(-9);
+    // A type of SOL_SOCKET that is not passed, and a length that does not fit
+    p.msg(M2, 0x200, 1, &cmsg(77, &[0; 4]), 24);
+    p.sys(211, &[I(5), D(M2), I(0)]).expect(-22);
+    let mut long = rights(&[3]);
+    long[0] = 40;
+    p.msg(M3, 0x200, 1, &long, 24);
+    p.sys(211, &[I(5), D(M3), I(0)]).expect(-22);
+    // Not over the network
+    p.sys(198, &[I(2), I(2), I(0)]).expect(7);
+    p.msg(0x800, 0x200, 1, &rights(&[3]), 24);
+    p.sys(211, &[I(7), D(0x800), I(0)]).expect(-22);
+    let mut p = start(&mut vm, p);
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn descriptors_in_flight_survive_a_snapshot() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, b"x").put(0x210, b"kept");
+    pipe_and_pair(&mut p, 1);
+    p.msg(M1, 0x200, 1, &rights(&[3]), 24);
+    p.msg(M2, 0x300, 1, &[], 24);
+    p.sys(211, &[I(5), D(M1), I(0)]).expect(1);
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x210), I(4)]).expect(4);
+    p.sys(63, &[I(0), D(0x380), I(1)]).expect(1); // waits for a key
+    p.sys(212, &[I(6), D(M2), I(0)]).expect(1);
+    p.sys(63, &[W(M2 + CTL + 16), D(0x340), I(16)]).expect(4);
+    p.out(0x340, 4);
+    let mut p = start(&mut vm, p);
+    let status = loop {
+        let status = p.run(&mut vm.cpus[0], Duration::from_millis(20));
+        if !matches!(status, Status::Running) {
+            break status;
+        }
+    };
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    p.input(b"\n");
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert!(out.ends_with(b"kept"), "{out:?}");
 }

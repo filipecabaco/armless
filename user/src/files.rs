@@ -87,6 +87,8 @@ pub(crate) enum Kind {
     Pidfd {
         pid: i64,
     },
+    /// A timerfd: its timer and the expirations not read yet (timerfd.rs)
+    TimerFd(crate::timerfd::Timer),
     Epoll {
         watch: BTreeMap<i32, Watch>,
     },
@@ -349,6 +351,10 @@ impl Files {
                     w.u(13);
                     w.u(*pid as u64);
                 },
+                Kind::TimerFd(t) => {
+                    w.u(14);
+                    t.save(w, crate::host::Instant::now());
+                },
                 Kind::Epoll { watch } => {
                     w.u(10);
                     w.u(watch.len() as u64);
@@ -408,6 +414,7 @@ impl Files {
                 11 => Kind::Sock(r.u()? as u32),
                 12 => Kind::Signal { mask: r.u()? },
                 13 => Kind::Pidfd { pid: r.u()? as i64 },
+                14 => Kind::TimerFd(crate::timerfd::Timer::load(r)?),
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {

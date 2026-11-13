@@ -299,6 +299,11 @@ impl Guest {
         self.seq.insert(sport, seq.wrapping_add(1));
     }
 
+    pub(crate) fn rst(&mut self, dst: [u8; 4], sport: u16, dport: u16, ack: u32) {
+        let seq = self.seq[&sport];
+        self.send_tcp(dst, sport, dport, seq, ack, RST | ACK, 0, &[], &[]);
+    }
+
     /// The guest accepts a connection the host opened into it (`syn`, to its `syn.dport`).
     pub(crate) fn accept(&mut self, syn: &Seg, isn: u32) {
         let ack = syn.seq.wrapping_add(1);
