@@ -139,7 +139,7 @@ impl Action {
 
 /// What delivering a signal does.
 #[derive(PartialEq, Debug)]
-enum Disposition {
+pub(crate) enum Disposition {
     Ignore,
     Terminate,
     Handle(Action),
@@ -253,7 +253,7 @@ impl Signals {
         a.handler == SIG_IGN || a.flags & SA_NOCLDWAIT != 0
     }
 
-    fn disposition(&self, sig: u32) -> Disposition {
+    pub(crate) fn disposition(&self, sig: u32) -> Disposition {
         let a = self.actions[sig as usize];
         match a.handler {
             _ if sig == SIGKILL || sig == SIGSTOP => {
@@ -519,7 +519,8 @@ impl Process {
     /// Ends the call thread `i` is parked in, if any, as a handler with `act` interrupts it.
     fn interrupt(&mut self, i: usize, act: &Action) {
         let t = &mut self.threads[i];
-        let Some((wait, deadline)) = t.wait.take() else {
+        // Its call, parked; or woken to run again and not run yet, its pc still at its svc
+        let Some((wait, deadline)) = t.wait.take().or_else(|| t.rerun.take()) else {
             return;
         };
         t.resume_deadline = None;
