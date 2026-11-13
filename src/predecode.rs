@@ -12,15 +12,19 @@
 //! the loop decodes the instructions from there to the end of the block (`Cpu::fill_ops`).
 //!
 //! The ops of a page live in a slot of the cache of the CPU (`Cache`, `Jit::pre`), 16 KiB each, in memory that
-//! stays allocated for as long as the cache lives, so the loop can hold a pointer to them. The cache holds
+//! stays mapped for as long as the cache lives, so the loop can hold a pointer to them. The cache holds
 //! at most `MAX_SLOTS` slots (24 MiB) and, past that, gives the slot of the page that was used the longest
-//! ago to the next page. A slot's ops are dropped wherever the JIT's code is: a store to the page, an
+//! ago to the next page. On unix the slots are packed in one arena reserved with `mmap` (nothing is resident
+//! until it is written), so a page that is only partly executed costs the host pages its decoded blocks
+//! touch, not 16 KiB; a slot given to another page is cleared by handing its whole host pages back. A slot's ops are dropped wherever the JIT's code is: a store to the page, an
 //! instruction-cache invalidation, a DMA write into it, a full flush.
 
 use crate::bits::{bit, decode_bit_masks, field, sext};
 use crate::board::Host;
 use crate::cpu::{Cpu, Res};
-use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+#[cfg(not(unix))]
+use std::alloc::{alloc_zeroed, dealloc};
+use std::alloc::{handle_alloc_error, Layout};
 
 /// Instructions in a 4 KiB page.
 pub(crate) const PAGE_INSNS: usize = 1024;
@@ -1083,7 +1087,13 @@ pub struct Cache {
     /// Slot -> its page's ops (`SLOT_OPS` of them), allocated once and kept until the cache is dropped: a
     /// dropped page's slot is zeroed when it is given to another page, not before, so a pointer to the ops
     /// that the interpreter holds stays valid.
+    ///
+    /// On unix slot `i` is at `arena + i * SLOT_OPS`, in one mapping of `MAX_SLOTS` slots made when the first
+    /// slot is handed out; elsewhere each slot is an allocation of its own.
     slots: Vec<*mut Op>,
+    /// The mapping the slots are packed in (null until the first slot), unmapped on drop.
+    #[cfg(unix)]
+    arena: *mut Op,
     slot_page: Vec<u32>,
     free: Vec<u32>,
     /// Whether the slot was current since the clock hand last passed it.
@@ -1094,7 +1104,7 @@ pub struct Cache {
     pub(crate) cur_base: usize,
     pub(crate) cur_slot: u32,
     pub(crate) cur_ptr: *mut Op,
-    /// Slots at most (`MAX_SLOTS`).
+    /// Slots at most (`MAX_SLOTS`; a larger value is capped by `alloc`, the arena has no more).
     pub(crate) max_slots: usize,
     /// Statistics: pages decoded, pages dropped, pages evicted for want of a slot, full flushes, blocks of ops
     /// decoded and the instructions in them.
@@ -1111,6 +1121,8 @@ impl Cache {
         Cache {
             page_slot: vec![0; memory_size.div_ceil(4096)],
             slots: Vec::new(),
+            #[cfg(unix)]
+            arena: std::ptr::null_mut(),
             slot_page: Vec::new(),
             free: Vec::new(),
             referenced: Vec::new(),
@@ -1134,7 +1146,8 @@ impl Cache {
         self.max_slots = (bytes / (SLOT_OPS * std::mem::size_of::<Op>())).max(2);
     }
 
-    /// The slots allocated so far and the bytes they hold, with the cache's tables.
+    /// The slots handed out so far and the bytes they span, with the cache's tables. The bytes are an upper
+    /// bound: a slot is resident only where its ops were decoded, a page that is only partly executed costs less.
     pub fn bytes(&self) -> (usize, usize) {
         let slots = self.slots.len();
         let tables = self.page_slot.capacity() * 4
@@ -1238,16 +1251,8 @@ impl Cache {
     pub(crate) fn alloc(&mut self, page: usize) -> u32 {
         let slot = if let Some(s) = self.free.pop() {
             s
-        } else if self.slots.len() < self.max_slots.max(2) {
-            let layout = Layout::array::<Op>(SLOT_OPS).unwrap();
-            // SAFETY: the layout is not empty. All zero is `K::Miss` all through, and the `End` after the
-            // last instruction is set once and never written again.
-            let p = unsafe { alloc_zeroed(layout) } as *mut Op;
-            if p.is_null() {
-                handle_alloc_error(layout);
-            }
-            // SAFETY: `p` is not null (checked above) and the slot has `SLOT_OPS` (`PAGE_INSNS + 1`) ops.
-            unsafe { (*p.add(PAGE_INSNS)).k = K::End };
+        } else if self.slots.len() < self.max_slots.clamp(2, MAX_SLOTS) {
+            let p = self.new_slot();
             self.slots.push(p);
             self.slot_page.push(NONE);
             self.referenced.push(false);
@@ -1259,12 +1264,61 @@ impl Cache {
         } else {
             self.evict()
         };
-        // SAFETY: the slot has `SLOT_OPS` ops, `PAGE_INSNS` of which are the ones to clear.
-        unsafe { std::ptr::write_bytes(self.slots[slot as usize], 0, PAGE_INSNS) };
+        // SAFETY: the slot is one of this cache's (`slots`), so it has `SLOT_OPS` ops, `PAGE_INSNS` of which are the
+        // ones to clear, and nothing of another slot is in the range `clear_slot` clears.
+        unsafe { clear_slot(self.slots[slot as usize]) };
         self.set_slot(page, slot);
         self.slot_page[slot as usize] = page as u32;
         self.decoded += 1;
         slot
+    }
+
+    /// The next slot of the arena (`slots.len()`), all `Miss` and with its `End` set. Unix: the slot lies in the
+    /// mapping, which is made now if this is the first, and no host page of it is resident yet.
+    #[cfg(unix)]
+    fn new_slot(&mut self) -> *mut Op {
+        if self.arena.is_null() {
+            let bytes = MAX_SLOTS * SLOT_OPS * std::mem::size_of::<Op>();
+            // SAFETY: a new anonymous mapping at an address the kernel picks, of `bytes` bytes that nothing else
+            // owns; `drop` unmaps it once. `MAP_NORESERVE` makes it cost address space only: a page is resident
+            // when it is first written, and reads as zero (`K::Miss`) until then.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                handle_alloc_error(Layout::from_size_align(bytes, 4096).unwrap());
+            }
+            self.arena = p.cast();
+        }
+        // SAFETY: `slots.len()` is below `MAX_SLOTS` (`alloc` checks), so the slot lies inside the mapping.
+        let p = unsafe { self.arena.add(self.slots.len() * SLOT_OPS) };
+        // SAFETY: `p` points at `SLOT_OPS` ops of the mapping, all zero, so the last is the `End` to set (once,
+        // it is never written again), the others are `K::Miss`.
+        unsafe { (*p.add(PAGE_INSNS)).k = K::End };
+        p
+    }
+
+    /// The next slot: an allocation of its own (the host has no pages to leave unwritten), all `Miss`, with its
+    /// `End` set.
+    #[cfg(not(unix))]
+    fn new_slot(&mut self) -> *mut Op {
+        let layout = Layout::array::<Op>(SLOT_OPS).unwrap();
+        // SAFETY: the layout is not empty. All zero is `K::Miss` all through, and the `End` after the
+        // last instruction is set once and never written again.
+        let p = unsafe { alloc_zeroed(layout) } as *mut Op;
+        if p.is_null() {
+            handle_alloc_error(layout);
+        }
+        // SAFETY: `p` is not null (checked above) and the slot has `SLOT_OPS` (`PAGE_INSNS + 1`) ops.
+        unsafe { (*p.add(PAGE_INSNS)).k = K::End };
+        p
     }
 
     /// The slot of the page that was current the longest ago, but not the current one, free of its page.
@@ -1351,12 +1405,104 @@ impl Cache {
 
 impl Drop for Cache {
     fn drop(&mut self) {
-        let layout = Layout::array::<Op>(SLOT_OPS).unwrap();
-        for &p in &self.slots {
-            // SAFETY: allocated in `alloc` with this layout, and nothing points at it any more.
-            unsafe { dealloc(p as *mut u8, layout) };
+        #[cfg(unix)]
+        if !self.arena.is_null() {
+            let bytes = MAX_SLOTS * SLOT_OPS * std::mem::size_of::<Op>();
+            // SAFETY: the mapping `new_slot` made, of this size, and nothing points into it any more.
+            unsafe { libc::munmap(self.arena.cast(), bytes) };
+        }
+        #[cfg(not(unix))]
+        {
+            let layout = Layout::array::<Op>(SLOT_OPS).unwrap();
+            for &p in &self.slots {
+                // SAFETY: allocated in `new_slot` with this layout, and nothing points at it any more.
+                unsafe { dealloc(p as *mut u8, layout) };
+            }
         }
     }
+}
+
+/// Zero the `PAGE_INSNS` ops of the slot at `slot` (not its `End`): every op is `K::Miss` again.
+///
+/// Linux: the host pages that lie wholly inside the range go back to the kernel with `madvise(MADV_DONTNEED)`,
+/// which makes a private anonymous page read as zero and not resident until it is written again, so what
+/// the old page never touched costs nothing; the unaligned head and tail, which share their pages with the
+/// slots on either side (and with the `End`), are zeroed by hand. Other unix: the same pages are replaced with
+/// fresh zero pages by a `MAP_FIXED` mapping (`MADV_DONTNEED` does not promise zero fill there, this does
+/// everywhere). The pointer to the slot stays valid: the mapping stays at the same addresses.
+///
+/// # Safety
+/// `slot` points at a slot of the arena (`SLOT_OPS` ops, in a mapping that is live), and nothing else
+/// holds a reference to the ops being cleared.
+#[cfg(unix)]
+unsafe fn clear_slot(slot: *mut Op) {
+    static PAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut page = PAGE.load(std::sync::atomic::Ordering::Relaxed);
+    if page == 0 {
+        // SAFETY: `sysconf` reads a constant.
+        page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        PAGE.store(page, std::sync::atomic::Ordering::Relaxed);
+    }
+    let start = slot as usize;
+    let end = start + PAGE_INSNS * std::mem::size_of::<Op>();
+    // The pages inside [start, end): the `End` op, at `end`, and the ops of the next slot are not in them.
+    let lo = start.next_multiple_of(page);
+    let hi = end & !(page - 1);
+    if lo >= hi {
+        // SAFETY: the `PAGE_INSNS` ops of the slot.
+        unsafe { std::ptr::write_bytes(slot, 0, PAGE_INSNS) };
+        return;
+    }
+    let zeroed = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // SAFETY: `[lo, hi)` is whole pages of the mapping, all inside the slot's ops.
+            unsafe { libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED) == 0 }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // SAFETY: `[lo, hi)` is whole pages of the arena's mapping, inside the slot's ops; `MAP_FIXED`
+            // replaces them in place with anonymous zero pages, the same protection and sharing.
+            let p = unsafe {
+                libc::mmap(
+                    lo as *mut libc::c_void,
+                    hi - lo,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            // A `MAP_FIXED` mapping that fails may already have unmapped part of the range (POSIX), so
+            // writing the slot by hand is not safe then: give up as for any failed allocation.
+            if p == libc::MAP_FAILED {
+                handle_alloc_error(Layout::from_size_align(hi - lo, page).unwrap());
+            }
+            true
+        }
+    };
+    if !zeroed {
+        // `madvise` failed and left the pages as they were. SAFETY: the `PAGE_INSNS` ops of the slot.
+        unsafe { std::ptr::write_bytes(slot, 0, PAGE_INSNS) };
+        return;
+    }
+    // SAFETY: the head `[start, lo)` and the tail `[hi, end)` are inside the slot's ops, and `lo`, `hi` are
+    // op-aligned (the page size is a multiple of the op size, the arena is page-aligned and a slot's stride is
+    // a whole number of ops).
+    unsafe {
+        std::ptr::write_bytes(start as *mut u8, 0, lo - start);
+        std::ptr::write_bytes(hi as *mut u8, 0, end - hi);
+    }
+}
+
+/// Zero the `PAGE_INSNS` ops of the slot at `slot` (not its `End`). Without host pages to hand back, by hand.
+///
+/// # Safety
+/// `slot` points at a slot (`SLOT_OPS` ops) and nothing else holds a reference to the ops being cleared.
+#[cfg(not(unix))]
+unsafe fn clear_slot(slot: *mut Op) {
+    // SAFETY: the `PAGE_INSNS` ops of the slot.
+    unsafe { std::ptr::write_bytes(slot, 0, PAGE_INSNS) };
 }
 
 impl<H: Host> Cpu<H> {
@@ -1503,6 +1649,55 @@ mod tests {
         // Never below two slots: the page running and the one it jumps to
         c.jit.pre.set_limit(0);
         assert_eq!(c.jit.pre.max_slots, 2);
+    }
+
+    /// The bytes of the `PAGE_INSNS` ops of a slot, and whether its last op is the `End`.
+    fn slot_ops(c: &Cache, slot: u32) -> (&[u8], bool) {
+        let p = c.slots[slot as usize];
+        let n = PAGE_INSNS * std::mem::size_of::<Op>();
+        // SAFETY: the slot is the cache's, `SLOT_OPS` ops long, and nothing writes it while the slice lives.
+        unsafe {
+            (
+                std::slice::from_raw_parts(p as *const u8, n),
+                matches!((*p.add(PAGE_INSNS)).k, K::End),
+            )
+        }
+    }
+
+    #[test]
+    fn a_recycled_slot_reads_all_miss_and_leaves_its_neighbours_alone() {
+        // A slot's stride is not a multiple of the host page, so slots start at different offsets in their
+        // pages: the head and tail fragments and the whole pages between them are all exercised.
+        let mut c = Cache::new(64 << 20);
+        c.max_slots = 8;
+        let n = PAGE_INSNS * std::mem::size_of::<Op>();
+        // Every op of every page "decoded": non-zero bytes (never read as an `Op`).
+        let fill = |c: &Cache, slot: u32| {
+            // SAFETY: the `PAGE_INSNS` ops of a slot of the cache, which nothing else reads now.
+            unsafe { std::ptr::write_bytes(c.slots[slot as usize] as *mut u8, 0xaa, n) }
+        };
+        for page in 0..8 {
+            let slot = c.alloc(page);
+            assert_eq!(slot, page as u32);
+            fill(&c, slot);
+        }
+        for round in 0..2 {
+            for victim in 0..8u32 {
+                // Dropped, then handed to another page: the slot comes back from the free list.
+                c.drop_page(c.slot_page[victim as usize] as usize);
+                assert_eq!(c.alloc(100 + 8 * round + victim as usize), victim);
+                let (ops, end) = slot_ops(&c, victim);
+                assert!(ops.iter().all(|&b| b == 0), "slot {victim} not all Miss");
+                assert!(end);
+                for other in (0..8u32).filter(|&o| o != victim) {
+                    let (ops, end) = slot_ops(&c, other);
+                    assert!(ops.iter().all(|&b| b == 0xaa), "slot {other} touched by {victim}");
+                    assert!(end);
+                }
+                // Decoded into again, so the next recycle has something to clear.
+                fill(&c, victim);
+            }
+        }
     }
 
     #[test]
