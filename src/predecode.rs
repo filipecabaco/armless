@@ -1081,7 +1081,8 @@ fn vldst(insn: u32, idx: usize) -> Option<Op> {
 
 /// The decoded pages of one CPU.
 pub struct Cache {
-    /// Physical page number -> slot, or NONE.
+    /// Physical page number -> its slot plus one, or 0 for no slot (`NONE`). Zero is the empty value so that the
+    /// table is allocated zeroed and no page of it is touched until a page of that range is decoded.
     page_slot: Vec<u32>,
     /// Slot -> its page's ops (`SLOT_OPS` of them), allocated once and kept until the cache is dropped: a
     /// dropped page's slot is zeroed when it is given to another page, not before, so a pointer to the ops
@@ -1118,7 +1119,7 @@ pub struct Cache {
 impl Cache {
     pub fn new(memory_size: usize) -> Cache {
         Cache {
-            page_slot: vec![NONE; memory_size.div_ceil(4096)],
+            page_slot: vec![0; memory_size.div_ceil(4096)],
             slots: Vec::new(),
             #[cfg(unix)]
             arena: std::ptr::null_mut(),
@@ -1159,7 +1160,14 @@ impl Cache {
 
     #[inline(always)]
     pub(crate) fn slot(&self, page: usize) -> u32 {
-        self.page_slot[page]
+        self.page_slot[page].wrapping_sub(1)
+    }
+
+    /// Record `slot` (or `NONE`) as the slot of physical page `page`: the table holds the slot plus one, so
+    /// `NONE` is stored as 0.
+    #[inline(always)]
+    fn set_slot(&mut self, page: usize, slot: u32) {
+        self.page_slot[page] = slot.wrapping_add(1);
     }
 
     /// Make `slot`, the slot of the page at physical address `base`, the current page.
@@ -1187,7 +1195,7 @@ impl Cache {
         if base == self.cur_base {
             return self.cur_ptr;
         }
-        let slot = self.page_slot[base >> 12];
+        let slot = self.slot(base >> 12);
         if slot == NONE {
             return std::ptr::null_mut();
         }
@@ -1203,7 +1211,7 @@ impl Cache {
     pub(crate) fn bump(&mut self, base: usize, i: usize) -> u32 {
         debug_assert!(i < PAGE_INSNS);
         if base != self.cur_base {
-            let slot = self.page_slot[base >> 12];
+            let slot = self.slot(base >> 12);
             if slot == NONE {
                 return 0;
             }
@@ -1249,7 +1257,7 @@ impl Cache {
             self.slot_page.push(NONE);
             self.referenced.push(false);
             let s = (self.slots.len() - 1) as u32;
-            self.page_slot[page] = s;
+            self.set_slot(page, s);
             self.slot_page[s as usize] = page as u32;
             self.decoded += 1;
             return s;
@@ -1259,7 +1267,7 @@ impl Cache {
         // SAFETY: the slot is one of this cache's (`slots`), so it has `SLOT_OPS` ops, `PAGE_INSNS` of which are the
         // ones to clear, and nothing of another slot is in the range `clear_slot` clears.
         unsafe { clear_slot(self.slots[slot as usize]) };
-        self.page_slot[page] = slot;
+        self.set_slot(page, slot);
         self.slot_page[slot as usize] = page as u32;
         self.decoded += 1;
         slot
@@ -1329,7 +1337,7 @@ impl Cache {
                 continue;
             }
             let page = self.slot_page[s];
-            self.page_slot[page as usize] = NONE;
+            self.set_slot(page as usize, NONE);
             self.slot_page[s] = NONE;
             self.evictions += 1;
             return s as u32;
@@ -1342,9 +1350,10 @@ impl Cache {
     #[allow(unsafe_code)]
     pub(crate) fn forget_words(&mut self, page: usize, first: usize, last: usize) {
         debug_assert!(first <= last && last < PAGE_INSNS);
-        let Some(&slot) = self.page_slot.get(page) else {
+        let Some(&stored) = self.page_slot.get(page) else {
             return;
         };
+        let slot = stored.wrapping_sub(1);
         if slot == NONE {
             return;
         }
@@ -1361,13 +1370,14 @@ impl Cache {
 
     /// Forget the decoded instructions of physical page `page`, if any.
     pub(crate) fn drop_page(&mut self, page: usize) {
-        let Some(&slot) = self.page_slot.get(page) else {
+        let Some(&stored) = self.page_slot.get(page) else {
             return;
         };
+        let slot = stored.wrapping_sub(1);
         if slot == NONE {
             return;
         }
-        self.page_slot[page] = NONE;
+        self.set_slot(page, NONE);
         self.slot_page[slot as usize] = NONE;
         self.free.push(slot);
         self.dropped += 1;
@@ -1377,7 +1387,7 @@ impl Cache {
     pub(crate) fn clear(&mut self) {
         for (slot, page) in self.slot_page.iter_mut().enumerate() {
             if *page != NONE {
-                self.page_slot[*page as usize] = NONE;
+                self.page_slot[*page as usize] = 0;
                 *page = NONE;
                 self.free.push(slot as u32);
             }

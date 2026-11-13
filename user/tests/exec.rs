@@ -97,10 +97,22 @@ fn echo() -> Vec<u8> {
     elf(&code, &[])
 }
 
+/// The CPUs a test's machine has: ARMLESS_TEST_CPUS (default 1), for the tests to run on several
+fn test_cpus() -> usize {
+    std::env::var("ARMLESS_TEST_CPUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
 fn machine() -> Vm<armless::platform::NativePlatform> {
+    machine_with_cpus(test_cpus())
+}
+
+fn machine_with_cpus(cpus: usize) -> Vm<armless::platform::NativePlatform> {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus,
         devices: armless::dev::DeviceConfig {
             console: false,
             ..Default::default()
@@ -110,11 +122,11 @@ fn machine() -> Vm<armless::platform::NativePlatform> {
 }
 
 /// Run until it exits, faults or waits with nothing to wake it; what it printed, and how.
-fn run(p: &mut Process, cpu: &mut NativeCpu) -> (Vec<u8>, Status) {
+fn run(p: &mut Process, cpus: &mut [NativeCpu]) -> (Vec<u8>, Status) {
     let mut out = Vec::new();
     let begun = Instant::now();
     loop {
-        let status = p.run(cpu, Duration::from_millis(50));
+        let status = p.run_on(cpus, Duration::from_millis(50));
         out.extend(p.take_output());
         match status {
             Status::Running => assert!(begun.elapsed() < Duration::from_secs(10), "still running"),
@@ -128,7 +140,7 @@ fn a_program_runs_with_no_kernel() {
     let mut vm = machine();
     let mut p =
         Process::exec_bytes(&mut vm.cpus[0], None, &hello(), &["hello".into()], &[]).unwrap();
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(
         out, b"hello\r\n",
         "on a terminal, ONLCR: a newline starts a line"
@@ -142,7 +154,7 @@ fn a_program_runs_with_no_kernel() {
 fn a_program_waits_for_input_and_answers_it() {
     let mut vm = machine();
     let mut p = Process::exec_bytes(&mut vm.cpus[0], None, &echo(), &["echo".into()], &[]).unwrap();
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert!(out.is_empty());
     assert!(
         matches!(status, Status::Idle(None)),
@@ -152,12 +164,12 @@ fn a_program_waits_for_input_and_answers_it() {
     assert!(p.waiting_for_input());
     p.input(b"one\n");
     assert_eq!(
-        run(&mut p, &mut vm.cpus[0]).0,
+        run(&mut p, &mut vm.cpus).0,
         b"one\r\none\r\n",
         "the line echoed as typed, then the program's copy"
     );
     p.close_input();
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Exited(7)), "{status:?}");
 }
 
@@ -167,7 +179,7 @@ fn a_saved_process_goes_on_in_another_machine() {
     let mut vm = machine();
     let mut p = Process::exec_bytes(&mut vm.cpus[0], None, &echo(), &["echo".into()], &[]).unwrap();
     p.input(b"before\n");
-    assert_eq!(run(&mut p, &mut vm.cpus[0]).0, b"before\r\nbefore\r\n");
+    assert_eq!(run(&mut p, &mut vm.cpus).0, b"before\r\nbefore\r\n");
     let process = p.save(&vm.cpus[0]);
     let state = vm.save_state();
     drop((p, vm));
@@ -176,7 +188,7 @@ fn a_saved_process_goes_on_in_another_machine() {
     vm.load_state(&state).unwrap();
     let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
     p.input(b"after\n");
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"after\r\nafter\r\n");
     assert!(matches!(status, Status::Idle(None)), "{status:?}");
 
@@ -233,7 +245,7 @@ fn cat_greeting() -> Vec<u8> {
 fn a_file_whose_contents_havent_arrived_waits_for_them() {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus: test_cpus(),
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: Some("host9p".into()),
@@ -254,7 +266,7 @@ fn a_file_whose_contents_havent_arrived_waits_for_them() {
         &[],
     )
     .unwrap();
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert!(out.is_empty());
     assert!(
         matches!(status, Status::Idle(None)),
@@ -275,7 +287,7 @@ fn a_file_whose_contents_havent_arrived_waits_for_them() {
     board
         .provide_raw_blob("greeting-blob", b"hello\n".to_vec())
         .unwrap();
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"hello\r\n");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -488,7 +500,7 @@ fn a_handler_runs_and_sigreturn_gives_the_thread_back_whole() {
         .b("handler")
         .common();
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"HB", "{status:?}");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
     assert_eq!(p.stats.signals_delivered, 1);
@@ -521,7 +533,7 @@ fn blocked_then_unblocked(wait_for_input: bool) -> Vec<u8> {
 #[test]
 fn a_blocked_signal_waits_until_it_is_unblocked() {
     let (mut vm, mut p) = start(&blocked_then_unblocked(false));
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"AHB");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -529,7 +541,7 @@ fn a_blocked_signal_waits_until_it_is_unblocked() {
 #[test]
 fn a_pending_signal_and_the_handlers_survive_a_snapshot() {
     let (mut vm, mut p) = start(&blocked_then_unblocked(true));
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Idle(None)), "{status:?}");
     let process = p.save(&vm.cpus[0]);
@@ -540,7 +552,7 @@ fn a_pending_signal_and_the_handlers_survive_a_snapshot() {
     vm.load_state(&state).unwrap();
     let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
     p.input(b"x\n");
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(
         out, b"x\r\nHB",
         "SIGUSR1 still pending, its handler still set"
@@ -573,10 +585,10 @@ fn reader(sig: u16, flags: u32) -> Vec<u8> {
 #[test]
 fn ctrl_c_interrupts_a_read_with_eintr() {
     let (mut vm, mut p) = start(&reader(SIGINT, SA_RESTORER));
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Idle(None)), "{status:?}");
     p.input(b"abc\x03");
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(
         out, b"^CHE",
         "the echo flushed, ^C, the handler, then read's EINTR"
@@ -587,16 +599,16 @@ fn ctrl_c_interrupts_a_read_with_eintr() {
 #[test]
 fn sa_restart_starts_the_read_again_after_the_handler() {
     let (mut vm, mut p) = start(&reader(SIGINT, SA_RESTORER | SA_RESTART));
-    run(&mut p, &mut vm.cpus[0]);
+    run(&mut p, &mut vm.cpus);
     p.kill(2); // the host's own interrupt
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"H");
     assert!(
         matches!(status, Status::Idle(None)),
         "reading again: {status:?}"
     );
     p.input(b"x\n");
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"x\r\nR");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -604,9 +616,9 @@ fn sa_restart_starts_the_read_again_after_the_handler() {
 #[test]
 fn sigint_with_no_handler_ends_the_program() {
     let (mut vm, mut p) = start(&echo());
-    run(&mut p, &mut vm.cpus[0]);
+    run(&mut p, &mut vm.cpus);
     p.input(b"\x03");
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"^C");
     assert!(matches!(status, Status::Exited(130)), "{status:?}");
 }
@@ -615,25 +627,25 @@ fn sigint_with_no_handler_ends_the_program() {
 fn a_resize_is_sigwinch() {
     // No handler: ignored
     let (mut vm, mut p) = start(&echo());
-    run(&mut p, &mut vm.cpus[0]);
+    run(&mut p, &mut vm.cpus);
     p.resize(100, 40);
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Idle(None)), "{status:?}");
 
     // A handler: once per change of size. With no SA_RESTORER (as Go has it on arm64) the
     // handler returns to a trampoline of the process's, as to the vDSO's on Linux
     let (mut vm, mut p) = start(&reader(SIGWINCH, SA_RESTART));
-    run(&mut p, &mut vm.cpus[0]);
+    run(&mut p, &mut vm.cpus);
     p.resize(100, 40);
-    assert_eq!(run(&mut p, &mut vm.cpus[0]).0, b"H");
+    assert_eq!(run(&mut p, &mut vm.cpus).0, b"H");
     p.resize(100, 40);
     assert_eq!(
-        run(&mut p, &mut vm.cpus[0]).0,
+        run(&mut p, &mut vm.cpus).0,
         b"",
         "the same size: no signal"
     );
     p.resize(120, 40);
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"H");
     assert!(matches!(status, Status::Idle(None)), "{status:?}");
 }
@@ -660,11 +672,11 @@ fn a_sleep_a_handler_interrupts_returns_eintr_and_the_time_left() {
         .exit(1)
         .common();
     let (mut vm, mut p) = start(&a.elf());
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Idle(Some(_))), "{status:?}");
     assert!(!p.waiting_for_input(), "asleep, not waiting for input");
     p.kill(SIGUSR1 as u32);
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"HE", "{status:?}");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -733,7 +745,7 @@ const EXIT: [u32; 2] = [movz(8, 94), SVC];
 fn lazy_machine(prog: &[u8]) -> Vm<armless::platform::NativePlatform> {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus: test_cpus(),
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: Some("host9p".into()),
@@ -767,7 +779,7 @@ fn run_serving(
     let mut out = Vec::new();
     let mut asked = Vec::new();
     loop {
-        let (o, status) = run(p, &mut vm.cpus[0]);
+        let (o, status) = run(p, &mut vm.cpus);
         out.extend(o);
         let wanted: Vec<String> = vm
             .board
@@ -981,7 +993,7 @@ impl Asm {
     }
     fn run_program(&mut self) -> Status {
         let (mut vm, mut p) = start(&self.elf());
-        run(&mut p, &mut vm.cpus[0]).1
+        run(&mut p, &mut vm.cpus).1
     }
 }
 
@@ -1060,7 +1072,7 @@ fn a_system_call_cant_write_where_the_program_cant() {
         .svc(94);
     let (mut vm, mut p) = start(&a.elf());
     p.input(b"x\n");
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Exited(14)), "EFAULT: {status:?}");
 }
 
@@ -1078,7 +1090,7 @@ fn the_break_gives_pages_back_and_keeps_what_is_below_it() {
     a.i(ldrb(22, 19)).i(ldrb(23, 20)); // 5, and 0 again
     a.i(add(0, 22, 23)).svc(94);
     let (mut vm, mut p) = start(&a.elf());
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Exited(5)), "{status:?}");
 }
 
@@ -1110,7 +1122,7 @@ fn mremap_moves_pages_without_copying_them() {
     a.i(add_imm(24, 22, 1, true)).i(ldrb(25, 24));
     a.i(add(0, 23, 25)).svc(94);
     let (mut vm, mut p) = start(&a.elf());
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Exited(7)), "{status:?}");
 }
 
@@ -1180,7 +1192,7 @@ fn a_reservation_larger_than_ram_costs_frames_only_where_it_is_touched() {
     let (mut vm, mut p) = start(&a.elf());
     let mut frames = Vec::new();
     for _ in 0..5 {
-        let (_, status) = run(&mut p, &mut vm.cpus[0]);
+        let (_, status) = run(&mut p, &mut vm.cpus);
         assert!(
             matches!(status, Status::Idle(None)),
             "waits for input: {status:?}"
@@ -1188,7 +1200,7 @@ fn a_reservation_larger_than_ram_costs_frames_only_where_it_is_touched() {
         frames.push(p.frames_in_use());
         p.input(b"\n");
     }
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert!(out.ends_with(b"A"), "{out:?}");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
     let [before, reserved, touched, advised, unmapped] = frames[..] else {
@@ -1226,7 +1238,7 @@ fn the_address_space_holds_many_reservations_and_ends_where_it_ends() {
     a.cmn_imm(0, 12).bcond(COND_NE, "fail"); // ENOMEM
     a.ends();
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1332,7 +1344,7 @@ fn a_forked_child_ends_alone_and_its_parent_hears_how() {
         .bcond(COND_NE, "fail"); // tid == pid
     a.exit(5);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1344,7 +1356,7 @@ fn the_machine_ends_when_init_does_with_children_still_alive() {
     a.exit(3);
     a.label("child").label("spin").b("spin");
     let (mut vm, mut p) = start(&a.elf());
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Exited(3)), "{status:?}");
 }
 
@@ -1371,7 +1383,7 @@ fn a_fork_shares_pages_until_either_side_writes() {
     a.i(ldrb(21, 19)).cmp_imm(21, 2).bcond(COND_NE, "fail");
     a.i(mov(0, 22)).svc(94);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1393,7 +1405,7 @@ fn a_pipe_joins_a_parent_and_its_child_and_closes_when_both_have_let_go() {
     a.adr(1, "B").i(mov(0, 24)).movz(2, 1).svc(64);
     a.exit(0);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"BA");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1413,7 +1425,7 @@ fn a_vfork_child_runs_in_its_parents_memory_and_the_parent_waits_for_it() {
     a.status_is(3 << 8).ends();
     a.label("child").movz(21, 5).i(strb(21, 19)).exit(3);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1433,7 +1445,7 @@ fn wait4_says_zero_for_a_running_child_and_echild_when_none_are_left() {
     a.ends();
     a.label("child").read_byte(23).b("fail");
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1450,7 +1462,7 @@ fn a_child_that_ends_signals_its_parent_with_sigchld() {
     a.label("child").exit(0);
     a.common();
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"HA");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1476,7 +1488,7 @@ fn processes_survive_a_snapshot_with_their_shared_pages() {
     a.i(ldrb(22, 19)).movz(21, 4).i(strb(21, 19));
     a.i(mov(0, 22)).svc(94);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"");
     assert!(matches!(status, Status::Idle(None)), "{status:?}");
     let process = p.save(&vm.cpus[0]);
@@ -1487,7 +1499,7 @@ fn processes_survive_a_snapshot_with_their_shared_pages() {
     vm.load_state(&state).unwrap();
     let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
     p.input(b"x\n");
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"x\r\nA");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1507,7 +1519,7 @@ fn machine_with(
 ) -> Vm<armless::platform::NativePlatform> {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus: test_cpus(),
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: Some("host9p".into()),
@@ -1549,7 +1561,7 @@ fn run_with_files(
     let mut out = Vec::new();
     let mut asked = Vec::new();
     loop {
-        let (o, status) = run(p, &mut vm.cpus[0]);
+        let (o, status) = run(p, &mut vm.cpus);
         out.extend(o);
         let wanted: Vec<String> = vm
             .board
@@ -1868,9 +1880,12 @@ impl Asm {
     }
 }
 
+/// Runs threads that order themselves with sched_yield (a yield lets the others run to their
+/// waits), which only one CPU makes an order: on several, as on Linux's, it doesn't.
 fn run_threads(a: &mut Asm) {
-    let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let mut vm = machine_with_cpus(1);
+    let mut p = Process::exec_bytes(&mut vm.cpus[0], None, &a.elf(), &["sig".into()], &[]).unwrap();
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"BBA", "{status:?}");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -1951,7 +1966,7 @@ fn an_undefined_instruction_is_sigill_for_a_program_with_a_handler() {
         .b("handler")
         .common();
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"HB", "{status:?}");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
     assert_eq!(p.stats.signals_delivered, 1);
@@ -1960,7 +1975,7 @@ fn an_undefined_instruction_is_sigill_for_a_program_with_a_handler() {
 #[test]
 fn an_undefined_instruction_ends_a_program_with_no_handler_saying_where() {
     let (mut vm, mut p) = start(&elf(&[SVE_PROBE], &[]));
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert!(out.is_empty());
     let Status::Fault(f) = status else {
         panic!("{status:?}")
@@ -2043,7 +2058,7 @@ fn the_program_headers_and_the_loaders_path_are_read_from_wherever_they_are_in_t
     );
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus: test_cpus(),
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: Some("host9p".into()),
@@ -2131,7 +2146,7 @@ impl Asm {
 
 fn run_ok(a: &mut Asm) {
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2416,7 +2431,7 @@ fn scheduling_survives_a_snapshot() {
     a.getpriority().is(16);
     a.ends();
     let (mut vm, mut p) = start(&a.elf());
-    let (_, status) = run(&mut p, &mut vm.cpus[0]);
+    let (_, status) = run(&mut p, &mut vm.cpus);
     assert!(matches!(status, Status::Idle(None)), "{status:?}");
     let process = p.save(&vm.cpus[0]);
     let state = vm.save_state();
@@ -2425,7 +2440,7 @@ fn scheduling_survives_a_snapshot() {
     vm.load_state(&state).unwrap();
     let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
     p.input(b"x\n");
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert!(out.ends_with(b"A"), "{out:?}");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2533,7 +2548,7 @@ fn a_process_descriptor_is_readable_when_its_process_ends_and_waitid_waits_for_i
     a.ends();
     a.label("child").exit(7);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2563,7 +2578,7 @@ fn a_signal_through_a_process_descriptor_ends_a_sleeping_child() {
     a.ends();
     a.label("child").write_w(24).read_byte(0).b("fail");
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2609,7 +2624,7 @@ fn clone3_and_clone_with_clone_pidfd_store_a_process_descriptor() {
     a.label("child3").exit(9);
     a.label("child").exit(5);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2642,7 +2657,7 @@ fn pidfd_getfd_takes_a_description_from_another_process() {
     a.ends();
     a.label("child").read_byte(0).b("fail");
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2671,7 +2686,7 @@ fn pidfd_open_refuses_what_is_not_a_process_and_waitid_what_is_not_a_child() {
     a.ends();
     a.label("thread").label("spin").b("spin");
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2698,7 +2713,7 @@ fn waitid_on_a_non_blocking_process_descriptor_never_waits() {
     a.ends();
     a.label("child").read_byte(0).b("fail");
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2735,7 +2750,7 @@ fn epoll_reports_a_process_descriptor_when_its_process_ends() {
     a.ends();
     a.label("child").exit(3);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"A");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2754,7 +2769,7 @@ fn a_process_descriptor_survives_a_snapshot_and_its_poll_goes_on() {
     a.ends();
     a.label("child").read_byte(0).exit(4);
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"");
     assert!(matches!(status, Status::Idle(None)), "{status:?}");
     let process = p.save(&vm.cpus[0]);
@@ -2765,7 +2780,7 @@ fn a_process_descriptor_survives_a_snapshot_and_its_poll_goes_on() {
     vm.load_state(&state).unwrap();
     let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
     p.input(b"x\n");
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"x\r\nA");
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
@@ -2807,7 +2822,7 @@ fn a_process_descriptor_has_a_proc_link_and_fdinfo() {
         .svc(64);
     a.ends();
     let (mut vm, mut p) = start(&a.elf());
-    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    let (out, status) = run(&mut p, &mut vm.cpus);
     let out = String::from_utf8_lossy(&out);
     assert!(out.contains("flags:\t02000002\r\n"), "{out:?}");
     assert!(out.contains("\r\nPid:\t1000\r\n"), "{out:?}");

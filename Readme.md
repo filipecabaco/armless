@@ -66,6 +66,7 @@ host's, or (`--fs DIR`, a snowglobe site's `system/` say) one found in a machine
 ```sh
 cargo run --release --bin armless-exec -- ./my-static-binary arg1 arg2
 cargo run --release --bin armless-exec -- --fs site/system --keys 'print(6*7)\n' python3
+cargo run --release --bin armless-exec -- --cpus 4 --fs site/system duckdb -c 'select 42'
 cargo run --release --bin armless-exec -- --stop-after "ready" --save snap ./server
 cargo run --release --bin armless-exec -- --restore snap --input "a line for its terminal"
 ```

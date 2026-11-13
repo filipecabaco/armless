@@ -22,6 +22,16 @@ use crate::gic::Gic;
 use crate::ram::Ram;
 use crate::rtc::Rtc;
 
+/// `n` flags, all 0, allocated zeroed: a table sized by guest memory costs nothing until a flag in one of its
+/// pages is written.
+#[allow(unsafe_code)]
+fn zeroed_flags(n: usize) -> Vec<AtomicU8> {
+    let mut v = std::mem::ManuallyDrop::new(vec![0u8; n]);
+    // SAFETY: `AtomicU8` has the same size, alignment and bit validity as `u8` (as std documents), so the
+    // buffer, its length and its capacity are valid for a `Vec<AtomicU8>`, which now owns the allocation.
+    unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU8, v.len(), v.capacity()) }
+}
+
 pub const MAX_CPUS: usize = 8;
 
 /// A minimal spinlock: critical sections here are a few hundred instructions.
@@ -255,6 +265,9 @@ pub struct PerCpu {
     /// The CPU's hardware vCPU plus one, when it runs in hardware (`cpu::hv`): a kick makes it leave the
     /// guest. 0: none.
     pub hv_vcpu: AtomicU64,
+    /// Set by `Machine::preempt`: the CPU's `run` returns (`Exit::Budget`) at its next instruction
+    /// boundary, for whoever runs it to look at what changed (user mode: a thread that ended).
+    pub preempt: AtomicBool,
 }
 
 /// Instruction-cache invalidations kept for CPUs that have not applied them yet. A CPU further
@@ -396,9 +409,7 @@ impl Machine {
             dma_code_invals: AtomicU64::new(0),
             sev: AtomicU32::new(0),
             host_cores: AtomicU32::new(0),
-            code_pages: (0..memory_size.div_ceil(4096))
-                .map(|_| AtomicU8::new(0))
-                .collect(),
+            code_pages: zeroed_flags(memory_size.div_ceil(4096)),
             waker: SpinLock::new(None),
         };
         // CPU 0 starts running; the others wait for PSCI CPU_ON.
@@ -415,6 +426,35 @@ impl Machine {
     }
 
     /// Ask CPU `cpu` to look at shared state, waking it if it is idle.
+    /// `cpu` is on, as CPU_ON leaves it: for a host that runs programs on the CPUs itself (user
+    /// mode), with no guest kernel to start them.
+    pub fn power_on(&self, cpu: usize) {
+        self.cpus[cpu].power.store(POWER_ON, Ordering::SeqCst);
+    }
+
+    /// `cpu` runs no guest code (as `Cpu::left_guest` says of it): for a CPU that hasn't run since
+    /// the machine was made or restored, which TLB shootdowns would otherwise wait for.
+    pub fn out_of_guest(&self, cpu: usize) {
+        self.cpus[cpu].run_state.store(RUN_IDLE, Ordering::SeqCst);
+    }
+
+    /// `cpu` is off, as CPU_OFF leaves it: for a host that runs programs on the CPUs itself (user
+    /// mode) and is done with this one, so that a snapshot can leave it out (`save_state_cpus`).
+    pub fn power_off(&self, cpu: usize) {
+        self.cpus[cpu].power.store(POWER_OFF, Ordering::SeqCst);
+    }
+
+    /// Whether `cpu` is running guest code (in its `run`, and not since `Cpu::left_guest`).
+    pub fn in_guest(&self, cpu: usize) -> bool {
+        self.cpus[cpu].run_state.load(Ordering::SeqCst) == RUN_RUNNING
+    }
+
+    /// Have `cpu`'s `run` return at its next instruction boundary (`PerCpu::preempt`).
+    pub fn preempt(&self, cpu: usize) {
+        self.cpus[cpu].preempt.store(true, Ordering::SeqCst);
+        self.kick(cpu);
+    }
+
     pub fn kick(&self, cpu: usize) {
         self.stats[3].fetch_add(1, Ordering::Relaxed);
         let c = &self.cpus[cpu];

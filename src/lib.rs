@@ -52,6 +52,7 @@ pub(crate) mod ser;
 pub(crate) mod simd;
 pub(crate) mod simd_ls;
 pub(crate) mod smp;
+pub use smp::Machine;
 pub(crate) mod state;
 pub(crate) mod sysreg;
 pub mod vm;

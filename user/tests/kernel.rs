@@ -21,7 +21,7 @@ const EAGAIN: i64 = -11;
 fn machine_with_prog(elf: &[u8]) -> Vm<armless::platform::NativePlatform> {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus: test_cpus(),
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: Some("host9p".into()),
@@ -194,7 +194,7 @@ fn a_futex_in_shared_memory_wakes_a_waiter_in_another_process() {
     p.sys(260, &[I(0xffff_ffff), D(0x300), I(0), I(0)]);
     p.arg(0, W(0x300));
     p.expect(0); // the child exited 0: its wake found the parent
-    let mut vm = machine();
+    let mut vm = machine_with_cpus(1);
     let mut proc = start(&mut vm, p);
     let (_, status) = run(&mut proc, &mut vm);
     ok(&status);
@@ -297,7 +297,7 @@ fn a_pidfd_becomes_readable_when_its_process_ends_and_waitid_takes_it() {
 fn machine_with_script(elf: &[u8], script: &[u8]) -> Vm<armless::platform::NativePlatform> {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus: test_cpus(),
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: Some("host9p".into()),
@@ -614,7 +614,7 @@ fn aio_contexts_and_groups_survive_a_snapshot() {
     p.expect(0x222);
     let mut p = start(&mut vm, p);
     let status = loop {
-        let status = p.run(&mut vm.cpus[0], std::time::Duration::from_millis(20));
+        let status = p.run_on(&mut vm.cpus, std::time::Duration::from_millis(20));
         if !matches!(status, armless_user::Status::Running) {
             break status;
         }
@@ -1101,7 +1101,7 @@ fn armed_timers_go_on_in_a_restored_process() {
     let mut vm = machine();
     let mut proc = start(&mut vm, p);
     let status = loop {
-        match proc.run(&mut vm.cpus[0], std::time::Duration::from_millis(20)) {
+        match proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20)) {
             armless_user::Status::Running => {},
             s => break s,
         }
@@ -1116,5 +1116,63 @@ fn armed_timers_go_on_in_a_restored_process() {
     vm.load_state(&state).unwrap();
     let mut proc = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
     let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+/// struct flock: a lock of `typ` (0 read, 1 write, 2 unlock) on the whole file
+fn flock_all(typ: u16) -> Vec<u8> {
+    let mut b = vec![0u8; 32];
+    b[0..2].copy_from_slice(&typ.to_le_bytes());
+    b
+}
+
+#[test]
+fn a_record_lock_holds_others_off_until_its_process_closes_the_file() {
+    // SQLite's locks, by which the Supabase CLI tells its stack's owner is running
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/locked\0");
+    p.put(0x300, &flock_all(1)).put(0x340, &flock_all(1)).put(0x380, &flock_all(1));
+    p.sys(56, &[I(0xffff_ff9c), D(0x200), I(0o102), I(0o644)]).expect(3);
+    p.sys(56, &[I(0xffff_ff9c), D(0x200), I(2), I(0)]).expect(4);
+    p.sys(25, &[I(3), I(6), D(0x300)]).expect(0); // F_SETLK, write, the whole file
+    let child = p.fork();
+    // Another process: F_GETLK names the holder, F_SETLK is refused
+    p.sys(25, &[I(3), I(5), D(0x340)]).expect(0);
+    p.arg(0, W(0x340));
+    p.expect(1); // F_WRLCK, from the start (whence 0)
+    p.arg(0, W(0x340 + 24));
+    p.expect(1000); // its pid
+    p.sys(25, &[I(3), I(6), D(0x380)]).expect(-11); // EAGAIN
+    p.parent(child);
+    p.sys(260, &[I(0xffff_ffff), D(0x500), I(0), I(0)]);
+    p.arg(0, W(0x500));
+    p.expect(0);
+    // Closing any descriptor of the file lets go of the process's locks on it
+    p.sys(57, &[I(4)]).expect(0);
+    let child = p.fork();
+    p.sys(25, &[I(3), I(6), D(0x380)]).expect(0);
+    p.parent(child);
+    p.sys(260, &[I(0xffff_ffff), D(0x500), I(0), I(0)]);
+    p.arg(0, W(0x500));
+    p.expect(0);
+    let (_, status) = run_linked(p);
+    ok(&status);
+}
+
+#[test]
+fn flock_is_shared_or_exclusive_and_lock_nb_does_not_wait() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/flocked\0");
+    p.sys(56, &[I(0xffff_ff9c), D(0x200), I(0o102), I(0o644)]).expect(3);
+    p.sys(56, &[I(0xffff_ff9c), D(0x200), I(2), I(0)]).expect(4);
+    p.sys(32, &[I(3), I(1)]).expect(0); // LOCK_SH
+    p.sys(32, &[I(4), I(1)]).expect(0); // another description shares it
+    p.sys(32, &[I(4), I(2 | 4)]).expect(-11); // LOCK_EX | LOCK_NB: 3 shares it
+    p.sys(32, &[I(3), I(8)]).expect(0); // LOCK_UN
+    p.sys(32, &[I(4), I(2 | 4)]).expect(0);
+    p.sys(32, &[I(3), I(1 | 4)]).expect(-11);
+    p.sys(57, &[I(4)]).expect(0); // its description closed, its lock goes
+    p.sys(32, &[I(3), I(2 | 4)]).expect(0);
+    let (_, status) = run_linked(p);
     ok(&status);
 }
