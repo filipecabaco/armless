@@ -345,9 +345,10 @@ impl Stream {
             if read == 0 && written == 0 && !rest.is_empty() {
                 return Fed::Corrupt; // no progress with input left (zstd does not do that)
             }
-            // Done with this input once it is consumed and the output buffer was not filled
-            // (nothing more buffered inside).
-            if rest.is_empty() && written < self.buf.len() {
+            // Done with this input once it is consumed and nothing more is buffered inside: the
+            // output buffer was not filled, or the frame ended (a hint of 0: all of it is out; a
+            // call with no input would start reading the next frame's header).
+            if rest.is_empty() && (written < self.buf.len() || hint == 0) {
                 return Fed::Done;
             }
         }
@@ -440,8 +441,9 @@ impl<R: Read> Read for Reader<R> {
             if dst.is_empty() {
                 return Ok(0);
             }
-            // The last output filled the buffer: more may be inside, even with no input left.
-            let drain = self.out_len == self.buf.len();
+            // The last output filled the buffer in the middle of a frame: more may be inside, even
+            // with no input left (not so if the frame ended: the next call would start the next).
+            let drain = self.out_len == self.buf.len() && self.mid_frame;
             if self.in_pos == self.in_len && !drain {
                 if self.eof {
                     return Ok(0);
@@ -537,6 +539,120 @@ mod tests {
         let (input, want) = frames();
         assert_eq!(decompress(&input).unwrap(), want);
         assert_eq!(decompress(&[]).unwrap(), b"");
+    }
+
+    /// One zstd frame (RFC 8878) of raw blocks of at most 128 KiB each, no checksum: a window of
+    /// 128 KiB, so the largest block is 128 KiB.
+    fn raw_frame(data: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x28, 0xb5, 0x2f, 0xfd]; // magic
+        f.push(0x00); // Frame_Header_Descriptor: no size, no checksum, no dictionary
+        f.push(0x38); // Window_Descriptor: exponent 7, mantissa 0: a 128 KiB window
+        let blocks: Vec<&[u8]> =
+            if data.is_empty() { vec![data] } else { data.chunks(128 << 10).collect() };
+        for (i, block) in blocks.iter().enumerate() {
+            let last = u32::from(i + 1 == blocks.len());
+            // Block_Header: Last_Block bit, Block_Type 0 (raw) in 2 bits, Block_Size in 21 bits
+            let header = last | ((block.len() as u32) << 3);
+            f.extend_from_slice(&header.to_le_bytes()[..3]);
+            f.extend_from_slice(block);
+        }
+        f
+    }
+
+    fn bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Frames whose decompressed size is a multiple of the output buffer, alone and followed by
+    /// another frame, with what they decompress to.
+    fn boundary_cases() -> Vec<(String, Vec<u8>, Vec<u8>)> {
+        let k = 128 << 10;
+        let mut cases = Vec::new();
+        for len in [k, 2 * k, 3 * k] {
+            cases.push((format!("{len} bytes"), raw_frame(&bytes(len)), bytes(len)));
+        }
+        let tails = [
+            ("raw 100", raw_frame(&bytes(100)), bytes(100)),
+            ("small", SMALL.to_vec(), HELLO.to_vec()),
+            ("raw 128 KiB", raw_frame(&bytes(k)), bytes(k)),
+        ];
+        for (name, frame, want) in tails {
+            for len in [k, 2 * k] {
+                cases.push((
+                    format!("{len} bytes, then {name}"),
+                    [raw_frame(&bytes(len)), frame.clone()].concat(),
+                    [bytes(len), want.clone()].concat(),
+                ));
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn a_frame_that_ends_on_a_full_output_buffer_is_complete() {
+        for (name, input, want) in boundary_cases() {
+            assert_eq!(decompress(&input).as_deref(), Some(&want[..]), "{name}");
+
+            let mut got = Vec::new();
+            let ended = decompress_each(&input, &mut |piece| {
+                assert!(piece.len() <= 128 << 10);
+                got.extend_from_slice(piece);
+                true
+            });
+            assert_eq!(ended, Ended::Done, "{name}");
+            assert_eq!(got, want, "{name}");
+
+            for step in [1000, 128 << 10, input.len()] {
+                let mut r = reader(Dribble(&input, step, false)).unwrap();
+                let mut got = Vec::new();
+                r.read_to_end(&mut got)
+                    .unwrap_or_else(|e| panic!("{name}, step {step}: {e}"));
+                assert_eq!(got, want, "{name}, step {step}");
+
+                let mut s = Stream::new();
+                let mut got = Vec::new();
+                for chunk in input.chunks(step) {
+                    assert!(
+                        s.feed(chunk, &mut |b| got.extend_from_slice(b)),
+                        "{name}, step {step}"
+                    );
+                }
+                assert_eq!(got, want, "{name}, step {step}");
+                assert!(!s.mid_frame, "{name}, step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_cut_off_on_a_full_output_buffer_is_refused() {
+        let k = 128 << 10;
+        let two = raw_frame(&bytes(2 * k));
+        let first_block = 6 + 3 + k; // header of the frame, then the first block
+        let boundary = raw_frame(&bytes(k));
+        let cuts = [
+            // the first of two blocks is out (a full buffer), the frame goes on
+            two[..first_block].to_vec(),
+            // the last block's header, none of its data
+            two[..first_block + 3].to_vec(),
+            // inside the last block
+            two[..two.len() - 1].to_vec(),
+            // a frame that ended on a full buffer, then the start of the next one
+            [&boundary[..], &SMALL[..2]].concat(),
+            [&boundary[..], &SMALL[..SMALL.len() - 1]].concat(),
+            // a single block frame cut off inside its data
+            boundary[..boundary.len() - 1].to_vec(),
+        ];
+        for (i, bad) in cuts.iter().enumerate() {
+            assert_eq!(decompress(bad), None, "cut {i}");
+            assert_eq!(
+                decompress_each(bad, &mut |_| true),
+                Ended::Corrupt,
+                "cut {i}"
+            );
+            let mut r = reader(Dribble(bad, 4096, false)).unwrap();
+            let e = r.read_to_end(&mut Vec::new()).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "cut {i}");
+        }
     }
 
     #[test]

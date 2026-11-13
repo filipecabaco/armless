@@ -14,6 +14,7 @@ fn main() {
             .warnings(false)
             // Not exported from binaries and shared libraries: no clash with a libzstd of the process
             .define("ZSTDLIB_VISIBILITY", "")
+            .define("ZSTDERRORLIB_VISIBILITY", "")
             .flag_if_supported("-fvisibility=hidden")
             .compile("zstddeclib");
     }
