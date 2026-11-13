@@ -22,6 +22,16 @@ use crate::gic::Gic;
 use crate::ram::Ram;
 use crate::rtc::Rtc;
 
+/// `n` flags, all 0, allocated zeroed: a table sized by guest memory costs nothing until a flag in one of its
+/// pages is written.
+#[allow(unsafe_code)]
+fn zeroed_flags(n: usize) -> Vec<AtomicU8> {
+    let mut v = std::mem::ManuallyDrop::new(vec![0u8; n]);
+    // SAFETY: `AtomicU8` has the same size, alignment and bit validity as `u8` (as std documents), so the
+    // buffer, its length and its capacity are valid for a `Vec<AtomicU8>`, which now owns the allocation.
+    unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU8, v.len(), v.capacity()) }
+}
+
 pub const MAX_CPUS: usize = 8;
 
 /// A minimal spinlock: critical sections here are a few hundred instructions.
@@ -399,9 +409,7 @@ impl Machine {
             dma_code_invals: AtomicU64::new(0),
             sev: AtomicU32::new(0),
             host_cores: AtomicU32::new(0),
-            code_pages: (0..memory_size.div_ceil(4096))
-                .map(|_| AtomicU8::new(0))
-                .collect(),
+            code_pages: zeroed_flags(memory_size.div_ceil(4096)),
             waker: SpinLock::new(None),
         };
         // CPU 0 starts running; the others wait for PSCI CPU_ON.
