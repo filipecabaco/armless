@@ -716,7 +716,35 @@ impl Process {
         .flatten()
     }
 
+    /// `path` from `dirfd` as an absolute path, when it is relative to a directory of the files made
+    /// here (/dev, /proc, /sys): a program that opens `null` from a descriptor of /dev, as
+    /// wasmtime's guests open every file from their preopened directories, gets /dev/null.
+    fn under_special(&self, dirfd: i32, path: &[u8]) -> Option<Vec<u8>> {
+        if path.first() == Some(&b'/') || path.is_empty() || path.split(|&b| b == b'/').any(|c| c == b"..") {
+            return None;
+        }
+        let dir = match self.files.get(dirfd).map(|d| &d.kind) {
+            Some(Kind::Dir { ino, .. }) => self.fs(|fs| files::path_of(fs, *ino))?,
+            _ if dirfd == AT_FDCWD => self.fs(|fs| files::path_of(fs, self.p.cwd))?,
+            _ => return None,
+        };
+        // (Its first component; /dev/shm is a directory of the filesystem, shm_open's)
+        let top = dir.split(|&b| b == b'/').nth(1).unwrap_or_default();
+        if !matches!(top, b"dev" | b"proc" | b"sys") || dir.starts_with(b"/dev/shm") {
+            return None;
+        }
+        let mut full = dir.clone();
+        if !full.ends_with(b"/") {
+            full.push(b'/');
+        }
+        full.extend_from_slice(path.strip_prefix(b"./").unwrap_or(path));
+        Some(full)
+    }
+
     fn openat(&mut self, dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Ret {
+        if let Some(full) = self.under_special(dirfd, path) {
+            return self.openat(AT_FDCWD, &full, flags, mode);
+        }
         let cloexec = flags & O_CLOEXEC != 0;
         let status = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
         let absolute = path.first() == Some(&b'/');
@@ -830,6 +858,9 @@ impl Process {
     fn stat_path(&self, dirfd: i32, path: &[u8], flags: u64) -> Result<Stat, i64> {
         if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
             return self.stat_fd(dirfd);
+        }
+        if let Some(full) = self.under_special(dirfd, path) {
+            return self.stat_path(AT_FDCWD, &full, flags);
         }
         if let Some((_, mode, rdev)) = device(path) {
             return Ok(Stat::device(mode, rdev));

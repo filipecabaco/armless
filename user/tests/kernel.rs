@@ -1176,3 +1176,27 @@ fn flock_is_shared_or_exclusive_and_lock_nb_does_not_wait() {
     let (_, status) = run_linked(p);
     ok(&status);
 }
+
+#[test]
+fn a_device_opened_from_a_descriptor_of_dev_is_the_device() {
+    // wasmtime's guests open every file from a preopened directory: the Erlang VM of supa-wasm's
+    // Realtime opens `null` from one of /dev, and looped on ENOENT
+    let mut p = Prog::default();
+    p.put(0x200, b"/dev\0").put(0x210, b"null\0").put(0x220, b"zero\0");
+    // openat(AT_FDCWD, "/dev", O_PATH | O_DIRECTORY | O_CLOEXEC)
+    p.sys(56, &[I(0xffff_ff9c), D(0x200), I(0x284000), I(0)]).expect(3);
+    // openat(3, "null", O_WRONLY | O_NOFOLLOW | O_CLOEXEC): /dev/null, which takes what it's given
+    p.sys(56, &[I(3), D(0x210), I(0xa8001), I(0)]).expect(4);
+    p.sys(64, &[I(4), D(0x210), I(4)]).expect(4);
+    // and /dev/zero reads zeros; fstatat sees a character device
+    p.put(0x300, &[7u8; 4]);
+    p.sys(56, &[I(3), D(0x220), I(0), I(0)]).expect(5);
+    p.sys(63, &[I(5), D(0x300), I(4)]).expect(4);
+    p.is(0x300, 0);
+    p.sys(79, &[I(3), D(0x210), D(0x400), I(0)]).expect(0);
+    p.arg(0, W(0x400 + 16)); // st_mode
+    p.code.push(0xd34c_fc00); // lsr x0, x0, #12: the file type
+    p.expect(2); // S_IFCHR >> 12
+    let (_, status) = run_linked(p);
+    ok(&status);
+}
