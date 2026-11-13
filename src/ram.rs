@@ -329,7 +329,23 @@ impl Ram {
             debug_assert!(false, "load of {size} at {at:#x} outside RAM");
             return 0;
         }
-        // SAFETY: in bounds; guest accesses need not be aligned, hence read_unaligned.
+        // SAFETY: in bounds (above).
+        unsafe { self.load_in_page(at, size) }
+    }
+
+    /// `load` without the bounds check, for the CPU's fast-table hits.
+    ///
+    /// # Safety
+    ///
+    /// The `size` bytes at `at` must lie in RAM (`at + size <= len`).
+    #[inline(always)]
+    pub unsafe fn load_in_page(&self, at: usize, size: u32) -> u64 {
+        debug_assert!(
+            self.holds(at, size as usize),
+            "load of {size} at {at:#x} outside RAM"
+        );
+        // SAFETY: in bounds (the caller's promise); guest accesses need not be aligned, hence
+        // read_unaligned.
         unsafe {
             let p = self.ptr.add(at);
             match size {
@@ -350,7 +366,29 @@ impl Ram {
             return;
         }
         self.mark_written();
-        // SAFETY: as in `load`.
+        // SAFETY: in bounds (above), and RAM is marked written.
+        unsafe { self.store_in_page(at, size, value) }
+    }
+
+    /// `store` without the bounds check and without `mark_written`, for the CPU's fast-table
+    /// hits.
+    ///
+    /// # Safety
+    ///
+    /// The `size` bytes at `at` must lie in RAM (`at + size <= len`), and `mark_written` must
+    /// have been called on this RAM (or an alias of it) before this call: the CPU does so when it
+    /// fills the fast write entry the store goes through, and `fresh` never becomes true again.
+    #[inline(always)]
+    pub unsafe fn store_in_page(&self, at: usize, size: u32, value: u64) {
+        debug_assert!(
+            self.holds(at, size as usize),
+            "store of {size} at {at:#x} outside RAM"
+        );
+        debug_assert!(
+            !self.fresh.load(Ordering::Relaxed),
+            "store before RAM was marked written"
+        );
+        // SAFETY: in bounds (the caller's promise).
         unsafe {
             let p = self.ptr.add(at);
             match size {
