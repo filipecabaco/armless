@@ -126,6 +126,30 @@ impl Prog {
         self
     }
 
+
+    /// A struct msghdr at `base` of one iovec over `buf` (`len` long) and the control data `ctl`
+    /// in a buffer of `cap` bytes (none: no pointer)
+    pub fn msg(&mut self, base: u32, buf: u32, len: u64, ctl: &[u8], cap: u64) -> &mut Self {
+        let mut h = vec![0u8; 56];
+        h[16..24].copy_from_slice(&(DATA + base as u64 + 0x40).to_le_bytes());
+        h[24..32].copy_from_slice(&1u64.to_le_bytes());
+        if cap != 0 {
+            h[32..40].copy_from_slice(&(DATA + base as u64 + 0x60).to_le_bytes());
+        }
+        h[40..48].copy_from_slice(&cap.to_le_bytes());
+        let mut v = (DATA + buf as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(&len.to_le_bytes());
+        self.put(base, &h).put(base + 0x40, &v);
+        let mut c = ctl.to_vec();
+        c.resize(c.len().max(cap as usize), 0);
+        self.put(base + 0x60, &c)
+    }
+
+    /// The 32-bit value at this offset is `v` (it goes through umask, which gives its old value)
+    pub fn is(&mut self, off: u32, v: i64) -> &mut Self {
+        self.sys(166, &[W(off)]);
+        self.sys(166, &[I(0)]).expect(v)
+    }
     /// The executable: exit_group(0) after what it does
     pub fn elf(mut self) -> Vec<u8> {
         self.sys(94, &[I(0)]);
