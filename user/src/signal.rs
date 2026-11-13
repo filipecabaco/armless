@@ -35,6 +35,8 @@ use crate::{Ctx, Process, Ret, Wait, INIT};
 
 pub(crate) const SIGINT: u32 = 2;
 pub(crate) const SIGILL: u32 = 4;
+pub(crate) const SIGBUS: u32 = 7;
+pub(crate) const SIGSEGV: u32 = 11;
 pub(crate) const SIGQUIT: u32 = 3;
 pub(crate) const SIGKILL: u32 = 9;
 pub(crate) const SIGCHLD: u32 = 17;
@@ -189,6 +191,8 @@ pub(crate) struct ThreadSig {
     /// stacks: the thread may have set one (Go's threads all have), so its first SA_ONSTACK
     /// handler gets one of its own
     pub altstack_unknown: bool,
+    /// The address of a fault it takes as SIGSEGV or SIGBUS (`Process::abort`): its si_addr
+    pub fault_addr: Option<u64>,
 }
 
 impl ThreadSig {
@@ -333,6 +337,8 @@ impl ThreadSig {
             altstack,
             saved_mask: has.then_some(m),
             altstack_unknown: r.u()? != 0,
+            // (Delivered as soon as it is raised, before any snapshot)
+            fault_addr: None,
         })
     }
 }
@@ -587,6 +593,7 @@ impl Process {
         }
         let t = &mut self.threads[i];
         let alt = t.sig.altstack;
+        let fault_addr = t.sig.fault_addr.take();
         let mut sp = ctx.sp;
         if act.flags & SA_ONSTACK != 0 && alt.size != 0 && !alt.on(sp) {
             sp = alt.sp + alt.size;
@@ -607,6 +614,9 @@ impl Process {
         } else if sig == SIGILL {
             // si_addr: the instruction
             f[16..24].copy_from_slice(&ctx.pc.to_le_bytes());
+        } else if let (SIGSEGV | SIGBUS, Some(addr)) = (sig, fault_addr) {
+            // si_addr: the address it touched
+            f[16..24].copy_from_slice(&addr.to_le_bytes());
         }
         let uc = SIGINFO_SIZE;
         // uc_flags, uc_link: 0; uc_stack: the alternate stack as it was

@@ -37,7 +37,7 @@ use armless::{Host, Ram};
 use crate::elf::Seg;
 use crate::files::{got, Desc, Got, Kind};
 use crate::ser::{R, W};
-use crate::signal::SIGILL;
+use crate::signal::{SIGILL, SIGSEGV};
 use crate::{page_up, ExecError, Process, Ret, Wait, PAGE};
 
 pub(crate) const PROT_READ: u8 = 1;
@@ -1407,6 +1407,18 @@ impl Process {
                 if ec == 0 && self.raise_fault(SIGILL, ILL_ILLOPC) {
                     return false;
                 }
+                // A load, store or fetch where nothing is mapped (SEGV_MAPERR) or that the page's
+                // protection refuses (SEGV_ACCERR) is SIGSEGV, at the address it touched: a JVM
+                // takes its guard pages and safepoint polls so, Go its nil dereferences
+                if matches!(ec, 0x20 | 0x24) {
+                    let code = if fsc >> 2 == 3 { SEGV_ACCERR } else { SEGV_MAPERR };
+                    let cur = self.cur;
+                    self.threads[cur].sig.fault_addr = Some(far);
+                    if self.raise_fault(SIGSEGV, code) {
+                        return false;
+                    }
+                    self.threads[cur].sig.fault_addr = None;
+                }
                 self.crash(format!(
                     "exception class {ec:#x} (esr {esr:#x}) at pc {elr:#x}, far {far:#x}"
                 ));
@@ -1707,6 +1719,8 @@ const HEAD: usize = 64 << 10;
 
 /// si_code of SIGILL: an illegal opcode
 const ILL_ILLOPC: i32 = 1;
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
 
 /// An executable to load: its bytes, or a file of the filesystem (and its first bytes) whose
 /// segments are mapped lazily.

@@ -156,6 +156,10 @@ pub(crate) struct Thread {
     /// The deadline a retried call had when it was parked, for it to keep
     pub resume_deadline: Option<Instant>,
     pub exited: bool,
+    /// Its call, parked to run again (`Wait::Retry`), waits on the terminal: a read of it, or a
+    /// poll, select or epoll with it in its set (`waiting_for_input`). Not kept in a snapshot: a
+    /// restore runs every such call again, which says it anew.
+    pub tty_wait: bool,
     pub sig: ThreadSig,
     pub sched: sched::Sched,
 }
@@ -718,6 +722,7 @@ impl Process {
             wait: None,
             resume_deadline: None,
             exited: false,
+            tty_wait: false,
             sig: ThreadSig::default(),
             sched: Default::default(),
         });
@@ -889,12 +894,11 @@ impl Process {
     /// that only sleeps (`time.sleep` in the middle of a command, whose threads wait on their
     /// deadlines or on each other) — both are idle, only the first is done.
     pub fn waiting_for_input(&self) -> bool {
-        // (A parent that waits for its child, wait4 and waitid, waits for no input.)
+        // (Not a call on a pipe or a socket: Python's subprocess reading what pip prints, pip
+        // waiting on the network. Nor a parent waiting for its child, wait4 and waitid.)
         !self.waiting_on_blobs()
             && self.threads.iter().any(|t| {
-                !t.exited
-                    && matches!(t.wait, Some((Wait::Retry { .. }, _)))
-                    && !matches!(t.ctx.x[8], 260 | 95)
+                !t.exited && t.tty_wait && matches!(t.wait, Some((Wait::Retry { .. }, _)))
             })
     }
 
@@ -1124,6 +1128,8 @@ impl Process {
                         on_timeout,
                     } => {
                         cpu.pc = elr - 4;
+                        let args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4]];
+                        self.threads[cur].tty_wait = self.waits_on_tty(cpu.x[8], args);
                         self.park(cpu);
                         self.threads[cur].wait = Some((Wait::Retry { on_timeout }, deadline));
                         self.cur = next;
@@ -1549,6 +1555,7 @@ impl Process {
                 wait: wait.map(|w| (w, deadline)),
                 resume_deadline,
                 exited,
+                tty_wait: false,
                 sig: ThreadSig::load(&mut r)?,
                 sched: if ver >= 7 { sched::Sched::load(&mut r)? } else { sched::Sched::default() },
             });

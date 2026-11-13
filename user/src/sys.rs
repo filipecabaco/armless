@@ -184,6 +184,34 @@ impl Process {
         }
     }
 
+    /// Whether system call `nr` with `a`, parked to run again, waits on the terminal: a read of
+    /// it, or a poll, select or epoll wait with it in its set (`Process::waiting_for_input`).
+    pub(crate) fn waits_on_tty(&self, nr: u64, a: [u64; 5]) -> bool {
+        let tty = |fd: i64| {
+            i32::try_from(fd).is_ok_and(|fd| matches!(self.files.get(fd).map(|d| &d.kind), Some(Kind::Tty)))
+        };
+        match nr {
+            // read, readv
+            63 | 65 => tty(a[0] as i32 as i64),
+            // ppoll: its struct pollfd array (fd, events, revents)
+            73 => (0..a[1].min(256)).any(|k| self.u32_at(a[0] + 8 * k).is_some_and(|fd| tty(fd as i32 as i64))),
+            // pselect6: the descriptors of its read set
+            72 => {
+                let n = a[0].min(1024);
+                a[1] != 0
+                    && self
+                        .bytes_at(a[1], n.div_ceil(8) as usize)
+                        .is_some_and(|b| (0..n).any(|fd| b[(fd / 8) as usize] & (1 << (fd % 8)) != 0 && tty(fd as i64)))
+            },
+            // epoll_pwait, epoll_pwait2: what its instance watches
+            22 | 441 => match self.files.get(a[0] as i32).map(|d| &d.kind) {
+                Some(Kind::Epoll { watch }) => watch.keys().any(|&fd| tty(fd as i64)),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// The CPUs a program is told it has (`NCPUS_REPORTED`)
     pub(crate) fn ncpus_reported(&self) -> u64 {
         NCPUS_REPORTED.max(self.on_cpu.len() as u64)
