@@ -14,17 +14,12 @@ use armless::cpu::Cpu;
 use armless::dev::fs::{S_IFMT, S_IFREG};
 use armless::Host;
 
-use crate::files::{Kind, EACCES, EBADF, ENOENT};
+use crate::errno::{E2BIG, EACCES, EBADF, EFAULT, EINVAL, ELOOP, ENOENT, ENOEXEC, ENOMEM};
+use crate::files::Kind;
 use crate::mm::Image;
 use crate::signal::AltStack;
 use crate::{Ctx, ExecError, Layout, Process, Ret, PAGE};
 
-const E2BIG: i64 = 7;
-const ENOEXEC: i64 = 8;
-const ENOMEM: i64 = 12;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-const ELOOP: i64 = 40;
 
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -83,7 +78,7 @@ impl Process {
             return Ok(out);
         }
         for i in 0.. {
-            let p = self.u64_at(addr + 8 * i).ok_or(-EFAULT)?;
+            let p = self.u64_at(addr.wrapping_add(8 * i)).ok_or(-EFAULT)?;
             if p == 0 {
                 break;
             }

@@ -1639,11 +1639,17 @@ impl<H: Host> Cpu<H> {
         Ok(old)
     }
 
-    /// The Data Abort for an unaligned atomic access.
+    /// The Data Abort for an unaligned atomic access (a write, as a read-modify-write is).
     pub(crate) fn alignment_fault(&self, va: u64) -> Event {
+        self.alignment_fault_as(va, true)
+    }
+
+    /// The Data Abort for an unaligned access that must be aligned (exclusives, acquire and
+    /// release): DFSC 0x21, and WnR for a write.
+    pub(crate) fn alignment_fault_as(&self, va: u64, write: bool) -> Event {
         Event::Sync {
             ec: if self.el == 0 { ec::DABT_LOW } else { ec::DABT_CUR },
-            iss: 0x21 | (1 << 6),
+            iss: 0x21 | (write as u32) << 6,
             far: Some(va),
             ret_next: false,
         }

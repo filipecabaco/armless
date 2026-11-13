@@ -496,6 +496,10 @@ impl Gic {
                     .push(u32::from_le_bytes(take(4)?.try_into().ok()?));
             }
         }
+        // The CPUs the snapshot lacks: as a new machine's, whatever they held before
+        for c in self.cpu.iter_mut().skip(n) {
+            *c = CpuIf::new();
+        }
         for k in 0..NUM_SHARED {
             let b = take(3)?;
             self.shared[k].set_flags(b[0]);
@@ -538,6 +542,23 @@ mod tests {
             Gic::new(2).load(&mut out.as_slice()).is_none(),
             "a snapshot of more CPUs than the machine has"
         );
+    }
+
+    #[test]
+    fn the_cpus_a_snapshot_lacks_load_as_a_new_machine_has_them() {
+        // A 1-CPU snapshot onto a 2-CPU GIC whose second CPU interface was in use: it is reset
+        let mut out = Vec::new();
+        Gic::new(1).save(&mut out);
+        let mut two = Gic::new(2);
+        two.cpu_write(1, 0x00, 1);
+        two.cpu_write(1, 0x04, 0xf0);
+        two.dist_write(1, 0x100, 4, 0xffff);
+        two.load(&mut out.as_slice()).unwrap();
+        let fresh = CpuIf::new();
+        let c = &two.cpu[1];
+        assert_eq!((c.enabled, c.pmr, c.bpr), (fresh.enabled, fresh.pmr, fresh.bpr));
+        assert!(c.active_stack.is_empty());
+        assert!(c.banked.iter().zip(&fresh.banked).all(|(a, b)| a.flags() == b.flags()));
     }
 
     #[test]

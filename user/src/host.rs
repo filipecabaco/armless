@@ -56,6 +56,10 @@ mod wasm {
         pub fn duration_since(&self, earlier: Instant) -> Duration {
             self.saturating_duration_since(earlier)
         }
+
+        pub fn checked_add(&self, d: Duration) -> Option<Instant> {
+            u64::try_from(d.as_nanos()).ok().and_then(|n| self.0.checked_add(n)).map(Instant)
+        }
     }
 
     impl Add<Duration> for Instant {

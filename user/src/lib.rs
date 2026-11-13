@@ -35,6 +35,7 @@
 mod aio;
 mod creds;
 mod elf;
+mod errno;
 mod exec;
 mod files;
 mod locks;
@@ -68,6 +69,7 @@ use armless::cpu::{Cpu, Exit, StopReason};
 use armless::dev::fs::{Fs, Ino, ROOT};
 use armless::{Board, Host, Ram};
 
+use errno::{EFAULT, EINVAL, ETIMEDOUT};
 use files::Files;
 use host::Instant;
 pub use smp::Smp;
@@ -84,6 +86,10 @@ pub(crate) const INIT: i64 = 1000;
 pub(crate) const SLICE: u64 = 1 << 20;
 const STACK_SIZE: u64 = 8 << 20;
 const BRK_SIZE: u64 = 64 << 20;
+/// The most one read or write moves, as Linux's: a page short of 2 GiB
+pub(crate) const MAX_RW_COUNT: u64 = 0x7fff_f000;
+/// The most iovecs one call takes (UIO_MAXIOV)
+pub(crate) const UIO_MAXIOV: u64 = 1024;
 /// Where a position-independent executable is loaded
 const PIE_BASE: u64 = 0x10_0000;
 
@@ -376,7 +382,8 @@ pub enum Status {
 }
 
 pub(crate) fn page_up(v: u64) -> u64 {
-    (v + PAGE - 1) & !(PAGE - 1)
+    // (A length a program got wrong saturates: what uses it then finds it past everything)
+    v.saturating_add(PAGE - 1) & !(PAGE - 1)
 }
 
 /// Where an executable's pieces go: its segments, the stack, the break and the mmap area.
@@ -462,9 +469,20 @@ pub(crate) fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
 impl Process {
     // ------------------------------------------------------------ guest memory
 
+    /// `len` bytes of the program's at `addr`: never more than its RAM, which no buffer of the
+    /// program's can be past (a length from a program is not an allocation to make)
     pub(crate) fn bytes_at(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+        if len as u64 > self.ram_size {
+            return None;
+        }
         let mut b = vec![0; len];
         self.read(addr, &mut b).then_some(b)
+    }
+
+    /// The count a read or write of `n` bytes moves at most: MAX_RW_COUNT, as Linux, and no more
+    /// than the RAM, which bounds what a call holds on the host while it copies
+    pub(crate) fn rw_count(&self, n: u64) -> usize {
+        n.min(MAX_RW_COUNT).min(self.ram_size) as usize
     }
 
     pub(crate) fn u32_at(&self, addr: u64) -> Option<u32> {
@@ -525,16 +543,24 @@ impl Process {
         }
     }
 
-    pub(crate) fn timespec(&self, addr: u64) -> Option<Duration> {
-        let s = self.u64_at(addr)?;
-        let ns = self.u64_at(addr + 8)?;
-        Some(Duration::new(s, (ns % 1_000_000_000) as u32))
+    /// The struct timespec at `addr`: -EFAULT where nothing is mapped, and -EINVAL for negative
+    /// seconds or nanoseconds outside a second, as Linux checks them.
+    pub(crate) fn timespec(&self, addr: u64) -> Result<Duration, i64> {
+        let (Some(s), Some(ns)) = (self.u64_at(addr), self.u64_at(addr.wrapping_add(8))) else {
+            return Err(-EFAULT);
+        };
+        if (s as i64) < 0 || ns >= 1_000_000_000 {
+            return Err(-EINVAL);
+        }
+        Ok(Duration::new(s, ns as u32))
     }
 
-    /// The host instant at which `clock` reads `abs`.
+    /// The host instant at which `clock` reads `abs` (one far enough to be never, past what
+    /// a u64 of nanoseconds holds).
     pub(crate) fn deadline_at(&self, clock: u64, abs: Duration) -> Instant {
         let now = self.now_ns(clock);
-        Instant::now() + Duration::from_nanos((abs.as_nanos() as u64).saturating_sub(now))
+        let abs = abs.as_nanos().min(u64::MAX as u128) as u64;
+        Instant::now() + Duration::from_nanos(abs.saturating_sub(now))
     }
 
     /// The filesystem's time now, for what a program creates or writes
@@ -1225,7 +1251,7 @@ impl Process {
             let expired = deadline.is_some_and(|d| d <= now);
             match w {
                 Wait::Futex { .. } if expired => {
-                    t.ctx.x[0] = (-110i64) as u64; // ETIMEDOUT
+                    t.ctx.x[0] = -ETIMEDOUT as u64;
                     t.wait = None;
                 },
                 Wait::Sleep if expired => {

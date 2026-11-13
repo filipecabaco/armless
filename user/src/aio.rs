@@ -10,13 +10,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::files::{Kind, EBADF, EINVAL};
+use crate::errno::{EAGAIN, EBADF, EFAULT, EINVAL};
+use crate::files::Kind;
 use crate::host::Instant;
 use crate::ser::{R, W};
 use crate::{Process, Ret, PAGE, RETRY_AT_DEADLINE};
 
-const EAGAIN: i64 = 11;
-const EFAULT: i64 = 14;
 
 /// aio-max-nr
 const AIO_MAX_NR: u64 = 65536;
@@ -102,7 +101,7 @@ impl Process {
         }
         let nr = (nr as u64).min(ctx.cap);
         for i in 0..nr {
-            let r = match self.u64_at(iocbpp + 8 * i) {
+            let r = match self.u64_at(iocbpp.wrapping_add(8 * i)) {
                 None => Err(Ret::Val(-EFAULT)),
                 Some(iocb) => self.aio_one(id, iocb),
             };
@@ -163,7 +162,7 @@ impl Process {
             return v(-EINVAL);
         }
         let iov = if vectored {
-            self.iovecs(buf, nbytes).ok_or(Ret::Val(-EFAULT))?
+            self.iovecs(buf, nbytes).map_err(Ret::Val)?
         } else {
             vec![(buf, nbytes)]
         };
@@ -207,9 +206,10 @@ impl Process {
             (Some(d), _) => Some(Some(d)),
             (None, 0) => Some(None),
             (None, t) => match self.timespec(t) {
-                Some(d) if d.is_zero() => None,
-                Some(d) => Some(Some(Instant::now() + d)),
-                None => return Ret::Val(-EFAULT),
+                Ok(d) if d.is_zero() => None,
+                // (Too long to say: no deadline)
+                Ok(d) => Some(Instant::now().checked_add(d)),
+                Err(e) => return Ret::Val(e),
             },
         };
         // Enough, or a wait that is over (no time to wait, or its deadline passed)

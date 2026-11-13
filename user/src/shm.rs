@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::errno::{EACCES, EEXIST, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSPC, EPERM};
 use crate::mm::{PROT_READ, PROT_WRITE};
 use crate::ser::{R, W};
 use crate::{page_up, Process, Ret, PAGE};
@@ -33,14 +34,6 @@ const SHMLBA: u64 = 4 * PAGE;
 const SHMMAX: u64 = 1 << 36;
 const SHMMNI: usize = 4096;
 
-const EPERM: i64 = 1;
-const ENOENT: i64 = 2;
-const ENOMEM: i64 = 12;
-const EACCES: i64 = 13;
-const EFAULT: i64 = 14;
-const EEXIST: i64 = 17;
-const EINVAL: i64 = 22;
-const ENOSPC: i64 = 28;
 
 #[derive(Clone, Debug, Default)]
 struct Segment {

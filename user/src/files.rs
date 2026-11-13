@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use armless::dev::fs::{self, Content, Fail, Fs, Ino, ROOT, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
+use crate::errno::{EEXIST, EINVAL, ELOOP, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR};
 use crate::net::Net;
 use crate::ser::{R, W};
 
@@ -26,15 +27,6 @@ pub(crate) const O_DIRECTORY: u32 = 0o40000;
 pub(crate) const O_NOFOLLOW: u32 = 0o100000;
 pub(crate) const O_CLOEXEC: u32 = 0o2000000;
 
-pub(crate) const ENOENT: i64 = 2;
-pub(crate) const EBADF: i64 = 9;
-pub(crate) const EACCES: i64 = 13;
-pub(crate) const EEXIST: i64 = 17;
-pub(crate) const ENOTDIR: i64 = 20;
-pub(crate) const EISDIR: i64 = 21;
-pub(crate) const EINVAL: i64 = 22;
-pub(crate) const ENAMETOOLONG: i64 = 36;
-pub(crate) const ELOOP: i64 = 40;
 
 /// What a call into the filesystem gave: a value, an errno, or blobs to wait for.
 pub(crate) enum Got<T> {
@@ -48,6 +40,17 @@ pub(crate) fn got<T>(r: fs::Res<T>) -> Got<T> {
         Ok(v) => Got::Ok(v),
         Err(Fail::Errno(e)) => Got::Err(-(e as i64)),
         Err(Fail::Need(b)) => Got::Need(b),
+    }
+}
+
+impl<T> Got<T> {
+    /// `f` of what it got, if it got it
+    pub(crate) fn map_ok<U>(self, f: impl FnOnce(T) -> U) -> Got<U> {
+        match self {
+            Got::Ok(v) => Got::Ok(f(v)),
+            Got::Err(e) => Got::Err(e),
+            Got::Need(b) => Got::Need(b),
+        }
     }
 }
 
@@ -131,6 +134,10 @@ pub(crate) struct Pipe {
 /// A pipe holds at most this before a write waits.
 pub(crate) const PIPE_BUF_MAX: usize = 64 << 10;
 
+/// The descriptors a process may have (RLIMIT_NOFILE, soft and hard, as getrlimit says it):
+/// each is below this
+pub(crate) const NOFILE: u64 = 4096;
+
 /// The descriptor table and what it refers to.
 #[derive(Default)]
 pub(crate) struct Files {
@@ -186,11 +193,14 @@ impl Files {
         p
     }
 
-    /// The lowest free descriptor at or above `min`, for description `d`.
-    pub fn install(&mut self, d: u32, min: i32, cloexec: bool) -> i32 {
-        let fd = (min..).find(|n| !self.fds.contains_key(n)).unwrap();
+    /// The lowest free descriptor at or above `min` and below NOFILE, for description `d`; or
+    /// -EMFILE, with `d` left as it was (`Process::new_fd` lets go of it).
+    pub fn install(&mut self, d: u32, min: i32, cloexec: bool) -> Result<i32, i64> {
+        let fd = (min.max(0)..NOFILE as i32)
+            .find(|n| !self.fds.contains_key(n))
+            .ok_or(-EMFILE)?;
         self.put(fd, d, cloexec);
-        fd
+        Ok(fd)
     }
 
     /// Descriptor `fd` refers to description `d` (closing what it referred to).
