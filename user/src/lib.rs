@@ -1072,6 +1072,9 @@ impl Process {
                 cpu.pc = elr;
                 self.resume_deadline = self.threads[cur].resume_deadline.take();
                 let (nr, a0, a1, a2) = (cpu.x[8], cpu.x[0], cpu.x[1], cpu.x[2]);
+                // (A call on a path: its path, read before the call, which may change it)
+                let path = (self.trace && matches!(nr, 34 | 35 | 38 | 48 | 53 | 54 | 56 | 78 | 79 | 276 | 291 | 437))
+                    .then(|| String::from_utf8_lossy(&self.cstr(a1)).into_owned());
                 let ret = self.syscall_lazily(cpu, cur);
                 self.flush_net();
                 if self.trace {
@@ -1091,8 +1094,9 @@ impl Process {
                         Ret::GroupExit(c) => format!("exit {c}"),
                     };
                     eprintln!(
-                        "[{}] sys {nr}({a0:#x}, {a1:#x}, {a2:#x}) = {r}",
-                        self.threads.get(cur).map_or(0, |t| t.tid)
+                        "[{}] sys {nr}({a0:#x}, {a1:#x}, {a2:#x}) = {r}{}",
+                        self.threads.get(cur).map_or(0, |t| t.tid),
+                        path.map_or(String::new(), |p| format!(" {p:?}"))
                     );
                 }
                 let next = (cur + 1) % self.threads.len().max(1);
