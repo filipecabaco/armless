@@ -1249,6 +1249,7 @@ impl Process {
         }
         drop(pages);
         self.files.net.save_rights(&mut w);
+        self.files.net.save_cm(&mut w);
         w.0
     }
 
@@ -1418,8 +1419,9 @@ impl Process {
                 let (ino, off, pa) = (r.u()?, r.u()?, r.u()?);
                 file_pages.insert((ino, off), pa);
             }
-            files.net.load_rights(&mut r)?;
+            files.net.load_rights(&mut r, ver)?;
         }
+        files.net.load_cm(&mut r, ver)?;
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);

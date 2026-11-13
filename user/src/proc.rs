@@ -19,6 +19,11 @@
 //! the address space (`Mm::fork`), or the same one (CLONE_VM, with CLONE_VFORK its parent waits
 //! until the child execs or ends). The descriptor table is always copied, never shared
 //! (CLONE_FILES), and so are the signal actions and the working directory.
+//!
+//! A pidfd (`pidfd_open`, or CLONE_PIDFD) is a description of `Kind::Pidfd`: the process by its
+//! pid, which is never reused. It is readable once the process has ended, and hung up as well once
+//! it is waited for; `pidfd_send_signal` signals it, `pidfd_getfd` takes a description of its
+//! table, and `waitid(P_PIDFD)` waits for it (one with PIDFD_NONBLOCK never waits).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,12 +31,15 @@ use std::rc::Rc;
 use armless::cpu::Cpu;
 use armless::Host;
 
+use crate::files::Kind;
 use crate::mm::Mm;
 use crate::signal::{self, ThreadSig};
 use crate::{Ctx, Proc, Process, Ret, Thread, Wait, INIT};
 
 const EPERM: i64 = 1;
 const ESRCH: i64 = 3;
+const EBADF: i64 = 9;
+const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const ECHILD: i64 = 10;
@@ -82,6 +90,8 @@ pub(crate) struct CloneArgs {
     pub ptid: u64,
     pub ctid: u64,
     pub tls: u64,
+    /// Where CLONE_PIDFD puts the pidfd (clone's is `ptid`)
+    pub pidfd: u64,
 }
 
 /// Which children wait4 and waitid pick.
@@ -372,6 +382,36 @@ impl Process {
         Ret::Val(0)
     }
 
+    /// pidfd_getfd(pidfd, targetfd, flags): a descriptor here, close-on-exec, of the description
+    /// the pidfd's process has at `targetfd` (as ptrace allows: root, or the same user)
+    pub(crate) fn sys_pidfd_getfd(&mut self, fd: i32, target: i32, flags: u64) -> Ret {
+        if flags != 0 {
+            return Ret::Val(-EINVAL);
+        }
+        let pid = match self.files.get(fd).map(|d| &d.kind) {
+            Some(crate::files::Kind::Pidfd { pid }) => *pid,
+            Some(_) => return Ret::Val(-EINVAL),
+            None => return Ret::Val(-EBADF),
+        };
+        let Some(p) = self.proc_ref(pid).filter(|p| p.zombie.is_none()) else {
+            return Ret::Val(-ESRCH);
+        };
+        let me = self.p.creds;
+        if me.euid() != 0 && me.euid() != p.creds.uid[0] {
+            return Ret::Val(-EPERM);
+        }
+        // The process that runs has its descriptors in `files`, the others in their Proc
+        let desc = if pid == self.p.pid {
+            self.files.desc_of(target)
+        } else {
+            p.fds.get(&target).map(|&(d, _)| d)
+        };
+        let Some(d) = desc else {
+            return Ret::Val(-EBADF);
+        };
+        Ret::Val(self.files.install(d, 0, true) as i64)
+    }
+
     /// waitid(idtype, id, infop, options, rusage)
     pub(crate) fn sys_waitid(&mut self, a: &[u64; 6]) -> Ret {
         let (kind, id, info, options, rusage) = (a[0], a[1] as i32 as i64, a[2], a[3] as u32, a[4]);
@@ -390,12 +430,15 @@ impl Process {
             3 => match self.files.get(id as i32).map(|d| &d.kind) {
                 Some(crate::files::Kind::Pidfd { pid }) => Pick::Pid(*pid),
                 Some(_) => return Ret::Val(-EINVAL),
-                None => return Ret::Val(-9), // EBADF
+                None => return Ret::Val(-EBADF),
             },
             _ => return Ret::Val(-EINVAL),
         };
+        // A pidfd opened with PIDFD_NONBLOCK never waits for its process (EAGAIN)
+        let nonblock = kind == 3 && self.nonblock(id as i32);
         match self.children(pick) {
             None => Ret::Val(-ECHILD),
+            Some(None) if nonblock && options & WNOHANG == 0 => Ret::Val(-EAGAIN),
             Some(None) if options & WNOHANG != 0 => {
                 // Nothing yet: its siginfo says so (si_signo and si_pid zero)
                 if info != 0 && !self.write(info, &[0u8; 128]) {
@@ -493,7 +536,9 @@ impl Process {
         let (v, f) = (Ret::Val, c.flags);
         if f & CLONE_THREAD != 0 && f & (CLONE_SIGHAND | CLONE_VM) != (CLONE_SIGHAND | CLONE_VM)
             || f & CLONE_SIGHAND != 0 && f & CLONE_VM == 0
-            || f & CLONE_PIDFD != 0
+            || f & CLONE_PIDFD != 0 && f & CLONE_THREAD != 0
+            // clone puts the pidfd where ptid points, so it can't have the tid there too
+            || f & CLONE_PIDFD != 0 && f & CLONE_PARENT_SETTID != 0 && c.pidfd == c.ptid
             || f & CLONE_VFORK != 0 && f & CLONE_THREAD != 0
             || f & CLONE_PARENT != 0 && self.p.pid == INIT
         {
@@ -511,6 +556,7 @@ impl Process {
             | CLONE_PARENT_SETTID
             | CLONE_CHILD_CLEARTID
             | CLONE_CHILD_SETTID
+            | CLONE_PIDFD
             | CLONE_IGNORED;
         if f & !known != 0 {
             return v(-EINVAL);
@@ -597,6 +643,12 @@ impl Process {
             sig,
             sched: self.threads[cur].sched.fork(),
         });
+        if f & CLONE_PIDFD != 0 {
+            // A pidfd of the child, close-on-exec, in the parent's table
+            let d = self.files.add(Kind::Pidfd { pid: id }, 2);
+            let fd = self.files.install(d, 0, true);
+            self.put_u32(c.pidfd, fd as u32);
+        }
         if f & CLONE_PARENT_SETTID != 0 {
             self.put_u32(c.ptid, id as u32);
         }
@@ -652,6 +704,7 @@ impl Process {
                 ptid,
                 ctid,
                 tls,
+                pidfd: field(1),
             },
         )
     }

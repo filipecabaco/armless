@@ -110,10 +110,11 @@ impl Process {
             },
             Kind::Event { count } => (*count > 0, true, false),
             Kind::Signal { mask } => (self.signal_pending(*mask), false, false),
+            // Readable once its process has ended; hung up too once it was waited for
             Kind::Pidfd { pid } => (
                 self.proc_ref(*pid).is_none_or(|p| p.zombie.is_some()),
                 false,
-                false,
+                self.proc_ref(*pid).is_none(),
             ),
             Kind::Sock(id) => self.sock_ready(*id),
             Kind::Epoll { watch } => (
@@ -248,7 +249,9 @@ impl Process {
                 if at.is_some() {
                     return Err(Ret::Val(-ESPIPE));
                 }
-                self.sock_recv(fd, id, max, 0).map(|r| r.0)
+                let got = self.sock_recv(fd, id, max, 0).map(|r| r.0);
+                self.drop_taken();
+                got
             },
             Kind::PipeWrite(_) | Kind::Epoll { .. } => Err(Ret::Val(-EINVAL)),
         }
@@ -342,7 +345,7 @@ impl Process {
                 if at.is_some() {
                     return Err(Ret::Val(-ESPIPE));
                 }
-                self.sock_send(fd, id, data, 0, None, &[])
+                self.sock_send(fd, id, data, 0, None, &Default::default())
             },
             Kind::PipeRead(_) | Kind::Epoll { .. } => Err(Ret::Val(-EBADF)),
         }
@@ -1328,6 +1331,7 @@ impl Process {
             // pidfd_open(pid, flags), pidfd_send_signal(pidfd, sig, info, flags) (proc.rs)
             434 => self.sys_pidfd_open(a[0] as i32 as i64, a[1]),
             424 => self.sys_pidfd_send_signal(a[0] as i32, a[1] as u32),
+            438 => self.sys_pidfd_getfd(a[0] as i32, a[1] as i32, a[2]),
             // signalfd4(fd, mask, sizemask, flags)
             74 => self.sys_signalfd(a[0] as i32, a[1], a[2], a[3]),
             // eventfd2
@@ -1448,6 +1452,7 @@ impl Process {
                     ptid: a[2],
                     tls: a[3],
                     ctid: a[4],
+                    pidfd: a[2],
                 },
             ),
             435 => self.sys_clone3(cpu, cur, a[0], a[1]),
