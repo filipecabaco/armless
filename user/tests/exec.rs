@@ -1972,6 +1972,41 @@ fn an_undefined_instruction_is_sigill_for_a_program_with_a_handler() {
     assert_eq!(p.stats.signals_delivered, 1);
 }
 
+const SIGSEGV: u16 = 11;
+
+#[test]
+fn a_load_from_an_unmapped_address_is_sigsegv_for_a_program_with_a_handler() {
+    // A JVM's guard pages and safepoint polls, Go's nil dereferences
+    let mut a = Asm::default();
+    a.sigaction(SIGSEGV, "check", SA_SIGINFO | SA_RESTORER)
+        .movz(10, 0x18)
+        .i(0xf940_014b) // ldr x11, [x10]: nothing is mapped at 0x18
+        .print("B", 1)
+        .exit(0)
+        .label("fail")
+        .exit(1)
+        // The handler: SIGSEGV, SEGV_MAPERR, si_addr the address loaded from; it skips the load
+        .label("check")
+        .cmp_imm(0, SIGSEGV as u32)
+        .bcond(COND_NE, "fail")
+        .i(0xb940_0829) // ldr w9, [x1, #8]: si_code
+        .cmp_imm(9, 1)
+        .bcond(COND_NE, "fail")
+        .i(0xf940_0829) // ldr x9, [x1, #16]: si_addr
+        .cmp(9, 10)
+        .bcond(COND_NE, "fail")
+        .i(0xf940_dc49) // ldr x9, [x2, #440]: the pc
+        .i(0x9100_1129) // add x9, x9, #4
+        .i(0xf900_dc49) // str x9, [x2, #440]
+        .b("handler")
+        .common();
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus);
+    assert_eq!(out, b"HB", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+    assert_eq!(p.stats.signals_delivered, 1);
+}
+
 #[test]
 fn an_undefined_instruction_ends_a_program_with_no_handler_saying_where() {
     let (mut vm, mut p) = start(&elf(&[SVE_PROBE], &[]));

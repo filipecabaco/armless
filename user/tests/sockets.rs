@@ -961,3 +961,37 @@ fn descriptors_in_flight_survive_a_snapshot() {
     ok(&status);
     assert!(out.ends_with(b"kept"), "{out:?}");
 }
+
+#[test]
+fn a_seqpacket_pair_keeps_its_messages_apart_and_ends_when_its_peer_closes() {
+    // supa-wasm's guests talk to their host over these
+    let mut p = Prog::default();
+    p.put(0x200, b"abc").put(0x210, b"de");
+    p.sys(199, &[I(1), I(5), I(0), D(0x100)]).expect(0); // socketpair(AF_UNIX, SOCK_SEQPACKET): 3, 4
+    p.sys(64, &[I(3), D(0x200), I(3)]).expect(3);
+    p.sys(64, &[I(3), D(0x210), I(2)]).expect(2);
+    // One message a read, however much room it has
+    p.sys(63, &[I(4), D(0x300), I(64)]).expect(3);
+    p.sys(63, &[I(4), D(0x300), I(64)]).expect(2);
+    p.sys(57, &[I(3)]).expect(0);
+    // Its peer gone: the end, and a send is EPIPE (MSG_NOSIGNAL: no SIGPIPE)
+    p.sys(63, &[I(4), D(0x300), I(64)]).expect(0);
+    p.sys(206, &[I(4), D(0x200), I(3), I(0x4000), I(0), I(0)]).expect(-32);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn a_read_of_a_pipe_is_not_waiting_for_input() {
+    // Python's subprocess reading what pip prints: the program is busy, not at its prompt
+    let mut p = Prog::default();
+    p.sys(59, &[D(0x100), I(0)]).expect(0); // pipe2: 3, 4 (4 stays open: the read waits)
+    p.sys(63, &[I(3), D(0x200), I(1)]);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let status = proc.run_on(&mut vm.cpus, Duration::from_millis(200));
+    assert!(matches!(status, Status::Idle(_)), "{status:?}");
+    assert!(!proc.waiting_for_input(), "a pipe is not the terminal");
+}

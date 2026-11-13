@@ -16,9 +16,9 @@
 //! (a datagram carries them, a stream the bytes of the send that had them), and a socket with
 //! SO_PASSCRED receives SCM_CREDENTIALS, who sent what it reads (the sender's pid, uid and gid, or
 //! what it gave, as root may). Not here: other ancillary data of a unix socket (EINVAL), UDP to
-//! the outside (but DNS), IPv6 to the outside, raw and packet sockets, SOCK_SEQPACKET, MSG_OOB,
-//! and a stream's backpressure towards the host (what a process writes waits in the network's
-//! outbox).
+//! the outside (but DNS), IPv6 to the outside, raw and packet sockets, SOCK_SEQPACKET but a
+//! socketpair's, MSG_OOB, and a stream's backpressure towards the host (what a process writes
+//! waits in the network's outbox).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -36,6 +36,14 @@ const AF_NETLINK: u16 = 16;
 
 const SOCK_STREAM: u8 = 1;
 const SOCK_DGRAM: u8 = 2;
+/// A connection that keeps its messages' boundaries (AF_UNIX pairs: socketpair)
+const SOCK_SEQPACKET: u8 = 5;
+
+/// Whether a socket of type `ty` carries messages (a datagram, or a seqpacket's) rather than a
+/// stream of bytes
+fn messages(ty: u8) -> bool {
+    matches!(ty, SOCK_DGRAM | SOCK_SEQPACKET)
+}
 
 const EPERM: i64 = 1;
 const ESRCH: i64 = 3;
@@ -859,6 +867,10 @@ impl Process {
                     .is_some_and(|b| b.local_pending(s.port()) > 0);
             return (!s.backlog.is_empty() || waiting, false, false);
         }
+        if s.ty == SOCK_SEQPACKET {
+            // Readable at the end too (a read gives 0), hung up once its peer is closed
+            return (!s.msgs.is_empty() || s.fin, !s.gone, s.gone);
+        }
         if s.ty == SOCK_DGRAM {
             return (!s.msgs.is_empty(), true, false);
         }
@@ -895,7 +907,7 @@ impl Process {
         let Some(s) = self.files.net.socks.get(&id) else {
             return 0;
         };
-        if s.ty == SOCK_DGRAM {
+        if messages(s.ty) {
             return s.msgs.front().map_or(0, |m| m.data.len());
         }
         match (s.host, &self.board) {
@@ -931,8 +943,12 @@ impl Process {
             return Err(e(EINVAL));
         }
         let passcred = s.passcred();
-        if s.ty == SOCK_DGRAM {
+        if messages(s.ty) {
             let Some(m) = (if peek { s.msgs.front().cloned() } else { s.msgs.pop_front() }) else {
+                // A seqpacket's end: its peer closed, and nothing is left to read
+                if s.ty == SOCK_SEQPACKET && s.fin {
+                    return Ok((Vec::new(), Vec::new(), false));
+                }
                 return Err(self.would_block(id, nonblock, 20));
             };
             // The descriptors go with the datagram, cut or not; a peek gives copies (a reference
@@ -1085,7 +1101,10 @@ impl Process {
             self.poke();
             return Ok(data.len());
         }
-        if s.ty == SOCK_DGRAM {
+        if s.ty == SOCK_SEQPACKET && (s.gone || s.wr_shut) {
+            return Err(e(EPIPE));
+        }
+        if messages(s.ty) {
             let (peer, default) = (s.peer, s.peer_name.clone());
             let msg = Dgram {
                 from: Vec::new(),
@@ -1221,7 +1240,7 @@ impl Process {
             },
         };
         match target.and_then(|t| self.files.net.socks.get_mut(&t)) {
-            Some(t) if t.ty == SOCK_DGRAM && t.msgs.len() < DGRAM_MAX => {
+            Some(t) if messages(t.ty) && t.msgs.len() < DGRAM_MAX => {
                 let rights = msg.rights.clone();
                 t.msgs.push_back(msg);
                 rights.iter().for_each(|&d| self.files.hold(d));
@@ -1230,7 +1249,7 @@ impl Process {
             },
             // UDP drops what a full socket cannot take, and what nobody listens for
             _ if inet => Ok(len),
-            Some(t) if t.ty == SOCK_DGRAM => Err(self.would_block(id, nonblock, 21)),
+            Some(t) if messages(t.ty) => Err(self.would_block(id, nonblock, 21)),
             _ => Err(e(ECONNREFUSED)),
         }
     }
@@ -1323,7 +1342,8 @@ impl Process {
                 EAFNOSUPPORT
             });
         }
-        if !matches!(kind as u8, SOCK_STREAM | SOCK_DGRAM) {
+        // (SOCK_SEQPACKET as a pair only: socket() of one, to bind and connect, is not here yet)
+        if !matches!(kind as u8, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
             return e(ESOCKTNOSUPPORT);
         }
         let net = &mut self.files.net;
@@ -1687,7 +1707,7 @@ impl Process {
             if peer { sa_nl(0) } else { s.name.clone() }
         } else if peer {
             if !s.connected && !s.gone
-                || s.ty == SOCK_DGRAM && s.peer_name.is_empty() && s.peer.is_none()
+                || messages(s.ty) && s.peer_name.is_empty() && s.peer.is_none()
             {
                 return e(ENOTCONN);
             }

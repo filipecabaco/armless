@@ -44,7 +44,7 @@ const EFAULT: i64 = 14;
 const ECHILD: i64 = 10;
 const EINVAL: i64 = 22;
 
-const SIGSEGV: u32 = 11;
+use crate::signal::SIGSEGV;
 
 pub(crate) const CLONE_VM: u64 = 0x100;
 const CLONE_SIGHAND: u64 = 0x800;
@@ -604,6 +604,7 @@ impl Process {
                 wait: None,
                 resume_deadline: None,
                 exited: false,
+                tty_wait: false,
                 sig: self.threads[cur].sig.inherit(),
                 sched: self.threads[cur].sched.fork(),
             });
@@ -658,6 +659,7 @@ impl Process {
             wait: None,
             resume_deadline: None,
             exited: false,
+            tty_wait: false,
             sig,
             sched: self.threads[cur].sched.fork(),
         });
