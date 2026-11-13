@@ -448,6 +448,35 @@ impl Net {
     }
 
     /// Closes the socket: its peer sees it go, its name is free.
+    /// A socket in a few words, for a host looking at what a program waits on: its type, its
+    /// address and its peer's, what is buffered, and how it stands
+    pub(crate) fn brief(&self, id: u32) -> String {
+        let Some(s) = self.socks.get(&id) else {
+            return format!("sock {id} gone");
+        };
+        let addr = |sa: &[u8]| match sa {
+            [2, 0, p0, p1, a, b, c, d, ..] => format!("{a}.{b}.{c}.{d}:{}", u16::from_be_bytes([*p0, *p1])),
+            [1, 0, rest @ ..] => format!("unix:{}", String::from_utf8_lossy(rest).trim_end_matches('\0')),
+            [] => "-".into(),
+            _ => "?".into(),
+        };
+        format!(
+            "sock{id}[{} {}->{} peer={:?} host={:?} rx={} msgs={} backlog={}{}{}{}{}]",
+            s.ty,
+            addr(&s.name),
+            addr(&s.peer_name),
+            s.peer,
+            s.host,
+            s.rx.len(),
+            s.msgs.len(),
+            s.backlog.len(),
+            if s.listening { " listening" } else { "" },
+            if s.connecting { " connecting" } else { "" },
+            if s.fin { " fin" } else { "" },
+            if s.gone { " gone" } else { "" },
+        )
+    }
+
     pub fn close(&mut self, id: u32) {
         let Some(s) = self.socks.remove(&id) else {
             return;

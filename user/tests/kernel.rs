@@ -1366,3 +1366,50 @@ fn a_device_opened_from_a_descriptor_of_dev_is_the_device() {
     let (_, status) = run_linked(p);
     ok(&status);
 }
+
+#[test]
+fn the_host_starts_a_process_with_pipes_and_takes_its_output_and_status() {
+    // snowglobe's jobs on a site with no kernel: a shell command run beside the program
+    let mut p = Prog::default();
+    p.put(0x200, b"out\n").put(0x210, b"err\n");
+    p.sys(173, &[]); // getppid: 0 for the one the host started
+    let at = p.code.len();
+    p.code.push(0); // cbnz x0: the first process's part
+    p.out(0x200, 4);
+    p.sys(64, &[I(2), D(0x210), I(4)]);
+    p.sys(63, &[I(0), D(0x300), I(4)]).expect(4);
+    p.sys(64, &[I(1), D(0x300), I(4)]);
+    p.sys(63, &[I(0), D(0x300), I(4)]).expect(0); // its stdin closed: the end
+    p.sys(94, &[I(3)]);
+    p.code[at] = 0xb500_0000 | ((p.code.len() - at) as u32) << 5;
+    // The first process waits on the terminal
+    p.sys(63, &[I(0), D(0x300), I(1)]);
+    let mut vm = machine_with_prog(&p.elf());
+    let board = vm.board.clone();
+    let mut proc = Process::exec(&mut vm.cpus[0], board, &["/usr/bin/prog".into()], &[], "/").unwrap();
+    let mut step = |proc: &mut Process| proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20));
+    step(&mut proc);
+    let pid = proc.spawn(&["prog".into()], &["PATH=/usr/bin".into()], "/tmp", None).unwrap();
+    assert_ne!(pid, 1000);
+    assert!(proc.spawn_input(pid, b"ping"));
+    proc.spawn_close_input(pid);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let begun = std::time::Instant::now();
+    let exit = loop {
+        step(&mut proc);
+        let r = proc.spawn_poll(pid).unwrap();
+        out.extend(r.stdout);
+        err.extend(r.stderr);
+        if let Some(e) = r.exit {
+            break e;
+        }
+        assert!(begun.elapsed() < std::time::Duration::from_secs(10), "still running");
+    };
+    assert_eq!((out.as_slice(), err.as_slice(), exit), (&b"out\nping"[..], &b"err\n"[..], 3));
+    // Released: gone, and the first process goes on waiting
+    proc.spawn_release(pid);
+    assert!(proc.spawned().is_empty());
+    assert!(proc.spawn_poll(pid).is_none());
+    assert_eq!(proc.processes(), 1);
+    assert!(proc.waiting_for_input());
+}

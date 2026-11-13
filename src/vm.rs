@@ -1089,9 +1089,9 @@ impl StateLoader {
                                     mem.len() >> 20
                                 ));
                             }
-                            if ncpus != board.config.cpus {
+                            if ncpus > board.config.cpus {
                                 return Err(format!(
-                                    "the snapshot was saved with {ncpus} CPUs, this machine has {}",
+                                    "the snapshot was saved with {ncpus} CPUs, more than this machine's {}",
                                     board.config.cpus
                                 ));
                             }

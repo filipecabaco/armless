@@ -472,11 +472,14 @@ impl Gic {
             Some(a.to_vec())
         };
         let h = take(2)?;
-        if h[1] as usize != self.ncpus {
-            return None; // snapshot from a machine with another CPU count
+        // A machine of as many CPUs, or of more: the first are the snapshot's, the others are
+        // as a new machine's are (powered off, `save_cpus`)
+        let n = h[1] as usize;
+        if n == 0 || n > self.ncpus {
+            return None; // snapshot from a machine with more CPUs
         }
         self.dist_enabled = h[0] != 0;
-        for c in self.cpu.iter_mut() {
+        for c in self.cpu.iter_mut().take(n) {
             let b = take(9)?;
             c.enabled = b[0] != 0;
             c.pmr = u32::from_le_bytes(b[1..5].try_into().ok()?);
@@ -524,9 +527,16 @@ mod tests {
         let mut out = Vec::new();
         g.save_cpus(&mut out, 1);
         assert!(Gic::new(1).load(&mut out.as_slice()).is_some());
+        // Onto a machine of more CPUs: the first is the snapshot's, the others are new
+        let mut four = Gic::new(4);
+        assert!(four.load(&mut out.as_slice()).is_some(), "a 4-CPU GIC loads a 1-CPU one");
+        assert_eq!(four.targets[40 - 32], 0b0001);
+        // Not onto fewer
+        let mut out = Vec::new();
+        g.save_cpus(&mut out, 4);
         assert!(
-            Gic::new(4).load(&mut out.as_slice()).is_none(),
-            "the CPU count is checked"
+            Gic::new(2).load(&mut out.as_slice()).is_none(),
+            "a snapshot of more CPUs than the machine has"
         );
     }
 

@@ -3,7 +3,7 @@ members = ["user"]
 
 [package]
 name = "armless"
-version = "0.17.3"
+version = "0.18.0"
 edition = "2021"
 # Cranelift (the native-jit feature) needs 1.97
 rust-version = "1.97"

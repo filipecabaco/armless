@@ -148,7 +148,9 @@ impl<H: Host> Cpu<H> {
             )));
         }
         let ncpus = r.u32()? as usize;
-        if ncpus != m.ncpus || ncpus != cpus.len() {
+        // Restored onto a machine of more CPUs: the others stay as they are, powered off, for a
+        // host that runs programs on them itself (user mode) or a guest's CPU_ON
+        if ncpus == 0 || ncpus > m.ncpus || cpus.len() != m.ncpus {
             return Some(Err(format!(
                 "state was saved with {ncpus} CPUs but this machine has {}",
                 m.ncpus
@@ -189,7 +191,7 @@ impl<H: Host> Cpu<H> {
             rtc.irq_mask = f & 2 != 0;
             rtc.raw_irq = f & 4 != 0;
         }
-        for cpu in cpus.iter_mut() {
+        for cpu in cpus.iter_mut().take(ncpus) {
             cpu.load_one(&mut r)?;
         }
         // The guest's counter continues from where it was saved.

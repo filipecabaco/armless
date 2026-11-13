@@ -605,6 +605,7 @@ impl Process {
                 resume_deadline: None,
                 exited: false,
                 tty_wait: false,
+                rerun: None,
                 sig: self.threads[cur].sig.inherit(),
                 sched: self.threads[cur].sched.fork(),
             });
@@ -660,6 +661,7 @@ impl Process {
             resume_deadline: None,
             exited: false,
             tty_wait: false,
+            rerun: None,
             sig,
             sched: self.threads[cur].sched.fork(),
         });

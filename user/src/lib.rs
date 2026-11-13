@@ -49,6 +49,7 @@ mod shm;
 mod timerfd;
 mod signal;
 mod smp;
+mod spawn;
 mod sys;
 mod timer;
 mod tty;
@@ -69,6 +70,7 @@ use armless::{Board, Host, Ram};
 use files::Files;
 use host::Instant;
 pub use smp::Smp;
+pub use spawn::SpawnPoll;
 use ser::{R, W};
 use signal::{Signals, ThreadSig};
 use timer::Timers;
@@ -160,6 +162,11 @@ pub(crate) struct Thread {
     /// poll, select or epoll with it in its set (`waiting_for_input`). Not kept in a snapshot: a
     /// restore runs every such call again, which says it anew.
     pub tty_wait: bool,
+    /// A call parked to run again (`Wait::Retry`) that was woken for it and hasn't run yet: its pc
+    /// is still at its svc. A signal delivered meanwhile interrupts that call, as one delivered
+    /// while it waited would (sigsuspend returns EINTR rather than waiting again for a signal the
+    /// handler took). Cleared when the thread runs.
+    pub rerun: Option<(Wait, Option<Instant>)>,
     pub sig: ThreadSig,
     pub sched: sched::Sched,
 }
@@ -331,7 +338,11 @@ pub struct Process {
     pub(crate) shm: shm::Shm,
     /// The interval and POSIX timers, and the CPU time they count (timer.rs)
     pub(crate) timers: Timers,
+    /// The processes the host started (spawn.rs), and its ends of their pipes. Not saved.
+    pub(crate) spawned: BTreeMap<i64, spawn::Spawned>,
     pub trace: bool,
+    /// With `trace`, only these system calls (empty: all of them)
+    pub trace_only: Vec<u64>,
     pub stats: Stats,
 }
 
@@ -700,9 +711,11 @@ impl Process {
             machine: cpu.machine.clone(),
             resume_deadline: None,
             trace: false,
+            trace_only: Vec::new(),
             stats: Stats::default(),
             shm: shm::Shm::default(),
             timers: Timers::default(),
+            spawned: BTreeMap::new(),
         };
         p.net_attach();
         let (entry, sp) = match p.load_image(&image, &layout, args, env, exe) {
@@ -730,6 +743,7 @@ impl Process {
             resume_deadline: None,
             exited: false,
             tty_wait: false,
+            rerun: None,
             sig: ThreadSig::default(),
             sched: Default::default(),
         });
@@ -1036,6 +1050,8 @@ impl Process {
                         .min(),
                 ));
             };
+            // (It runs: a call woken to run again does, so no signal interrupts it in between)
+            self.threads[next].rerun = None;
             if self.on_cpu[self.cpu] != Some(next) {
                 self.park(cpu);
                 self.threads[next].ctx.load(cpu);
@@ -1080,11 +1096,17 @@ impl Process {
                 self.resume_deadline = self.threads[cur].resume_deadline.take();
                 let (nr, a0, a1, a2) = (cpu.x[8], cpu.x[0], cpu.x[1], cpu.x[2]);
                 // (A call on a path: its path, read before the call, which may change it)
-                let path = (self.trace && matches!(nr, 34 | 35 | 38 | 48 | 53 | 54 | 56 | 78 | 79 | 276 | 291 | 437))
-                    .then(|| String::from_utf8_lossy(&self.cstr(a1)).into_owned());
+                let path = match nr {
+                    _ if !self.trace => None,
+                    34 | 35 | 38 | 48 | 53 | 54 | 56 | 78 | 79 | 276 | 291 | 437 => Some(self.cstr(a1)),
+                    // execve: its path is the first argument
+                    221 => Some(self.cstr(a0)),
+                    _ => None,
+                }
+                .map(|p| String::from_utf8_lossy(&p).into_owned());
                 let ret = self.syscall_lazily(cpu, cur);
                 self.flush_net();
-                if self.trace {
+                if self.trace && (self.trace_only.is_empty() || self.trace_only.contains(&nr)) {
                     let r = match &ret {
                         Ret::Val(r) => format!("{r:#x}"),
                         Ret::Block(w, d) => format!(
@@ -1212,7 +1234,7 @@ impl Process {
                 },
                 Wait::Retry { .. } if poked || expired => {
                     t.resume_deadline = deadline;
-                    t.wait = None;
+                    t.rerun = t.wait.take();
                 },
                 Wait::Blobs(_) if blobs_in => t.wait = None,
                 _ => {},
@@ -1569,6 +1591,7 @@ impl Process {
                 resume_deadline,
                 exited,
                 tty_wait: false,
+                rerun: None,
                 sig: ThreadSig::load(&mut r)?,
                 sched: if ver >= 7 { sched::Sched::load(&mut r)? } else { sched::Sched::default() },
             });
@@ -1628,9 +1651,11 @@ impl Process {
             machine: cpu.machine.clone(),
             resume_deadline: None,
             trace: false,
+            trace_only: Vec::new(),
             stats: Stats::default(),
             shm,
             timers,
+            spawned: BTreeMap::new(),
         };
         p.net_attach();
         let wanted: Vec<String> = p
