@@ -29,12 +29,166 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
+/// The CPUs a program is told of with one CPU, so that a runtime sizing its threads by them
+/// (Go's GOMAXPROCS, a JVM's GC threads) has some; with more, as many as there are.
 const NCPUS_REPORTED: u64 = 4;
 
 /// What a descriptor is ready for: (readable, writable, hung up)
 type Ready = (bool, bool, bool);
 
 impl Process {
+    /// The lock table, its locks whose holder is gone dropped first (locks.rs)
+    fn locks(&mut self) -> &mut crate::locks::Locks {
+        use crate::locks::Owner;
+        let pids: Vec<i64> = self
+            .proc_list()
+            .filter(|p| p.zombie.is_none())
+            .map(|p| p.pid)
+            .collect();
+        let descs = &self.files.descs;
+        self.files.locks.sweep(|o| match o {
+            Owner::Proc(p) => pids.contains(&p),
+            Owner::Desc(d) => descs.contains_key(&d),
+        });
+        &mut self.files.locks
+    }
+
+    /// fcntl's locks: F_GETLK (5), F_SETLK (6), F_SETLKW (7), and F_OFD_GETLK, F_OFD_SETLK,
+    /// F_OFD_SETLKW (36, 37, 38), with the struct flock at `at`.
+    fn fcntl_lock(&mut self, fd: i32, cmd: u64, at: u64) -> Ret {
+        use crate::locks::Owner;
+        let v = Ret::Val;
+        let (Some(d), Some(desc)) = (self.files.desc_of(fd), self.files.get(fd)) else {
+            return v(-EBADF);
+        };
+        let (ino, pos, mode) = match desc.kind {
+            Kind::File { ino, pos } => (ino, pos, desc.flags & 3),
+            _ => return v(-EINVAL),
+        };
+        // struct flock: l_type, l_whence (i16), l_start, l_len (i64, at 8 and 16), l_pid (i32, 24)
+        let Some(b) = self.bytes_at(at, 32) else {
+            return v(-EFAULT);
+        };
+        let i16_at = |o: usize| i16::from_le_bytes([b[o], b[o + 1]]);
+        let i64_at = |o: usize| i64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let (typ, whence, start, len) = (i16_at(0), i16_at(2), i64_at(8), i64_at(16));
+        let ofd = cmd >= 36;
+        if ofd && i32::from_le_bytes(b[24..28].try_into().unwrap()) != 0 {
+            return v(-EINVAL);
+        }
+        let kind = match typ {
+            0 => Some(false),
+            1 => Some(true),
+            2 => None,
+            _ => return v(-EINVAL),
+        };
+        // A read lock needs the file open for reading, a write lock for writing
+        if cmd != 5 && cmd != 36 {
+            match kind {
+                Some(false) if mode == 1 => return v(-EBADF),
+                Some(true) if mode == 0 => return v(-EBADF),
+                _ => {},
+            }
+        }
+        let base = match whence {
+            0 => 0,
+            1 => pos as i64,
+            2 => self.fs(|fs| fs.get(ino).map_or(0, |i| i.size)).unwrap_or(0) as i64,
+            _ => return v(-EINVAL),
+        };
+        let Some(s) = base.checked_add(start) else {
+            return v(-75); // EOVERFLOW
+        };
+        // A negative length is the bytes before the start
+        let (s, e) = match len {
+            0 => (s, u64::MAX as i128),
+            l if l > 0 => (s, s as i128 + l as i128),
+            l => (s + l, s as i128),
+        };
+        if s < 0 {
+            return v(-EINVAL);
+        }
+        let (s, e) = (s as u64, e.min(u64::MAX as i128) as u64);
+        let owner = if ofd { Owner::Desc(d) } else { Owner::Proc(self.p.pid) };
+        let locks = self.locks();
+        match cmd {
+            // F_GETLK: the first lock in the way, or F_UNLCK
+            5 | 36 => {
+                let mut out = b.clone();
+                match locks.conflict(ino, owner, kind != Some(false), s, e) {
+                    None => out[0..2].copy_from_slice(&2i16.to_le_bytes()),
+                    Some(l) => {
+                        out[0..2].copy_from_slice(&(l.write as i16).to_le_bytes());
+                        out[2..4].copy_from_slice(&0i16.to_le_bytes());
+                        out[8..16].copy_from_slice(&(l.start as i64).to_le_bytes());
+                        let len = if l.end == u64::MAX { 0 } else { (l.end - l.start) as i64 };
+                        out[16..24].copy_from_slice(&len.to_le_bytes());
+                        let holder = match l.owner {
+                            Owner::Proc(p) => p as i32,
+                            Owner::Desc(_) => -1,
+                        };
+                        out[24..28].copy_from_slice(&holder.to_le_bytes());
+                    },
+                }
+                v(if self.write(at, &out) { 0 } else { -EFAULT })
+            },
+            _ => {
+                if let Some(write) = kind {
+                    if locks.conflict(ino, owner, write, s, e).is_some() {
+                        // F_SETLK: EAGAIN; F_SETLKW: wait for the holder to let go
+                        if cmd == 6 || cmd == 37 {
+                            return v(-EAGAIN);
+                        }
+                        return Ret::Retry {
+                            deadline: None,
+                            on_timeout: 0,
+                        };
+                    }
+                }
+                locks.set(ino, owner, kind, s, e);
+                // (What waits for a lock looks again)
+                self.poke();
+                v(0)
+            },
+        }
+    }
+
+    /// flock(fd, op): LOCK_SH (1), LOCK_EX (2) or LOCK_UN (8), with LOCK_NB (4) not to wait.
+    fn flock(&mut self, fd: i32, op: u64) -> Ret {
+        let v = Ret::Val;
+        let Some(d) = self.files.desc_of(fd) else {
+            return v(-EBADF);
+        };
+        let ino = match self.files.get(fd).map(|x| &x.kind) {
+            Some(Kind::File { ino, .. } | Kind::Dir { ino, .. }) => *ino,
+            // (Anything else: nothing else takes its lock)
+            Some(_) => return v(0),
+            None => return v(-EBADF),
+        };
+        let kind = match op & !4 {
+            1 => Some(false),
+            2 => Some(true),
+            8 => None,
+            _ => return v(-EINVAL),
+        };
+        match self.locks().flock(ino, d, kind) {
+            Ok(()) => {
+                self.poke();
+                v(0)
+            },
+            Err(()) if op & 4 != 0 => v(-EAGAIN),
+            Err(()) => Ret::Retry {
+                deadline: None,
+                on_timeout: 0,
+            },
+        }
+    }
+
+    /// The CPUs a program is told it has (`NCPUS_REPORTED`)
+    pub(crate) fn ncpus_reported(&self) -> u64 {
+        NCPUS_REPORTED.max(self.on_cpu.len() as u64)
+    }
+
     /// FUTEX_WAKE_OP: applies the operation `enc` (the kernel's encoded `op`, `oparg`, `cmp` and
     /// `cmparg`) to the word at `addr2`, wakes up to `nwake` threads waiting on `addr`, and, if
     /// the old value of the word satisfies the comparison, up to `nwake2` waiting on `addr2`.
@@ -434,6 +588,11 @@ impl Process {
     }
 
     pub(crate) fn close_fd(&mut self, fd: i32) -> bool {
+        // A process's record locks on a file go when it closes any descriptor of it
+        if let Some(Kind::File { ino, .. }) = self.files.get(fd).map(|d| &d.kind) {
+            let ino = *ino;
+            self.files.locks.closed(ino, self.p.pid);
+        }
         match self.files.close(fd) {
             None => false,
             Some(ino) => {
@@ -490,7 +649,7 @@ impl Process {
             return Some(s.into_bytes());
         }
         Some(match path {
-            b"/proc/cpuinfo" => (0..NCPUS_REPORTED)
+            b"/proc/cpuinfo" => (0..self.ncpus_reported())
                 .map(|i| format!("processor\t: {i}\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd aes pmull sha1 sha2 crc32 atomics sha3 sm3 sm4 sha512\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n"))
                 .collect::<String>()
                 .into_bytes(),
@@ -1344,8 +1503,10 @@ impl Process {
                 });
                 v(done.unwrap_or(-ENOENT))
             },
-            // utimensat, sync, fsync, fdatasync, syncfs, fadvise64, flock
-            88 | 81 | 82 | 83 | 267 | 223 | 32 => v(0),
+            // utimensat, sync, fsync, fdatasync, syncfs, fadvise64
+            88 | 81 | 82 | 83 | 267 | 223 => v(0),
+            // flock
+            32 => self.flock(fd0, a[1]),
             // statfs, fstatfs: one 9p filesystem
             43 | 44 => {
                 let mut b = [0u8; 120];
@@ -1406,12 +1567,8 @@ impl Process {
                             | (a[2] as u32 & (O_APPEND | O_NONBLOCK | O_ASYNC));
                         v(0)
                     },
-                    // F_GETLK: unlocked; F_SETLK(W), OFD locks: granted
-                    5 | 36 => {
-                        self.write(a[2], &2u16.to_le_bytes()); // F_UNLCK
-                        v(0)
-                    },
-                    6 | 7 | 37 | 38 => v(0),
+                    // F_GETLK, F_SETLK, F_SETLKW and their OFD forms (locks.rs)
+                    5..=7 | 36..=38 => self.fcntl_lock(fd0, a[1], a[2]),
                     // F_SETOWN, F_SETSIG: who gets SIGIO, which isn't sent; F_GETOWN, F_GETSIG
                     8 | 10 => v(0),
                     9 | 11 => v(0),
@@ -1645,13 +1802,15 @@ impl Process {
                 if a[1] < 8 {
                     return v(-EINVAL);
                 }
-                v(if self.put_u64(a[2], (1 << NCPUS_REPORTED) - 1) { 8 } else { -EFAULT })
+                let mask = (1u64 << self.ncpus_reported()) - 1;
+                v(if self.put_u64(a[2], mask) { 8 } else { -EFAULT })
             },
             // getcpu
             168 => {
-                for at in [a[0], a[1]] {
+                // (The CPU this thread runs on; one node)
+                for (at, n) in [(a[0], self.cpu as u32), (a[1], 0)] {
                     if at != 0 {
-                        self.put_u32(at, 0);
+                        self.put_u32(at, n);
                     }
                 }
                 v(0)

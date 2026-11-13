@@ -53,6 +53,7 @@ pub(crate) mod ser;
 pub(crate) mod simd;
 pub(crate) mod simd_ls;
 pub(crate) mod smp;
+pub use smp::Machine;
 #[allow(unsafe_code)]
 pub(crate) mod spill;
 pub(crate) mod state;

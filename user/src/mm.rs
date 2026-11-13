@@ -28,9 +28,7 @@
 //! The CPU's TLB is told of what a call changes after it (`sync_mmu`): the whole of it when pages
 //! went away or lost permissions, the pages of a break of sharing otherwise.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
-use std::rc::Rc;
 
 use armless::cpu::Cpu;
 use armless::dev::fs::{Ino, EIO};
@@ -111,12 +109,12 @@ pub(crate) struct Frames {
     /// Frames whose count fell to zero, not yet zeroed (`reap`)
     dying: Vec<u64>,
     /// Drops what the CPUs decoded or compiled from a physical page
-    purge: Box<dyn Fn(u64)>,
+    purge: Box<dyn Fn(u64) + Send>,
     pub(crate) live: u64,
 }
 
 impl Frames {
-    pub(crate) fn new(ram: Ram, purge: Box<dyn Fn(u64)>) -> Frames {
+    pub(crate) fn new(ram: Ram, purge: Box<dyn Fn(u64) + Send>) -> Frames {
         let n = ram.len() / PAGE as usize;
         Frames {
             ram,
@@ -1273,12 +1271,17 @@ impl Process {
     pub(crate) fn sync_mmu<H: Host>(&self, cpu: &mut Cpu<H>) {
         let mut mm = self.p.mm.borrow_mut();
         let (mut next, mut gen) = self.asids.get();
+        let smp = self.machine.ncpus > 1;
         if mm.gen != gen {
-            // Out of ASIDs: new ones for everything, and nothing of the old is in the TLB
+            // Out of ASIDs: new ones for everything, and nothing of the old is in the TLB (any CPU's)
             if next > 0xffff {
                 next = 1;
                 gen += 1;
-                cpu.tlb_flush();
+                if smp {
+                    cpu.tlb_shootdown(&[], true);
+                } else {
+                    cpu.tlb_flush();
+                }
             }
             mm.asid = next as u16;
             mm.gen = gen;
@@ -1292,7 +1295,16 @@ impl Process {
             cpu.sys.sctlr |= 1;
             cpu.ttbr_changed();
         }
-        if std::mem::take(&mut mm.stale) {
+        if smp {
+            // Other CPUs may run threads of this address space: what they hold of what changed
+            // goes too, before the call that changed it returns (and before their next
+            // instruction)
+            let all = std::mem::take(&mut mm.stale);
+            if all || !mm.flush.is_empty() {
+                let pages = std::mem::take(&mut mm.flush);
+                cpu.tlb_shootdown(&pages, all);
+            }
+        } else if std::mem::take(&mut mm.stale) {
             mm.flush.clear();
             cpu.tlb_flush();
         } else {
@@ -1372,7 +1384,7 @@ impl Process {
                 self.park(cpu);
                 let cur = self.cur;
                 self.threads[cur].wait = Some((Wait::Blobs(blobs), None));
-                self.cur = (cur + 1) % self.threads.len();
+                self.end_slice();
                 false
             },
             Err(Miss::Oom) => {
@@ -1833,5 +1845,31 @@ impl Process {
     }
 }
 
-/// The address spaces of a process, for the code that makes and drops them.
-pub(crate) type SharedMm = Rc<RefCell<Mm>>;
+/// An address space, shared by the processes that have it (vfork, CLONE_VM). Every use is under
+/// the lock that the CPUs of a machine take to answer their programs (`Process`'s), so a borrow
+/// never waits: one that would is a borrow of the same space twice, which panics as a
+/// `RefCell`'s would.
+#[derive(Clone)]
+pub(crate) struct SharedMm(std::sync::Arc<std::sync::Mutex<Mm>>);
+
+impl SharedMm {
+    pub(crate) fn new(mm: Mm) -> SharedMm {
+        SharedMm(std::sync::Arc::new(std::sync::Mutex::new(mm)))
+    }
+
+    pub(crate) fn borrow(&self) -> std::sync::MutexGuard<'_, Mm> {
+        self.0.try_lock().expect("address space already borrowed")
+    }
+
+    pub(crate) fn borrow_mut(&self) -> std::sync::MutexGuard<'_, Mm> {
+        self.borrow()
+    }
+
+    pub(crate) fn ptr_eq(a: &SharedMm, b: &SharedMm) -> bool {
+        std::sync::Arc::ptr_eq(&a.0, &b.0)
+    }
+
+    pub(crate) fn strong_count(m: &SharedMm) -> usize {
+        std::sync::Arc::strong_count(&m.0)
+    }
+}

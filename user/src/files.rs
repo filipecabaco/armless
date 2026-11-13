@@ -140,6 +140,8 @@ pub(crate) struct Files {
     pub pipes: BTreeMap<u32, Pipe>,
     /// The sockets (see net.rs)
     pub net: Net,
+    /// fcntl's and flock's locks (locks.rs)
+    pub locks: crate::locks::Locks,
     next_desc: u32,
     next_pipe: u32,
 }

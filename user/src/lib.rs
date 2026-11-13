@@ -26,7 +26,8 @@
 //! do with the RAM: what a program maps costs frames only where it touches, so a reservation far
 //! larger than the RAM is fine, and a fork shares its pages copy on write.
 //!
-//! Not yet: more than one vCPU (threads of all processes take turns on one CPU).
+//! On one CPU, the threads of all processes take turns (`Process::run`); on several, they run at
+//! the same time, each CPU taking the next thread no other CPU has (`Smp`).
 
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
@@ -36,6 +37,7 @@ mod creds;
 mod elf;
 mod exec;
 mod files;
+mod locks;
 pub mod host;
 mod mm;
 mod net;
@@ -46,6 +48,7 @@ mod ser;
 mod shm;
 mod timerfd;
 mod signal;
+mod smp;
 mod sys;
 mod timer;
 mod tty;
@@ -55,7 +58,6 @@ pub mod wasm;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,6 +68,7 @@ use armless::{Board, Host, Ram};
 
 use files::Files;
 use host::Instant;
+pub use smp::Smp;
 use ser::{R, W};
 use signal::{Signals, ThreadSig};
 use timer::Timers;
@@ -75,7 +78,7 @@ pub(crate) const PAGE: u64 = 4096;
 /// The pid of the first process, the program the machine runs: when it ends, the machine does
 pub(crate) const INIT: i64 = 1000;
 /// Instructions a guest thread runs before the next one gets the CPU.
-const SLICE: u64 = 1 << 20;
+pub(crate) const SLICE: u64 = 1 << 20;
 const STACK_SIZE: u64 = 8 << 20;
 const BRK_SIZE: u64 = 64 << 20;
 /// Where a position-independent executable is loaded
@@ -300,9 +303,17 @@ pub struct Process {
     /// How many times something changed (`poke`): an edge-triggered epoll watch on a descriptor
     /// still ready is reported again when this has moved since it was last reported
     pub(crate) epoch: u64,
-    /// The thread whose turn it is, and the one whose registers are on the CPU.
+    /// The thread whose turn it is on the CPU that answers (`cpu`): the one whose call is
+    /// answered, or where its round robin goes on from.
     pub(crate) cur: usize,
-    pub(crate) loaded: Option<usize>,
+    /// The CPU whose thread is answered: one at a time, under `smp::Smp`'s lock (0 with one CPU)
+    pub(crate) cpu: usize,
+    /// Per CPU, the thread whose registers are on it
+    pub(crate) on_cpu: Vec<Option<usize>>,
+    /// Per CPU, where its round robin goes on from while another CPU answers (`cur`)
+    pub(crate) cpu_cur: Vec<usize>,
+    /// The machine's CPUs, to stop one (`take_off_cpus`)
+    pub(crate) machine: Arc<armless::Machine>,
     /// The deadline the current call had when it was last parked (Thread::resume_deadline)
     pub(crate) resume_deadline: Option<Instant>,
     /// Print every syscall to stderr.
@@ -402,7 +413,7 @@ impl Layout {
 
 /// EL0, interrupts masked and no vector table: every exception the program takes stops the CPU,
 /// for the process to answer. The MMU is switched on with the process's tables (`sync_mmu`).
-fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
+pub(crate) fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
     cpu.el = 0;
     cpu.spsel = false;
     cpu.daif = 0xf << 6;
@@ -413,6 +424,15 @@ fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
     cpu.sys.cpacr = 3 << 20;
     cpu.sys.cntkctl = 3;
     cpu.stop_on_exceptions = true;
+    // On, with no guest kernel to start it; and in no guest code yet, nor are the others when a
+    // program starts or is restored (CPU 0's call), for TLB shootdowns not to wait for them
+    if cpu.index == 0 {
+        for c in 0..cpu.machine.ncpus {
+            cpu.machine.out_of_guest(c);
+        }
+    }
+    cpu.left_guest();
+    cpu.machine.power_on(cpu.index);
 }
 
 impl Process {
@@ -636,7 +656,7 @@ impl Process {
                 ppid: 1,
                 pgid: INIT,
                 sid: INIT,
-                mm: Rc::new(RefCell::new(mm)),
+                mm: mm::SharedMm::new(mm),
                 fds: BTreeMap::new(),
                 exit_signal: 0,
                 zombie: None,
@@ -663,7 +683,10 @@ impl Process {
             poked: false,
             epoch: 0,
             cur: 0,
-            loaded: None,
+            cpu: 0,
+            on_cpu: vec![None; cpu.machine.ncpus],
+            cpu_cur: vec![0; cpu.machine.ncpus],
+            machine: cpu.machine.clone(),
             resume_deadline: None,
             trace: false,
             stats: Stats::default(),
@@ -892,17 +915,81 @@ impl Process {
     /// Run the program for up to `budget` of wall time, or until every thread waits.
     pub fn run<H: Host>(&mut self, cpu: &mut Cpu<H>, budget: Duration) -> Status {
         let until = Instant::now() + budget;
-        'run: loop {
+        loop {
+            let start = match self.schedule(cpu, until) {
+                Ok(start) => start,
+                Err(status) => return status,
+            };
+            // Run it until it blocks, faults, or its slice ends: syscalls answered on the way
+            // count against the slice, so a thread that polls the clock cannot keep the CPU.
+            loop {
+                let used = cpu.insn_count - start;
+                if used >= SLICE {
+                    self.end_slice();
+                    break;
+                }
+                let exit = cpu.run(SLICE - used);
+                if !self.answer(cpu, exit, until) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The next thread of the CPU's (`self.cpu`) round robin
+    pub(crate) fn end_slice(&mut self) {
+        self.cur = (self.cur + 1) % self.threads.len().max(1);
+    }
+
+    /// Whether thread `i` has its registers on a CPU other than the one answering
+    pub(crate) fn on_other_cpu(&self, i: usize) -> bool {
+        self.on_cpu
+            .iter()
+            .enumerate()
+            .any(|(c, &t)| c != self.cpu && t == Some(i))
+    }
+
+    /// The threads `which` picks that run on other CPUs stop running there: their CPUs leave the
+    /// guest before this returns, and look for another thread (theirs end: their process ended,
+    /// or exec'd). What frees their memory waits for this.
+    pub(crate) fn take_off_cpus(&mut self, which: impl Fn(&Thread) -> bool) {
+        let mut stopped = Vec::new();
+        for c in 0..self.on_cpu.len() {
+            match self.on_cpu[c] {
+                Some(t) if c != self.cpu && which(&self.threads[t]) => {
+                    self.on_cpu[c] = None;
+                    self.machine.preempt(c);
+                    stopped.push(c);
+                },
+                _ => {},
+            }
+        }
+        for c in stopped {
+            while self.machine.in_guest(c) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// What CPU `cpu` (`self.cpu`) runs next: the next thread that can run (one no other CPU
+    /// has), on the CPU with its address space, and where its slice starts (`cpu.insn_count`);
+    /// or, when there is none, what the host is told.
+    pub(crate) fn schedule<H: Host>(
+        &mut self,
+        cpu: &mut Cpu<H>,
+        until: Instant,
+    ) -> Result<u64, Status> {
+        loop {
             self.charge_cpu();
             if let Some(c) = self.exit_code {
                 self.net_exit();
-                return Status::Exited(c);
+                return Err(Status::Exited(c));
             }
             if let Some(f) = &self.fault {
-                return Status::Fault(f.clone());
+                return Err(Status::Fault(f.clone()));
             }
             if Instant::now() >= until {
-                return Status::Running;
+                return Err(Status::Running);
             }
             // Timers that are due signal (timer.rs)
             self.fire_timers();
@@ -919,30 +1006,29 @@ impl Process {
             self.wake();
             // The next runnable thread, round robin, starting with the current one
             let n = self.threads.len();
-            let cur = self.cur;
-            let Some(next) = (0..n)
-                .map(|i| (cur + i) % n)
-                .find(|&i| !self.threads[i].exited && self.threads[i].wait.is_none())
-            else {
+            let cur = self.cur % n.max(1);
+            let Some(next) = (0..n).map(|i| (cur + i) % n).find(|&i| {
+                !self.threads[i].exited && self.threads[i].wait.is_none() && !self.on_other_cpu(i)
+            }) else {
                 if self.threads.is_empty() {
                     // Only the first process ends the machine (`end_process`), so this is a
                     // state that can't be
                     self.exit_code = Some(0);
                     continue;
                 }
-                return Status::Idle(
+                return Err(Status::Idle(
                     self.threads
                         .iter()
                         .filter_map(|t| t.wait.as_ref().and_then(|(_, d)| *d))
                         .chain(self.timer_wake())
                         .chain(self.next_timerfd())
                         .min(),
-                );
+                ));
             };
-            if self.loaded != Some(next) {
+            if self.on_cpu[self.cpu] != Some(next) {
                 self.park(cpu);
                 self.threads[next].ctx.load(cpu);
-                self.loaded = Some(next);
+                self.on_cpu[self.cpu] = Some(next);
                 self.stats.switches += 1;
             }
             self.cur = next;
@@ -951,116 +1037,121 @@ impl Process {
             self.switch_to(pid);
             self.sync_mmu(cpu);
             self.begin_slice(pid, self.threads[next].tid);
+            return Ok(cpu.insn_count);
+        }
+    }
 
-            // Run it until it blocks, faults, or its slice ends: syscalls answered on the way
-            // count against the slice, so a thread that polls the clock cannot keep the CPU.
-            let slice_start = cpu.insn_count;
-            loop {
-                let used = cpu.insn_count - slice_start;
-                if used >= SLICE {
-                    self.cur = (self.cur + 1) % self.threads.len();
-                    continue 'run;
+    /// The CPU's thread stopped (`exit`): its system call is answered, its fault handled. Whether
+    /// it runs on (true), or the CPU looks for the next thread (false).
+    pub(crate) fn answer<H: Host>(&mut self, cpu: &mut Cpu<H>, exit: Exit, until: Instant) -> bool {
+        // (None: another CPU took it off this one, its process having ended)
+        let Some(cur) = self.on_cpu[self.cpu] else {
+            return false;
+        };
+        self.cur = cur;
+        // Its process (another CPU may have answered another's since)
+        let pid = self.threads[cur].pid;
+        if self.p.pid != pid {
+            self.switch_to(pid);
+            self.sync_mmu(cpu);
+        }
+        match exit {
+            Exit::Budget | Exit::Idle { .. } => {
+                self.end_slice();
+                false
+            },
+            Exit::Stop(StopReason::UnhandledException { esr, elr, far }) => {
+                if esr >> 26 != 0x15 {
+                    // A lazy page (filled: on), or a fault
+                    return self.abort(cpu, esr, elr, far);
                 }
-                match cpu.run(SLICE - used) {
-                    Exit::Budget | Exit::Idle { .. } => {
-                        self.cur = (self.cur + 1) % self.threads.len();
-                        continue 'run;
+                cpu.pc = elr;
+                self.resume_deadline = self.threads[cur].resume_deadline.take();
+                let (nr, a0, a1, a2) = (cpu.x[8], cpu.x[0], cpu.x[1], cpu.x[2]);
+                let ret = self.syscall_lazily(cpu, cur);
+                self.flush_net();
+                if self.trace {
+                    let r = match &ret {
+                        Ret::Val(r) => format!("{r:#x}"),
+                        Ret::Block(w, d) => format!(
+                            "block {w:?} {:?}",
+                            d.map(|d| d.saturating_duration_since(Instant::now()))
+                        ),
+                        Ret::Retry { deadline, .. } => format!(
+                            "wait {:?}",
+                            deadline.map(|d| d.saturating_duration_since(Instant::now()))
+                        ),
+                        Ret::Need(b) => format!("needs {} blob(s)", b.len()),
+                        Ret::Yield => "yield".into(),
+                        Ret::ThreadExit(c) => format!("thread exit {c}"),
+                        Ret::GroupExit(c) => format!("exit {c}"),
+                    };
+                    eprintln!(
+                        "[{}] sys {nr}({a0:#x}, {a1:#x}, {a2:#x}) = {r}",
+                        self.threads.get(cur).map_or(0, |t| t.tid)
+                    );
+                }
+                let next = (cur + 1) % self.threads.len().max(1);
+                match ret {
+                    Ret::Val(r) => {
+                        cpu.x[0] = r as u64;
+                        // (Its thread may be gone: its process ended)
+                        let on = Instant::now() < until
+                            && self.on_cpu[self.cpu] == Some(cur)
+                            && self.exit_code.is_none()
+                            && self.fault.is_none()
+                            && !self.signal_ready();
+                        if on && self.p.pid != self.threads[cur].pid {
+                            // (A call that went to another process's state, as kill's end of one)
+                            self.switch_to(self.threads[cur].pid);
+                            self.sync_mmu(cpu);
+                        }
+                        on
                     },
-                    Exit::Stop(StopReason::UnhandledException { esr, elr, far }) => {
-                        if esr >> 26 != 0x15 {
-                            // A lazy page (filled: on), or a fault
-                            if self.abort(cpu, esr, elr, far) {
-                                continue;
-                            }
-                            continue 'run;
-                        }
-                        cpu.pc = elr;
-                        let cur = self.cur;
-                        self.resume_deadline = self.threads[cur].resume_deadline.take();
-                        let (nr, a0, a1, a2) = (cpu.x[8], cpu.x[0], cpu.x[1], cpu.x[2]);
-                        let ret = self.syscall_lazily(cpu, cur);
-                        self.flush_net();
-                        if self.trace {
-                            let r = match &ret {
-                                Ret::Val(r) => format!("{r:#x}"),
-                                Ret::Block(w, d) => format!(
-                                    "block {w:?} {:?}",
-                                    d.map(|d| d.saturating_duration_since(Instant::now()))
-                                ),
-                                Ret::Retry { deadline, .. } => format!(
-                                    "wait {:?}",
-                                    deadline.map(|d| d.saturating_duration_since(Instant::now()))
-                                ),
-                                Ret::Need(b) => format!("needs {} blob(s)", b.len()),
-                                Ret::Yield => "yield".into(),
-                                Ret::ThreadExit(c) => format!("thread exit {c}"),
-                                Ret::GroupExit(c) => format!("exit {c}"),
-                            };
-                            eprintln!(
-                                "[{}] sys {nr}({a0:#x}, {a1:#x}, {a2:#x}) = {r}",
-                                self.threads.get(cur).map_or(0, |t| t.tid)
-                            );
-                        }
-                        match ret {
-                            Ret::Val(r) => {
-                                cpu.x[0] = r as u64;
-                                // (Its thread may be gone: its process ended)
-                                if Instant::now() >= until
-                                    || self.loaded != Some(cur)
-                                    || self.exit_code.is_some()
-                                    || self.fault.is_some()
-                                    || self.signal_ready()
-                                {
-                                    continue 'run;
-                                }
-                            },
-                            Ret::Yield => {
-                                cpu.x[0] = 0;
-                                self.cur = (cur + 1) % self.threads.len();
-                                continue 'run;
-                            },
-                            Ret::Block(w, d) => {
-                                self.park(cpu);
-                                self.threads[cur].wait = Some((w, d));
-                                self.cur = (cur + 1) % self.threads.len();
-                                continue 'run;
-                            },
-                            Ret::Retry {
-                                deadline,
-                                on_timeout,
-                            } => {
-                                cpu.pc = elr - 4;
-                                self.park(cpu);
-                                self.threads[cur].wait =
-                                    Some((Wait::Retry { on_timeout }, deadline));
-                                self.cur = (cur + 1) % self.threads.len();
-                                continue 'run;
-                            },
-                            Ret::Need(blobs) => {
-                                self.want_blobs(&blobs);
-                                cpu.pc = elr - 4;
-                                self.park(cpu);
-                                self.threads[cur].wait = Some((Wait::Blobs(blobs), None));
-                                self.cur = (cur + 1) % self.threads.len();
-                                continue 'run;
-                            },
-                            Ret::ThreadExit(code) => {
-                                self.thread_exit(cur, code);
-                                continue 'run;
-                            },
-                            Ret::GroupExit(code) => {
-                                let pid = self.p.pid;
-                                self.end_process(pid, proc::End::Exit(code));
-                                continue 'run;
-                            },
-                        }
+                    Ret::Yield => {
+                        cpu.x[0] = 0;
+                        self.cur = next;
+                        false
                     },
-                    Exit::Stop(r) => {
-                        self.crash(format!("stopped: {r:?}"));
-                        continue 'run;
+                    Ret::Block(w, d) => {
+                        self.park(cpu);
+                        self.threads[cur].wait = Some((w, d));
+                        self.cur = next;
+                        false
+                    },
+                    Ret::Retry {
+                        deadline,
+                        on_timeout,
+                    } => {
+                        cpu.pc = elr - 4;
+                        self.park(cpu);
+                        self.threads[cur].wait = Some((Wait::Retry { on_timeout }, deadline));
+                        self.cur = next;
+                        false
+                    },
+                    Ret::Need(blobs) => {
+                        self.want_blobs(&blobs);
+                        cpu.pc = elr - 4;
+                        self.park(cpu);
+                        self.threads[cur].wait = Some((Wait::Blobs(blobs), None));
+                        self.cur = next;
+                        false
+                    },
+                    Ret::ThreadExit(code) => {
+                        self.thread_exit(cur, code);
+                        false
+                    },
+                    Ret::GroupExit(code) => {
+                        let pid = self.p.pid;
+                        self.end_process(pid, proc::End::Exit(code));
+                        false
                     },
                 }
-            }
+            },
+            Exit::Stop(r) => {
+                self.crash(format!("stopped: {r:?}"));
+                false
+            },
         }
     }
 
@@ -1170,7 +1261,7 @@ impl Process {
     /// Takes the registers of the thread on the CPU back into the process, so that every thread
     /// is in the process's state and none in the CPU's.
     pub fn park<H: Host>(&mut self, cpu: &Cpu<H>) {
-        if let Some(i) = self.loaded.take() {
+        if let Some(i) = self.on_cpu[self.cpu].take() {
             self.threads[i].ctx = Ctx::save(cpu);
         }
     }
@@ -1197,7 +1288,7 @@ impl Process {
         // The address spaces, one each whoever shares it (an ended process has none)
         let mut spaces: Vec<&mm::SharedMm> = Vec::new();
         for p in self.proc_list().filter(|p| p.zombie.is_none()) {
-            if !spaces.iter().any(|m| Rc::ptr_eq(m, &p.mm)) {
+            if !spaces.iter().any(|m| mm::SharedMm::ptr_eq(m, &p.mm)) {
                 spaces.push(&p.mm);
             }
         }
@@ -1218,7 +1309,7 @@ impl Process {
             w.u(p.zombie.unwrap_or(0) as u32 as u64);
             w.u(spaces
                 .iter()
-                .position(|m| Rc::ptr_eq(m, &p.mm))
+                .position(|m| mm::SharedMm::ptr_eq(m, &p.mm))
                 .map_or(u64::MAX, |i| i as u64));
             Files::save_fds(
                 if p.pid == self.p.pid { &self.files.fds } else { &p.fds },
@@ -1299,6 +1390,7 @@ impl Process {
         self.files.net.save_rights(&mut w);
         self.files.net.save_cm(&mut w);
         self.timers.save(&mut w, now);
+        self.files.locks.save(&mut w);
         w.0
     }
 
@@ -1346,7 +1438,7 @@ impl Process {
         let tty = Tty::load(&mut r)?;
         let mut spaces = Vec::new();
         for _ in 0..r.u()? {
-            spaces.push(Rc::new(RefCell::new(mm::Mm::load(&mut r, ram_size)?)));
+            spaces.push(mm::SharedMm::new(mm::Mm::load(&mut r, ram_size)?));
         }
         let mut all = BTreeMap::new();
         let mut timers = Timers::default();
@@ -1357,8 +1449,8 @@ impl Process {
             let (ended, status) = (r.u()? != 0, r.u()? as u32 as i32);
             let space = r.u()?;
             let mm = match (ended, spaces.get(space as usize)) {
-                (false, Some(m)) => Rc::clone(m),
-                (true, _) => Rc::new(RefCell::new(mm::Mm::husk())),
+                (false, Some(m)) => m.clone(),
+                (true, _) => mm::SharedMm::new(mm::Mm::husk()),
                 (false, None) => return Err("a process has no address space".into()),
             };
             let fds = Files::load_fds(&mut r)?;
@@ -1476,6 +1568,10 @@ impl Process {
         if ver >= 7 {
             timers.load(&mut r, now)?;
         }
+        // File locks from ARMLUSR8 (before, every lock was granted and none kept)
+        if ver >= 8 {
+            files.locks = locks::Locks::load(&mut r)?;
+        }
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);
@@ -1505,7 +1601,10 @@ impl Process {
             poked: true,
             epoch: 0,
             cur,
-            loaded: None,
+            cpu: 0,
+            on_cpu: vec![None; cpu.machine.ncpus],
+            cpu_cur: vec![0; cpu.machine.ncpus],
+            machine: cpu.machine.clone(),
             resume_deadline: None,
             trace: false,
             stats: Stats::default(),
@@ -1562,5 +1661,10 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
 /// timers but ITIMER_REAL, with the CPU time they count (timer.rs, at the end); ARMLUSR6
 /// (0.15) has none of that; ARMLUSR5 (0.14) has neither the ids, timers, shared memory, shared
 /// file pages nor descriptors in flight of 0.15. Each still loads.
-const MAGIC: &[u8; 8] = b"ARMLUSR7";
-const MAGICS: [&[u8; 8]; 3] = [b"ARMLUSR5", b"ARMLUSR6", MAGIC];
+const MAGIC: &[u8; 8] = b"ARMLUSR8";
+const MAGICS: [&[u8; 8]; 4] = [b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", MAGIC];
+
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<Process>();
+};

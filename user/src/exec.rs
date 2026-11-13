@@ -10,9 +10,6 @@
 //! an ELF is an error the caller gets back, and one whose pages haven't arrived makes the call
 //! wait for them and run again.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use armless::cpu::Cpu;
 use armless::dev::fs::{S_IFMT, S_IFREG};
 use armless::Host;
@@ -206,7 +203,7 @@ impl Process {
             Ok(s) => s,
             Err(_) => return v(-ENOMEM),
         };
-        let old = std::mem::replace(&mut self.p.mm, Rc::new(RefCell::new(space)));
+        let old = std::mem::replace(&mut self.p.mm, crate::mm::SharedMm::new(space));
         let (entry, sp) = match self.load_image(&image, &layout, &args, &env, &exe) {
             Ok(r) => r,
             Err(e) => {
@@ -219,9 +216,13 @@ impl Process {
             },
         };
 
-        // From here it is the new program. The old address space goes with its last user (a vfork
+        // From here it is the new program. Its other threads stop (those on other CPUs before the
+        // old address space goes), and the old address space goes with its last user (a vfork
         // parent still has it).
-        if Rc::strong_count(&old) == 1 {
+        let me = self.threads[cur].tid;
+        let pid = self.p.pid;
+        self.take_off_cpus(|t| t.pid == pid && t.tid != me);
+        if crate::mm::SharedMm::strong_count(&old) == 1 {
             let refs = {
                 let mut m = old.borrow_mut();
                 m.destroy(&mut self.frames.borrow_mut());
@@ -231,7 +232,6 @@ impl Process {
             self.trim_file_pages();
         }
         drop(old);
-        let pid = self.p.pid;
         // musl's loader finds $ORIGIN from /proc/self/exe, as for /usr/bin/java ->
         // ../lib/jvm/.../bin/java, whose libjli.so is beside the real one
         self.p.exe = real.unwrap_or(exe);
