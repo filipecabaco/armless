@@ -172,27 +172,78 @@ mod sys {
 
 const MALLOC_ALIGN: usize = 16;
 
-/// malloc for the C decoder: a 16-byte-aligned block, its size in a header before it. Null if it
+/// What `malloc` records in the header before a block: its size, and how it was allocated.
+const KIND_HEAP: usize = 0;
+#[cfg(unix)]
+const KIND_MMAP: usize = 1;
+
+/// From this size a block is its own anonymous mapping, which `free` unmaps: the pages go back to
+/// the system (glibc's `free` keeps what a decoder window touched resident).
+#[cfg(unix)]
+const MMAP_FROM: usize = 128 << 10;
+
+/// The size of the mapping of a block of `size` bytes (header included, whole pages).
+#[cfg(unix)]
+fn mapping_len(size: usize) -> Option<usize> {
+    // SAFETY: sysconf takes no pointers.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    size.checked_add(MALLOC_ALIGN)?
+        .checked_next_multiple_of(page)
+}
+
+/// malloc for the C decoder: a 16-byte-aligned block, a header before it with its size and how it
+/// was allocated (`std::alloc`, or on unix an anonymous mapping from `MMAP_FROM` bytes). Null if it
 /// could not allocate (zstd checks).
 ///
 /// # Safety
 /// The result is for `free` only.
 unsafe fn malloc(size: usize) -> *mut u8 {
-    let Some(total) = size.checked_add(MALLOC_ALIGN) else {
-        return std::ptr::null_mut();
-    };
-    let Ok(layout) = alloc::Layout::from_size_align(total, MALLOC_ALIGN) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: the layout is never zero-sized (MALLOC_ALIGN bytes of header at least).
-    let base = unsafe { alloc::alloc(layout) };
-    if base.is_null() {
-        return base;
+    #[cfg(unix)]
+    let mut kind = KIND_HEAP;
+    #[allow(unused_mut)]
+    let mut base: *mut u8 = std::ptr::null_mut();
+    #[cfg(unix)]
+    if size >= MMAP_FROM {
+        let Some(len) = mapping_len(size) else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: a new private anonymous mapping, at an address the system chooses.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return std::ptr::null_mut();
+        }
+        kind = KIND_MMAP;
+        base = addr as *mut u8; // (page-aligned)
     }
-    // SAFETY: the header, at the start of what was just allocated, aligned for a usize; the block
-    // the caller gets starts MALLOC_ALIGN bytes in, inside the allocation.
+    #[cfg(not(unix))]
+    let kind = KIND_HEAP;
+    if base.is_null() {
+        let Some(total) = size.checked_add(MALLOC_ALIGN) else {
+            return std::ptr::null_mut();
+        };
+        let Ok(layout) = alloc::Layout::from_size_align(total, MALLOC_ALIGN) else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: the layout is never zero-sized (MALLOC_ALIGN bytes of header at least).
+        base = unsafe { alloc::alloc(layout) };
+        if base.is_null() {
+            return base;
+        }
+    }
+    // SAFETY: the header (two usizes), at the start of what was just allocated, aligned for a
+    // usize; the block the caller gets starts MALLOC_ALIGN bytes in, inside the allocation.
     unsafe {
         (base as *mut usize).write(size);
+        (base as *mut usize).add(1).write(kind);
         base.add(MALLOC_ALIGN)
     }
 }
@@ -204,10 +255,19 @@ unsafe fn free(ptr: *mut u8) {
         return;
     }
     // SAFETY: `ptr` came from `malloc` (the caller's promise), so its header is before it.
-    let (base, size) = unsafe {
+    let (base, size, kind) = unsafe {
         let base = ptr.sub(MALLOC_ALIGN);
-        (base, (base as *const usize).read())
+        let header = base as *const usize;
+        (base, header.read(), header.add(1).read())
     };
+    #[cfg(unix)]
+    if kind == KIND_MMAP {
+        let len = mapping_len(size).expect("the mapping malloc made");
+        // SAFETY: the mapping `malloc` made at `base`, with this length, unmapped once.
+        unsafe { libc::munmap(base as *mut libc::c_void, len) };
+        return;
+    }
+    debug_assert_eq!(kind, KIND_HEAP);
     let layout = alloc::Layout::from_size_align(size + MALLOC_ALIGN, MALLOC_ALIGN)
         .expect("the layout malloc made");
     // SAFETY: allocated by `malloc` with this layout.
@@ -477,6 +537,35 @@ mod tests {
         let (input, want) = frames();
         assert_eq!(decompress(&input).unwrap(), want);
         assert_eq!(decompress(&[]).unwrap(), b"");
+    }
+
+    #[test]
+    fn malloc_serves_small_and_large_blocks() {
+        for size in [
+            0,
+            1,
+            100,
+            (128 << 10) - 1,
+            128 << 10,
+            8 << 20,
+            (8 << 20) + 1,
+        ] {
+            // SAFETY: blocks from `malloc`, written within their size, freed once.
+            unsafe {
+                let p = malloc(size);
+                assert!(
+                    !p.is_null() && (p as usize).is_multiple_of(MALLOC_ALIGN),
+                    "size {size}"
+                );
+                std::ptr::write_bytes(p, 0xa5, size);
+                assert!(std::slice::from_raw_parts(p, size)
+                    .iter()
+                    .all(|&b| b == 0xa5));
+                free(p);
+            }
+        }
+        // SAFETY: null is allowed.
+        unsafe { free(std::ptr::null_mut()) };
     }
 
     #[test]
