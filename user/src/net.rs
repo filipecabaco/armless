@@ -12,7 +12,8 @@
 //! to port 53 is answered by the network's name service. Without a network (a machine built with
 //! `net: false`) only the processes' own sockets exist.
 //!
-//! Not here: SCM_RIGHTS and other ancillary data (EOPNOTSUPP), UDP to the outside (but DNS),
+//! Descriptors pass between unix streams with SCM_RIGHTS. Not here: other ancillary data (taken
+//! and ignored), descriptors over datagrams (EOPNOTSUPP), UDP to the outside (but DNS),
 //! IPv6 to the outside, raw and packet sockets, SOCK_SEQPACKET, MSG_OOB, and a stream's
 //! backpressure towards the host (what a process writes waits in the network's outbox).
 
@@ -100,6 +101,11 @@ pub(crate) struct Sock {
     host: Option<u32>,
     /// Stream bytes not read yet
     rx: VecDeque<u8>,
+    /// Where `rx` begins in the stream, for `rights` (not saved: a restored socket counts from 0)
+    rx_base: u64,
+    /// Descriptions passed with SCM_RIGHTS, by where in the stream the bytes sent with them begin.
+    /// They hold a reference each until they are received.
+    rights: VecDeque<(u64, Vec<u32>)>,
     /// Datagrams not read yet: (from, data)
     msgs: VecDeque<(Vec<u8>, Vec<u8>)>,
     /// Connections made and not accepted yet, and how many may wait
@@ -146,6 +152,8 @@ pub(crate) enum Op {
     Unlisten(u16),
     /// A reference of an inode a socket was bound to
     FsDrop(u64),
+    /// A description passed over a socket that closed before anyone received it
+    Release(u32),
 }
 
 /// Every socket, and the names they are bound to.
@@ -161,6 +169,9 @@ pub(crate) struct Net {
     pub ops: Vec<Op>,
     /// What `Board::local_gen` was when the process last looked (not saved)
     pub seen_gen: u64,
+    /// The descriptions the last receive took with its bytes, for recvmsg to install (released
+    /// by the next receive if a plain read took them: not saved)
+    pub taken: Vec<u32>,
 }
 
 fn port_key(proto: u8, port: u16) -> Vec<u8> {
@@ -355,6 +366,9 @@ impl Net {
         if let Some(ino) = s.ino {
             self.ops.push(Op::FsDrop(ino));
         }
+        for (_, ds) in &s.rights {
+            self.ops.extend(ds.iter().map(|&d| Op::Release(d)));
+        }
         if let Some(h) = s.host {
             self.ops.push(Op::Drop(h));
         }
@@ -426,6 +440,35 @@ impl Net {
             w.b(k);
             w.u(id as u64);
         }
+    }
+
+    /// The descriptions on their way over sockets (SCM_RIGHTS): socket, how far into its unread
+    /// bytes, and the descriptions. (Since ARMLUSR6; `rx_base` starts again at 0.)
+    pub fn save_rights(&self, w: &mut W) {
+        let all: Vec<(u32, u64, &Vec<u32>)> = self
+            .socks
+            .iter()
+            .flat_map(|(&id, s)| s.rights.iter().map(move |(at, ds)| (id, at - s.rx_base, ds)))
+            .collect();
+        w.u(all.len() as u64);
+        for (id, at, ds) in all {
+            w.u(id as u64);
+            w.u(at);
+            w.u(ds.len() as u64);
+            for &d in ds {
+                w.u(d as u64);
+            }
+        }
+    }
+
+    pub fn load_rights(&mut self, r: &mut R) -> Result<(), String> {
+        for _ in 0..r.u()? {
+            let (id, at) = (r.u()? as u32, r.u()?);
+            let ds = (0..r.u()?).map(|_| r.u().map(|d| d as u32)).collect::<Result<Vec<_>, _>>()?;
+            let s = self.socks.get_mut(&id).ok_or("descriptors passed over a socket that isn't there")?;
+            s.rights.push_back((at, ds));
+        }
+        Ok(())
     }
 
     /// The sockets from `save`. A stream that was at the host is not any more: the host that
@@ -520,6 +563,7 @@ impl Process {
                 Op::FsDrop(ino) => {
                     self.fs(|fs| fs.drop_ref(ino));
                 },
+                Op::Release(d) => self.release_desc(d),
             }
         }
     }
@@ -714,6 +758,10 @@ impl Process {
     ) -> Result<Recvd, Ret> {
         let nonblock = self.nonblock(fd) || flags & MSG_DONTWAIT != 0;
         self.sock_refresh(id);
+        // Descriptions a plain read took (Linux closes them): released now
+        for d in std::mem::take(&mut self.files.net.taken) {
+            self.release_desc(d);
+        }
         let peek = flags & MSG_PEEK != 0;
         let board = self.board.clone();
         let Some(s) = self.files.net.socks.get_mut(&id) else {
@@ -769,16 +817,37 @@ impl Process {
                         Err(self.would_block(id, nonblock, 20))
                     };
                 }
-                let n = s.rx.len().min(max);
+                let start = s.rx_base;
+                let mut n = s.rx.len().min(max);
+                // A read stops before the bytes the next descriptors came with, so that those
+                // come with the read that begins with them (as Linux's)
+                if let Some(&(at, _)) = s.rights.iter().find(|r| r.0 > start) {
+                    n = n.min((at - start) as usize);
+                }
                 if peek {
                     s.rx.iter().take(n).copied().collect()
                 } else {
+                    s.rx_base += n as u64;
+                    let mut took = Vec::new();
+                    while s.rights.front().is_some_and(|r| r.0 < start + n as u64) {
+                        took.extend(s.rights.pop_front().unwrap().1);
+                    }
+                    self.files.net.taken = took;
+                    let s = self.files.net.socks.get_mut(&id).unwrap();
                     s.rx.drain(..n).collect()
                 }
             },
         };
         self.poke();
         Ok((data, Vec::new(), false))
+    }
+
+    /// One reference fewer to description `d`, as close gives one up
+    pub(crate) fn release_desc(&mut self, d: u32) {
+        if let Some(Some(ino)) = self.files.release(d) {
+            self.fs(|fs| fs.drop_ref(ino));
+        }
+        self.poke();
     }
 
     /// Sends `data` on socket `id` (to `dest` for a datagram socket with no address of its own):
@@ -790,6 +859,7 @@ impl Process {
         data: &[u8],
         flags: u64,
         dest: Option<Vec<u8>>,
+        rights: &[u32],
     ) -> Result<usize, Ret> {
         let nonblock = self.nonblock(fd) || flags & MSG_DONTWAIT != 0;
         self.sock_refresh(id);
@@ -797,6 +867,10 @@ impl Process {
         let Some(s) = self.files.net.socks.get_mut(&id) else {
             return Err(e(9));
         };
+        // Descriptors go only between streams in memory (a unix socket pair or connection)
+        if !rights.is_empty() && (s.ty == SOCK_DGRAM || s.host.is_some() || s.inet()) {
+            return Err(e(EOPNOTSUPP));
+        }
         if s.ty == SOCK_DGRAM {
             let (peer, default) = (s.peer, s.peer_name.clone());
             return self.dgram_send(id, nonblock, data, peer, dest.unwrap_or(default));
@@ -838,7 +912,15 @@ impl Process {
             return Err(self.would_block(id, nonblock, 21));
         }
         let n = room.min(data.len());
+        if !rights.is_empty() {
+            // With the first of these bytes; each holds its description until received
+            let at = p.rx_base + p.rx.len() as u64;
+            p.rights.push_back((at, rights.to_vec()));
+        }
         p.rx.extend(&data[..n]);
+        for &d in rights {
+            self.files.hold(d);
+        }
         self.poke();
         Ok(n)
     }
@@ -1093,9 +1175,10 @@ impl Process {
     fn unix_create(&mut self, path: &[u8]) -> Result<(Vec<u8>, Option<u64>), Ret> {
         let (now, mode) = (self.now_secs(), files::S_IFSOCK | (0o777 & !self.p.umask));
         let cwd = self.p.cwd;
+        let (uid, gid) = (self.p.creds.euid(), self.p.creds.egid());
         match self.fs(|fs| {
             let (dir, name) = files::resolve_parent(fs, cwd, path).map_err(Got::Err)?;
-            let ino = match files::got(fs.create(dir, &name, mode, 0, 0, now)) {
+            let ino = match files::got(fs.create(dir, &name, mode, uid, gid, now)) {
                 Got::Ok(i) => i,
                 Got::Err(n) if n == -files::EEXIST => return Err(Got::Err(-EADDRINUSE)),
                 Got::Err(n) => return Err(Got::Err(n)),
@@ -1289,7 +1372,12 @@ impl Process {
         let (domain, lname) = (l.domain, concrete(&l.name));
         let net = &mut self.files.net;
         net.autobind(id);
-        let cname = net.socks[&id].name.clone();
+        let mut cname = net.socks[&id].name.clone();
+        if cname.is_empty() && domain as u16 == AF_UNIX {
+            // An unbound unix client's address is its family alone, as accept and getpeername
+            // say it (Postgres matches a connection to pg_hba.conf's "local" lines by it)
+            cname = vec![AF_UNIX as u8, 0];
+        }
         let child = net.add(domain, SOCK_STREAM);
         let c = net.socks.get_mut(&child).unwrap();
         (c.connected, c.peer, c.name, c.peer_name) = (true, Some(id), lname.clone(), cname);
@@ -1378,7 +1466,7 @@ impl Process {
         } else {
             None
         };
-        match self.sock_send(fd, id, &data, a[3], dest) {
+        match self.sock_send(fd, id, &data, a[3], dest, &[]) {
             Ok(n) => Ret::Val(n as i64),
             Err(r) => r,
         }
@@ -1416,7 +1504,10 @@ impl Process {
         ) else {
             return Err(e(EFAULT));
         };
-        // struct cmsghdr: len, level, type: SCM_RIGHTS (1, 1) is not carried
+        // struct cmsghdr: len, level, type, then its data. SCM_RIGHTS (1, 1) passes descriptors:
+        // their descriptions go with the bytes (Erlang hands its port programs' pipes to
+        // erl_child_setup this way); other kinds (credentials) are taken and say nothing.
+        let mut rights = Vec::new();
         let mut off = 0;
         while off + 16 <= ctllen {
             let (Some(l), Some(level), Some(ty)) = (
@@ -1426,13 +1517,16 @@ impl Process {
             ) else {
                 return Err(e(EFAULT));
             };
+            if l < 16 || off + l > ctllen {
+                return Err(e(EINVAL));
+            }
             if level == 1 && ty == 1 {
-                return Err(e(EOPNOTSUPP));
+                for i in 0..(l - 16) / 4 {
+                    let f = self.u32_at(ctl + off + 16 + 4 * i).ok_or(e(EFAULT))? as i32;
+                    rights.push(self.files.desc_of(f).ok_or(e(9))?); // EBADF
+                }
             }
             off += (l + 7) & !7;
-            if l < 16 {
-                break;
-            }
         }
         let iov = self.iovecs(iov, n).ok_or(e(EFAULT))?;
         let mut data = Vec::new();
@@ -1444,14 +1538,18 @@ impl Process {
         } else {
             None
         };
-        self.sock_send(fd, id, &data, flags, dest)
+        self.sock_send(fd, id, &data, flags, dest, &rights)
     }
 
     fn recvmsg_one(&mut self, fd: i32, at: u64, flags: u64) -> Result<usize, Ret> {
         let id = self.sock_id(fd)?;
-        let (Some(name), Some(iov), Some(n)) =
-            (self.u64_at(at), self.u64_at(at + 16), self.u64_at(at + 24))
-        else {
+        let (Some(name), Some(iov), Some(n), Some(ctl), Some(ctllen)) = (
+            self.u64_at(at),
+            self.u64_at(at + 16),
+            self.u64_at(at + 24),
+            self.u64_at(at + 32),
+            self.u64_at(at + 40),
+        ) else {
             return Err(e(EFAULT));
         };
         let iov = self.iovecs(iov, n).ok_or(e(EFAULT))?;
@@ -1470,8 +1568,45 @@ impl Process {
             self.write(name, &from[..from.len().min(cap)]);
             self.put_u32(at + 8, from.len() as u32);
         }
-        self.put_u64(at + 40, 0);
-        self.put_u32(at + 48, if trunc { MSG_TRUNC as u32 } else { 0 });
+        // The descriptors that came with these bytes: new ones in this process, in an SCM_RIGHTS
+        // message, as many as its room holds (the rest closed, and MSG_CTRUNC said)
+        const MSG_CTRUNC: u32 = 8;
+        const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+        let taken = std::mem::take(&mut self.files.net.taken);
+        let fit = if ctl == 0 { 0 } else { (ctllen.saturating_sub(16) / 4) as usize };
+        let mut fds = Vec::new();
+        for (i, &d) in taken.iter().enumerate() {
+            if i < fit {
+                fds.push(self.files.install(d, 0, flags & MSG_CMSG_CLOEXEC != 0));
+            }
+            // The reference it had on its way
+            self.release_desc(d);
+        }
+        let mut ctrunc = fds.len() < taken.len();
+        let used = if fds.is_empty() {
+            0
+        } else {
+            let mut m = (16 + 4 * fds.len() as u64).to_le_bytes().to_vec();
+            m.extend_from_slice(&1u32.to_le_bytes()); // SOL_SOCKET
+            m.extend_from_slice(&1u32.to_le_bytes()); // SCM_RIGHTS
+            for f in &fds {
+                m.extend_from_slice(&f.to_le_bytes());
+            }
+            if !self.write(ctl, &m) {
+                return Err(e(EFAULT));
+            }
+            // CMSG_SPACE: the message padded to 8, as much as there is room for
+            ((m.len() as u64 + 7) & !7).min(ctllen)
+        };
+        if ctl != 0 && taken.is_empty() && ctllen > 0 {
+            ctrunc = false;
+        }
+        self.put_u64(at + 40, used);
+        let mut mflags = if trunc { MSG_TRUNC as u32 } else { 0 };
+        if ctrunc {
+            mflags |= MSG_CTRUNC;
+        }
+        self.put_u32(at + 48, mflags);
         Ok(data.len())
     }
 

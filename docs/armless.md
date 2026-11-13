@@ -299,9 +299,15 @@ x0–x5, answers it in x0, and resumes at ELR.
   - *Snapshots:* the sockets' state is in the machine's, streams and queues with their bytes,
     whatever process holds them. A connection to the host can't survive a restore:
     it reads as closed, and one that was connecting as reset.
-  - *Not supported:* `SCM_RIGHTS` and other ancillary data (`EOPNOTSUPP`), `SOCK_SEQPACKET`,
-    raw and packet sockets, `socketpair` for anything but AF_UNIX, a separate `RDHUP`, backpressure
-    from the guest to the host (a host stream's data is taken as it comes).
+  - *Descriptors* pass between unix streams with `SCM_RIGHTS` (Erlang hands its port programs'
+    pipes to `erl_child_setup` so): the descriptions go with the bytes sent with them, holding a
+    reference until received, and `recvmsg` installs them (MSG_CMSG_CLOEXEC, MSG_CTRUNC when its
+    room is short). A read stops before the bytes the next descriptors came with, as Linux's.
+    An unbound unix client is accepted as its family alone (Postgres's "local" lines match so).
+  - *Not supported:* descriptors over datagrams and to the host (`EOPNOTSUPP`), other ancillary
+    data (taken, ignored), `SOCK_SEQPACKET`, raw and packet sockets, `socketpair` for anything
+    but AF_UNIX, a separate `RDHUP`, backpressure from the guest to the host (a host stream's
+    data is taken as it comes).
 - **Memory** (user/src/mm.rs): virtual. Each process has page tables of its own (4 KiB pages,
   39 bits: 512 GiB of address space, an ASID per process so a switch flushes nothing) over one
   pool of refcounted frames, the machine's RAM; the tables are in frames too, which no process
@@ -326,14 +332,19 @@ x0–x5, answers it in x0, and resumes at ELR.
   and only their blobs are fetched. The fault the touch is stops the CPU; the host fills the page
   from its file (or the thread waits for its blobs, as a read does, and touches it again), maps
   it and resumes. A system call that reads or writes a lazy page (a `write` from a mapped page)
-  fills it first. File mappings are private copies: a write gets the page a frame of its own and
-  the file keeps its contents. The areas' bookkeeping is in the process state.
+  fills it first. A MAP_PRIVATE mapping is a copy: a write gets the page a frame of its own and
+  the file keeps its contents. A MAP_SHARED one is the file's: every mapping of a page of it, in
+  any process, has the one frame (`Process::file_pages`, Postgres's dynamic shared memory), and
+  the page is written back to its file once no mapping holds it. The areas' bookkeeping is in
+  the process state.
   `ARMLESS_USER_EAGER=1` reads every mapped page at once, for comparisons.
 - **Threads:** every guest thread is a saved register context, and they take turns on one
   CPU in slices of instructions; a syscall answered on the way counts against the slice.
   `clone` (threads, CLONE_THREAD), futexes (wait and wake, with timeouts and bitsets; requeue and
   wake-op, which musl's condition variables use), `set_tid_address` and
-  `CLONE_CHILD_CLEARTID`.
+  `CLONE_CHILD_CLEARTID`. A futex is its process's address, unless it is in a shared area and
+  the call has no FUTEX_PRIVATE_FLAG: then it is its frame's, and waits and wakes meet across
+  processes (Postgres's semaphores are in its shared memory).
 - **Processes** (user/src/proc.rs, exec.rs): a process is an address space, a descriptor table,
   a working directory, signal actions and its threads; the descriptions the descriptors refer
   to, the pipes, the terminal and the clock are the machine's, shared by all, so a pipe joins a
@@ -350,10 +361,31 @@ x0–x5, answers it in x0, and resumes at ELR.
   ends (a parent that ignores it leaves no zombies). A process's `exit_group` ends only it; its
   children go to the first process, and the machine ends when that one does. Not yet: the
   descriptor table, signal actions and working directory shared by CLONE_FILES, CLONE_SIGHAND
-  and CLONE_FS (copied instead), futexes across processes (those of a MAP_SHARED page, or of
-  CLONE_VM processes, wake only within a process), the siginfo of SIGCHLD (its pid and status),
-  job control (stop and continue), CLONE_PIDFD, namespaces, and a MAP_SHARED area that was
-  PROT_NONE at a fork shares nothing (the others have their untouched pages made at the fork).
+  and CLONE_FS (copied instead), futexes in the private memory of CLONE_VM processes (they wake
+  only within a process), the siginfo of SIGCHLD (its pid and status), job control (stop and
+  continue), CLONE_PIDFD, namespaces, and an anonymous MAP_SHARED area that was PROT_NONE at a
+  fork shares nothing (the others have their untouched pages made at the fork).
+- **Users** (user/src/creds.rs): a process has real, effective and saved user and group ids,
+  root to start with. `setuid`, `setgid`, `setreuid`, `setregid`, `setresuid` and `setresgid`
+  change them as Linux does (root to anything, anyone else among its own), `getuid` and the
+  rest say them, a child has its parent's and `execve` keeps them, and what a process makes
+  (files, directories, links, sockets' names) is owned by its effective ids. `chown` and
+  `fchownat` set a file's owner (root to anyone, its owner to one of its groups); `setgroups`
+  is root's. So `su` and Postgres's `pg_ctl` (which refuses to run as root) work. Permissions
+  are not checked by them.
+- **System V shared memory** (user/src/shm.rs): `shmget`, `shmat`, `shmdt`, `shmctl` (IPC_STAT,
+  IPC_SET, IPC_RMID). A segment is the machine's: it has frames of its own, each attach maps
+  them as a shared area, and a fork shares them; it goes once removed and detached.
+- **signalfd and timers:** `signalfd4` gives a descriptor whose reads take the pending signals
+  of its mask, which the program blocks (a `signalfd_siginfo` each), readable to poll and epoll.
+  `setitimer` and `getitimer` arm a process's ITIMER_REAL, which raises SIGALRM (once, or every
+  interval); the virtual and profiling timers are taken and never fire. `pidfd_open` gives a
+  descriptor of a process, readable once it has ended; `pidfd_send_signal` and
+  `waitid(P_PIDFD)` take one (the Supabase CLI watches its stack's owner so).
+- **/proc/self:** `exe` is the file that runs with its links followed (musl's loader finds
+  `$ORIGIN` from it: `/usr/bin/java` links into the JDK); `fd/N` says what each descriptor is open
+  on, as Linux does (a path, `pipe:[N]`, `socket:[N]`, `anon_inode:[...]`), for realpath in Zig,
+  Bun and Deno.
 - **Blocking:** a call that can't complete (a read of the terminal or a pipe, a poll, a wait
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
@@ -378,8 +410,11 @@ x0–x5, answers it in x0, and resumes at ELR.
   the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
   and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
   are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
-  A state from before 0.14 does not load (`ARMLUSR5`: addresses are virtual, there are
-  processes, and the sockets are in the machine's state).
+  The state is `ARMLUSR6`: 0.14's `ARMLUSR5` with each process's ids and interval timer, the
+  System V segments, the shared file pages, and the descriptors on their way over sockets.
+  An `ARMLUSR5` state loads (its processes are root, with nothing of the rest); a state from
+  before 0.14 does not (addresses are virtual, there are processes, and the sockets are in the
+  machine's state).
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,
@@ -423,9 +458,12 @@ Not yet: signals for faults (a fault ends the process, SIGSEGV is not delivered 
 handler), more than one vCPU, and the hypervisor backends (an SVC at EL0 traps to EL1 in
 hardware there, not to the host).
 
-What runs: snowglobe's `go` (Bubble Tea, static), `python` (the 3.14 REPL, 122 shared
-libraries) and `duckdb` (C++) examples, from their own images' filesystems; a Python REPL saved
-with its state and restored in 120 ms. `user/corpus/survey.exs` traces what each of snowglobe's
+What runs, from snowglobe's examples' own filesystems: `apk`, `curl` (HTTPS through the host),
+`duckdb` (C++), `go` (Bubble Tea, static), `java` (OpenJDK 21), `python` (the 3.14 REPL, 122
+shared libraries, subprocesses), `python-agent`, `rust` (a static binary), `typescript` (tsx on
+Node), `iex` (Erlang/OTP, with port programs), `postgres` (`su`, `pg_ctl`, the postmaster and its
+processes, queries through psql: 100,000 rows in 1.2 s) and `elixir` (a release talking to that
+Postgres); a Python REPL saved with its state and restored in 120 ms. `user/corpus/survey.exs` traces what each of snowglobe's
 examples asks of a kernel, for what comes next.
 
 Measured as a snowglobe site (a Go program with eight goroutines, macOS, the same

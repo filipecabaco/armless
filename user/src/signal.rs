@@ -991,6 +991,96 @@ fn pstate(c: &Ctx) -> u64 {
     (n as u64) << 31 | (z as u64) << 30 | (cf as u64) << 29 | (v as u64) << 28
 }
 
+// ---------------------------------------------------------------- signalfd
+
+/// struct signalfd_siginfo
+const SIGNALFD_SIGINFO: usize = 128;
+const SFD_NONBLOCK: u64 = 0o4000;
+const SFD_CLOEXEC: u64 = 0o2000000;
+
+impl Process {
+    /// signalfd4(fd, mask, sizemask, flags): a descriptor whose reads take the pending signals of
+    /// `mask`, which the program blocks (Postgres 18 waits for its signals this way, in epoll).
+    /// With an fd that is one already, its mask is changed.
+    pub(crate) fn sys_signalfd(&mut self, fd: i32, mask: u64, size: u64, flags: u64) -> Ret {
+        let v = Ret::Val;
+        const EINVAL: i64 = 22;
+        if size != 8 || flags & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
+            return v(-EINVAL);
+        }
+        let Some(mask) = self.u64_at(mask) else {
+            return v(-14); // EFAULT
+        };
+        let mask = mask & !UNBLOCKABLE;
+        if fd != -1 {
+            return match self.files.get_mut(fd).map(|d| &mut d.kind) {
+                Some(crate::files::Kind::Signal { mask: m }) => {
+                    *m = mask;
+                    self.poke();
+                    v(fd as i64)
+                },
+                Some(_) => v(-EINVAL),
+                None => v(-9), // EBADF
+            };
+        }
+        let d = self.files.add(
+            crate::files::Kind::Signal { mask },
+            2 | (flags & SFD_NONBLOCK) as u32,
+        );
+        v(self.files.install(d, 0, flags & SFD_CLOEXEC != 0) as i64)
+    }
+
+    /// Whether a signal of `mask` is pending for the current thread or its process
+    pub(crate) fn signal_pending(&self, mask: u64) -> bool {
+        let mine = self.threads.get(self.cur).map_or(0, |t| set(&t.sig.pending));
+        (mine | set(&self.p.sig.pending)) & mask != 0
+    }
+
+    /// A read of a signalfd of `mask`, `max` bytes at most: a signalfd_siginfo for each pending
+    /// signal of `mask` it takes (the thread's first, then its process's), or the wait.
+    pub(crate) fn read_signalfd(&mut self, mask: u64, max: usize, nonblock: bool) -> Result<Vec<u8>, Ret> {
+        if max < SIGNALFD_SIGINFO {
+            return Err(Ret::Val(-22)); // EINVAL
+        }
+        let mut out = Vec::new();
+        let cur = self.cur;
+        while out.len() + SIGNALFD_SIGINFO <= max {
+            let pick = |p: &BTreeMap<u32, i32>| p.iter().find(|(&s, _)| bit(s) & mask != 0).map(|(&s, &c)| (s, c));
+            let taken = match self.threads.get_mut(cur).and_then(|t| pick(&t.sig.pending).map(|x| (x, &mut t.sig.pending))) {
+                Some(((s, c), pending)) => {
+                    pending.remove(&s);
+                    Some((s, c))
+                },
+                None => pick(&self.p.sig.pending).inspect(|&(s, _)| {
+                    self.p.sig.pending.remove(&s);
+                }),
+            };
+            let Some((sig, code)) = taken else { break };
+            let mut info = [0u8; SIGNALFD_SIGINFO];
+            info[0..4].copy_from_slice(&sig.to_le_bytes()); // ssi_signo
+            info[8..12].copy_from_slice(&code.to_le_bytes()); // ssi_code
+            out.extend_from_slice(&info);
+        }
+        if !out.is_empty() {
+            self.poke();
+            return Ok(out);
+        }
+        Err(if nonblock {
+            Ret::Val(-11) // EAGAIN
+        } else {
+            Ret::Retry {
+                deadline: None,
+                on_timeout: 0,
+            }
+        })
+    }
+}
+
+/// The signals of a pending map, as a mask
+fn set(pending: &BTreeMap<u32, i32>) -> u64 {
+    pending.keys().fold(0, |m, &s| m | bit(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

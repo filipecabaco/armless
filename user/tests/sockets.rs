@@ -3,229 +3,14 @@
 //! that plays the network: connections the program makes to an address out there, and
 //! connections the host makes to a port the program listens on.
 
+mod prog;
+
 use std::cell::RefCell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use armless::dev::Event;
-use armless::vm::{Board, Config, Vm};
 use armless_user::{Process, Status};
-
-const BASE: u64 = 0x40_0000;
-/// ELF header and one program header: the code starts right after them.
-const CODE: u64 = 64 + 56;
-/// The data starts a page in; slots for descriptors and results are below 0x100
-const DATA: u64 = BASE + 0x1000;
-
-/// What a system call is given in a register
-#[derive(Clone, Copy)]
-enum A {
-    /// A number
-    I(u64),
-    /// The 32-bit value at this offset of the data
-    W(u32),
-    /// The address of this offset of the data
-    D(u32),
-}
-use A::{D, I, W};
-
-/// A program: code and data, and the checks it makes of what its system calls return.
-#[derive(Default)]
-struct Prog {
-    code: Vec<u32>,
-    data: Vec<u8>,
-    checks: u32,
-}
-
-impl Prog {
-    fn li(&mut self, rd: u32, v: u64) {
-        assert!(v < 1 << 32);
-        self.code.push(0xd280_0000 | (v as u32 & 0xffff) << 5 | rd);
-        if v >> 16 != 0 {
-            self.code.push(0xf2a0_0000 | (v as u32 >> 16) << 5 | rd);
-        }
-    }
-
-    fn arg(&mut self, rd: u32, a: A) {
-        match a {
-            I(v) => self.li(rd, v),
-            D(off) => self.li(rd, DATA + off as u64),
-            W(off) => {
-                self.li(9, DATA);
-                // ldr wd, [x9, #off]
-                self.code.push(0xb940_0000 | (off / 4) << 10 | 9 << 5 | rd);
-            },
-        }
-    }
-
-    /// The system call `nr`; its result is in x0
-    fn sys(&mut self, nr: u64, args: &[A]) -> &mut Self {
-        for (i, &a) in args.iter().enumerate() {
-            self.arg(i as u32, a);
-        }
-        self.li(8, nr);
-        self.code.push(0xd400_0001);
-        self
-    }
-
-    /// Keeps x0 at this offset of the data
-    fn save(&mut self, off: u32) -> &mut Self {
-        self.li(9, DATA);
-        self.code.push(0xf900_0000 | (off / 8) << 10 | 9 << 5);
-        self
-    }
-
-    /// Exits with 100 + the check's number unless x0 is `v`
-    fn expect(&mut self, v: i64) -> &mut Self {
-        self.checks += 1;
-        let imm = v.unsigned_abs() as u32;
-        assert!(imm < 4096);
-        // cmp x0, #v, or cmn for a negative one
-        self.code
-            .push(if v < 0 { 0xb100_001f } else { 0xf100_001f } | imm << 10);
-        self.code.push(0x5400_0080); // b.eq +16
-        self.li(0, 100 + self.checks as u64);
-        self.li(8, 94);
-        self.code.push(0xd400_0001);
-        self
-    }
-
-    /// write(1, data[off..off + len])
-    fn out(&mut self, off: u32, len: u32) -> &mut Self {
-        self.sys(64, &[I(1), D(off), I(len as u64)])
-    }
-
-    fn put(&mut self, off: u32, bytes: &[u8]) -> &mut Self {
-        let end = off as usize + bytes.len();
-        if self.data.len() < end {
-            self.data.resize(end, 0);
-        }
-        self.data[off as usize..end].copy_from_slice(bytes);
-        self
-    }
-
-    /// clone(SIGCHLD), a fork: what follows is the child's, up to `parent`. Gives what `parent`
-    /// needs.
-    fn fork(&mut self) -> usize {
-        self.sys(220, &[I(17), I(0), I(0), I(0), I(0)]);
-        // A cbnz x0 over the child's part, once it is known
-        self.code.push(0);
-        self.code.len() - 1
-    }
-
-    /// The child exits (its checks passed: 0) and the parent's part begins
-    fn parent(&mut self, at: usize) -> &mut Self {
-        self.sys(94, &[I(0)]);
-        let skip = (self.code.len() - at) as u32;
-        self.code[at] = 0xb500_0000 | skip << 5;
-        self
-    }
-
-    /// The executable: exit_group(0) after what it does
-    fn elf(mut self) -> Vec<u8> {
-        self.sys(94, &[I(0)]);
-        let mut body: Vec<u8> = self.code.iter().flat_map(|w| w.to_le_bytes()).collect();
-        assert!(body.len() as u64 + CODE <= 0x1000, "code past its page");
-        body.resize(0x1000 - CODE as usize, 0);
-        body.extend_from_slice(&self.data);
-        let filesz = CODE + body.len() as u64;
-        let memsz = filesz + 0x4000;
-        let mut e = Vec::new();
-        e.extend_from_slice(b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0");
-        e.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-        e.extend_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
-        e.extend_from_slice(&1u32.to_le_bytes());
-        e.extend_from_slice(&(BASE + CODE).to_le_bytes()); // entry
-        e.extend_from_slice(&64u64.to_le_bytes()); // phoff
-        e.extend_from_slice(&0u64.to_le_bytes()); // shoff
-        e.extend_from_slice(&0u32.to_le_bytes());
-        for v in [64u16, 56, 1, 64, 0, 0] {
-            e.extend_from_slice(&v.to_le_bytes());
-        }
-        e.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-        e.extend_from_slice(&7u32.to_le_bytes()); // R W X
-        for v in [0, BASE, BASE, filesz, memsz, 0x1000] {
-            e.extend_from_slice(&v.to_le_bytes());
-        }
-        e.extend_from_slice(&body);
-        e
-    }
-}
-
-/// struct sockaddr_in
-fn sa_in(ip: [u8; 4], port: u16) -> Vec<u8> {
-    let mut b = vec![2, 0];
-    b.extend_from_slice(&port.to_be_bytes());
-    b.extend_from_slice(&ip);
-    b.extend_from_slice(&[0; 8]);
-    b
-}
-
-/// struct sockaddr_un: a path (with its NUL), or an abstract name (starting with NUL)
-fn sa_un(name: &[u8]) -> Vec<u8> {
-    let mut b = vec![1, 0];
-    b.extend_from_slice(name);
-    if name.first() != Some(&0) {
-        b.push(0);
-    }
-    b
-}
-
-fn machine() -> Vm<armless::platform::NativePlatform> {
-    let config = Config {
-        memory_size: 128 << 20,
-        cpus: 1,
-        devices: armless::dev::DeviceConfig {
-            console: false,
-            net: true,
-            ..Default::default()
-        },
-    };
-    armless::runner::new_vm(config).unwrap().0
-}
-
-fn start(vm: &mut Vm<armless::platform::NativePlatform>, p: Prog) -> Process {
-    let board = Some(vm.board.clone());
-    Process::exec_bytes(&mut vm.cpus[0], board, &p.elf(), &["p".into()], &[]).unwrap()
-}
-
-/// Runs until it exits or faults, with the host's part played by `host`: it is given each event
-/// the machine raised (`Some`), and is called once more every round (`None`), with whether the
-/// program waits for something.
-fn drive(
-    p: &mut Process,
-    vm: &mut Vm<armless::platform::NativePlatform>,
-    host: &mut dyn FnMut(&Board, Option<Event>, bool),
-) -> (Vec<u8>, Status) {
-    let board = vm.board.clone();
-    let begun = Instant::now();
-    let mut out = Vec::new();
-    loop {
-        let status = p.run(&mut vm.cpus[0], Duration::from_millis(20));
-        out.extend(p.take_output());
-        let idle = matches!(status, Status::Idle(_));
-        for e in board.events() {
-            host(&board, Some(e), idle);
-        }
-        host(&board, None, idle);
-        match status {
-            Status::Exited(_) | Status::Fault(_) => return (out, status),
-            Status::Idle(_) => std::thread::sleep(Duration::from_millis(1)),
-            Status::Running => {},
-        }
-        assert!(begun.elapsed() < Duration::from_secs(10), "still waiting");
-    }
-}
-
-fn run(p: &mut Process, vm: &mut Vm<armless::platform::NativePlatform>) -> (Vec<u8>, Status) {
-    drive(p, vm, &mut |_, _, _| {})
-}
-
-fn ok(status: &Status) {
-    assert!(
-        matches!(status, Status::Exited(0)),
-        "a check failed (100 + its number) or it faulted: {status:?}"
-    );
-}
+use prog::*;
 
 #[test]
 fn a_socketpair_carries_bytes_both_ways_and_messages() {
@@ -756,5 +541,84 @@ fn what_is_not_supported_says_so() {
     p.sys(210, &[I(1), I(0)]).expect(-88); // shutdown of a descriptor that is not a socket
     let mut p = start(&mut vm, p);
     let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+/// struct msghdr of one iovec (at `iov`) and a control buffer (at `ctl`, `ctllen` bytes)
+fn msghdr(iov: u32, ctl: u32, ctllen: u64) -> Vec<u8> {
+    let mut h = vec![0u8; 56];
+    h[16..24].copy_from_slice(&(DATA + iov as u64).to_le_bytes());
+    h[24..32].copy_from_slice(&1u64.to_le_bytes());
+    if ctllen > 0 {
+        h[32..40].copy_from_slice(&(DATA + ctl as u64).to_le_bytes());
+        h[40..48].copy_from_slice(&ctllen.to_le_bytes());
+    }
+    h
+}
+
+fn iovec(buf: u32, len: u64) -> Vec<u8> {
+    let mut v = (DATA + buf as u64).to_le_bytes().to_vec();
+    v.extend_from_slice(&len.to_le_bytes());
+    v
+}
+
+#[test]
+fn a_descriptor_passes_over_a_unix_stream_with_scm_rights() {
+    // Erlang hands erl_child_setup the pipes of the programs it starts this way
+    let mut p = Prog::default();
+    p.put(0x200, b"hello").put(0x210, b"x");
+    // The message: one byte, and an SCM_RIGHTS of descriptor 5 (CMSG_LEN 20, CMSG_SPACE 24)
+    let mut cmsg = 20u64.to_le_bytes().to_vec();
+    cmsg.extend_from_slice(&1u32.to_le_bytes());
+    cmsg.extend_from_slice(&1u32.to_le_bytes());
+    cmsg.extend_from_slice(&5u32.to_le_bytes());
+    p.put(0x600, &cmsg);
+    p.put(0x400, &msghdr(0x480, 0x600, 24)).put(0x480, &iovec(0x210, 1));
+    p.put(0x500, &msghdr(0x580, 0x700, 64)).put(0x580, &iovec(0x800, 16));
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0); // socketpair: 3, 4
+    p.sys(59, &[D(0x108), I(0)]).expect(0); // pipe2: 5, 6
+    p.sys(64, &[I(6), D(0x200), I(5)]).expect(5);
+    p.sys(211, &[I(3), D(0x400), I(0)]).expect(1);
+    // Only the copy on its way holds the pipe's read end now; the write end goes
+    p.sys(57, &[I(5)]).expect(0);
+    p.sys(57, &[I(6)]).expect(0);
+    p.sys(212, &[I(4), D(0x500), I(0)]).expect(1);
+    // One SCM_RIGHTS message of one descriptor: the lowest free, 5
+    p.arg(0, X(0x500 + 40)); // msg_controllen: CMSG_SPACE(4)
+    p.expect(24);
+    p.arg(0, X(0x700)); // cmsg_len
+    p.expect(20);
+    p.arg(0, W(0x700 + 16));
+    p.expect(5);
+    // The pipe it is: what was written, then its end
+    p.sys(63, &[W(0x700 + 16), D(0x900), I(16)]).expect(5);
+    p.out(0x900, 5);
+    p.sys(63, &[W(0x700 + 16), D(0x900), I(16)]).expect(0);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (out, status) = run(&mut proc, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"hello");
+}
+
+#[test]
+fn an_unbound_unix_client_is_accepted_as_its_family_alone() {
+    // Postgres matches a connection to pg_hba.conf's "local" lines by the address's family
+    let mut p = Prog::default();
+    p.put(0x200, &sa_un(b"/tmp/s"));
+    p.put(0x300, &128u32.to_le_bytes());
+    p.sys(198, &[I(1), I(1), I(0)]).expect(3); // socket(AF_UNIX, SOCK_STREAM)
+    p.sys(200, &[I(3), D(0x200), I(9)]).expect(0);
+    p.sys(201, &[I(3), I(4)]).expect(0);
+    p.sys(198, &[I(1), I(1), I(0)]).expect(4);
+    p.sys(203, &[I(4), D(0x200), I(9)]).expect(0);
+    p.sys(202, &[I(3), D(0x280), D(0x300)]).expect(5); // accept
+    p.arg(0, W(0x300));
+    p.expect(2); // just sun_family
+    p.arg(0, W(0x280));
+    p.expect(1); // AF_UNIX
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
     ok(&status);
 }

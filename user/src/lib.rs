@@ -30,6 +30,7 @@
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
 
+mod creds;
 mod elf;
 mod exec;
 mod files;
@@ -38,6 +39,8 @@ mod mm;
 mod net;
 mod proc;
 mod ser;
+mod itimer;
+mod shm;
 mod signal;
 mod sys;
 mod tty;
@@ -201,6 +204,44 @@ pub(crate) struct Proc {
     /// The executable's path, for /proc/self/exe
     pub exe: Vec<u8>,
     pub sig: Signals,
+    pub creds: Creds,
+    /// ITIMER_REAL, when armed (itimer.rs): a child doesn't inherit it, exec keeps it
+    pub alarm: Option<itimer::Alarm>,
+}
+
+/// Who a process is: its real, effective and saved user and group ids. A program starts as root;
+/// su, pg_ctl and the like become another user with setuid and setgid, and Postgres refuses to
+/// run as root, so what they set is kept, given to children and to what the process execs, and
+/// owns the files it makes. Permissions aren't checked by them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Creds {
+    /// Real, effective, saved
+    pub uid: [u32; 3],
+    pub gid: [u32; 3],
+}
+
+impl Creds {
+    pub(crate) fn euid(&self) -> u32 {
+        self.uid[1]
+    }
+
+    pub(crate) fn egid(&self) -> u32 {
+        self.gid[1]
+    }
+
+    fn save(&self, w: &mut W) {
+        for v in self.uid.iter().chain(&self.gid) {
+            w.u(*v as u64);
+        }
+    }
+
+    fn load(r: &mut R) -> Result<Creds, String> {
+        let mut c = Creds::default();
+        for v in c.uid.iter_mut().chain(c.gid.iter_mut()) {
+            *v = r.u()? as u32;
+        }
+        Ok(c)
+    }
 }
 
 /// A program's process: its threads, memory map, descriptors, terminal and clock. A snapshot
@@ -218,6 +259,9 @@ pub struct Process {
     pub(crate) need: RefCell<Vec<String>>,
     /// Pages of files read into frames so far
     pub(crate) filled: Cell<u64>,
+    /// The pages of files mapped MAP_SHARED, one frame each whoever maps them: (file, offset)
+    /// -> frame, which this holds a reference on (mm.rs `populate`)
+    pub(crate) file_pages: RefCell<BTreeMap<(Ino, u64), u64>>,
     /// The process that runs
     pub(crate) p: Proc,
     /// The other processes (zombies too), by pid
@@ -249,6 +293,8 @@ pub struct Process {
     /// The deadline the current call had when it was last parked (Thread::resume_deadline)
     pub(crate) resume_deadline: Option<Instant>,
     /// Print every syscall to stderr.
+    /// The machine's System V shared memory (shm.rs)
+    pub(crate) shm: shm::Shm,
     pub trace: bool,
     pub stats: Stats,
 }
@@ -480,8 +526,15 @@ impl Process {
             .ok_or_else(|| fail("the machine has no filesystem".into()))?;
         let (path, ino, cwd_ino) = found.ok_or_else(|| fail(format!("{name}: not found")))?;
         let image = mm::Image::of(&board, ino)?;
+        let exe = board
+            .with_fs(|fs| files::canonical(fs, cwd_ino, path.as_bytes()).ok())
+            .flatten();
         let mut p = Process::start(cpu, Some(board), image, path.as_bytes(), args, env)?;
         p.p.cwd = cwd_ino;
+        // /proc/self/exe: the file itself, symlinks resolved (exec.rs says why)
+        if let Some(exe) = exe {
+            p.p.exe = exe;
+        }
         Ok(p)
     }
 
@@ -530,6 +583,7 @@ impl Process {
             asids: Cell::new((1, 0)),
             need: RefCell::new(Vec::new()),
             filled: Cell::new(0),
+            file_pages: RefCell::new(BTreeMap::new()),
             p: Proc {
                 pid: INIT,
                 ppid: 1,
@@ -544,6 +598,8 @@ impl Process {
                 umask: 0o022,
                 exe: exe.to_vec(),
                 sig: Signals::default(),
+                creds: Creds::default(),
+                alarm: None,
             },
             procs: BTreeMap::new(),
             threads: Vec::new(),
@@ -563,6 +619,7 @@ impl Process {
             resume_deadline: None,
             trace: false,
             stats: Stats::default(),
+            shm: shm::Shm::default(),
         };
         p.net_attach();
         let (entry, sp) = match p.load_image(&image, &layout, args, env, exe) {
@@ -676,6 +733,7 @@ impl Process {
             mm.take_refs()
         };
         self.settle_refs(refs);
+        self.trim_file_pages();
     }
 
     // ------------------------------------------------------------ the host's side
@@ -795,6 +853,8 @@ impl Process {
             if Instant::now() >= until {
                 return Status::Running;
             }
+            // Interval timers that are due raise SIGALRM
+            self.fire_alarms();
             // Signals first: a call a handler interrupts ends rather than runs again
             self.deliver_signals(cpu);
             if self.exit_code.is_some() || self.fault.is_some() {
@@ -821,6 +881,7 @@ impl Process {
                     self.threads
                         .iter()
                         .filter_map(|t| t.wait.as_ref().and_then(|(_, d)| *d))
+                        .chain(self.next_alarm())
                         .min(),
                 );
             };
@@ -996,17 +1057,17 @@ impl Process {
         }
     }
 
-    /// Wakes up to `n` threads of the process that runs waiting on the futex at `addr`. (A futex
-    /// is its process's: threads of other processes, one that shares this one's memory too,
-    /// aren't woken.)
+    /// Wakes up to `n` threads waiting on the futex `addr` (`futex_key`'s): of the process that
+    /// runs, or of any process for a shared one (a frame's).
     pub(crate) fn futex_wake(&mut self, addr: u64, n: u64, mask: u32) -> i64 {
         let pid = self.p.pid;
+        let shared = addr & mm::SHARED_FUTEX != 0;
         let mut woken = 0;
         for t in self.threads.iter_mut() {
             if woken >= n {
                 break;
             }
-            if t.pid != pid {
+            if t.pid != pid && !shared {
                 continue;
             }
             if let Some((Wait::Futex { addr: a, mask: m }, _)) = t.wait {
@@ -1032,12 +1093,13 @@ impl Process {
     ) -> (u64, u64) {
         let woken = self.futex_wake(addr, nwake, u32::MAX) as u64;
         let pid = self.p.pid;
+        let shared = addr & mm::SHARED_FUTEX != 0;
         let mut moved = 0;
         for t in self.threads.iter_mut() {
             if moved >= nrequeue {
                 break;
             }
-            if t.pid != pid {
+            if t.pid != pid && !shared {
                 continue;
             }
             if let Some((Wait::Futex { addr: a, .. }, _)) = &mut t.wait {
@@ -1111,6 +1173,14 @@ impl Process {
             w.u(p.umask as u64);
             w.b(&p.exe);
             p.sig.save(&mut w);
+            p.creds.save(&mut w);
+            match p.alarm {
+                Some(a) => {
+                    w.u(a.at.saturating_duration_since(now).as_nanos() as u64);
+                    w.u(a.every.as_nanos() as u64);
+                },
+                None => w.u(u64::MAX),
+            }
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1165,6 +1235,16 @@ impl Process {
             w.u(left(t.resume_deadline));
             t.sig.save(&mut w);
         }
+        self.shm.save(&mut w);
+        let pages = self.file_pages.borrow();
+        w.u(pages.len() as u64);
+        for (&(ino, off), &pa) in pages.iter() {
+            w.u(ino);
+            w.u(off);
+            w.u(pa);
+        }
+        drop(pages);
+        self.files.net.save_rights(&mut w);
         w.0
     }
 
@@ -1175,7 +1255,13 @@ impl Process {
         board: Option<Arc<Board>>,
         data: &[u8],
     ) -> Result<Process, String> {
-        let mut r = R(data.strip_prefix(MAGIC).ok_or("not a process state")?);
+        // ARMLUSR5 (0.14.0) is ARMLUSR6 without each process's ids
+        let (rest, v6) = match (data.strip_prefix(MAGIC), data.strip_prefix(MAGIC_V5)) {
+            (Some(rest), _) => (rest, true),
+            (None, Some(rest)) => (rest, false),
+            (None, None) => return Err("not a process state".into()),
+        };
+        let mut r = R(rest);
         let ram = cpu.mem.alias();
         let ram_size = r.u()?;
         if ram_size != ram.len() as u64 {
@@ -1221,6 +1307,15 @@ impl Process {
             let (cwd, umask) = (r.u()?, r.u()? as u32);
             let exe = r.b()?.to_vec();
             let sig = Signals::load(&mut r)?;
+            // Before ARMLUSR6 every process was root
+            let creds = if v6 { Creds::load(&mut r)? } else { Creds::default() };
+            let alarm = match v6.then(|| r.u()).transpose()? {
+                Some(left) if left != u64::MAX => Some(itimer::Alarm {
+                    at: Instant::now() + Duration::from_nanos(left),
+                    every: Duration::from_nanos(r.u()?),
+                }),
+                _ => None,
+            };
             all.insert(
                 pid,
                 Proc {
@@ -1237,6 +1332,8 @@ impl Process {
                     umask,
                     exe,
                     sig,
+                    creds,
+                    alarm,
                 },
             );
         }
@@ -1305,6 +1402,16 @@ impl Process {
                 sig: ThreadSig::load(&mut r)?,
             });
         }
+        // Before ARMLUSR6 there was no System V shared memory
+        let shm = if v6 { shm::Shm::load(&mut r)? } else { shm::Shm::default() };
+        let mut file_pages = BTreeMap::new();
+        if v6 {
+            for _ in 0..r.u()? {
+                let (ino, off, pa) = (r.u()?, r.u()?, r.u()?);
+                file_pages.insert((ino, off), pa);
+            }
+            files.net.load_rights(&mut r)?;
+        }
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);
@@ -1317,6 +1424,7 @@ impl Process {
             asids: Cell::new((1, 0)),
             need: RefCell::new(Vec::new()),
             filled: Cell::new(filled),
+            file_pages: RefCell::new(file_pages),
             p: first,
             procs: all,
             threads,
@@ -1337,6 +1445,7 @@ impl Process {
             resume_deadline: None,
             trace: false,
             stats: Stats::default(),
+            shm,
         };
         p.net_attach();
         let wanted: Vec<String> = p
@@ -1367,4 +1476,5 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-const MAGIC: &[u8; 8] = b"ARMLUSR5";
+const MAGIC: &[u8; 8] = b"ARMLUSR6";
+const MAGIC_V5: &[u8; 8] = b"ARMLUSR5";

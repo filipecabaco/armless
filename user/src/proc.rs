@@ -164,7 +164,7 @@ impl Process {
         let ct = self.threads[i].clear_tid;
         if ct != 0 {
             self.write(ct, &0u32.to_le_bytes());
-            self.futex_wake(ct, 1, u32::MAX);
+            self.futex_wake(self.futex_key(ct, false), 1, u32::MAX);
         }
         self.threads[i].exited = true;
         if self.loaded == Some(i) {
@@ -228,6 +228,7 @@ impl Process {
                 m.take_refs()
             };
             self.settle_refs(refs);
+            self.trim_file_pages();
         }
         drop(mm);
         self.p.sig.pending.clear();
@@ -336,6 +337,41 @@ impl Process {
         }
     }
 
+    /// pidfd_open(pid, flags): a descriptor of process `pid`, readable once it has ended (the
+    /// Supabase CLI watches its stack's owner so)
+    pub(crate) fn sys_pidfd_open(&mut self, pid: i64, flags: u64) -> Ret {
+        const PIDFD_NONBLOCK: u64 = 0o4000;
+        if flags & !PIDFD_NONBLOCK != 0 || pid <= 0 {
+            return Ret::Val(-EINVAL);
+        }
+        if self.proc_ref(pid).is_none_or(|p| p.zombie.is_some()) {
+            return Ret::Val(-3); // ESRCH
+        }
+        let d = self
+            .files
+            .add(crate::files::Kind::Pidfd { pid }, flags as u32 & PIDFD_NONBLOCK as u32);
+        Ret::Val(self.files.install(d, 0, true) as i64)
+    }
+
+    /// pidfd_send_signal(pidfd, sig, info, flags): kill for the process a pidfd is of
+    pub(crate) fn sys_pidfd_send_signal(&mut self, fd: i32, sig: u32) -> Ret {
+        let pid = match self.files.get(fd).map(|d| &d.kind) {
+            Some(crate::files::Kind::Pidfd { pid }) => *pid,
+            Some(_) => return Ret::Val(-EINVAL),
+            None => return Ret::Val(-9), // EBADF
+        };
+        if self.proc_ref(pid).is_none_or(|p| p.zombie.is_some()) {
+            return Ret::Val(-3); // ESRCH
+        }
+        if sig > 64 {
+            return Ret::Val(-EINVAL);
+        }
+        if sig != 0 {
+            self.raise_in(pid, sig, None, 0); // SI_USER
+        }
+        Ret::Val(0)
+    }
+
     /// waitid(idtype, id, infop, options, rusage)
     pub(crate) fn sys_waitid(&mut self, a: &[u64; 6]) -> Ret {
         let (kind, id, info, options, rusage) = (a[0], a[1] as i32 as i64, a[2], a[3] as u32, a[4]);
@@ -350,6 +386,12 @@ impl Process {
             0 => Pick::Any,
             1 => Pick::Pid(id),
             2 => Pick::Group(if id == 0 { self.p.pgid } else { id }),
+            // P_PIDFD: the process a pidfd is of
+            3 => match self.files.get(id as i32).map(|d| &d.kind) {
+                Some(crate::files::Kind::Pidfd { pid }) => Pick::Pid(*pid),
+                Some(_) => return Ret::Val(-EINVAL),
+                None => return Ret::Val(-9), // EBADF
+            },
             _ => return Ret::Val(-EINVAL),
         };
         match self.children(pick) {
@@ -539,6 +581,8 @@ impl Process {
             umask: self.p.umask,
             exe: self.p.exe.clone(),
             sig: self.p.sig.fork(),
+            creds: self.p.creds,
+            alarm: None,
         };
         self.procs.insert(id, child);
         self.threads.push(Thread {

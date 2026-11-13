@@ -38,7 +38,15 @@ impl Process {
     /// FUTEX_WAKE_OP: applies the operation `enc` (the kernel's encoded `op`, `oparg`, `cmp` and
     /// `cmparg`) to the word at `addr2`, wakes up to `nwake` threads waiting on `addr`, and, if
     /// the old value of the word satisfies the comparison, up to `nwake2` waiting on `addr2`.
-    fn futex_wake_op(&mut self, addr: u64, nwake: u64, addr2: u64, nwake2: u64, enc: u32) -> i64 {
+    fn futex_wake_op(
+        &mut self,
+        addr: u64,
+        nwake: u64,
+        addr2: u64,
+        nwake2: u64,
+        enc: u32,
+        private: bool,
+    ) -> i64 {
         let sign = |v: u32| ((v << 20) as i32) >> 20;
         let (mut op, cmp) = ((enc >> 28) & 0xf, (enc >> 24) & 0xf);
         let (mut oparg, cmparg) = (sign((enc >> 12) & 0xfff), sign(enc & 0xfff));
@@ -70,9 +78,10 @@ impl Process {
         if !self.put_u32(addr2, new as u32) {
             return -EFAULT;
         }
-        let mut woken = self.futex_wake(addr, nwake, u32::MAX);
+        let (key, key2) = (self.futex_key(addr, private), self.futex_key(addr2, private));
+        let mut woken = self.futex_wake(key, nwake, u32::MAX);
         if hit {
-            woken += self.futex_wake(addr2, nwake2, u32::MAX);
+            woken += self.futex_wake(key2, nwake2, u32::MAX);
         }
         woken
     }
@@ -100,6 +109,12 @@ impl Process {
                 )
             },
             Kind::Event { count } => (*count > 0, true, false),
+            Kind::Signal { mask } => (self.signal_pending(*mask), false, false),
+            Kind::Pidfd { pid } => (
+                self.proc_ref(*pid).is_none_or(|p| p.zombie.is_some()),
+                false,
+                false,
+            ),
             Kind::Sock(id) => self.sock_ready(*id),
             Kind::Epoll { watch } => (
                 watch.iter().any(|(&f, w)| {
@@ -203,6 +218,8 @@ impl Process {
                 self.poke();
                 Ok(out)
             },
+            Kind::Signal { mask } => self.read_signalfd(mask, max, nonblock),
+            Kind::Pidfd { .. } => Err(Ret::Val(-EINVAL)),
             Kind::Event { count } => {
                 if max < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -304,6 +321,8 @@ impl Process {
                 self.poke();
                 Ok(n)
             },
+            Kind::Signal { .. } => Err(Ret::Val(-EINVAL)),
+            Kind::Pidfd { .. } => Err(Ret::Val(-EINVAL)),
             Kind::Event { .. } => {
                 if data.len() < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -323,7 +342,7 @@ impl Process {
                 if at.is_some() {
                     return Err(Ret::Val(-ESPIPE));
                 }
-                self.sock_send(fd, id, data, 0, None)
+                self.sock_send(fd, id, data, 0, None, &[])
             },
             Kind::PipeRead(_) | Kind::Epoll { .. } => Err(Ret::Val(-EBADF)),
         }
@@ -436,6 +455,7 @@ impl Process {
             }
         }
         let (now, umask) = (self.now_secs(), self.p.umask);
+        let (uid, gid) = (self.p.creds.euid(), self.p.creds.egid());
         let opened = self.fs(|fs| -> Result<Ino, i64> {
             let ino = if flags & O_CREAT != 0 {
                 let (dir, name) = files::resolve_parent(fs, start, path)?;
@@ -443,7 +463,7 @@ impl Process {
                     Ok(_) if flags & O_EXCL != 0 => return Err(-EEXIST),
                     Ok(_) => files::resolve(fs, start, path, flags & O_NOFOLLOW == 0)?,
                     Err(_) => fs
-                        .create(dir, &name, S_IFREG | (mode & !umask & 0o7777), 0, 0, now)
+                        .create(dir, &name, S_IFREG | (mode & !umask & 0o7777), uid, gid, now)
                         .map_err(|_| -EACCES)?,
                 }
             } else {
@@ -499,7 +519,9 @@ impl Process {
             },
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
             Kind::Sock(_) => Stat::device(files::S_IFSOCK | 0o777, 0),
-            Kind::Event { .. } | Kind::Epoll { .. } => Stat::device(0o600, 0),
+            Kind::Event { .. } | Kind::Signal { .. } | Kind::Pidfd { .. } | Kind::Epoll { .. } => {
+                Stat::device(0o600, 0)
+            },
         })
     }
 
@@ -737,13 +759,22 @@ impl Process {
                 Ok(b) => v(if self.write(a[1], &b) { b.len() as i64 } else { -EFAULT }),
                 Err(r) => r,
             },
-            // readv, preadv
-            65 | 69 => {
+            // readv, preadv, preadv2 (whose offset -1 is the current position; its RWF_ flags only ask
+            // for what happens anyway). Postgres 18 reads and writes with them.
+            65 | 69 | 286 => {
+                if nr == 286 && a[5] & !0x1f != 0 {
+                    return v(-95); // EOPNOTSUPP
+                }
+                let at = match nr {
+                    69 => Some(a[3]),
+                    286 => (a[3] != u64::MAX).then_some(a[3]),
+                    _ => None,
+                };
                 let Some(iov) = self.iovecs(a[1], a[2]) else {
                     return v(-EFAULT);
                 };
                 let total: u64 = iov.iter().map(|&(_, l)| l).sum();
-                match self.read_fd(fd0, total as usize, (nr == 69).then_some(a[3])) {
+                match self.read_fd(fd0, total as usize, at) {
                     Ok(b) => {
                         let mut off = 0;
                         for (base, len) in iov {
@@ -770,8 +801,16 @@ impl Process {
                     .write_fd(fd0, &b, Some(a[3]))
                     .map_or_else(|r| r, |n| v(n as i64)),
             },
-            // writev, pwritev
-            66 | 70 => {
+            // writev, pwritev, pwritev2 (as preadv2)
+            66 | 70 | 287 => {
+                if nr == 287 && a[5] & !0x1f != 0 {
+                    return v(-95); // EOPNOTSUPP
+                }
+                let at = match nr {
+                    70 => Some(a[3]),
+                    287 => (a[3] != u64::MAX).then_some(a[3]),
+                    _ => None,
+                };
                 let Some(iov) = self.iovecs(a[1], a[2]) else {
                     return v(-EFAULT);
                 };
@@ -782,7 +821,7 @@ impl Process {
                     };
                     all.extend_from_slice(&b);
                 }
-                self.write_fd(fd0, &all, (nr == 70).then_some(a[3]))
+                self.write_fd(fd0, &all, at)
                     .map_or_else(|r| r, |n| v(n as i64))
             },
             // sendfile(out, in, offset*, count)
@@ -907,10 +946,30 @@ impl Process {
                     .strip_prefix(b"/proc/self/fd/")
                     .and_then(|n| std::str::from_utf8(n).ok()?.parse::<i32>().ok())
                 {
-                    if self.files.get(fd).is_some() {
-                        Ok(format!("/dev/fd/{fd}").into_bytes())
-                    } else {
-                        Err(-ENOENT)
+                    // What it is open on, as Linux says it: realpath in Zig, Bun and Deno is
+                    // open, then this link (the Supabase CLI resolves its project root so)
+                    match self.files.get(fd).map(|d| d.kind.clone()) {
+                        Some(Kind::Dir { ino, .. }) => Ok(self
+                            .fs(|fs| files::path_of(fs, ino))
+                            .unwrap_or_else(|| format!("/dev/fd/{fd}").into_bytes())),
+                        Some(Kind::File { ino, .. }) => Ok(self
+                            .fs(|fs| files::find_path(fs, ino))
+                            .flatten()
+                            .unwrap_or_else(|| format!("/dev/fd/{fd}").into_bytes())),
+                        Some(Kind::PipeRead(p) | Kind::PipeWrite(p)) => {
+                            Ok(format!("pipe:[{p}]").into_bytes())
+                        },
+                        Some(Kind::Sock(id)) => Ok(format!("socket:[{id}]").into_bytes()),
+                        Some(Kind::Tty) => Ok(b"/dev/tty".to_vec()),
+                        Some(Kind::Null) => Ok(b"/dev/null".to_vec()),
+                        Some(Kind::Zero) => Ok(b"/dev/zero".to_vec()),
+                        Some(Kind::Random) => Ok(b"/dev/urandom".to_vec()),
+                        Some(Kind::Event { .. }) => Ok(b"anon_inode:[eventfd]".to_vec()),
+                        Some(Kind::Signal { .. }) => Ok(b"anon_inode:[signalfd]".to_vec()),
+                        Some(Kind::Pidfd { .. }) => Ok(b"anon_inode:[pidfd]".to_vec()),
+                        Some(Kind::Epoll { .. }) => Ok(b"anon_inode:[eventpoll]".to_vec()),
+                        Some(Kind::Mem { .. }) => Ok(format!("/dev/fd/{fd}").into_bytes()),
+                        None => Err(-ENOENT),
                     }
                 } else {
                     self.lookup(a[0] as i32, &path, false).and_then(|ino| {
@@ -993,6 +1052,7 @@ impl Process {
             34 => {
                 let (path, mode, now, umask) =
                     (self.cstr(a[1]), a[2] as u32, self.now_secs(), self.p.umask);
+                let (uid, gid) = (self.p.creds.euid(), self.p.creds.egid());
                 let start = match self.start_dir(a[0] as i32) {
                     Ok(s) => s,
                     Err(e) => return v(e),
@@ -1000,7 +1060,7 @@ impl Process {
                 v(self
                     .fs(|fs| {
                         let (dir, name) = files::resolve_parent(fs, start, &path)?;
-                        fs.create(dir, &name, S_IFDIR | (mode & !umask & 0o7777), 0, 0, now)
+                        fs.create(dir, &name, S_IFDIR | (mode & !umask & 0o7777), uid, gid, now)
                             .map(|_| 0)
                             .map_err(errno)
                     })
@@ -1027,6 +1087,7 @@ impl Process {
             // symlinkat(target, dirfd, path)
             36 => {
                 let (target, path, now) = (self.cstr(a[0]), self.cstr(a[2]), self.now_secs());
+                let (uid, gid) = (self.p.creds.euid(), self.p.creds.egid());
                 let start = match self.start_dir(a[1] as i32) {
                     Ok(s) => s,
                     Err(e) => return v(e),
@@ -1034,7 +1095,7 @@ impl Process {
                 v(self
                     .fs(|fs| {
                         let (dir, name) = files::resolve_parent(fs, start, &path)?;
-                        fs.symlink(dir, &name, &target, 0, 0, now)
+                        fs.symlink(dir, &name, &target, uid, gid, now)
                             .map(|_| 0)
                             .map_err(errno)
                     })
@@ -1113,8 +1174,53 @@ impl Process {
                     Err(e) => v(e),
                 }
             },
-            // fchown, fchownat, utimensat, sync, fsync, fdatasync, syncfs, fadvise64, flock
-            55 | 54 | 88 | 81 | 82 | 83 | 267 | 223 | 32 => v(0),
+            // fchown(fd, uid, gid), fchownat(dirfd, path, uid, gid, flags): -1 leaves one; root
+            // may give a file to anyone, its owner only to one of its own groups
+            55 | 54 => {
+                const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+                const AT_EMPTY_PATH: u64 = 0x1000;
+                let (ino, uid, gid) = if nr == 55
+                    || a[4] & AT_EMPTY_PATH != 0 && self.cstr(a[1]).is_empty()
+                {
+                    let fd = if nr == 55 { fd0 } else { a[0] as i32 };
+                    let (uid, gid) = if nr == 55 { (a[1], a[2]) } else { (a[2], a[3]) };
+                    match self.files.get(fd).map(|d| &d.kind) {
+                        Some(Kind::File { ino, .. } | Kind::Dir { ino, .. }) => (Ok(*ino), uid, gid),
+                        Some(_) => (Err(-(crate::files::EINVAL)), 0, 0),
+                        None => (Err(-EBADF), 0, 0),
+                    }
+                } else {
+                    let follow = a[4] & AT_SYMLINK_NOFOLLOW == 0;
+                    (self.lookup(a[0] as i32, &self.cstr(a[1]), follow), a[2], a[3])
+                };
+                let (uid, gid) = (uid as u32, gid as u32);
+                let c = self.p.creds;
+                let ino = match ino {
+                    Ok(i) => i,
+                    Err(e) => return v(e),
+                };
+                let done = self.fs(|fs| {
+                    let Some(i) = fs.get_mut(ino) else {
+                        return -ENOENT;
+                    };
+                    let root = c.euid() == 0;
+                    let uid_ok = uid == u32::MAX || root || uid == i.uid && i.uid == c.euid();
+                    let gid_ok = gid == u32::MAX || root || i.uid == c.euid() && c.gid.contains(&gid);
+                    if !(uid_ok && gid_ok) {
+                        return -1; // EPERM
+                    }
+                    if uid != u32::MAX {
+                        i.uid = uid;
+                    }
+                    if gid != u32::MAX {
+                        i.gid = gid;
+                    }
+                    0
+                });
+                v(done.unwrap_or(-ENOENT))
+            },
+            // utimensat, sync, fsync, fdatasync, syncfs, fadvise64, flock
+            88 | 81 | 82 | 83 | 267 | 223 | 32 => v(0),
             // statfs, fstatfs: one 9p filesystem
             43 | 44 => {
                 let mut b = [0u8; 120];
@@ -1211,6 +1317,19 @@ impl Process {
                     },
                 )
             },
+            // getitimer, setitimer (itimer.rs)
+            102 => self.sys_getitimer(a[0], a[1]),
+            103 => self.sys_setitimer(a[0], a[1], a[2]),
+            // shmget, shmctl, shmat, shmdt (shm.rs)
+            194 => self.sys_shmget(a[0] as i32, a[1], a[2]),
+            195 => self.sys_shmctl(a[0] as i32, a[1], a[2]),
+            196 => self.sys_shmat(a[0] as i32, a[1], a[2]),
+            197 => self.sys_shmdt(a[0]),
+            // pidfd_open(pid, flags), pidfd_send_signal(pidfd, sig, info, flags) (proc.rs)
+            434 => self.sys_pidfd_open(a[0] as i32 as i64, a[1]),
+            424 => self.sys_pidfd_send_signal(a[0] as i32, a[1] as u32),
+            // signalfd4(fd, mask, sizemask, flags)
+            74 => self.sys_signalfd(a[0] as i32, a[1], a[2], a[3]),
             // eventfd2
             19 => {
                 let d = self
@@ -1336,6 +1455,9 @@ impl Process {
             98 => {
                 let (addr, op, val) = (a[0], a[1] as u32, a[2]);
                 let realtime = op & 256 != 0;
+                // FUTEX_PRIVATE_FLAG: the process's own; without it, a futex in shared memory is
+                // the one every process mapping it meets at (futex_key)
+                let private = op & 128 != 0;
                 match op & 0x7f {
                     0 | 9 => {
                         let Some(cur_val) = self.u32_at(addr) else {
@@ -1353,20 +1475,23 @@ impl Process {
                             self.timespec(a[3])
                                 .map(|t| self.deadline_at(if realtime { 0 } else { 1 }, t))
                         };
+                        let addr = self.futex_key(addr, private);
                         Ret::Block(Wait::Futex { addr, mask }, deadline)
                     },
-                    1 => v(self.futex_wake(addr, val, u32::MAX)),
-                    10 => v(self.futex_wake(addr, val, a[5] as u32)),
+                    1 => v(self.futex_wake(self.futex_key(addr, private), val, u32::MAX)),
+                    10 => v(self.futex_wake(self.futex_key(addr, private), val, a[5] as u32)),
                     // FUTEX_REQUEUE and FUTEX_CMP_REQUEUE (a[5] is the value to compare with):
                     // musl's condition variables broadcast with them.
                     3 | 4 => {
                         if op & 0x7f == 4 && self.u32_at(addr) != Some(a[5] as u32) {
                             return v(-EAGAIN);
                         }
-                        let (woken, moved) = self.futex_requeue(addr, val, a[4], a[3]);
+                        let (key, key2) =
+                            (self.futex_key(addr, private), self.futex_key(a[4], private));
+                        let (woken, moved) = self.futex_requeue(key, val, key2, a[3]);
                         v((woken + moved) as i64)
                     },
-                    5 => v(self.futex_wake_op(addr, val, a[4], a[3], a[5] as u32)),
+                    5 => v(self.futex_wake_op(addr, val, a[4], a[3], a[5] as u32, private)),
                     _ => v(-ENOSYS),
                 }
             },
@@ -1410,22 +1535,34 @@ impl Process {
             178 => v(tid),
             172 => v(self.p.pid),
             173 => v(self.p.ppid),
-            174..=177 => v(0),
-            // setuid, setgid, setreuid, setregid, setresuid, setresgid, setfsuid, setfsgid
-            146 | 144 | 145 | 143 | 147 | 149 | 151 | 152 => v(0),
-            // getresuid, getresgid
-            148 | 150 => {
-                for at in [a[0], a[1], a[2]] {
-                    self.put_u32(at, 0);
-                }
-                v(0)
-            },
+            // getuid, geteuid, getgid, getegid
+            174 => v(self.p.creds.uid[0] as i64),
+            175 => v(self.p.creds.euid() as i64),
+            176 => v(self.p.creds.gid[0] as i64),
+            177 => v(self.p.creds.egid() as i64),
+            // setuid, setgid, setreuid, setregid, setresuid, setresgid, setfsuid, setfsgid,
+            // getresuid, getresgid (creds.rs)
+            143..=152 => self.sys_ids(nr, &a),
             // getpgid, getsid
             155 | 156 => self.sys_getpgid(nr, a[0] as i32 as i64),
             157 => self.sys_setsid(),
             154 => self.sys_setpgid(a[0] as i32 as i64, a[1] as i32 as i64),
-            // getgroups
+            // getgroups: no supplementary groups
             158 => v(0),
+            // setgroups(size, list): root may (su calls it before setgid and setuid). The groups
+            // aren't kept: nothing here checks permissions by them.
+            159 => {
+                const NGROUPS_MAX: u64 = 65536;
+                if self.p.creds.euid() != 0 {
+                    v(-1) // EPERM
+                } else if a[0] > NGROUPS_MAX {
+                    v(-(crate::files::EINVAL))
+                } else if a[0] > 0 && self.bytes_at(a[1], a[0] as usize * 4).is_none() {
+                    v(-EFAULT)
+                } else {
+                    v(0)
+                }
+            },
             // capget: no capabilities
             90 => {
                 if a[1] != 0 {

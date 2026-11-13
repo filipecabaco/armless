@@ -145,6 +145,8 @@ impl Process {
         };
         // What the program is named, as it is told to the program
         let exe = name.clone();
+        // Where `name` is from: dirfd, then the cwd once a script's interpreter runs instead
+        let mut from = dirfd;
         let mut depth = 0;
         let image = loop {
             let runs = self.fs(|fs| {
@@ -178,7 +180,14 @@ impl Process {
                 Err(e) => return v(e),
             };
             name = interp;
+            from = AT_FDCWD;
         };
+        // /proc/self/exe: the file that runs, symlinks resolved (/dev/fd/N stays as it is)
+        let real = self
+            .start_dir(from)
+            .ok()
+            .and_then(|start| self.fs(|fs| crate::files::canonical(fs, start, &name).ok()))
+            .flatten();
         let layout = match Layout::of(&image, Some(&*board)) {
             Ok(l) => l,
             Err(ExecError::Need(b)) => return Ret::Need(b),
@@ -219,10 +228,13 @@ impl Process {
                 m.take_refs()
             };
             self.settle_refs(refs);
+            self.trim_file_pages();
         }
         drop(old);
         let pid = self.p.pid;
-        self.p.exe = exe;
+        // musl's loader finds $ORIGIN from /proc/self/exe, as for /usr/bin/java ->
+        // ../lib/jvm/.../bin/java, whose libjli.so is beside the real one
+        self.p.exe = real.unwrap_or(exe);
         self.p.sig.exec();
         for (i, t) in self.threads.iter_mut().enumerate() {
             if t.pid == pid && i != cur {
