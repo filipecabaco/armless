@@ -382,7 +382,8 @@ pub enum Status {
 }
 
 pub(crate) fn page_up(v: u64) -> u64 {
-    (v + PAGE - 1) & !(PAGE - 1)
+    // (A length a program got wrong saturates: what uses it then finds it past everything)
+    v.saturating_add(PAGE - 1) & !(PAGE - 1)
 }
 
 /// Where an executable's pieces go: its segments, the stack, the break and the mmap area.
@@ -545,7 +546,7 @@ impl Process {
     /// The struct timespec at `addr`: -EFAULT where nothing is mapped, and -EINVAL for negative
     /// seconds or nanoseconds outside a second, as Linux checks them.
     pub(crate) fn timespec(&self, addr: u64) -> Result<Duration, i64> {
-        let (Some(s), Some(ns)) = (self.u64_at(addr), self.u64_at(addr + 8)) else {
+        let (Some(s), Some(ns)) = (self.u64_at(addr), self.u64_at(addr.wrapping_add(8))) else {
             return Err(-EFAULT);
         };
         if (s as i64) < 0 || ns >= 1_000_000_000 {

@@ -78,7 +78,7 @@ impl Process {
             return Ok(out);
         }
         for i in 0.. {
-            let p = self.u64_at(addr + 8 * i).ok_or(-EFAULT)?;
+            let p = self.u64_at(addr.wrapping_add(8 * i)).ok_or(-EFAULT)?;
             if p == 0 {
                 break;
             }

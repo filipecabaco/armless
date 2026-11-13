@@ -116,7 +116,7 @@ pub(crate) fn answer(req: &[u8], pid: u32, network: bool, guest: [u8; 4], router
         if len < 16 || at + len > req.len() {
             break;
         }
-        let (ty, flags, seq) = (u16_at(at + 4), u16_at(at + 6), u32_at(at + 8));
+        let (ty, flags, seq) = (u16_at(at.wrapping_add(4)), u16_at(at.wrapping_add(6)), u32_at(at.wrapping_add(8)));
         let body = &req[at + 16..at + len];
         let family = body.first().copied().unwrap_or(AF_UNSPEC);
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;

@@ -17,7 +17,7 @@ impl Process {
         match nr {
             nr::READ | nr::READV => tty(a[0] as i32 as i64),
             // its struct pollfd array (fd, events, revents)
-            nr::PPOLL => (0..a[1].min(256)).any(|k| self.u32_at(a[0] + 8 * k).is_some_and(|fd| tty(fd as i32 as i64))),
+            nr::PPOLL => (0..a[1].min(256)).any(|k| self.u32_at(a[0].wrapping_add(8 * k)).is_some_and(|fd| tty(fd as i32 as i64))),
             // the descriptors of its read set
             nr::PSELECT6 => {
                 let n = a[0].min(1024);
@@ -71,7 +71,7 @@ impl Process {
             self.switch_to(pid);
             let fds: Vec<i32> = match nr {
                 nr::READ | nr::READV | nr::RECVFROM | nr::RECVMSG | nr::ACCEPT | nr::ACCEPT4 => vec![a0 as i32],
-                nr::PPOLL => (0..a1.min(64)).filter_map(|k| self.u32_at(a0 + 8 * k).map(|f| f as i32)).collect(),
+                nr::PPOLL => (0..a1.min(64)).filter_map(|k| self.u32_at(a0.wrapping_add(8 * k)).map(|f| f as i32)).collect(),
                 nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => match self.files.get(a0 as i32).map(|d| &d.kind) {
                     Some(Kind::Epoll { watch }) => watch.keys().copied().collect(),
                     _ => Vec::new(),

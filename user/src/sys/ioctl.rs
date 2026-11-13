@@ -12,7 +12,7 @@ impl Process {
         let guest = crate::net::GUEST_IP;
         if req == 0x8912 {
             // struct ifconf: ifc_len (int), pad, ifc_buf (pointer); a NULL buffer asks the length
-            let (Some(room), Some(buf)) = (self.u32_at(arg), self.u64_at(arg + 8)) else {
+            let (Some(room), Some(buf)) = (self.u32_at(arg), self.u64_at(arg.wrapping_add(8))) else {
                 return -EFAULT;
             };
             let all = crate::netlink::ifconf(if buf == 0 { usize::MAX } else { room as usize }, network, guest);

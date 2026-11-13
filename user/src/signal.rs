@@ -542,7 +542,7 @@ impl Process {
                         d.saturating_duration_since(Instant::now())
                     });
                     self.put_u64(rem, left.as_secs());
-                    self.put_u64(rem + 8, left.subsec_nanos() as u64);
+                    self.put_u64(rem.wrapping_add(8), left.subsec_nanos() as u64);
                 }
                 Interrupted::Returns(-EINTR)
             },
@@ -640,7 +640,7 @@ impl Process {
         }
         let ok = self.write(frame, &f)
             && self.put_u64(record, ctx.x[29])
-            && self.put_u64(record + 8, ctx.x[30]);
+            && self.put_u64(record.wrapping_add(8), ctx.x[30]);
         if !ok {
             // Linux would kill it with SIGSEGV
             self.crash(format!(

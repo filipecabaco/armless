@@ -1437,7 +1437,7 @@ impl Process {
             63 | 67 | 207 => vec![(a1, a2)],
             65 | 69 => self.iovecs(a1, a2).unwrap_or_default(),
             // recvmsg: the msghdr's iovec array
-            212 => match (self.u64_at(a1 + 16), self.u64_at(a1 + 24)) {
+            212 => match (self.u64_at(a1.wrapping_add(16)), self.u64_at(a1.wrapping_add(24))) {
                 (Some(iov), Some(n)) => self.iovecs(iov, n).unwrap_or_default(),
                 _ => Vec::new(),
             },

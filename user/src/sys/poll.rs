@@ -61,7 +61,7 @@ impl Process {
             let Some(fd) = self.u32_at(at).map(|v| v as i32) else {
                 return Ret::Val(-EFAULT);
             };
-            let events = self.u32_at(at + 4).map_or(0, |v| v & 0xffff) as u16;
+            let events = self.u32_at(at.wrapping_add(4)).map_or(0, |v| v & 0xffff) as u16;
             let revents: u16 = if fd < 0 {
                 0
             } else {
@@ -82,7 +82,7 @@ impl Process {
                     },
                 }
             };
-            self.write(at + 6, &revents.to_le_bytes());
+            self.write(at.wrapping_add(6), &revents.to_le_bytes());
             if revents != 0 {
                 ready += 1;
             }
@@ -121,7 +121,7 @@ impl Process {
                 vec![0; words as usize]
             } else {
                 (0..words)
-                    .map(|i| p.u64_at(at + 8 * i).unwrap_or(0))
+                    .map(|i| p.u64_at(at.wrapping_add(8 * i)).unwrap_or(0))
                     .collect()
             }
         };
@@ -153,7 +153,7 @@ impl Process {
             ] {
                 if at != 0 {
                     for (i, v) in set.iter().enumerate() {
-                        self.put_u64(at + 8 * i as u64, *v);
+                        self.put_u64(at.wrapping_add(8 * i as u64), *v);
                     }
                 }
             }
@@ -166,7 +166,7 @@ impl Process {
         for at in [rset, wset, eset] {
             if at != 0 && deadline.is_some_and(|d| d <= Instant::now()) {
                 for i in 0..words {
-                    self.put_u64(at + 8 * i, 0);
+                    self.put_u64(at.wrapping_add(8 * i), 0);
                 }
             }
         }
@@ -261,7 +261,7 @@ impl Process {
         let fd0 = a[0] as i32;
         let (ev, data) = (
             self.u32_at(a[3]).unwrap_or(0),
-            self.u64_at(a[3] + 8).unwrap_or(0),
+            self.u64_at(a[3].wrapping_add(8)).unwrap_or(0),
         );
         if self.files.get(a[2] as i32).is_none() {
             return v(-EBADF);
@@ -304,7 +304,7 @@ impl Process {
                 // struct epoll_event on arm64: u32 events, 4 bytes of padding, u64 data
                 let at = a[1] + 16 * i as u64;
                 self.put_u32(at, ev);
-                self.put_u64(at + 8, data);
+                self.put_u64(at.wrapping_add(8), data);
             }
             return v(n as i64);
         }

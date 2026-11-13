@@ -1814,11 +1814,11 @@ impl Process {
         let id = self.sock_id(fd)?;
         let (Some(name), Some(namelen), Some(iov), Some(n), Some(ctl), Some(ctllen)) = (
             self.u64_at(at),
-            self.u32_at(at + 8),
-            self.u64_at(at + 16),
-            self.u64_at(at + 24),
-            self.u64_at(at + 32),
-            self.u64_at(at + 40),
+            self.u32_at(at.wrapping_add(8)),
+            self.u64_at(at.wrapping_add(16)),
+            self.u64_at(at.wrapping_add(24)),
+            self.u64_at(at.wrapping_add(32)),
+            self.u64_at(at.wrapping_add(40)),
         ) else {
             return Err(e(EFAULT));
         };
@@ -1848,9 +1848,9 @@ impl Process {
         let mut off = 0;
         while off + CMSG_HDR as u64 <= ctllen {
             let (Some(l), Some(level), Some(ty)) = (
-                self.u64_at(ctl + off),
-                self.u32_at(ctl + off + 8),
-                self.u32_at(ctl + off + 12),
+                self.u64_at(ctl.wrapping_add(off)),
+                self.u32_at(ctl.wrapping_add(off + 8)),
+                self.u32_at(ctl.wrapping_add(off + 12)),
             ) else {
                 return Err(e(EFAULT));
             };
@@ -1862,7 +1862,7 @@ impl Process {
             match (level, ty) {
                 (SOL_SOCKET, SCM_RIGHTS) if unix => {
                     for i in 0..len / 4 {
-                        let f = self.u32_at(at + 4 * i).ok_or(e(EFAULT))? as i32;
+                        let f = self.u32_at(at.wrapping_add(4 * i)).ok_or(e(EFAULT))? as i32;
                         cm.rights.push(self.files.desc_of(f).ok_or(e(EBADF))?);
                     }
                     if cm.rights.len() > SCM_MAX_FD {
@@ -1875,7 +1875,7 @@ impl Process {
                         return Err(e(EINVAL));
                     }
                     let (Some(pid), Some(uid), Some(gid)) =
-                        (self.u32_at(at), self.u32_at(at + 4), self.u32_at(at + 8))
+                        (self.u32_at(at), self.u32_at(at.wrapping_add(4)), self.u32_at(at.wrapping_add(8)))
                     else {
                         return Err(e(EFAULT));
                     };
@@ -1908,10 +1908,10 @@ impl Process {
         let id = self.sock_id(fd)?;
         let (Some(name), Some(iov), Some(n), Some(ctl), Some(ctllen)) = (
             self.u64_at(at),
-            self.u64_at(at + 16),
-            self.u64_at(at + 24),
-            self.u64_at(at + 32),
-            self.u64_at(at + 40),
+            self.u64_at(at.wrapping_add(16)),
+            self.u64_at(at.wrapping_add(24)),
+            self.u64_at(at.wrapping_add(32)),
+            self.u64_at(at.wrapping_add(40)),
         ) else {
             return Err(e(EFAULT));
         };
@@ -1927,9 +1927,9 @@ impl Process {
             off += n;
         }
         if name != 0 {
-            let cap = self.u32_at(at + 8).unwrap_or(0) as usize;
+            let cap = self.u32_at(at.wrapping_add(8)).unwrap_or(0) as usize;
             self.write(name, &from[..from.len().min(cap)]);
-            self.put_u32(at + 8, from.len() as u32);
+            self.put_u32(at.wrapping_add(8), from.len() as u32);
         }
         // The control data, as Linux puts it: who sent the bytes (with SO_PASSCRED), then the
         // descriptors that came with them, new ones in this process, as many as the room left
@@ -1963,12 +1963,12 @@ impl Process {
             return Err(e(EFAULT));
         }
         let used = out.len() as u64;
-        self.put_u64(at + 40, used);
+        self.put_u64(at.wrapping_add(40), used);
         let mut mflags = if trunc { MSG_TRUNC as u32 } else { 0 };
         if ctrunc {
             mflags |= MSG_CTRUNC;
         }
-        self.put_u32(at + 48, mflags);
+        self.put_u32(at.wrapping_add(48), mflags);
         Ok(data.len())
     }
 
@@ -1987,7 +1987,7 @@ impl Process {
             };
             match r {
                 Ok(len) => {
-                    if !self.put_u32(at + 56, len as u32) {
+                    if !self.put_u32(at.wrapping_add(56), len as u32) {
                         return e(EFAULT);
                     }
                     done += 1;

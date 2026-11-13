@@ -146,7 +146,7 @@ impl Process {
         let v = Ret::Val;
         let ns = self.now_ns(a[0]);
         let ok = self.put_u64(a[1], ns / 1_000_000_000)
-            && self.put_u64(a[1] + 8, ns % 1_000_000_000);
+            && self.put_u64(a[1].wrapping_add(8), ns % 1_000_000_000);
         v(if ok { 0 } else { -EFAULT })
     }
 
@@ -156,7 +156,7 @@ impl Process {
         let ns = self.now_ns(0);
         let ok = (a[0] == 0
             || self.put_u64(a[0], ns / 1_000_000_000)
-                && self.put_u64(a[0] + 8, ns % 1_000_000_000 / 1000))
+                && self.put_u64(a[0].wrapping_add(8), ns % 1_000_000_000 / 1000))
             && (a[1] == 0 || self.put_u64(a[1], 0));
         v(if ok { 0 } else { -EFAULT })
     }
@@ -165,7 +165,7 @@ impl Process {
         let v = Ret::Val;
         if a[1] != 0 {
             self.put_u64(a[1], 0);
-            self.put_u64(a[1] + 8, 1);
+            self.put_u64(a[1].wrapping_add(8), 1);
         }
         v(0)
     }

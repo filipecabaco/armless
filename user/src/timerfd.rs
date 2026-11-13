@@ -205,7 +205,7 @@ impl Process {
 
     /// A struct timespec at `at`, if it is one (nanoseconds below a second, seconds not negative)
     fn timespec_checked(&self, at: u64) -> Option<Duration> {
-        let (s, ns) = (self.u64_at(at)? as i64, self.u64_at(at + 8)? as i64);
+        let (s, ns) = (self.u64_at(at)? as i64, self.u64_at(at.wrapping_add(8))? as i64);
         (s >= 0 && (0..1_000_000_000).contains(&ns)).then(|| Duration::new(s as u64, ns as u32))
     }
 

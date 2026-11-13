@@ -201,7 +201,7 @@ pub(crate) fn stack(
     let mut put = |s: &[u8]| {
         sp -= s.len() as u64 + 1;
         write(sp, s);
-        write(sp + s.len() as u64, &[0]);
+        write(sp.wrapping_add(s.len() as u64), &[0]);
         sp
     };
     let execfn = put(execfn);

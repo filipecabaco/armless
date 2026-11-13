@@ -101,7 +101,7 @@ impl Process {
         }
         let nr = (nr as u64).min(ctx.cap);
         for i in 0..nr {
-            let r = match self.u64_at(iocbpp + 8 * i) {
+            let r = match self.u64_at(iocbpp.wrapping_add(8 * i)) {
                 None => Err(Ret::Val(-EFAULT)),
                 Some(iocb) => self.aio_one(id, iocb),
             };

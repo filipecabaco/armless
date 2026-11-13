@@ -147,7 +147,7 @@ impl Process {
             return v(-EMFILE);
         }
         v(
-            if self.put_u32(a[0], rf as u32) && self.put_u32(a[0] + 4, wf as u32) {
+            if self.put_u32(a[0], rf as u32) && self.put_u32(a[0].wrapping_add(4), wf as u32) {
                 0
             } else {
                 -EFAULT
