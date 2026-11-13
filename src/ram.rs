@@ -82,6 +82,40 @@ impl Ram {
         }
     }
 
+    /// RAM on a private anonymous mapping of its own: every page reads as zero and is backed on
+    /// demand (on Linux, without committing swap, and a read maps the kernel's one zero page), and
+    /// `discard` can always map fresh pages over a range, macOS included, since no allocator owns
+    /// it.
+    #[cfg(unix)]
+    pub fn mapped(len: usize) -> std::io::Result<Ram> {
+        if len == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "RAM of 0 bytes"));
+        }
+        // SAFETY: a new anonymous mapping at an address the kernel picks; nothing else owns that
+        // range, and `drop` unmaps it once.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Ram {
+            ptr: ptr.cast(),
+            len,
+            alloc: None,
+            mapped: true,
+            image: false,
+            fresh: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
     /// RAM whose pages are an image's: `file` holds RAM as it is, `len` bytes, with holes where it
     /// is zero (`split_state` writes one). It is mapped copy-on-write, private to this RAM:
     /// machines made from one image share the pages none of them writes (the host's page cache),
@@ -387,7 +421,7 @@ impl Drop for Ram {
         }
         #[cfg(unix)]
         if self.mapped {
-            // SAFETY: the mapping `from_image` made, unmapped once (aliases have none).
+            // SAFETY: the mapping `mapped` or `from_image` made, unmapped once (aliases have none).
             unsafe { libc::munmap(self.ptr.cast(), self.len) };
         }
     }
@@ -563,6 +597,20 @@ mod tests {
         {
             let f = image(64 * PAGE, &[]);
             check(Ram::from_image(&f, 64 * PAGE).unwrap());
+            check(Ram::mapped(64 * PAGE).unwrap());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_ram_is_zero_fresh_and_no_image() {
+        let ram = Ram::mapped(64 << 20).unwrap();
+        assert_eq!(ram.as_ptr() as usize % PAGE, 0);
+        assert!(!ram.is_image());
+        assert!(ram.is_zero(0, ram.len()));
+        assert!(ram.take_fresh(), "nothing has written it");
+        ram.store(ram.len() - 8, 8, 9);
+        assert_eq!(ram.load(ram.len() - 8, 8), 9);
+        assert!(Ram::mapped(0).is_err());
     }
 }
