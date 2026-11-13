@@ -25,14 +25,20 @@ config, notifications) and a legacy INTx line. The device tree marks the bus
 
 | | |
 |---|---|
-| `cpu.rs`, `a64.rs`, `advsimd.rs`, `crypto.rs`, `fp.rs`, `simd*.rs`, `mmu.rs`, `sysreg.rs` | the CPU |
-| `jit/` | page-at-a-time translation to WebAssembly modules (wasm builds only) |
+| `cpu.rs`, `a64.rs`, `advsimd.rs`, `crypto.rs`, `fp.rs`, `simd*.rs`, `mmu.rs`, `sysreg.rs` | the CPU: state, decode and execute, the MMU and system registers |
+| `predecode.rs`, `cpu/interp.rs` | the interpreter: each code page decoded once to ops, and the loop that runs them |
+| `jit/` | hot code pages translated to wasm (`gen.rs`): run as wasm in the browser, compiled to host code with Cranelift natively (`native.rs`, the default); `profile.rs` carries what a machine compiled to the next |
+| `cpu/hw.rs`, `cpu/hv.rs`, `cpu/kvm.rs` | the CPU in hardware (`hypervisor` feature): Hypervisor.framework, KVM |
 | `gic.rs`, `rtc.rs`, `smp.rs` | shared machine state, multi-CPU GIC, PSCI, TLB shootdowns |
-| `dev/` | UART, PCI, virtio transport, console, 9p + filesystem, net + network stack |
-| `vm.rs` | `Board` (devices + host API), `Vm` (with CPUs), snapshots |
-| `runner.rs`, `native.rs`, `platform.rs` | native hosting: threads, blob directory, TCP NAT |
-| `wasm.rs`, `js/armless.js` | the browser build |
+| `board.rs`, `dtb.rs`, `ram.rs` | the board's memory map and its device tree, guest RAM |
+| `dev/` | UART, PCI, virtio transport, console, 9p + filesystem, net + network stack, the web relay (`dev/web/`) |
+| `vm.rs`, `state.rs` | `Board` (devices + host API), `Vm` (with CPUs), snapshots and their CPU/machine state |
+| `runner.rs`, `native/`, `platform.rs`, `spill.rs` | native hosting: threads, blob directory, egress, TCP NAT, decompressed blobs on disk |
+| `kernel.rs` | a distribution's arm64 kernel made a raw `Image` |
+| `wasm.rs`, `heap.rs`, `js/armless.js` | the browser build |
 | `../user/` | user mode: a Linux program with no guest kernel (`armless-user`, `armless-exec`); its `wasm.rs` adds user mode's exports to armless.wasm |
+
+[map.md](map.md) says where each feature and each system call lives, and which tests cover what.
 
 ## Host interface
 
