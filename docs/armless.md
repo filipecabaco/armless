@@ -468,13 +468,47 @@ x0–x5, answers it in x0, and resumes at ELR.
   `wall_clock_ms`) and a SHA-256 generator keyed by the host's entropy (the last
   `armless_seed`, which armless.js gives after every restore).
 
+### Several CPUs
+
+On one CPU the threads of every process take turns (`Process::run`). On several (`Smp`, or
+`Process::run_on` with all the machine's CPUs; `armless-exec --cpus N`) they run at the same
+time: each CPU runs on a host thread of its own and runs guest code with no lock held. What a
+thread asks of its kernel (a system call, a page it touches first, a fault) stops its CPU,
+which takes the process's lock and answers it with the same code one CPU uses
+(`Process::answer`); picking a CPU's next thread is under the lock too (`Process::schedule`),
+and a CPU takes only a thread no other CPU has. Atomics need nothing more: a store-exclusive is
+armless's, as with a kernel, and futexes are answered under the lock.
+
+What one CPU does that another must see before it goes on:
+
+- **A change to an address space** (unmapped, protected, copied on write, a fork): the
+  translations every CPU holds of what changed go before the call returns, by armless's
+  broadcast TLB invalidation (`Cpu::tlb_shootdown`: the other CPUs drop them at their next
+  instruction, and the call waits for those in guest code).
+- **A process that ends or execs:** its threads on other CPUs stop there first
+  (`Machine::preempt` makes a CPU's `run` return at its next instruction), and their CPUs are
+  out of guest code (`Cpu::left_guest`) before its memory is freed (`take_off_cpus`).
+- **A signal for a thread another CPU runs:** that CPU is stopped, and delivers it itself, its
+  registers being on it.
+
+A CPU with nothing to run waits on a condition variable that a CPU making a thread runnable
+signals. A program is told of the CPUs there are (sched_getaffinity, `/proc/cpuinfo`; four at
+least, as on one CPU) and getcpu says which it is on. A snapshot is taken with every CPU's
+thread back in the process (`Smp::pause`), so it is the same whatever number of CPUs made it,
+and restores on any.
+
+Programs that do work in parallel go as much faster: four processes of Python 3.6 times, a
+DuckDB table scan 3.7 times, on four CPUs. A start that waits on itself does not: Supabase's
+stack is ready in 23 s rather than 25 s, its four CPUs running guest code a quarter of the time,
+the rest of it a chain of starts and the polls between them.
+
 ### In the browser
 
 armless.wasm is the cdylib of `armless-user`, which depends on armless, so one module has both
 export sets: armless's `armless_*` (the `#[no_mangle]` functions of a dependency are exported
 from a cdylib as they are) and user mode's `armless_user_*` (`user/src/wasm.rs`). These run on
 the machine `armless::wasm` keeps, with its `vm()`, `out()`, `set_error()` and pointer helpers.
-armless-smp.wasm is still built from armless alone: user mode runs on one CPU. User mode adds
+armless-smp.wasm is still built from armless alone: in a page, user mode runs on one CPU. User mode adds
 about 290 KB to armless.wasm (1.28 to 1.57 MB).
 
 A host makes the machine as for Linux (`armless_create`, `armless_fs_load`, `armless_seed`)
@@ -502,7 +536,7 @@ too. A snapshot is the pair a native host makes: the machine's state, the bytes 
 natively.
 
 Not yet: signals for faults (a fault ends the process, SIGSEGV is not delivered to a
-handler), more than one vCPU, and the hypervisor backends (an SVC at EL0 traps to EL1 in
+handler), more than one vCPU in a page, and the hypervisor backends (an SVC at EL0 traps to EL1 in
 hardware there, not to the host).
 
 What runs, from snowglobe's examples' own filesystems: `apk`, `curl` (HTTPS through the host),

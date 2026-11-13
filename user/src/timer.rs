@@ -177,7 +177,7 @@ pub(crate) struct Timers {
     cpu_proc: BTreeMap<i64, u64>,
     cpu_thread: BTreeMap<i64, u64>,
     /// The thread whose slice is running, and since when (counted by `charge_cpu`)
-    running: Option<(i64, i64, Instant)>,
+    running: Vec<Option<(i64, i64, Instant)>>,
 }
 
 /// How many times a timer `left` ns from its due time (negative: past it) with `interval` has
@@ -195,19 +195,22 @@ fn clamp(ns: u128) -> u64 {
 
 impl Timers {
     fn cpu(&self, scope: Scope, now: Instant) -> u64 {
-        let extra = |mine: bool| match self.running {
-            Some((_, _, at)) if mine => now.saturating_duration_since(at).as_nanos() as u64,
-            _ => 0,
+        // What the slices running now (one per CPU) have had so far
+        let extra = |mine: &dyn Fn(&(i64, i64, Instant)) -> bool| -> u64 {
+            self.running
+                .iter()
+                .flatten()
+                .filter(|r| mine(r))
+                .map(|r| now.saturating_duration_since(r.2).as_nanos() as u64)
+                .sum()
         };
         match scope {
             Scope::Wall => 0,
             Scope::Proc(pid) => {
-                self.cpu_proc.get(&pid).copied().unwrap_or(0)
-                    + extra(self.running.is_some_and(|r| r.0 == pid))
+                self.cpu_proc.get(&pid).copied().unwrap_or(0) + extra(&|r| r.0 == pid)
             },
             Scope::Thread(tid) => {
-                self.cpu_thread.get(&tid).copied().unwrap_or(0)
-                    + extra(self.running.is_some_and(|r| r.1 == tid))
+                self.cpu_thread.get(&tid).copied().unwrap_or(0) + extra(&|r| r.1 == tid)
             },
         }
     }
@@ -483,7 +486,8 @@ impl Process {
 
     /// Counts the time since the thread that runs began its slice to it and its process.
     pub(crate) fn charge_cpu(&mut self) {
-        let Some((pid, tid, at)) = self.timers.running.take() else {
+        let Some((pid, tid, at)) = self.timers.running.get_mut(self.cpu).and_then(Option::take)
+        else {
             return;
         };
         if self.proc_ref(pid).is_none() {
@@ -503,7 +507,11 @@ impl Process {
 
     /// Thread `tid` of process `pid` is about to run a slice.
     pub(crate) fn begin_slice(&mut self, pid: i64, tid: i64) {
-        self.timers.running = Some((pid, tid, Instant::now()));
+        let cpu = self.cpu;
+        if self.timers.running.len() <= cpu {
+            self.timers.running.resize(cpu + 1, None);
+        }
+        self.timers.running[cpu] = Some((pid, tid, Instant::now()));
     }
 
     /// The first time an armed timer that signals is due, to wake the machine at.

@@ -21,7 +21,7 @@ const EAGAIN: i64 = -11;
 fn machine_with_prog(elf: &[u8]) -> Vm<armless::platform::NativePlatform> {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus: test_cpus(),
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: Some("host9p".into()),
@@ -194,7 +194,7 @@ fn a_futex_in_shared_memory_wakes_a_waiter_in_another_process() {
     p.sys(260, &[I(0xffff_ffff), D(0x300), I(0), I(0)]);
     p.arg(0, W(0x300));
     p.expect(0); // the child exited 0: its wake found the parent
-    let mut vm = machine();
+    let mut vm = machine_with_cpus(1);
     let mut proc = start(&mut vm, p);
     let (_, status) = run(&mut proc, &mut vm);
     ok(&status);
@@ -297,7 +297,7 @@ fn a_pidfd_becomes_readable_when_its_process_ends_and_waitid_takes_it() {
 fn machine_with_script(elf: &[u8], script: &[u8]) -> Vm<armless::platform::NativePlatform> {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus: test_cpus(),
         devices: armless::dev::DeviceConfig {
             console: false,
             fs_tag: Some("host9p".into()),
@@ -614,7 +614,7 @@ fn aio_contexts_and_groups_survive_a_snapshot() {
     p.expect(0x222);
     let mut p = start(&mut vm, p);
     let status = loop {
-        let status = p.run(&mut vm.cpus[0], std::time::Duration::from_millis(20));
+        let status = p.run_on(&mut vm.cpus, std::time::Duration::from_millis(20));
         if !matches!(status, armless_user::Status::Running) {
             break status;
         }
@@ -1101,7 +1101,7 @@ fn armed_timers_go_on_in_a_restored_process() {
     let mut vm = machine();
     let mut proc = start(&mut vm, p);
     let status = loop {
-        match proc.run(&mut vm.cpus[0], std::time::Duration::from_millis(20)) {
+        match proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20)) {
             armless_user::Status::Running => {},
             s => break s,
         }

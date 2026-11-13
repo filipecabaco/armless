@@ -29,12 +29,19 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
+/// The CPUs a program is told of with one CPU, so that a runtime sizing its threads by them
+/// (Go's GOMAXPROCS, a JVM's GC threads) has some; with more, as many as there are.
 const NCPUS_REPORTED: u64 = 4;
 
 /// What a descriptor is ready for: (readable, writable, hung up)
 type Ready = (bool, bool, bool);
 
 impl Process {
+    /// The CPUs a program is told it has (`NCPUS_REPORTED`)
+    pub(crate) fn ncpus_reported(&self) -> u64 {
+        NCPUS_REPORTED.max(self.on_cpu.len() as u64)
+    }
+
     /// FUTEX_WAKE_OP: applies the operation `enc` (the kernel's encoded `op`, `oparg`, `cmp` and
     /// `cmparg`) to the word at `addr2`, wakes up to `nwake` threads waiting on `addr`, and, if
     /// the old value of the word satisfies the comparison, up to `nwake2` waiting on `addr2`.
@@ -490,7 +497,7 @@ impl Process {
             return Some(s.into_bytes());
         }
         Some(match path {
-            b"/proc/cpuinfo" => (0..NCPUS_REPORTED)
+            b"/proc/cpuinfo" => (0..self.ncpus_reported())
                 .map(|i| format!("processor\t: {i}\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd aes pmull sha1 sha2 crc32 atomics sha3 sm3 sm4 sha512\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n"))
                 .collect::<String>()
                 .into_bytes(),
@@ -1645,13 +1652,15 @@ impl Process {
                 if a[1] < 8 {
                     return v(-EINVAL);
                 }
-                v(if self.put_u64(a[2], (1 << NCPUS_REPORTED) - 1) { 8 } else { -EFAULT })
+                let mask = (1u64 << self.ncpus_reported()) - 1;
+                v(if self.put_u64(a[2], mask) { 8 } else { -EFAULT })
             },
             // getcpu
             168 => {
-                for at in [a[0], a[1]] {
+                // (The CPU this thread runs on; one node)
+                for (at, n) in [(a[0], self.cpu as u32), (a[1], 0)] {
                     if at != 0 {
-                        self.put_u32(at, 0);
+                        self.put_u32(at, n);
                     }
                 }
                 v(0)

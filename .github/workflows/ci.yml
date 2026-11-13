@@ -62,6 +62,9 @@ jobs:
       # The dev profile checks arithmetic for overflow; release wraps silently
       - name: Unit tests with overflow checks
         run: cargo test --workspace
+      # User mode's tests again with their programs' threads on four CPUs at once (user/src/smp.rs)
+      - name: User mode on several CPUs
+        run: ARMLESS_TEST_CPUS=4 cargo test --release -p armless-user
       - name: Type-check the wasm layer natively
         run: |
           cargo check --features wasm-api

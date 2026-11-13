@@ -976,6 +976,9 @@ impl<H: Host> Cpu<H> {
         }
         self.apply_tlb_shootdowns();
         self.apply_code_invalidations();
+        if me.preempt.swap(false, Ordering::SeqCst) {
+            return Some(Exit::Budget);
+        }
         None
     }
 
@@ -1067,6 +1070,29 @@ impl<H: Host> Cpu<H> {
         m.cpus[self.index].tlb_seen.store(gen, Ordering::SeqCst);
         self.tlb_sync_gen = gen;
         self.machine.poke_others(self.index);
+    }
+
+    /// What user mode (no guest kernel) needs of the TLBs of a machine of several CPUs: drop the
+    /// translations of `page` (a VA >> 12), or all of them (None), here and on every other CPU,
+    /// and wait until every CPU that runs guest code has (`tlbi_broadcast`, `tlb_sync`).
+    pub fn tlb_shootdown(&mut self, pages: &[u64], all: bool) {
+        if all {
+            self.tlbi_broadcast(smp::TLB_ALL);
+        } else {
+            for &p in pages {
+                self.tlbi_broadcast(p);
+            }
+        }
+        self.tlb_sync();
+    }
+
+    /// Whoever runs this CPU stopped running guest code on it (until its next `run`): a TLB
+    /// shootdown doesn't wait for it, nor does user mode, which waits for a CPU to have left the
+    /// guest before it frees what that CPU ran (`Machine::preempt`).
+    pub fn left_guest(&self) {
+        self.machine.cpus[self.index]
+            .run_state
+            .store(smp::RUN_IDLE, Ordering::SeqCst);
     }
 
     /// DSB after a broadcast TLBI: wait until every other running CPU applied it.
