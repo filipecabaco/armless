@@ -42,6 +42,7 @@ mod sched;
 mod ser;
 mod itimer;
 mod shm;
+mod timerfd;
 mod signal;
 mod sys;
 mod tty;
@@ -539,6 +540,7 @@ impl Process {
             })
             .ok_or_else(|| fail("the machine has no filesystem".into()))?;
         let (path, ino, cwd_ino) = found.ok_or_else(|| fail(format!("{name}: not found")))?;
+        board.with_fs(dev_shm);
         let image = mm::Image::of(&board, ino)?;
         // A script: its interpreter, the interpreter's argument, the script's path, then what
         // the script was given after its own name (as execve does)
@@ -883,6 +885,8 @@ impl Process {
             }
             // Interval timers that are due raise SIGALRM
             self.fire_alarms();
+            // timerfds that fired wake what waits on them
+            self.timerfds_due();
             // Signals first: a call a handler interrupts ends rather than runs again
             self.deliver_signals(cpu);
             if self.exit_code.is_some() || self.fault.is_some() {
@@ -910,6 +914,7 @@ impl Process {
                         .iter()
                         .filter_map(|t| t.wait.as_ref().and_then(|(_, d)| *d))
                         .chain(self.next_alarm())
+                        .chain(self.next_timerfd())
                         .min(),
                 );
             };
@@ -1493,6 +1498,23 @@ impl Process {
         p.want_blobs(&wanted);
         p.sync_mmu(cpu);
         Ok(p)
+    }
+}
+
+/// /dev/shm, where shm_open makes POSIX shared memory (glibc's and musl's): on Linux a tmpfs, here
+/// a directory of the machine's filesystem anyone may write in, made if the image has none
+/// (Supabase's Postgres keeps its dynamic shared memory there).
+fn dev_shm(fs: &mut Fs) {
+    use armless::dev::fs::S_IFDIR;
+    let dev = match fs.lookup(ROOT, b"dev") {
+        Ok(d) => d,
+        Err(_) => match fs.create(ROOT, b"dev", S_IFDIR | 0o755, 0, 0, 0) {
+            Ok(d) => d,
+            Err(_) => return,
+        },
+    };
+    if fs.lookup(dev, b"shm").is_err() {
+        let _ = fs.create(dev, b"shm", S_IFDIR | 0o1777, 0, 0, 0);
     }
 }
 

@@ -115,6 +115,7 @@ impl Process {
                 false,
                 false,
             ),
+            Kind::TimerFd(t) => (t.readable(Instant::now()), false, false),
             Kind::Sock(id) => self.sock_ready(*id),
             Kind::Epoll { watch } => (
                 watch.iter().any(|(&f, w)| {
@@ -220,6 +221,7 @@ impl Process {
             },
             Kind::Signal { mask } => self.read_signalfd(mask, max, nonblock),
             Kind::Pidfd { .. } => Err(Ret::Val(-EINVAL)),
+            Kind::TimerFd(_) => self.read_timerfd(fd, max, nonblock),
             Kind::Event { count } => {
                 if max < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -322,7 +324,7 @@ impl Process {
                 Ok(n)
             },
             Kind::Signal { .. } => Err(Ret::Val(-EINVAL)),
-            Kind::Pidfd { .. } => Err(Ret::Val(-EINVAL)),
+            Kind::Pidfd { .. } | Kind::TimerFd(_) => Err(Ret::Val(-EINVAL)),
             Kind::Event { .. } => {
                 if data.len() < 8 {
                     return Err(Ret::Val(-EINVAL));
@@ -438,6 +440,9 @@ impl Process {
             if path.starts_with(b"/proc/")
                 || path.starts_with(b"/sys/")
                 || path.starts_with(b"/dev/")
+                    // POSIX shared memory's files (shm_open) are made in /dev/shm, a directory
+                    // of the machine's filesystem here (Process::exec makes it)
+                    && !path.starts_with(b"/dev/shm/")
                     && !self
                         .fs(|fs| fs.lookup_path(&String::from_utf8_lossy(path)).is_some())
                         .unwrap_or(false)
@@ -519,7 +524,11 @@ impl Process {
             },
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
             Kind::Sock(_) => Stat::device(files::S_IFSOCK | 0o777, 0),
-            Kind::Event { .. } | Kind::Signal { .. } | Kind::Pidfd { .. } | Kind::Epoll { .. } => {
+            Kind::Event { .. }
+            | Kind::Signal { .. }
+            | Kind::Pidfd { .. }
+            | Kind::TimerFd(_)
+            | Kind::Epoll { .. } => {
                 Stat::device(0o600, 0)
             },
         })
@@ -967,6 +976,7 @@ impl Process {
                         Some(Kind::Event { .. }) => Ok(b"anon_inode:[eventfd]".to_vec()),
                         Some(Kind::Signal { .. }) => Ok(b"anon_inode:[signalfd]".to_vec()),
                         Some(Kind::Pidfd { .. }) => Ok(b"anon_inode:[pidfd]".to_vec()),
+                        Some(Kind::TimerFd(_)) => Ok(b"anon_inode:[timerfd]".to_vec()),
                         Some(Kind::Epoll { .. }) => Ok(b"anon_inode:[eventpoll]".to_vec()),
                         Some(Kind::Mem { .. }) => Ok(format!("/dev/fd/{fd}").into_bytes()),
                         None => Err(-ENOENT),
@@ -1144,6 +1154,42 @@ impl Process {
                     .unwrap_or(-EBADF)),
                 Some(_) => v(-EINVAL),
                 None => v(-EBADF),
+            },
+            // fallocate(fd, mode, offset, len): with mode 0 (posix_fallocate) the file is at least
+            // offset + len long, its new bytes zero (Postgres sizes a POSIX shared memory segment
+            // so); FALLOC_FL_KEEP_SIZE leaves it as it is, as space here is never reserved
+            47 => {
+                const FALLOC_FL_KEEP_SIZE: u64 = 1;
+                let (mode, off, len) = (a[1], a[2] as i64, a[3] as i64);
+                if off < 0 || len <= 0 {
+                    return v(-EINVAL);
+                }
+                if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+                    return v(-95); // EOPNOTSUPP: punching holes, zeroing and collapsing ranges
+                }
+                let Some(end) = off.checked_add(len) else {
+                    return v(-27); // EFBIG
+                };
+                match self.files.get(fd0).map(|d| (d.kind.clone(), d.flags)) {
+                    Some((Kind::File { ino, .. }, flags)) if flags & O_ACCMODE != 0 => {
+                        if mode & FALLOC_FL_KEEP_SIZE != 0 {
+                            return v(0);
+                        }
+                        v(self
+                            .fs(|fs| {
+                                let size = fs.get(ino).map_or(0, |i| i.size);
+                                if (end as u64) <= size {
+                                    return 0;
+                                }
+                                fs.truncate(ino, end as u64).map(|_| 0).unwrap_or_else(errno)
+                            })
+                            .unwrap_or(-EBADF))
+                    },
+                    Some((Kind::File { .. }, _)) => v(-EBADF),
+                    Some((Kind::PipeRead(_) | Kind::PipeWrite(_), _)) => v(-29), // ESPIPE
+                    Some(_) => v(-19), // ENODEV
+                    None => v(-EBADF),
+                }
             },
             // truncate
             45 => match self.lookup(AT_FDCWD, &self.cstr(a[0]), true) {
@@ -1325,6 +1371,10 @@ impl Process {
             195 => self.sys_shmctl(a[0] as i32, a[1], a[2]),
             196 => self.sys_shmat(a[0] as i32, a[1], a[2]),
             197 => self.sys_shmdt(a[0]),
+            // timerfd_create, timerfd_settime, timerfd_gettime (timerfd.rs)
+            85 => self.sys_timerfd_create(a[0], a[1]),
+            86 => self.sys_timerfd_settime(a[0] as i32, a[1], a[2], a[3]),
+            87 => self.sys_timerfd_gettime(a[0] as i32, a[1]),
             // pidfd_open(pid, flags), pidfd_send_signal(pidfd, sig, info, flags) (proc.rs)
             434 => self.sys_pidfd_open(a[0] as i32 as i64, a[1]),
             424 => self.sys_pidfd_send_signal(a[0] as i32, a[1] as u32),
