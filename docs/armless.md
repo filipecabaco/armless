@@ -269,6 +269,11 @@ x0–x5, answers it in x0, and resumes at ELR.
   output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
   newlines start a line (ONLCR).
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
+- **File locks** (user/src/locks.rs), as Linux keeps them: record locks (`fcntl` F_GETLK,
+  F_SETLK, F_SETLKW) are a process's, on byte ranges, and go when it closes any descriptor of the
+  file or ends; OFD locks are a description's and conflict with them; `flock` is a description's
+  whole-file lock. SQLite's locks hold, and the Supabase CLI tells its stack's owner is running by
+  one.
 - **Sockets** (user/src/net.rs): `socket`, `socketpair`, `bind`, `listen`, `accept` and `accept4`,
   `connect`, `sendto` and `recvfrom`, `sendmsg` and `recvmsg` (and the `mmsg` pair), `shutdown`,
   `getsockname`, `getpeername`, `getsockopt` and `setsockopt`; a socket is a descriptor like a
