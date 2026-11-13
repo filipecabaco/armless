@@ -496,13 +496,25 @@ impl Process {
 
     /// Starts `args[0]`, found in the machine's filesystem (by PATH from `env` when it has no
     /// slash), as execve would: a dynamically linked one with its loader (PT_INTERP) from the
-    /// filesystem too. `cwd` is the working directory.
+    /// filesystem too, and a `#!` script with its interpreter (an image's command is often a
+    /// script: Postgres's start-postgres, Supabase's launcher). `cwd` is the working directory.
     pub fn exec<H: Host>(
         cpu: &mut Cpu<H>,
         board: Arc<Board>,
         args: &[String],
         env: &[String],
         cwd: &str,
+    ) -> Result<Process, ExecError> {
+        Process::exec_script(cpu, board, args, env, cwd, 0)
+    }
+
+    fn exec_script<H: Host>(
+        cpu: &mut Cpu<H>,
+        board: Arc<Board>,
+        args: &[String],
+        env: &[String],
+        cwd: &str,
+        depth: usize,
     ) -> Result<Process, ExecError> {
         let fail = |s: String| ExecError::Fail(s);
         let name = args.first().ok_or_else(|| fail("no program".into()))?;
@@ -528,6 +540,19 @@ impl Process {
             .ok_or_else(|| fail("the machine has no filesystem".into()))?;
         let (path, ino, cwd_ino) = found.ok_or_else(|| fail(format!("{name}: not found")))?;
         let image = mm::Image::of(&board, ino)?;
+        // A script: its interpreter, the interpreter's argument, the script's path, then what
+        // the script was given after its own name (as execve does)
+        if let Some((interp, arg)) = exec::shebang(image.head()) {
+            if depth >= exec::MAX_SCRIPT_DEPTH {
+                return Err(fail(format!("{name}: too many levels of #! interpreters")));
+            }
+            let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+            let mut next = vec![s(&interp)];
+            next.extend(arg.as_deref().map(s));
+            next.push(path);
+            next.extend(args[1..].iter().cloned());
+            return Process::exec_script(cpu, board, &next, env, cwd, depth + 1);
+        }
         let exe = board
             .with_fs(|fs| files::canonical(fs, cwd_ino, path.as_bytes()).ok())
             .flatten();
