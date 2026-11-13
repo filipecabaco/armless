@@ -299,15 +299,25 @@ x0–x5, answers it in x0, and resumes at ELR.
   - *Snapshots:* the sockets' state is in the machine's, streams and queues with their bytes,
     whatever process holds them. A connection to the host can't survive a restore:
     it reads as closed, and one that was connecting as reset.
-  - *Descriptors* pass between unix streams with `SCM_RIGHTS` (Erlang hands its port programs'
-    pipes to `erl_child_setup` so): the descriptions go with the bytes sent with them, holding a
-    reference until received, and `recvmsg` installs them (MSG_CMSG_CLOEXEC, MSG_CTRUNC when its
-    room is short). A read stops before the bytes the next descriptors came with, as Linux's.
-    An unbound unix client is accepted as its family alone (Postgres's "local" lines match so).
-  - *Not supported:* descriptors over datagrams and to the host (`EOPNOTSUPP`), other ancillary
-    data (taken, ignored), `SOCK_SEQPACKET`, raw and packet sockets, `socketpair` for anything
-    but AF_UNIX, a separate `RDHUP`, backpressure from the guest to the host (a host stream's
-    data is taken as it comes).
+  - *Ancillary data* goes between unix sockets, streams and datagrams. `SCM_RIGHTS` passes
+    descriptors (Erlang hands its port programs' pipes to `erl_child_setup` so): a datagram
+    carries them, a stream the bytes of the send that had them, each holding a reference until
+    received; `recvmsg` installs them (MSG_CMSG_CLOEXEC, MSG_CTRUNC when its room is short), a
+    peek gives copies, and a read or `recvfrom`, which takes no control data, closes them. A stream
+    read that reaches a send carrying descriptors takes them and ends with that send, as Linux's.
+    With `SO_PASSCRED` a socket receives `SCM_CREDENTIALS`, who sent what it reads (pid, uid, gid,
+    or what the sender gave, as root may; a pid that isn't a process's is ESRCH). An unbound unix
+    client is accepted as its family alone (Postgres's "local" lines match so).
+  - *Interfaces* (user/src/netlink.rs): a netlink route socket answers the RTM_GETLINK,
+    RTM_GETADDR and RTM_GETROUTE dumps (`ip addr`, `ip route`, getifaddrs, Node's
+    `os.networkInterfaces()`, Go's `net.Interfaces()`, Erlang's `inet:getifaddrs()`): `lo`
+    (127.0.0.1/8, ::1/128) and, with a network, `eth0` at 192.168.86.100/24 with the default
+    route via 192.168.86.1; a change is EPERM. Any socket answers the SIOCGIF* ioctls from the
+    same table (`ifconfig`), and `/proc/net/dev` lists the interfaces.
+  - *Not supported:* descriptors to the host (`EOPNOTSUPP`), other ancillary data of a unix
+    socket (EINVAL), `SOCK_SEQPACKET`, raw and packet sockets but netlink's route family,
+    `socketpair` for anything but AF_UNIX, a separate `RDHUP`, backpressure from the guest to the
+    host (a host stream's data is taken as it comes).
 - **Memory** (user/src/mm.rs): virtual. Each process has page tables of its own (4 KiB pages,
   39 bits: 512 GiB of address space, an ASID per process so a switch flushes nothing) over one
   pool of refcounted frames, the machine's RAM; the tables are in frames too, which no process
@@ -336,7 +346,9 @@ x0–x5, answers it in x0, and resumes at ELR.
   the file keeps its contents. A MAP_SHARED one is the file's: every mapping of a page of it, in
   any process, has the one frame (`Process::file_pages`, Postgres's dynamic shared memory), and
   the page is written back to its file once no mapping holds it. The areas' bookkeeping is in
-  the process state.
+  the process state. POSIX shared memory (`shm_open`) is files in `/dev/shm`, a directory of the
+  machine's filesystem a program's start makes if the image has none (Supabase's Postgres keeps
+  its dynamic shared memory there), and `fallocate` sizes a file (mode 0, and KEEP_SIZE).
   `ARMLESS_USER_EAGER=1` reads every mapped page at once, for comparisons.
 - **Threads:** every guest thread is a saved register context, and they take turns on one
   CPU in slices of instructions; a syscall answered on the way counts against the slice.
@@ -364,7 +376,8 @@ x0–x5, answers it in x0, and resumes at ELR.
   first write by either takes a frame of its own, or makes the page writable again when the
   other side is gone). `execve` and `execveat` (an fd, AT_EMPTY_PATH) run another program in the
   same process: a new address space, the descriptors that are not close-on-exec, handled
-  signals back to the default, the other threads gone, and a `#!` script runs its interpreter; a
+  signals back to the default, the other threads gone, and a `#!` script runs its interpreter (so
+  does the first program, `Process::exec`: an image's command is often a script); a
   failure (ENOENT, EACCES, ENOEXEC, E2BIG, ELOOP) leaves the program as it was, and one whose
   file hasn't arrived waits for it and runs again. `wait4` and `waitid` (WNOHANG, a pid, a
   group or any child; a zombie keeps its status), `kill` of a pid, and SIGCHLD when a child
@@ -373,29 +386,51 @@ x0–x5, answers it in x0, and resumes at ELR.
   descriptor table, signal actions and working directory shared by CLONE_FILES, CLONE_SIGHAND
   and CLONE_FS (copied instead), futexes in the private memory of CLONE_VM processes (they wake
   only within a process), the siginfo of SIGCHLD (its pid and status), job control (stop and
-  continue), CLONE_PIDFD, namespaces, and an anonymous MAP_SHARED area that was PROT_NONE at a
+  continue), namespaces, and an anonymous MAP_SHARED area that was PROT_NONE at a
   fork shares nothing (the others have their untouched pages made at the fork).
 - **Users** (user/src/creds.rs): a process has real, effective and saved user and group ids,
   root to start with. `setuid`, `setgid`, `setreuid`, `setregid`, `setresuid` and `setresgid`
   change them as Linux does (root to anything, anyone else among its own), `getuid` and the
   rest say them, a child has its parent's and `execve` keeps them, and what a process makes
   (files, directories, links, sockets' names) is owned by its effective ids. `chown` and
-  `fchownat` set a file's owner (root to anyone, its owner to one of its groups); `setgroups`
-  is root's. So `su` and Postgres's `pg_ctl` (which refuses to run as root) work. Permissions
-  are not checked by them.
+  `fchownat` set a file's owner (root to anyone, its owner to one of its groups). A process has
+  supplementary groups too: `setgroups` (root's) keeps a list `getgroups` gives, a child
+  inherits and exec keeps. So `su` and Postgres's `pg_ctl` (which refuses to run as root) work.
+  Permissions are not checked by them.
 - **System V shared memory** (user/src/shm.rs): `shmget`, `shmat`, `shmdt`, `shmctl` (IPC_STAT,
   IPC_SET, IPC_RMID). A segment is the machine's: it has frames of its own, each attach maps
   them as a shared area, and a fork shares them; it goes once removed and detached.
-- **signalfd and timers:** `signalfd4` gives a descriptor whose reads take the pending signals
-  of its mask, which the program blocks (a `signalfd_siginfo` each), readable to poll and epoll.
-  `setitimer` and `getitimer` arm a process's ITIMER_REAL, which raises SIGALRM (once, or every
-  interval); the virtual and profiling timers are taken and never fire. `pidfd_open` gives a
-  descriptor of a process, readable once it has ended; `pidfd_send_signal` and
-  `waitid(P_PIDFD)` take one (the Supabase CLI watches its stack's owner so).
+- **signalfd:** `signalfd4` gives a descriptor whose reads take the pending signals of its mask,
+  which the program blocks (a `signalfd_siginfo` each, a timer's with its id and overrun),
+  readable to poll and epoll.
+- **Timers** (user/src/timer.rs, timerfd.rs): the interval timers (`setitimer`, `getitimer`:
+  ITIMER_REAL raises SIGALRM; ITIMER_VIRTUAL and ITIMER_PROF, SIGVTALRM and SIGPROF, from the
+  CPU time of the process, the host time its threads held the CPU) and the POSIX timers
+  (`timer_create`, `timer_settime` with TIMER_ABSTIME, `timer_gettime`, `timer_getoverrun`,
+  `timer_delete`: SIGEV_SIGNAL, SIGEV_THREAD_ID, SIGEV_NONE, the SI_TIMER siginfo and overruns)
+  on the wall, monotonic, boot and CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`,
+  `CLOCK_THREAD_CPUTIME_ID`, for `clock_gettime` too). A child has no timers; exec keeps the
+  interval timers and deletes the POSIX ones. A timerfd (`timerfd_create`, `timerfd_settime`,
+  `timerfd_gettime`; GHC's runtime, Supabase's PostgREST, makes one) counts its expirations:
+  a read gives them, poll and epoll see one that fired. An idle machine's host comes back when
+  the next timer is due.
+- **Process descriptors:** `pidfd_open` and `CLONE_PIDFD` (clone and clone3) give a descriptor
+  of a process, readable once it has ended and hung up once it was waited for; `pidfd_send_signal`
+  signals it, `pidfd_getfd` takes a description of its table, `waitid(P_PIDFD)` waits for it (one
+  with PIDFD_NONBLOCK never waits), and `/proc/self/fdinfo/N` says its pid (the Supabase CLI
+  watches its stack's owner so).
+- **AIO** (user/src/aio.rs): `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`
+  and `io_pgetevents`, done as they are submitted (reads, writes, their vectored forms and fsync),
+  their completions signalled to an eventfd with IOCB_FLAG_RESFD (nginx's `aio on`). `preadv2`
+  and `pwritev2` take RWF_NOAPPEND, RWF_APPEND and RWF_DONTCACHE (RWF_ATOMIC is EOPNOTSUPP), and a
+  positioned write to a descriptor opened O_APPEND goes to its end, as Linux's.
+- **CPU identification:** a read of an ID register (`mrs` of MIDR_EL1, MPIDR_EL1, the ID_AA64*
+  registers), which EL0 can't make, is answered with the CPU's value as Linux answers it for a
+  program (HWCAP_CPUID); Go's `x/sys/cpu` reads ID_AA64ISAR0_EL1 as it starts.
 - **/proc/self:** `exe` is the file that runs with its links followed (musl's loader finds
   `$ORIGIN` from it: `/usr/bin/java` links into the JDK); `fd/N` says what each descriptor is open
   on, as Linux does (a path, `pipe:[N]`, `socket:[N]`, `anon_inode:[...]`), for realpath in Zig,
-  Bun and Deno.
+  Bun and Deno; `fdinfo/N` its position and flags.
 - **Blocking:** a call that can't complete (a read of the terminal or a pipe, a poll, a wait
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
@@ -420,7 +455,9 @@ x0–x5, answers it in x0, and resumes at ELR.
   the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
   and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
   are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
-  The state is `ARMLUSR7`: 0.15's `ARMLUSR6` with each thread's scheduling; `ARMLUSR6` is 0.14's
+  The state is `ARMLUSR7`: 0.15's `ARMLUSR6` with each thread's scheduling, each process's
+  groups and AIO contexts, the armed timers (CPU time counted so far, and the POSIX ones), the
+  descriptors and senders of what waits at sockets, and timerfds; `ARMLUSR6` is 0.14's
   `ARMLUSR5` with each process's ids and interval timer, the System V segments, the shared file
   pages, and the descriptors on their way over sockets. Both older ones load (what they lack
   starts as a new process has it); a state from before 0.14 does not (addresses are virtual,
@@ -472,8 +509,11 @@ What runs, from snowglobe's examples' own filesystems: `apk`, `curl` (HTTPS thro
 `duckdb` (C++), `go` (Bubble Tea, static), `java` (OpenJDK 21), `python` (the 3.14 REPL, 122
 shared libraries, subprocesses), `python-agent`, `rust` (a static binary), `typescript` (tsx on
 Node), `iex` (Erlang/OTP, with port programs), `postgres` (`su`, `pg_ctl`, the postmaster and its
-processes, queries through psql: 100,000 rows in 1.2 s) and `elixir` (a release talking to that
-Postgres); a Python REPL saved with its state and restored in 120 ms. `user/corpus/survey.exs` traces what each of snowglobe's
+processes, queries through psql: 100,000 rows in 1.2 s), `elixir` (a release talking to that
+Postgres) and `supabase` (Postgres, PostgREST, Auth, Realtime and nginx from its own launcher:
+built as a snowglobe site with `--kernel none`, ready 24 s after it starts, signup, row-level
+security and the API on the machine's network address checked); a Python REPL saved with its
+state and restored in 120 ms. `user/corpus/survey.exs` traces what each of snowglobe's
 examples asks of a kernel, for what comes next.
 
 Measured as a snowglobe site (a Go program with eight goroutines, macOS, the same

@@ -36,9 +36,11 @@ armless started as a fork of [v86](https://github.com/copy/v86).
   Static and dynamically linked programs, the machine's filesystem, a terminal, threads,
   processes (fork, exec and wait), pipes, sockets (in memory, unix and loopback TCP and UDP, with
   the host's network behind them), epoll, poll and select, signals, virtual memory with
-  protections (an address space far larger than the RAM, backed as it is touched), and snapshots
-  of the running processes work. Go, Python 3.14 and DuckDB run this way from their own images,
-  natively and in the browser (a snapshot made on one restores on the other).
+  protections (an address space far larger than the RAM, backed as it is touched), shared memory
+  (System V, POSIX and MAP_SHARED files), users and groups, timers, timerfd, signalfd, pidfds,
+  AIO and the network's interfaces, and snapshots of the running processes work. Go, Python 3.14,
+  DuckDB, Java, Erlang and Elixir, Postgres and Supabase's whole stack run this way from their
+  own images, natively and in the browser (a snapshot made on one restores on the other).
 
 ## Quick start
 
