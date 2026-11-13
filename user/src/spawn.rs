@@ -125,6 +125,8 @@ impl Process {
                 cwd: cwd_ino,
                 umask: 0o022,
                 exe: exe.clone(),
+                // (load_image sets it)
+                cmdline: Vec::new(),
                 sig: Signals::default(),
                 creds,
                 groups: Vec::new(),

@@ -646,6 +646,7 @@ impl Process {
             cwd: self.p.cwd,
             umask: self.p.umask,
             exe: self.p.exe.clone(),
+            cmdline: self.p.cmdline.clone(),
             sig: self.p.sig.fork(),
             creds: self.p.creds,
             groups: self.p.groups.clone(),
