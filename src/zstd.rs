@@ -1,9 +1,10 @@
 //! zstd decompression: 9p blobs (`.bin.zst`), compressed snapshots and
 //! zstd-compressed kernels.
 //!
-//! Wasm and native hosts decode with the same C decoder (`lib/zstd/zstddeclib.c`): `build-wasm.sh`
-//! links it into the wasm module, `build.rs` compiles it into native hosts. `sys` is the only part
-//! that differs (the wasm ABI passes pointers and sizes as `u32`); everything else is shared.
+//! Wasm and native hosts decode with the C decoder: `build-wasm.sh` links `lib/zstd/zstddeclib.c`
+//! into the wasm module, native hosts use the `zstd-sys` crate (built from its bundled libzstd).
+//! `sys` is the only part that differs (the wasm ABI passes pointers and sizes as `u32`, and the
+//! native decoder is given `malloc` and `free` as a `ZSTD_customMem`); everything else is shared.
 
 use std::alloc;
 use std::io::Read;
@@ -90,55 +91,60 @@ mod sys {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod sys {
-    use std::ffi::{c_uint, c_void};
-
-    // SAFETY: the C decoder `build.rs` compiles, with these signatures (size_t is usize). Making a
-    // stream and telling an error code from a size take no pointers and have no preconditions.
-    unsafe extern "C" {
-        safe fn ZSTD_createDStream() -> *mut c_void;
-        fn ZSTD_freeDStream(ctx: *mut c_void) -> usize;
-        fn ZSTD_decompressStream_simpleArgs(
-            ctx: *mut c_void,
-            dst: *mut u8,
-            dst_capacity: usize,
-            dst_pos: *mut usize,
-            src: *const u8,
-            src_size: usize,
-            src_pos: *mut usize,
-        ) -> usize;
-        safe fn ZSTD_isError(code: usize) -> c_uint;
-    }
+    use std::ffi::c_void;
+    use zstd_sys::{
+        ZSTD_DStream, ZSTD_createDStream_advanced, ZSTD_customMem, ZSTD_decompressStream,
+        ZSTD_freeDStream, ZSTD_inBuffer, ZSTD_isError, ZSTD_outBuffer,
+    };
 
     /// A decompression context of the C decoder.
-    pub struct Ctx(*mut c_void);
+    pub struct Ctx(*mut ZSTD_DStream);
 
     // SAFETY: a context holds no thread-local state and is used by one thread at a time (`&mut`).
     unsafe impl Send for Ctx {}
 
+    /// The library's malloc: `super::malloc`.
+    unsafe extern "C" fn alloc(_opaque: *mut c_void, size: usize) -> *mut c_void {
+        // SAFETY: as malloc: any size.
+        unsafe { super::malloc(size) as *mut c_void }
+    }
+
+    /// The library's free: `super::free` (null is fine).
+    unsafe extern "C" fn dealloc(_opaque: *mut c_void, ptr: *mut c_void) {
+        // SAFETY: `ptr` came from `alloc`, or is null (the library's promise).
+        unsafe { super::free(ptr as *mut u8) }
+    }
+
     impl Ctx {
         /// None if the decoder could not allocate one.
         pub fn new() -> Option<Ctx> {
-            let ctx = ZSTD_createDStream();
+            let mem = ZSTD_customMem {
+                customAlloc: Some(alloc),
+                customFree: Some(dealloc),
+                opaque: std::ptr::null_mut(),
+            };
+            // SAFETY: the allocator functions are valid for the library's whole use of them.
+            let ctx = unsafe { ZSTD_createDStream_advanced(mem) };
             (!ctx.is_null()).then_some(Ctx(ctx))
         }
 
         /// One call of the streaming decoder: `(written, read, hint)`, or None on corrupt data.
         pub fn step(&mut self, dst: &mut [u8], src: &[u8]) -> Option<(usize, usize, usize)> {
-            let (mut dst_pos, mut src_pos) = (0usize, 0usize);
-            // SAFETY: a live context; `dst` and `src` are ours with their lengths, and the positions
-            // are this frame's own variables.
-            let r = unsafe {
-                ZSTD_decompressStream_simpleArgs(
-                    self.0,
-                    dst.as_mut_ptr(),
-                    dst.len(),
-                    &mut dst_pos,
-                    src.as_ptr(),
-                    src.len(),
-                    &mut src_pos,
-                )
+            let mut output = ZSTD_outBuffer {
+                dst: dst.as_mut_ptr() as *mut c_void,
+                size: dst.len(),
+                pos: 0,
             };
-            (ZSTD_isError(r) == 0).then_some((dst_pos, src_pos, r))
+            let mut input = ZSTD_inBuffer {
+                src: src.as_ptr() as *const c_void,
+                size: src.len(),
+                pos: 0,
+            };
+            // SAFETY: a live context; the buffers describe `dst` and `src` with their lengths, and
+            // are this frame's own variables.
+            let r = unsafe { ZSTD_decompressStream(self.0, &mut output, &mut input) };
+            // SAFETY: takes no pointers and has no preconditions.
+            (unsafe { ZSTD_isError(r) } == 0).then_some((output.pos, input.pos, r))
         }
     }
 
@@ -149,24 +155,6 @@ mod sys {
                 ZSTD_freeDStream(self.0);
             }
         }
-    }
-
-    /// malloc for the zstd library (`#define malloc v86_malloc`).
-    ///
-    /// # Safety
-    /// Called by C code only.
-    #[no_mangle]
-    pub unsafe extern "C" fn v86_malloc(size: usize) -> *mut c_void {
-        // SAFETY: as malloc: any size.
-        unsafe { super::malloc(size) as *mut c_void }
-    }
-
-    /// # Safety
-    /// `ptr` must come from `v86_malloc`, or be null.
-    #[no_mangle]
-    pub unsafe extern "C" fn v86_free(ptr: *mut c_void) {
-        // SAFETY: `ptr` came from `v86_malloc` (the caller's promise).
-        unsafe { super::free(ptr as *mut u8) }
     }
 }
 

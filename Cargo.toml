@@ -32,6 +32,9 @@ x25519-dalek = { version = "3", default-features = false, features = ["static_se
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1"
+# zstd decoding on native hosts (the bundled libzstd; `experimental` for ZSTD_customMem, which hands
+# the decoder src/zstd.rs's allocator)
+zstd-sys = { version = "2", default-features = false, features = ["experimental"] }
 # The native JIT: the blocks the JIT translates to wasm, compiled to host code instead (src/jit/native.rs)
 cranelift-codegen = { version = "=0.137.1", optional = true }
 cranelift-frontend = { version = "=0.137.1", optional = true }
@@ -43,10 +46,6 @@ cranelift-native = { version = "=0.137.1", optional = true }
 # code visible to other cores (membarrier), and maps its code memory itself (src/jit/native/code.rs)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-# The C zstd decoder (lib/zstd/zstddeclib.c) for native hosts: needs a C compiler
-[build-dependencies]
-cc = "1"
 
 [features]
 default = ["native-jit"]
