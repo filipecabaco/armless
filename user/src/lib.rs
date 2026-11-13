@@ -37,6 +37,7 @@ mod creds;
 mod elf;
 mod exec;
 mod files;
+mod locks;
 pub mod host;
 mod mm;
 mod net;
@@ -1389,6 +1390,7 @@ impl Process {
         self.files.net.save_rights(&mut w);
         self.files.net.save_cm(&mut w);
         self.timers.save(&mut w, now);
+        self.files.locks.save(&mut w);
         w.0
     }
 
@@ -1566,6 +1568,10 @@ impl Process {
         if ver >= 7 {
             timers.load(&mut r, now)?;
         }
+        // File locks from ARMLUSR8 (before, every lock was granted and none kept)
+        if ver >= 8 {
+            files.locks = locks::Locks::load(&mut r)?;
+        }
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);
@@ -1655,8 +1661,8 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
 /// timers but ITIMER_REAL, with the CPU time they count (timer.rs, at the end); ARMLUSR6
 /// (0.15) has none of that; ARMLUSR5 (0.14) has neither the ids, timers, shared memory, shared
 /// file pages nor descriptors in flight of 0.15. Each still loads.
-const MAGIC: &[u8; 8] = b"ARMLUSR7";
-const MAGICS: [&[u8; 8]; 3] = [b"ARMLUSR5", b"ARMLUSR6", MAGIC];
+const MAGIC: &[u8; 8] = b"ARMLUSR8";
+const MAGICS: [&[u8; 8]; 4] = [b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", MAGIC];
 
 const _: () = {
     const fn send<T: Send>() {}
