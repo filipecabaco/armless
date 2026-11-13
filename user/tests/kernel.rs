@@ -406,3 +406,312 @@ fn a_timerfd_counts_its_expirations_and_is_readable_when_one_is_in() {
     let (_, status) = run(&mut proc, &mut vm);
     ok(&status);
 }
+
+// ------------------------------------------------------------ groups, AIO, preadv2 and pwritev2
+
+const EBADF: i64 = -9;
+const EINVAL: i64 = -22;
+const EOPNOTSUPP: i64 = -95;
+/// openat's AT_FDCWD, and O_RDWR | O_CREAT
+const AT_FDCWD: u64 = 0xffff_ff9c;
+const O_RDWR_CREAT: u64 = 0o102;
+const O_APPEND: u64 = 0o2000;
+
+/// struct iocb: the request `op` on `fd` of `n` bytes at `buf` (an offset of the data), at `off`,
+/// with the RWF_ `rw_flags`, and an eventfd to signal
+#[allow(clippy::too_many_arguments)] // struct iocb's fields
+fn iocb(data: u64, op: u16, fd: u32, buf: u32, n: u64, off: u64, rw_flags: u32, resfd: Option<u32>) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&data.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes()); // aio_key
+    b.extend_from_slice(&rw_flags.to_le_bytes());
+    b.extend_from_slice(&op.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes()); // aio_reqprio
+    b.extend_from_slice(&fd.to_le_bytes());
+    // No bytes at offset 0 is no buffer: NULL (an FSYNC has none)
+    let at = if buf == 0 && n == 0 { 0 } else { DATA + buf as u64 };
+    b.extend_from_slice(&at.to_le_bytes());
+    b.extend_from_slice(&n.to_le_bytes());
+    b.extend_from_slice(&off.to_le_bytes());
+    b.extend_from_slice(&0u64.to_le_bytes()); // aio_reserved2
+    b.extend_from_slice(&(resfd.is_some() as u32).to_le_bytes()); // IOCB_FLAG_RESFD
+    b.extend_from_slice(&resfd.unwrap_or(0).to_le_bytes());
+    b
+}
+
+/// The address of the data's offset `off`, as a u64 in memory (an iocb pointer, an iovec base)
+fn addr(off: u32) -> [u8; 8] {
+    (DATA + off as u64).to_le_bytes()
+}
+
+/// iovecs at 0x700 on: "abc", "def", "XY", "Z" (put at 0x220 on), and 16 bytes at 0x400 to read into
+fn iovecs(p: &mut Prog) {
+    p.put(0x220, b"abcdefXYZ");
+    for (i, (at, n)) in [(0x220, 3u64), (0x223, 3), (0x226, 2), (0x228, 1), (0x400, 16)].into_iter().enumerate() {
+        p.put(0x700 + 16 * i as u32, &addr(at)).put(0x708 + 16 * i as u32, &n.to_le_bytes());
+    }
+}
+const ABC: u32 = 0x700;
+const XY: u32 = 0x720;
+const Z: u32 = 0x730;
+const INTO: u32 = 0x740;
+
+/// preadv2 (286) or pwritev2 (287) on `fd` of `cnt` iovecs at `iov`, at `pos` or (None, -1) the
+/// descriptor's position
+fn rwv2(p: &mut Prog, nr: u64, fd: u64, iov: u32, cnt: u64, pos: Option<u64>, flags: u64) -> &mut Prog {
+    p.arg(0, I(fd));
+    p.arg(1, D(iov));
+    p.arg(2, I(cnt));
+    match pos {
+        Some(at) => p.arg(3, I(at)),
+        None => p.code.push(0x9280_0003), // movn x3, #0: -1
+    }
+    p.arg(4, I(0));
+    p.arg(5, I(flags));
+    p.li(8, nr);
+    p.code.push(0xd400_0001);
+    p
+}
+
+/// lseek(fd, 0, SEEK_CUR): the descriptor's position
+fn pos(p: &mut Prog, fd: u64) -> &mut Prog {
+    p.sys(62, &[I(fd), I(0), I(1)])
+}
+
+#[test]
+fn setgroups_and_getgroups_keep_a_list_a_child_inherits() {
+    let mut p = Prog::default();
+    p.put(0x200, &5u32.to_le_bytes()).put(0x204, &7u32.to_le_bytes());
+    p.sys(158, &[I(0), I(0)]).expect(0); // getgroups: none to start with
+    p.sys(159, &[I(2), D(0x200)]).expect(0);
+    p.sys(158, &[I(0), I(0)]).expect(2); // size 0: how many
+    p.sys(158, &[I(1), D(0x300)]).expect(EINVAL); // too small
+    p.sys(158, &[I(2), D(0x300)]).expect(2);
+    p.arg(0, W(0x300));
+    p.expect(5);
+    p.arg(0, W(0x304));
+    p.expect(7);
+    p.sys(159, &[I(65537), D(0x200)]).expect(EINVAL); // more than NGROUPS_MAX
+    p.sys(159, &[I(1), I(0)]).expect(-14); // EFAULT
+    p.sys(158, &[I(0), I(0)]).expect(2); // the failures changed nothing
+    let child = p.fork();
+    // The child has them, and empties its own list
+    p.sys(158, &[I(0), I(0)]).expect(2);
+    p.sys(159, &[I(0), I(0)]).expect(0);
+    p.sys(158, &[I(0), I(0)]).expect(0);
+    p.parent(child);
+    p.sys(260, &[I(0xffff_ffff), D(0x380), I(0), I(0)]);
+    p.arg(0, W(0x380));
+    p.expect(0); // the child's checks passed
+    p.sys(158, &[I(0), I(0)]).expect(2); // the parent's are its own
+    // Not root any more: no groups to set, and those it has stay
+    p.sys(147, &[I(70), I(70), I(70)]).expect(0);
+    p.sys(159, &[I(0), I(0)]).expect(EPERM);
+    p.sys(158, &[I(0), I(0)]).expect(2);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn aio_writes_and_reads_a_file_and_signals_the_eventfd() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/f\0").put(0x220, b"hello");
+    // PWRITE "hello" at 0 with the eventfd; PREAD 5 at 0, and at 3; a bad opcode; a bad fd
+    p.put(0x500, &iocb(0x111, 1, 3, 0x220, 5, 0, 0, Some(4)));
+    p.put(0x540, &iocb(0x222, 0, 3, 0x400, 5, 0, 0, None));
+    p.put(0x580, &iocb(0x333, 0, 3, 0x420, 5, 3, 0, None));
+    p.put(0x5c0, &iocb(0x444, 9, 3, 0x400, 5, 0, 0, None));
+    p.put(0x600, &iocb(0x555, 0, 40, 0x400, 5, 0, 0, None));
+    for (i, at) in [0x500, 0x540, 0x580, 0x5c0, 0x600].into_iter().enumerate() {
+        p.put(0x108 + 8 * i as u32, &addr(at));
+    }
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_RDWR_CREAT), I(0o644)]).expect(3);
+    p.sys(19, &[I(0), I(0)]).expect(4); // eventfd2
+    p.sys(0, &[I(8), D(0x100)]).expect(0); // io_setup: the context at 0x100
+    p.sys(0, &[I(8), D(0x100)]).expect(EINVAL); // *ctxp must be 0
+    p.sys(2, &[X(0x100), I(1), D(0x108)]).expect(1); // io_submit
+    p.sys(4, &[X(0x100), I(1), I(1), D(0x300), I(0)]).expect(1); // io_getevents
+    p.arg(0, W(0x300)); // data
+    p.expect(0x111);
+    p.arg(0, W(0x310)); // res
+    p.expect(5);
+    // The eventfd counted the completion
+    p.sys(63, &[I(4), D(0x380), I(8)]).expect(8);
+    p.arg(0, W(0x380));
+    p.expect(1);
+    // Both reads at once: 5 bytes at 0, the 2 left at 3
+    p.sys(2, &[X(0x100), I(2), D(0x110)]).expect(2);
+    p.sys(4, &[X(0x100), I(2), I(8), D(0x300), I(0)]).expect(2);
+    p.arg(0, W(0x310));
+    p.expect(5);
+    p.arg(0, W(0x330));
+    p.expect(2);
+    p.out(0x400, 5);
+    p.out(0x420, 2);
+    // Nothing to cancel; nothing queued, and a zero timeout (at 0x340) returns at once
+    p.sys(3, &[X(0x100), D(0x540), D(0x300)]).expect(EINVAL);
+    p.sys(4, &[X(0x100), I(1), I(1), D(0x300), D(0x340)]).expect(0);
+    p.sys(2, &[X(0x100), I(1), D(0x120)]).expect(EINVAL); // the bad opcode
+    p.sys(2, &[X(0x100), I(1), D(0x128)]).expect(EBADF);
+    // A child doesn't have its parent's contexts
+    let child = p.fork();
+    p.sys(2, &[X(0x100), I(1), D(0x110)]).expect(EINVAL);
+    p.parent(child);
+    p.sys(260, &[I(0xffff_ffff), D(0x380), I(0), I(0)]);
+    p.arg(0, W(0x380));
+    p.expect(0);
+    // io_destroy, and the context is gone
+    p.sys(1, &[X(0x100)]).expect(0);
+    p.sys(1, &[X(0x100)]).expect(EINVAL);
+    p.sys(4, &[X(0x100), I(0), I(1), D(0x300), I(0)]).expect(EINVAL);
+    let (out, status) = run_linked(p);
+    ok(&status);
+    assert_eq!(out, b"hellolo");
+}
+
+#[test]
+fn aio_getevents_waits_its_timeout_and_then_gives_the_events_there_are() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/f\0").put(0x220, b"hello");
+    p.put(0x360, &10_000_000u64.to_le_bytes()); // a timespec of 10 ms at 0x358
+    p.put(0x500, &iocb(0x111, 1, 3, 0x220, 5, 0, 0, None));
+    p.put(0x108, &addr(0x500));
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_RDWR_CREAT), I(0o644)]).expect(3);
+    p.sys(0, &[I(8), D(0x100)]).expect(0);
+    // Nothing queued: none when the time is up
+    p.sys(4, &[X(0x100), I(1), I(1), D(0x300), D(0x358)]).expect(0);
+    // One completion, and two wanted: the one, when the time is up (io_pgetevents as well)
+    p.sys(2, &[X(0x100), I(1), D(0x108)]).expect(1);
+    p.sys(292, &[X(0x100), I(2), I(2), D(0x300), D(0x358), I(0)]).expect(1);
+    p.arg(0, W(0x300));
+    p.expect(0x111);
+    p.arg(0, W(0x310));
+    p.expect(5);
+    // It was taken: none left
+    p.sys(4, &[X(0x100), I(1), I(1), D(0x300), D(0x358)]).expect(0);
+    let (_, status) = run_linked(p);
+    ok(&status);
+}
+
+#[test]
+fn aio_contexts_and_groups_survive_a_snapshot() {
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x200, &5u32.to_le_bytes()).put(0x204, &7u32.to_le_bytes());
+    // An FSYNC of stdout, whose completion waits across the snapshot
+    p.put(0x500, &iocb(0x222, 2, 1, 0, 0, 0, 0, None)).put(0x108, &addr(0x500));
+    p.sys(159, &[I(2), D(0x200)]).expect(0);
+    p.sys(0, &[I(4), D(0x100)]).expect(0);
+    p.sys(2, &[X(0x100), I(1), D(0x108)]).expect(1);
+    p.sys(63, &[I(0), D(0x380), I(1)]).expect(1); // waits for a key
+    p.sys(158, &[I(2), D(0x300)]).expect(2);
+    p.arg(0, W(0x304));
+    p.expect(7);
+    p.sys(4, &[X(0x100), I(1), I(1), D(0x340), I(0)]).expect(1);
+    p.arg(0, W(0x340));
+    p.expect(0x222);
+    let mut p = start(&mut vm, p);
+    let status = loop {
+        let status = p.run(&mut vm.cpus[0], std::time::Duration::from_millis(20));
+        if !matches!(status, armless_user::Status::Running) {
+            break status;
+        }
+    };
+    assert!(matches!(status, armless_user::Status::Idle(None)), "{status:?}");
+    let process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    p.input(b"\n");
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn pwritev2_takes_noappend_and_dontcache_and_not_atomic() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/f\0");
+    iovecs(&mut p);
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_RDWR_CREAT | O_APPEND), I(0o644)]).expect(3);
+    // "abc" appended, then back to the start
+    rwv2(&mut p, 287, 3, ABC, 1, None, 0).expect(3);
+    p.sys(62, &[I(3), I(0), I(0)]).expect(0);
+    // RWF_NOAPPEND at the descriptor's position (0): "XY" over "ab", and the position moves on
+    rwv2(&mut p, 287, 3, XY, 1, None, 0x20).expect(2);
+    pos(&mut p, 3).expect(2);
+    // RWF_NOAPPEND at 1: "Z" over "Y", and the position stays
+    rwv2(&mut p, 287, 3, Z, 1, Some(1), 0x20).expect(1);
+    pos(&mut p, 3).expect(2);
+    // Without it O_APPEND sends the write to the end
+    rwv2(&mut p, 287, 3, ABC + 16, 1, None, 0).expect(3);
+    // RWF_DONTCACHE changes nothing, on a write or a read
+    rwv2(&mut p, 287, 3, Z, 1, Some(0), 0xa0).expect(1);
+    rwv2(&mut p, 286, 3, INTO, 1, Some(0), 0x80).expect(6);
+    p.out(0x400, 6);
+    // RWF_ATOMIC is not for this filesystem; APPEND and NOAPPEND together make no sense
+    rwv2(&mut p, 287, 3, Z, 1, Some(0), 0x40).expect(EOPNOTSUPP);
+    rwv2(&mut p, 287, 3, Z, 1, Some(0), 0x30).expect(EINVAL);
+    let (out, status) = run_linked(p);
+    ok(&status);
+    assert_eq!(out, b"ZZcdef");
+}
+
+#[test]
+fn a_positioned_write_to_a_file_opened_for_appending_goes_to_its_end() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/f\0");
+    iovecs(&mut p);
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_RDWR_CREAT | O_APPEND), I(0o644)]).expect(3);
+    p.sys(64, &[I(3), D(0x220), I(3)]).expect(3); // "abc": the position is 3
+    // pwrite64 "Z" at 0 goes to the end, and the position stays
+    p.sys(68, &[I(3), D(0x228), I(1), I(0)]).expect(1);
+    pos(&mut p, 3).expect(3);
+    // So do pwritev and pwritev2
+    p.sys(70, &[I(3), D(Z), I(1), I(0), I(0)]).expect(1);
+    pos(&mut p, 3).expect(3);
+    rwv2(&mut p, 287, 3, Z, 1, Some(0), 0).expect(1);
+    p.sys(67, &[I(3), D(0x400), I(16), I(0)]).expect(6);
+    p.out(0x400, 6);
+    // With RWF_NOAPPEND it writes where it is told
+    rwv2(&mut p, 287, 3, Z, 1, Some(0), 0x20).expect(1);
+    p.sys(67, &[I(3), D(0x400), I(16), I(0)]).expect(6);
+    p.out(0x400, 6);
+    let (out, status) = run_linked(p);
+    ok(&status);
+    assert_eq!(out, b"abcZZZZbcZZZ");
+}
+
+#[test]
+fn preadv2_and_pwritev2_take_a_position_or_the_descriptors_and_their_flags() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/f\0");
+    iovecs(&mut p);
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_RDWR_CREAT), I(0o644)]).expect(3);
+    // "abc" "def" at the descriptor's position: 6 bytes, and "XY" at 1 leaves the position at 6
+    rwv2(&mut p, 287, 3, ABC, 2, None, 0).expect(6);
+    rwv2(&mut p, 287, 3, XY, 1, Some(1), 0).expect(2);
+    rwv2(&mut p, 286, 3, INTO, 1, None, 0).expect(0); // at the end: nothing
+    rwv2(&mut p, 287, 3, XY, 1, Some(0), 0x100).expect(EOPNOTSUPP); // a flag it doesn't know
+    // RWF_DSYNC is a plain write; RWF_APPEND goes to the end even at a position, which stays
+    rwv2(&mut p, 287, 3, XY, 1, Some(0), 2).expect(2);
+    rwv2(&mut p, 287, 3, Z, 1, Some(0), 0x10).expect(1);
+    pos(&mut p, 3).expect(6);
+    // RWF_APPEND means nothing to a read (Linux takes it)
+    rwv2(&mut p, 286, 3, INTO, 1, Some(0), 0x10).expect(7);
+    p.out(0x400, 7);
+    // At the descriptor's position RWF_APPEND moves it to the new end
+    rwv2(&mut p, 287, 3, Z, 1, None, 0x10).expect(1);
+    pos(&mut p, 3).expect(8);
+    // RWF_NOWAIT: a file's bytes are there; an empty pipe's read would wait, so EAGAIN
+    rwv2(&mut p, 286, 3, INTO, 1, Some(0), 8).expect(8);
+    p.sys(59, &[D(0x100), I(0)]).expect(0); // pipe2: 4, 5
+    rwv2(&mut p, 286, 4, INTO, 1, None, 8).expect(EAGAIN);
+    let (out, status) = run_linked(p);
+    ok(&status);
+    assert_eq!(out, b"XYYdefZ");
+}

@@ -26,6 +26,7 @@
 //! table, and `waitid(P_PIDFD)` waits for it (one with PIDFD_NONBLOCK never waits).
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use armless::cpu::Cpu;
@@ -634,6 +635,8 @@ impl Process {
             exe: self.p.exe.clone(),
             sig: self.p.sig.fork(),
             creds: self.p.creds,
+            groups: self.p.groups.clone(),
+            aio: BTreeMap::new(),
             alarm: None,
         };
         self.procs.insert(id, child);

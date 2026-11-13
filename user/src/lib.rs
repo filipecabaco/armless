@@ -30,6 +30,7 @@
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
 
+mod aio;
 mod creds;
 mod elf;
 mod exec;
@@ -120,6 +121,9 @@ impl Ctx {
     }
 }
 
+/// The `on_timeout` of a call that runs again at its deadline (io_getevents)
+pub(crate) const RETRY_AT_DEADLINE: i64 = i64::MIN;
+
 /// What a parked thread waits for.
 #[derive(Clone, Debug)]
 pub(crate) enum Wait {
@@ -128,7 +132,8 @@ pub(crate) enum Wait {
     /// Its deadline (x0 0)
     Sleep,
     /// Anything that may let its call complete (input, a pipe, an eventfd, a close): the call,
-    /// rewound to its svc, runs again. At its deadline it returns `on_timeout` instead.
+    /// rewound to its svc, runs again. At its deadline it returns `on_timeout` instead, or with
+    /// `RETRY_AT_DEADLINE` runs once more (its `resume_deadline` passed) to give what it has.
     Retry { on_timeout: i64 },
     /// Blobs of the filesystem: the call runs again once they have all arrived
     Blobs(Vec<String>),
@@ -209,6 +214,10 @@ pub(crate) struct Proc {
     pub exe: Vec<u8>,
     pub sig: Signals,
     pub creds: Creds,
+    /// Supplementary groups (creds.rs)
+    pub groups: Vec<u32>,
+    /// AIO contexts by id (aio.rs)
+    pub aio: BTreeMap<u64, aio::Aio>,
     /// ITIMER_REAL, when armed (itimer.rs): a child doesn't inherit it, exec keeps it
     pub alarm: Option<itimer::Alarm>,
 }
@@ -629,6 +638,8 @@ impl Process {
                 exe: exe.to_vec(),
                 sig: Signals::default(),
                 creds: Creds::default(),
+                groups: Vec::new(),
+                aio: BTreeMap::new(),
                 alarm: None,
             },
             procs: BTreeMap::new(),
@@ -1075,13 +1086,13 @@ impl Process {
                     t.ctx.x[0] = 0;
                     t.wait = None;
                 },
-                Wait::Retry { on_timeout } if expired => {
+                Wait::Retry { on_timeout } if expired && on_timeout != RETRY_AT_DEADLINE => {
                     // Its call returns rather than run again: past its svc
                     t.ctx.pc += 4;
                     t.ctx.x[0] = on_timeout as u64;
                     t.wait = None;
                 },
-                Wait::Retry { .. } if poked => {
+                Wait::Retry { .. } if poked || expired => {
                     t.resume_deadline = deadline;
                     t.wait = None;
                 },
@@ -1215,6 +1226,8 @@ impl Process {
                 },
                 None => w.u(u64::MAX),
             }
+            creds::save_groups(&p.groups, &mut w);
+            aio::save(&p.aio, &mut w);
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1355,6 +1368,9 @@ impl Process {
                 }),
                 _ => None,
             };
+            // Before ARMLUSR7 there were no groups nor AIO contexts
+            let groups = if ver >= 7 { creds::load_groups(&mut r)? } else { Vec::new() };
+            let aio = if ver >= 7 { aio::load(&mut r)? } else { BTreeMap::new() };
             all.insert(
                 pid,
                 Proc {
@@ -1372,6 +1388,8 @@ impl Process {
                     exe,
                     sig,
                     creds,
+                    groups,
+                    aio,
                     alarm,
                 },
             );
