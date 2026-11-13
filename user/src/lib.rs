@@ -37,6 +37,7 @@ mod files;
 pub mod host;
 mod mm;
 mod net;
+mod netlink;
 mod proc;
 mod sched;
 mod ser;

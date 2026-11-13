@@ -357,6 +357,10 @@ impl Board {
     pub fn local_gen(&self) -> u64 {
         self.with_net(|s, _| s.local_gen()).unwrap_or(0)
     }
+    /// Whether the machine has a network (what user mode tells a program of its interfaces)
+    pub fn has_network(&self) -> bool {
+        self.with_net(|_, _| ()).is_some()
+    }
     /// A connection from the process (`TcpOpen` goes to the host); `None` without a network.
     pub fn local_open(&self, ip: [u8; 4], port: u16) -> Option<u32> {
         self.with_net(|s, io| s.local_open(ip, port, &io.out))

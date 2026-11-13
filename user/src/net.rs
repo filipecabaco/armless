@@ -28,6 +28,8 @@ use crate::{Process, Ret};
 const AF_UNIX: u16 = 1;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
+/// A netlink route socket (netlink.rs)
+const AF_NETLINK: u16 = 16;
 
 const SOCK_STREAM: u8 = 1;
 const SOCK_DGRAM: u8 = 2;
@@ -67,11 +69,19 @@ const HOST_WRITE_MAX: usize = 256 << 10;
 /// The first port of those chosen for a socket that has none
 const EPHEMERAL: u16 = 49152;
 /// The guest's address on the network the host gives it, and the router's
-const GUEST_IP: [u8; 4] = [192, 168, 86, 100];
+pub(crate) const GUEST_IP: [u8; 4] = [192, 168, 86, 100];
 const ROUTER_IP: [u8; 4] = [192, 168, 86, 1];
 
 fn e(errno: i64) -> Ret {
     Ret::Val(-errno)
+}
+
+/// struct sockaddr_nl: family, pad, port, groups
+fn sa_nl(pid: u32) -> Vec<u8> {
+    let mut b = vec![AF_NETLINK as u8, 0, 0, 0];
+    b.extend_from_slice(&pid.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b
 }
 
 /// A socket.
@@ -871,6 +881,17 @@ impl Process {
         if !rights.is_empty() && (s.ty == SOCK_DGRAM || s.host.is_some() || s.inet()) {
             return Err(e(EOPNOTSUPP));
         }
+        if s.domain as u16 == AF_NETLINK {
+            // A request to the kernel: its answer is the next datagram to read
+            let pid = u32::from_le_bytes(s.name[4..8].try_into().unwrap_or([0; 4]));
+            let network = board.as_ref().is_some_and(|b| b.has_network());
+            let reply = crate::netlink::answer(data, pid, network, GUEST_IP, ROUTER_IP);
+            if !reply.is_empty() {
+                s.msgs.push_back((sa_nl(0), reply));
+            }
+            self.poke();
+            return Ok(data.len());
+        }
         if s.ty == SOCK_DGRAM {
             let (peer, default) = (s.peer, s.peer_name.clone());
             return self.dgram_send(id, nonblock, data, peer, dest.unwrap_or(default));
@@ -1054,6 +1075,21 @@ impl Process {
         if flags & !((O_NONBLOCK | files::O_CLOEXEC) as u64) != 0 {
             return e(EINVAL);
         }
+        // A netlink route socket: a datagram socket the kernel (netlink.rs) answers
+        if domain as u16 == AF_NETLINK {
+            if !matches!(kind, 2 | 3) {
+                return e(ESOCKTNOSUPPORT);
+            }
+            if proto != 0 {
+                return e(EPROTONOSUPPORT);
+            }
+            let id = self.files.net.add(AF_NETLINK as u8, SOCK_DGRAM);
+            let pid = self.p.pid as u32;
+            if let Some(s) = self.files.net.socks.get_mut(&id) {
+                s.name = sa_nl(pid);
+            }
+            return Ret::Val(self.install_sock(id, flags));
+        }
         if !matches!(domain as u16, AF_UNIX | AF_INET | AF_INET6) {
             return e(EAFNOSUPPORT);
         }
@@ -1109,6 +1145,10 @@ impl Process {
             Ok(i) => i,
             Err(r) => return r,
         };
+        // A netlink socket's port is its process's pid, from the start
+        if self.files.net.socks[&id].domain as u16 == AF_NETLINK {
+            return Ret::Val(0);
+        }
         let sa = match self.sockaddr(addr, len) {
             Ok(s) => s,
             Err(r) => return r,
@@ -1293,6 +1333,10 @@ impl Process {
             Ok(i) => i,
             Err(r) => return r,
         };
+        // A netlink socket talks to the kernel whatever it connects to
+        if self.files.net.socks[&id].domain as u16 == AF_NETLINK {
+            return Ret::Val(0);
+        }
         let sa = match self.sockaddr(addr, len) {
             Ok(s) => s,
             Err(r) => return r,
@@ -1431,7 +1475,10 @@ impl Process {
         };
         self.sock_refresh(id);
         let s = &self.files.net.socks[&id];
-        let sa = if peer {
+        let sa = if s.domain as u16 == AF_NETLINK {
+            // Its own port, or the kernel's (0)
+            if peer { sa_nl(0) } else { s.name.clone() }
+        } else if peer {
             if !s.connected && !s.gone
                 || s.ty == SOCK_DGRAM && s.peer_name.is_empty() && s.peer.is_none()
             {
@@ -1674,7 +1721,7 @@ impl Process {
             Err(r) => return r,
         };
         let (level, name) = (a[1] as i32, a[2] as i32);
-        if !matches!(level, 0 | 1 | 6 | 17 | 41) {
+        if !matches!(level, 0 | 1 | 6 | 17 | 41 | 270) {
             return e(ENOPROTOOPT);
         }
         if a[4] > 256 {
@@ -1706,7 +1753,7 @@ impl Process {
             Err(r) => return r,
         };
         let (level, name) = (a[1] as i32, a[2] as i32);
-        if !matches!(level, 0 | 1 | 6 | 17 | 41) {
+        if !matches!(level, 0 | 1 | 6 | 17 | 41 | 270) {
             return e(ENOPROTOOPT);
         }
         self.sock_refresh(id);

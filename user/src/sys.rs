@@ -408,6 +408,15 @@ impl Process {
             },
             b"/proc/self/cmdline" => self.p.exe.iter().copied().chain([0]).collect(),
             b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
+            // The interfaces netlink.rs has, with nothing counted (ifconfig reads their list here)
+            b"/proc/net/dev" | b"/proc/self/net/dev" => {
+                let mut s = String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+                let network = self.board.as_ref().is_some_and(|b| b.has_network());
+                for name in ["lo"].into_iter().chain(network.then_some("eth0")) {
+                    s += &format!("{name:>6}:{}\n", "       0".repeat(16));
+                }
+                s.into_bytes()
+            },
             b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
             b"/sys/fs/cgroup/cpu.max" => b"max 100000\n".to_vec(),
             _ => return None,
@@ -1735,6 +1744,32 @@ impl Process {
         }
     }
 
+    /// A SIOCGIF* ioctl: struct ifreq at `arg` (SIOCGIFCONF: struct ifconf, a length and where)
+    fn ifreq_ioctl(&mut self, req: u32, arg: u64) -> i64 {
+        let network = self.board.as_ref().is_some_and(|b| b.has_network());
+        let guest = crate::net::GUEST_IP;
+        if req == 0x8912 {
+            // struct ifconf: ifc_len (int), pad, ifc_buf (pointer); a NULL buffer asks the length
+            let (Some(room), Some(buf)) = (self.u32_at(arg), self.u64_at(arg + 8)) else {
+                return -EFAULT;
+            };
+            let all = crate::netlink::ifconf(if buf == 0 { usize::MAX } else { room as usize }, network, guest);
+            if buf != 0 && !self.write(buf, &all) {
+                return -EFAULT;
+            }
+            return if self.put_u32(arg, all.len() as u32) { 0 } else { -EFAULT };
+        }
+        let Some(b) = self.bytes_at(arg, 40) else {
+            return -EFAULT;
+        };
+        let mut ifr: [u8; 40] = b.try_into().unwrap();
+        let r = crate::netlink::ifreq(req, &mut ifr, network, guest);
+        if r == 0 && !self.write(arg, &ifr) {
+            return -EFAULT;
+        }
+        r
+    }
+
     fn ioctl(&mut self, fd: i32, req: u32, arg: u64) -> Ret {
         let v = Ret::Val;
         let Some(d) = self.files.desc_of(fd) else {
@@ -1762,6 +1797,11 @@ impl Process {
                 return v(0);
             },
             _ => {},
+        }
+        // An interface's name, index, flags, addresses, MTU or queue, asked of any socket
+        // (SIOCGIF*: netlink.rs's table)
+        if (0x8910..=0x8950).contains(&req) && matches!(self.files.descs[&d].kind, Kind::Sock(_)) {
+            return v(self.ifreq_ioctl(req, arg));
         }
         let kind = self.files.descs[&d].kind.clone();
         match (kind, req) {

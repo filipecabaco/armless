@@ -625,3 +625,35 @@ fn an_unbound_unix_client_is_accepted_as_its_family_alone() {
     let (_, status) = run(&mut proc, &mut vm);
     ok(&status);
 }
+
+#[test]
+fn a_netlink_route_socket_lists_the_interfaces_and_their_addresses() {
+    // ip addr, getifaddrs, Node's os.networkInterfaces(): an RTM_GETADDR dump
+    let mut vm = machine();
+    let mut p = Prog::default();
+    // struct nlmsghdr (len 24, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, seq 1) + ifaddrmsg (AF_INET)
+    let mut req = 24u32.to_le_bytes().to_vec();
+    req.extend_from_slice(&22u16.to_le_bytes());
+    req.extend_from_slice(&0x301u16.to_le_bytes());
+    req.extend_from_slice(&1u32.to_le_bytes());
+    req.extend_from_slice(&0u32.to_le_bytes());
+    req.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
+    p.put(0x200, &req);
+    // struct ifreq for "lo"
+    p.put(0x300, b"lo\0");
+    p.sys(198, &[I(16), I(3), I(0)]).expect(3); // socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)
+    p.sys(206, &[I(3), D(0x200), I(24), I(0), I(0), I(0)]).expect(24);
+    p.sys(207, &[I(3), D(0x400), I(2048), I(0), I(0), I(0)]).save(0x100);
+    // The first message is an RTM_NEWADDR (its type, after the 4-byte length)
+    p.arg(0, W(0x404));
+    p.code.push(0x9240_3c00); // and x0, x0, #0xffff
+    p.expect(20);
+    // SIOCGIFINDEX of lo on any socket: 1
+    p.sys(29, &[I(3), I(0x8933), D(0x300)]).expect(0);
+    p.arg(0, W(0x310));
+    p.expect(1);
+    p.sys(29, &[I(3), I(0x8933), D(0x340)]).expect(-19); // ENODEV: no such interface (an empty name)
+    let mut p = start(&mut vm, p);
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
