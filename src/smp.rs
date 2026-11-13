@@ -430,6 +430,12 @@ impl Machine {
         self.cpus[cpu].run_state.store(RUN_IDLE, Ordering::SeqCst);
     }
 
+    /// `cpu` is off, as CPU_OFF leaves it: for a host that runs programs on the CPUs itself (user
+    /// mode) and is done with this one, so that a snapshot can leave it out (`save_state_cpus`).
+    pub fn power_off(&self, cpu: usize) {
+        self.cpus[cpu].power.store(POWER_OFF, Ordering::SeqCst);
+    }
+
     /// Whether `cpu` is running guest code (in its `run`, and not since `Cpu::left_guest`).
     pub fn in_guest(&self, cpu: usize) -> bool {
         self.cpus[cpu].run_state.load(Ordering::SeqCst) == RUN_RUNNING
