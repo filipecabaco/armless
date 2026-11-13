@@ -79,6 +79,14 @@ pub(crate) enum Kind {
     Event {
         count: u64,
     },
+    /// A signalfd: reading it takes the pending signals of `mask` (signal.rs)
+    Signal {
+        mask: u64,
+    },
+    /// A pidfd: readable once process `pid` has ended
+    Pidfd {
+        pid: i64,
+    },
     Epoll {
         watch: BTreeMap<i32, Watch>,
     },
@@ -208,6 +216,20 @@ impl Files {
     /// Returns the inode of a file whose last description went, for its reference.
     pub fn close(&mut self, fd: i32) -> Option<Option<Ino>> {
         let (d, _) = self.fds.remove(&fd)?;
+        self.release(d)
+    }
+
+    /// One more reference to description `d`: a descriptor passed over a socket (SCM_RIGHTS)
+    /// while it is on its way.
+    pub fn hold(&mut self, d: u32) {
+        if let Some(desc) = self.descs.get_mut(&d) {
+            desc.refs += 1;
+        }
+    }
+
+    /// One reference fewer to description `d` (a descriptor closed, or one passed over a socket
+    /// that nobody took): it goes when it has none, as `close` says.
+    pub fn release(&mut self, d: u32) -> Option<Option<Ino>> {
         let desc = self.descs.get_mut(&d)?;
         desc.refs -= 1;
         if desc.refs > 0 {
@@ -319,6 +341,14 @@ impl Files {
                     w.u(11);
                     w.u(*id as u64);
                 },
+                Kind::Signal { mask } => {
+                    w.u(12);
+                    w.u(*mask);
+                },
+                Kind::Pidfd { pid } => {
+                    w.u(13);
+                    w.u(*pid as u64);
+                },
                 Kind::Epoll { watch } => {
                     w.u(10);
                     w.u(watch.len() as u64);
@@ -376,6 +406,8 @@ impl Files {
                 8 => Kind::PipeWrite(r.u()? as u32),
                 9 => Kind::Event { count: r.u()? },
                 11 => Kind::Sock(r.u()? as u32),
+                12 => Kind::Signal { mask: r.u()? },
+                13 => Kind::Pidfd { pid: r.u()? as i64 },
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {
@@ -459,6 +491,70 @@ pub(crate) fn resolve(fs: &Fs, start: Ino, path: &[u8], follow_last: bool) -> Re
     Ok(cur)
 }
 
+/// The absolute path `path` (from the directory `start`) names with every symlink followed, as
+/// realpath gives it: what /proc/self/exe says of a program. (`path_of` finds a directory's path
+/// from its inode; a file's has to be walked to.)
+pub(crate) fn canonical(fs: &Fs, start: Ino, path: &[u8]) -> Result<Vec<u8>, i64> {
+    if path.is_empty() {
+        return Err(-ENOENT);
+    }
+    let split = |p: &[u8]| -> Vec<Vec<u8>> {
+        p.split(|&b| b == b'/')
+            .filter(|c| !c.is_empty())
+            .rev()
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    // The names walked so far, with their inodes; a relative path starts at `start`'s
+    let mut walked: Vec<(Vec<u8>, Ino)> = Vec::new();
+    if path[0] != b'/' {
+        let mut at = ROOT;
+        for name in split(&path_of(fs, start)).into_iter().rev() {
+            at = fs.lookup(at, &name).map_err(|_| -ENOENT)?;
+            walked.push((name, at));
+        }
+    }
+    let mut todo = split(path);
+    let mut links = 0;
+    while let Some(name) = todo.pop() {
+        let cur = walked.last().map_or(ROOT, |w| w.1);
+        match &name[..] {
+            b"." => continue,
+            b".." => {
+                walked.pop();
+                continue;
+            },
+            _ => {},
+        }
+        let next = fs.lookup(cur, &name).map_err(|_| -ENOENT)?;
+        let inode = fs.get(next).ok_or(-ENOENT)?;
+        if inode.mode & S_IFMT == S_IFLNK {
+            links += 1;
+            if links > 40 {
+                return Err(-ELOOP);
+            }
+            let Content::Symlink(target) = &inode.content else {
+                return Err(-ENOENT);
+            };
+            if target.first() == Some(&b'/') {
+                walked.clear();
+            }
+            todo.extend(split(target));
+            continue;
+        }
+        walked.push((name, next));
+    }
+    let mut out = Vec::new();
+    for (name, _) in &walked {
+        out.push(b'/');
+        out.extend_from_slice(name);
+    }
+    if out.is_empty() {
+        out.push(b'/');
+    }
+    Ok(out)
+}
+
 /// The directory `path`'s last component would be in, and that name (for creating, removing and
 /// renaming). The directory is resolved following every symlink.
 pub(crate) fn resolve_parent(fs: &Fs, start: Ino, path: &[u8]) -> Result<(Ino, Vec<u8>), i64> {
@@ -506,6 +602,28 @@ pub(crate) fn link_to_special(
         // A relative target is from the directory the link is in
         start = dir;
         path = target.clone();
+    }
+    None
+}
+
+/// The absolute path of a file whose inode is `ino`, found by walking the tree from the root (a
+/// file has no parent to go up to): for what /proc/self/fd/N says of it. The first of its names
+/// if it has more than one; None if it has none (unlinked).
+pub(crate) fn find_path(fs: &Fs, ino: Ino) -> Option<Vec<u8>> {
+    let mut todo = vec![(ROOT, Vec::new())];
+    while let Some((dir, path)) = todo.pop() {
+        let Ok(entries) = fs.list(dir) else { continue };
+        for (name, i) in entries.into_iter().skip(2) {
+            let mut p = path.clone();
+            p.push(b'/');
+            p.extend_from_slice(&name);
+            if i == ino {
+                return Some(p);
+            }
+            if fs.get(i).is_some_and(|n| n.is_dir()) {
+                todo.push((i, p));
+            }
+        }
     }
     None
 }

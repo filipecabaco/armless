@@ -62,6 +62,8 @@ const MAIR: u64 = 0xff;
 /// The end of the space a 39-bit table reaches: 512 GiB of address space for each process, far
 /// more than there is RAM, since a page has a frame only when something touches it.
 pub(crate) const VA_END: u64 = 1 << 39;
+/// A futex key's mark for one that is a frame's (`Process::futex_key`)
+pub(crate) const SHARED_FUTEX: u64 = 1 << 63;
 
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
@@ -374,6 +376,20 @@ impl Mm {
             t = e & ADDR;
         }
         f.put(t + 8 * idx(va, 3), d);
+        true
+    }
+
+    /// The frames `frames` mapped from `a` on, page after page, as `prot` (a shared area's: System
+    /// V shared memory, whose segment holds the frames), each counted once more. False when there
+    /// is no frame for a table.
+    pub(crate) fn map_frames(&mut self, f: &mut Frames, a: u64, frames: &[u64], prot: u8) -> bool {
+        for (i, &pa) in frames.iter().enumerate() {
+            if !self.set(f, a + i as u64 * PAGE, pa | bits(prot, true)) {
+                return false;
+            }
+            f.incref(pa);
+        }
+        self.stale = true;
         true
     }
 
@@ -759,12 +775,13 @@ impl Mm {
             per_file: self.per_file.clone(),
             refs: self.per_file.keys().map(|&i| (i, true)).collect(),
         };
-        // What is shared has all its pages first, for both sides to see the same ones
-        // (a PROT_NONE one, a reservation, has none to share and costs nothing)
+        // What is shared has all its pages first, for both sides to see the same ones (a PROT_NONE
+        // one, a reservation, has none to share and costs nothing; a shared file's untouched pages
+        // come from Process::file_pages to whichever side touches them)
         let shared: Vec<(u64, u64)> = self
             .vmas
             .iter()
-            .filter(|(_, v)| v.shared && v.prot != 0)
+            .filter(|(_, v)| v.shared && v.prot != 0 && v.file.is_none())
             .map(|(&s, v)| (s, v.end))
             .collect();
         for (s, e) in shared {
@@ -1016,6 +1033,31 @@ impl Process {
 
     /// A frame for the page at `page` of the area at `start`: its file's bytes, or zeros.
     fn populate(&self, page: u64, start: u64, vma: &Vma) -> Result<u64, Miss> {
+        // A file mapped MAP_SHARED: the one frame every mapping of that page of it has (Postgres's
+        // dynamic shared memory is files in pg_dynshmem that its processes map)
+        let key = vma
+            .file
+            .filter(|_| vma.shared)
+            .map(|b| (b.ino, b.off + (page - start)));
+        if let Some(key) = key {
+            let have = self.file_pages.borrow().get(&key).copied();
+            if let Some(pa) = have {
+                let counted = page < page_up(vma.file.unwrap().data_end);
+                {
+                    let mut mm = self.p.mm.borrow_mut();
+                    let mut f = self.frames.borrow_mut();
+                    if !mm.set(&mut f, page, pa | bits(vma.prot, true)) {
+                        return Err(Miss::Oom);
+                    }
+                    f.incref(pa);
+                    if counted {
+                        mm.lazy_less(key.0, 1);
+                    }
+                }
+                self.settle();
+                return Ok(pa);
+            }
+        }
         let mut data = Vec::new();
         let mut counted = false;
         if let Some(b) = vma.file {
@@ -1048,10 +1090,49 @@ impl Process {
                 mm.lazy_less(vma.file.unwrap().ino, 1);
                 self.filled.set(self.filled.get() + 1);
             }
+            if let Some(key) = key {
+                // The table's own hold on it, for the next mapping of this page
+                f.incref(pa);
+                self.file_pages.borrow_mut().insert(key, pa);
+            }
             pa
         };
         self.settle();
         Ok(pa)
+    }
+
+    /// The shared file pages no mapping holds any more (the table's is their last reference)
+    /// written back to their files, as far as each file goes, and let go: after an unmap, an exec
+    /// or a process's end. What was written through a MAP_SHARED mapping is then in the file, for
+    /// the next mapping of it and for read.
+    pub(crate) fn trim_file_pages(&self) {
+        if self.file_pages.borrow().is_empty() {
+            return;
+        }
+        let unmapped: Vec<((Ino, u64), u64)> = {
+            let f = self.frames.borrow();
+            self.file_pages
+                .borrow()
+                .iter()
+                .filter(|(_, &pa)| f.count(pa) == 1)
+                .map(|(&k, &pa)| (k, pa))
+                .collect()
+        };
+        let now = self.now_secs();
+        for ((ino, off), pa) in unmapped {
+            let mut page = vec![0u8; PAGE as usize];
+            self.ram.read(pa as usize, &mut page);
+            self.fs(|fs| {
+                let size = fs.get(ino).map_or(0, |i| i.size);
+                let n = size.saturating_sub(off).min(PAGE) as usize;
+                if n > 0 {
+                    let _ = fs.write(ino, off, &page[..n], now);
+                }
+            });
+            self.file_pages.borrow_mut().remove(&(ino, off));
+            self.frames.borrow_mut().decref(pa);
+        }
+        self.frames.borrow_mut().reap();
     }
 
     /// The write to the page at `page` (in the frame `pa`, which others may map): it gets a frame
@@ -1340,6 +1421,23 @@ impl Process {
         Some(at)
     }
 
+    /// What the futex at `addr` is, for waits and wakes to meet. A word of a shared area (of a
+    /// call without FUTEX_PRIVATE_FLAG) is its frame's, so processes that map it meet there
+    /// (Postgres's semaphores are in its shared memory); anything else is this process's own
+    /// address. (Bit 63, `SHARED_FUTEX`, tells them apart: no address reaches it.)
+    pub(crate) fn futex_key(&self, addr: u64, private: bool) -> u64 {
+        if !private {
+            let mm = self.p.mm.borrow();
+            if mm.find(addr).is_some_and(|(_, v)| v.shared) {
+                let d = mm.pte(&self.frames.borrow(), addr & !(PAGE - 1));
+                if d & 1 != 0 {
+                    return (d & ADDR) | (addr & (PAGE - 1)) | SHARED_FUTEX;
+                }
+            }
+        }
+        addr
+    }
+
     // ------------------------------------------------------------ system calls
 
     pub(crate) fn sys_brk(&mut self, to: u64) -> i64 {
@@ -1396,8 +1494,9 @@ impl Process {
         if !anon && !off.is_multiple_of(PAGE) {
             return v(-EINVAL);
         }
-        // A file mapping is a private copy of its contents (MAP_SHARED ones too: no other process
-        // sees it, and writes don't reach the file), its pages read as they are touched
+        // A file mapping's pages are read as they are touched. A MAP_PRIVATE one is a copy of its
+        // own; a MAP_SHARED one's pages are one frame each for every mapping of them (its writes
+        // are seen by the others, but not written back to the file)
         let mut file = None;
         if !anon {
             let Some(Desc { kind, .. }) = self.files.get(fd).cloned() else {
@@ -1429,7 +1528,9 @@ impl Process {
             off,
             data_end: at + data,
         });
-        let shared = anon && flags & 1 != 0;
+        // MAP_SHARED (and MAP_SHARED_VALIDATE): an anonymous area's pages are shared with the
+        // processes forked from this one, a file's with every mapping of it (file_pages)
+        let shared = flags & 1 != 0;
         self.map_area(at, at + len, prot as u8 & 7, shared, back);
         if back.is_some() && eager() {
             // A failure here leaves the pages lazy
@@ -1454,6 +1555,7 @@ impl Process {
             mm.release(a, b);
         }
         self.settle();
+        self.trim_file_pages();
         0
     }
 
