@@ -595,6 +595,16 @@ impl Mm {
         f.reap();
     }
 
+    /// Whether `a..b` has an area of a MAP_PRIVATE file, whose pages may be the page cache's
+    pub(crate) fn has_private_file(&self, a: u64, b: u64) -> bool {
+        // The areas do not overlap: going down from `b`, the first that ends before `a` is the last
+        self.vmas
+            .range(..b)
+            .rev()
+            .take_while(|(_, v)| v.end > a)
+            .any(|(_, v)| v.file.is_some() && !v.shared)
+    }
+
     /// The pages of the anonymous areas in `a..b` given back: they read as zeros again.
     pub(crate) fn discard(&mut self, f: &mut Frames, a: u64, b: u64) {
         for (&s, v) in self.vmas.range(..b) {
@@ -978,6 +988,21 @@ pub(crate) enum Miss {
     Io,
 }
 
+/// The page cache's key for the page at `page` of the area at `start`, a MAP_PRIVATE file's, when
+/// its file is at version `gen`: the file, the offset of the page in it, how many of its bytes
+/// come from it (none: nothing to cache) and the version. The version is last so that the few
+/// versions of one page are next to each other (`cache_versions`).
+fn cache_key(page: u64, start: u64, vma: &Vma, gen: u64) -> Option<(Ino, u64, u32, u64)> {
+    let b = vma.file.filter(|_| !vma.shared)?;
+    let n = b.data_end.min(page + PAGE).saturating_sub(page);
+    (n > 0).then(|| (b.ino, b.off + (page - start), n as u32, gen))
+}
+
+/// The keys of every version of the page that `key` is the key of
+fn cache_versions(key: (Ino, u64, u32, u64)) -> std::ops::RangeInclusive<(Ino, u64, u32, u64)> {
+    (key.0, key.1, key.2, 0)..=(key.0, key.1, key.2, u64::MAX)
+}
+
 impl Process {
     /// Takes a reference to a file, or gives one back, for the areas that changed.
     pub(crate) fn settle(&self) {
@@ -1015,7 +1040,7 @@ impl Process {
         }
         let pa = desc & ADDR;
         if desc & 1 == 0 {
-            return self.populate(page, start, &vma);
+            return self.populate(page, start, &vma, acc);
         }
         let write = matches!(acc, Acc::Write | Acc::Force);
         if !write || writable(desc) {
@@ -1026,14 +1051,18 @@ impl Process {
         }
         self.unshare(
             page,
+            start,
             pa,
             &vma,
             acc == Acc::Force && vma.prot & PROT_WRITE == 0,
         )
     }
 
-    /// A frame for the page at `page` of the area at `start`: its file's bytes, or zeros.
-    fn populate(&self, page: u64, start: u64, vma: &Vma) -> Result<u64, Miss> {
+    /// A frame for the page at `page` of the area at `start`: its file's bytes, or zeros. A read
+    /// of a MAP_PRIVATE file's page takes the page cache's frame for those bytes if it has one (or
+    /// puts the one it fills there), mapped read-only: the first write to it copies it. A write
+    /// (`acc`) gets a frame of its own, as does everything else.
+    fn populate(&self, page: u64, start: u64, vma: &Vma, acc: Acc) -> Result<u64, Miss> {
         // A file mapped MAP_SHARED: the one frame every mapping of that page of it has (Postgres's
         // dynamic shared memory is files in pg_dynshmem that its processes map)
         let key = vma
@@ -1059,19 +1088,51 @@ impl Process {
                 return Ok(pa);
             }
         }
+        let cacheable = matches!(acc, Acc::Read | Acc::Exec) && !vma.shared;
+        if let Some(b) = vma.file.filter(|_| cacheable) {
+            let gen = self.fs(|fs| fs.data_gen(b.ino)).flatten();
+            let have = gen
+                .and_then(|g| cache_key(page, start, vma, g))
+                .and_then(|k| self.page_cache.borrow().get(&k).copied());
+            if let Some(pa) = have {
+                let counted = page < page_up(b.data_end);
+                {
+                    let mut mm = self.p.mm.borrow_mut();
+                    let mut f = self.frames.borrow_mut();
+                    if !mm.set(&mut f, page, pa | bits(vma.prot, false)) {
+                        return Err(Miss::Oom);
+                    }
+                    f.incref(pa);
+                    if counted {
+                        mm.lazy_less(b.ino, 1);
+                    }
+                }
+                self.settle();
+                return Ok(pa);
+            }
+        }
         let mut data = Vec::new();
         let mut counted = false;
+        // Where the page goes in the page cache, if this read is the one that puts it there
+        let mut cache = None;
         if let Some(b) = vma.file {
             let n = b.data_end.min(page + PAGE).saturating_sub(page);
             counted = page < page_up(b.data_end);
             if n > 0 {
                 let off = b.off + (page - start);
-                match self.fs(|fs| got(fs.read(b.ino, off, n as usize))) {
-                    Some(Got::Ok(d)) => data = d,
-                    Some(Got::Need(blobs)) => return Err(Miss::Need(blobs)),
-                    Some(Got::Err(e)) if e == -(EIO as i64) => return Err(Miss::Io),
+                // The version of the file is taken with the bytes, in one go
+                let read = self.fs(|fs| (fs.data_gen(b.ino), got(fs.read(b.ino, off, n as usize))));
+                match read {
+                    Some((gen, Got::Ok(d))) => {
+                        data = d;
+                        cache = gen
+                            .filter(|_| cacheable)
+                            .and_then(|g| cache_key(page, start, vma, g));
+                    },
+                    Some((_, Got::Need(blobs))) => return Err(Miss::Need(blobs)),
+                    Some((_, Got::Err(e))) if e == -(EIO as i64) => return Err(Miss::Io),
                     // A file that is gone, or fails otherwise, reads as zeros
-                    Some(Got::Err(_)) | None => {},
+                    Some((_, Got::Err(_))) | None => {},
                 }
             }
         }
@@ -1084,7 +1145,8 @@ impl Process {
             if !data.is_empty() {
                 self.ram.write(pa as usize, &data);
             }
-            if !mm.set(&mut f, page, pa | bits(vma.prot, true)) {
+            let cached = cache.filter(|_| !data.is_empty());
+            if !mm.set(&mut f, page, pa | bits(vma.prot, cached.is_none())) {
                 f.decref(pa);
                 return Err(Miss::Oom);
             }
@@ -1097,6 +1159,14 @@ impl Process {
                 f.incref(pa);
                 self.file_pages.borrow_mut().insert(key, pa);
             }
+            if let Some(key) = cached {
+                // The page cache's hold on it, for the next mapping of these bytes
+                f.incref(pa);
+                let mut table = self.page_cache.borrow_mut();
+                if let Some(old) = table.insert(key, pa) {
+                    f.decref(old);
+                }
+            }
             pa
         };
         self.settle();
@@ -1108,6 +1178,7 @@ impl Process {
     /// or a process's end. What was written through a MAP_SHARED mapping is then in the file, for
     /// the next mapping of it and for read.
     pub(crate) fn trim_file_pages(&self) {
+        self.trim_page_cache();
         if self.file_pages.borrow().is_empty() {
             return;
         }
@@ -1137,10 +1208,37 @@ impl Process {
         self.frames.borrow_mut().reap();
     }
 
+    /// The page cache's frames no mapping holds any more (the table's is their last reference)
+    /// let go, so unmapped pages are not kept around.
+    fn trim_page_cache(&self) {
+        let mut cache = self.page_cache.borrow_mut();
+        if cache.is_empty() {
+            return;
+        }
+        let mut f = self.frames.borrow_mut();
+        cache.retain(|_, &mut pa| {
+            let idle = f.count(pa) == 1;
+            if idle {
+                f.decref(pa);
+            }
+            !idle
+        });
+        f.reap();
+    }
+
+    /// Every frame of the page cache let go of (what still maps one keeps it): before a snapshot,
+    /// which does not hold the table.
+    pub(crate) fn drop_page_cache(&self) {
+        let mut f = self.frames.borrow_mut();
+        for (_, pa) in std::mem::take(&mut *self.page_cache.borrow_mut()) {
+            f.decref(pa);
+        }
+    }
+
     /// The write to the page at `page` (in the frame `pa`, which others may map): it gets a frame
     /// of its own, or the one it has made writable if nobody else maps it. `ro` keeps it read-only
     /// (a host write to a read-only page).
-    fn unshare(&self, page: u64, pa: u64, vma: &Vma, ro: bool) -> Result<u64, Miss> {
+    fn unshare(&self, page: u64, start: u64, pa: u64, vma: &Vma, ro: bool) -> Result<u64, Miss> {
         let mut mm = self.p.mm.borrow_mut();
         let mut f = self.frames.borrow_mut();
         let Some(slot) = mm.slot(&f, page) else {
@@ -1158,6 +1256,24 @@ impl Process {
             f.copy(pa, new);
             f.put(slot, (keep & !ADDR) | new);
             f.decref(pa);
+            // If the page cache's frame is all that is left of it, it goes now: its bytes were
+            // copied to be written, and it would stay until the next unmap. The file may have
+            // changed since it was cached, so every version of the page is looked at
+            if f.count(pa) == 1 && vma.file.is_some() && !vma.shared {
+                // A key of any version: only the page matters here
+                let page_key = cache_key(page, start, vma, 0);
+                let mut cache = self.page_cache.borrow_mut();
+                let found = page_key.and_then(|k| {
+                    cache
+                        .range(cache_versions(k))
+                        .find(|(_, &v)| v == pa)
+                        .map(|(&k, _)| k)
+                });
+                if let Some(k) = found {
+                    cache.remove(&k);
+                    f.decref(pa);
+                }
+            }
             new
         };
         mm.flush.push(page >> 12);
@@ -1455,9 +1571,10 @@ impl Process {
     /// `a..b` mapped as `prot` (`shared`: MAP_SHARED anonymous), over what was there; its pages
     /// from `file` if given, or zeros.
     pub(crate) fn map_area(&mut self, a: u64, b: u64, prot: u8, shared: bool, file: Option<Back>) {
-        {
+        let replaced = {
             let mut mm = self.p.mm.borrow_mut();
             let mut f = self.frames.borrow_mut();
+            let replaced = mm.has_private_file(a, b);
             mm.unmap(&mut f, a, b);
             mm.carve(a, b);
             mm.insert(
@@ -1470,8 +1587,13 @@ impl Process {
                     file,
                 },
             );
-        }
+            replaced
+        };
         self.settle();
+        // A MAP_FIXED over private file pages leaves their cached frames to the cache alone
+        if replaced {
+            self.trim_file_pages();
+        }
     }
 
     /// A free range of `len` bytes of the mmap area mapped as `prot` anonymously (for the
@@ -1664,10 +1786,14 @@ impl Process {
             return -EFAULT;
         }
         if new_len <= old_len {
+            let cut = mm.has_private_file(old + new_len, old + old_len);
             mm.unmap(&mut f, old + new_len, old + old_len);
             mm.release(old + new_len, old + old_len);
             drop((mm, f));
             self.settle();
+            if cut {
+                self.trim_file_pages();
+            }
             return old as i64;
         }
         // The pages after are free: it grows where it is, the new ones zeros
