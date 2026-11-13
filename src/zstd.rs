@@ -8,8 +8,10 @@
 mod imp {
     use std::alloc;
 
-    extern "C" {
-        fn ZSTD_createDStream() -> u32;
+    // SAFETY: the C decoder linked in by build-wasm.sh, with these signatures. Making a stream and
+    // telling an error code from a size take no pointers and have no preconditions.
+    unsafe extern "C" {
+        safe fn ZSTD_createDStream() -> u32;
         fn ZSTD_freeDStream(ctx: u32) -> i32;
         fn ZSTD_decompressStream_simpleArgs(
             ctx: u32,
@@ -20,7 +22,7 @@ mod imp {
             src_size: u32,
             src_pos: *mut u32,
         ) -> i32;
-        fn ZSTD_isError(err: i32) -> bool;
+        safe fn ZSTD_isError(err: i32) -> bool;
     }
 
     const MALLOC_ALIGN: usize = 16;
@@ -76,8 +78,8 @@ mod imp {
     impl Stream {
         pub fn new() -> Stream {
             Stream {
-                // SAFETY: no arguments; 0 if it could not allocate, which `feed` checks.
-                ctx: unsafe { ZSTD_createDStream() },
+                // 0 if it could not allocate, which `feed` checks.
+                ctx: ZSTD_createDStream(),
                 buf: vec![0; 1 << 17],
             }
         }
@@ -103,8 +105,7 @@ mod imp {
                         &mut src_pos,
                     )
                 };
-                // SAFETY: only inspects the number.
-                if unsafe { ZSTD_isError(r) } {
+                if ZSTD_isError(r) {
                     return false;
                 }
                 if dst_pos > 0 {

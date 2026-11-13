@@ -210,7 +210,7 @@ fn give(start: usize, end: usize) {
 }
 
 /// A block that was kept and has the size and alignment asked for.
-unsafe fn kept(layout: Layout) -> Option<*mut u8> {
+fn kept(layout: Layout) -> Option<*mut u8> {
     let size = layout.size();
     if size < RELEASE_MIN {
         return None;
@@ -259,10 +259,10 @@ pub struct Heap;
 unsafe impl GlobalAlloc for Heap {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: `GlobalAlloc::alloc`'s contract is the one of `System.alloc`; a kept block has exactly this layout.
-        let p = match unsafe { kept(layout) } {
+        // A kept block has exactly this layout.
+        let p = match kept(layout) {
             Some(p) => p,
-            // SAFETY: as above.
+            // SAFETY: `GlobalAlloc::alloc`'s contract is the one of `System.alloc`.
             None => unsafe { System.alloc(layout) },
         };
         learn(p, layout.size());

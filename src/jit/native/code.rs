@@ -154,8 +154,8 @@ impl JITMemoryProvider for CodeMemory {
             return Err(std::io::Error::other("the JIT's code memory is full"));
         }
         self.used = at + size;
-        // SAFETY: inside the region.
-        Ok(unsafe { self.write.add(at) })
+        // Inside the region (above), so `add` would do; `wrapping_add` needs no promise.
+        Ok(self.write.wrapping_add(at))
     }
 
     unsafe fn free_memory(&mut self) {
@@ -171,8 +171,7 @@ impl JITMemoryProvider for CodeMemory {
     }
 
     fn finalize(&mut self, _: BranchProtection) -> ModuleResult<()> {
-        // SAFETY: inside the region.
-        sync_icache(unsafe { self.exec.add(self.fresh) }, self.used - self.fresh);
+        sync_icache(self.exec.wrapping_add(self.fresh), self.used - self.fresh);
         self.fresh = self.used;
         Ok(())
     }
