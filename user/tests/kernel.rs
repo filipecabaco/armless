@@ -1566,3 +1566,65 @@ fn a_restored_process_keeps_its_command_line() {
     ok(&status);
     assert!(out.ends_with(b"/usr/bin/prog\0-c\0a b\0"), "{:?}", String::from_utf8_lossy(&out));
 }
+
+const SIGPIPE: u64 = 13;
+const EPIPE: i64 = -32;
+const MSG_NOSIGNAL: u64 = 0x4000;
+
+/// Runs `p` on a machine of its own: how it ended
+fn ends(p: Prog) -> armless_user::Status {
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    run(&mut proc, &mut vm).1
+}
+
+#[test]
+fn a_write_to_a_pipe_nobody_reads_ends_the_program_by_sigpipe_unless_it_ignores_it() {
+    // pipe2: 3 and 4; the read end closed, a write ends the program (as a shell says it, 141)
+    let mut p = Prog::default();
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x200), I(1)]);
+    let status = ends(p);
+    assert!(matches!(status, armless_user::Status::Exited(141)), "{status:?}");
+
+    // Ignored: the write is EPIPE
+    let mut p = Prog::default();
+    p.ignore_signal(SIGPIPE);
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x200), I(1)]).expect(EPIPE);
+    ok(&ends(p));
+
+    // Blocked: EPIPE, and the signal pending for the thread
+    let mut p = Prog::default();
+    p.put(0x180, &(1u64 << (SIGPIPE - 1)).to_le_bytes());
+    p.sys(135, &[I(SIG_BLOCK), D(0x180), I(0), I(8)]).expect(0);
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x200), I(1)]).expect(EPIPE);
+    p.sys(136, &[D(0x190), I(8)]).expect(0); // rt_sigpending
+    p.arg(0, W(0x190));
+    p.expect_wide(1 << (SIGPIPE - 1));
+    ok(&ends(p));
+}
+
+#[test]
+fn a_send_to_a_closed_stream_raises_sigpipe_unless_msg_nosignal() {
+    // socketpair(AF_UNIX, SOCK_STREAM): 3 and 4; 4 closed
+    let mut p = Prog::default();
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0);
+    p.sys(57, &[I(4)]).expect(0);
+    // sendto with MSG_NOSIGNAL: EPIPE and nothing else; then a write: the signal
+    p.sys(206, &[I(3), D(0x200), I(1), I(MSG_NOSIGNAL), I(0), I(0)]).expect(EPIPE);
+    p.sys(64, &[I(3), D(0x200), I(1)]);
+    let status = ends(p);
+    assert!(matches!(status, armless_user::Status::Exited(141)), "{status:?}");
+
+    let mut p = Prog::default();
+    p.ignore_signal(SIGPIPE);
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0);
+    p.sys(57, &[I(4)]).expect(0);
+    p.sys(206, &[I(3), D(0x200), I(1), I(0), I(0), I(0)]).expect(EPIPE);
+    ok(&ends(p));
+}

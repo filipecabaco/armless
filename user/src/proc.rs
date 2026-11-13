@@ -30,19 +30,12 @@ use std::collections::BTreeMap;
 use armless::cpu::Cpu;
 use armless::Host;
 
+use crate::errno::{EAGAIN, EBADF, ECHILD, EFAULT, EINVAL, ENOMEM, EPERM, ESRCH};
 use crate::files::Kind;
 use crate::mm::Mm;
 use crate::signal::{self, ThreadSig};
 use crate::{Ctx, Proc, Process, Ret, Thread, Wait, INIT};
 
-const EPERM: i64 = 1;
-const ESRCH: i64 = 3;
-const EBADF: i64 = 9;
-const EAGAIN: i64 = 11;
-const ENOMEM: i64 = 12;
-const EFAULT: i64 = 14;
-const ECHILD: i64 = 10;
-const EINVAL: i64 = 22;
 
 use crate::signal::SIGSEGV;
 
@@ -375,7 +368,7 @@ impl Process {
         let d = self
             .files
             .add(crate::files::Kind::Pidfd { pid }, 2 | (flags as u32 & PIDFD_NONBLOCK as u32));
-        Ret::Val(self.files.install(d, 0, true) as i64)
+        Ret::Val(self.new_fd(d, 0, true))
     }
 
     /// pidfd_send_signal(pidfd, sig, info, flags): kill for the process a pidfd is of (no flags;
@@ -427,7 +420,7 @@ impl Process {
         let Some(d) = desc else {
             return Ret::Val(-EBADF);
         };
-        Ret::Val(self.files.install(d, 0, true) as i64)
+        Ret::Val(self.new_fd(d, 0, true))
     }
 
     /// waitid(idtype, id, infop, options, rusage)
@@ -669,8 +662,9 @@ impl Process {
         if f & CLONE_PIDFD != 0 {
             // A pidfd of the child, close-on-exec, in the parent's table
             let d = self.files.add(Kind::Pidfd { pid: id }, 2);
-            let fd = self.files.install(d, 0, true);
-            self.put_u32(c.pidfd, fd as u32);
+            // (With the table full, -1: the child runs regardless)
+            let fd = self.new_fd(d, 0, true);
+            self.put_u32(c.pidfd, fd.max(-1) as u32);
         }
         if f & CLONE_PARENT_SETTID != 0 {
             self.put_u32(c.ptid, id as u32);

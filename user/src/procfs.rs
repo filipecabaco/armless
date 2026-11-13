@@ -10,6 +10,7 @@
 
 use armless::dev::fs::{Ino, ROOT};
 
+use crate::errno::{EBADF, ENOTDIR};
 use crate::files::{self, encode_dirents};
 use crate::{Proc, Process};
 
@@ -81,7 +82,7 @@ impl Process {
     ) -> Result<(Vec<u8>, u64), i64> {
         let own = self
             .fs(|fs| -> Result<Vec<_>, i64> {
-                let entries = fs.list(ino).map_err(|_| -files::ENOTDIR)?;
+                let entries = fs.list(ino).map_err(|_| -ENOTDIR)?;
                 let n = entries.len() as u64;
                 let mut own: Vec<_> = entries
                     .into_iter()
@@ -98,7 +99,7 @@ impl Process {
                 own.push((PID_INO, n + 1, DT_LNK, b"self".to_vec()));
                 Ok(own)
             })
-            .ok_or(-files::EBADF)??;
+            .ok_or(-EBADF)??;
         let mut pids: Vec<i64> = self.proc_list().map(|p| p.pid).collect();
         pids.sort_unstable();
         let procs = pids.into_iter().map(|pid| {

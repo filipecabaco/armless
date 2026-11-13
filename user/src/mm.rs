@@ -34,6 +34,7 @@ use armless::cpu::Cpu;
 use armless::dev::fs::{Ino, EIO};
 use armless::{Host, Ram};
 
+use crate::errno::{EBADF, EEXIST, EFAULT, EINVAL, ENODEV, ENOMEM};
 use crate::elf::Seg;
 use crate::files::{got, Desc, Got, Kind};
 use crate::ser::{R, W};
@@ -63,12 +64,6 @@ pub(crate) const VA_END: u64 = 1 << 39;
 /// A futex key's mark for one that is a frame's (`Process::futex_key`)
 pub(crate) const SHARED_FUTEX: u64 = 1 << 63;
 
-const EBADF: i64 = 9;
-const ENOMEM: i64 = 12;
-const EFAULT: i64 = 14;
-const EEXIST: i64 = 17;
-const ENODEV: i64 = 19;
-const EINVAL: i64 = 22;
 
 fn bits(prot: u8, writable: bool) -> u64 {
     let mut d = VALID | MEM;
@@ -1519,8 +1514,9 @@ impl Process {
                     return true;
                 }
                 // An undefined instruction (EC 0) is SIGILL: a program probing for a CPU
-                // feature (OpenSSL's, for SVE or SM3) sets a handler and goes on without it
-                if ec == 0 && self.raise_fault(SIGILL, ILL_ILLOPC) {
+                // feature (OpenSSL's, for SVE or SM3) sets a handler and goes on without it. So
+                // is a system register EL0 is kept from (EC 0x18), as Linux answers it
+                if matches!(ec, 0 | 0x18) && self.raise_fault(SIGILL, ILL_ILLOPC) {
                     return false;
                 }
                 // A load, store or fetch where nothing is mapped (SEGV_MAPERR) or that the page's
@@ -1679,7 +1675,8 @@ impl Process {
         }
         // A file mapping's pages are read as they are touched. A MAP_PRIVATE one is a copy of its
         // own; a MAP_SHARED one's pages are one frame each for every mapping of them (its writes
-        // are seen by the others, but not written back to the file)
+        // are seen by the others at once, and are in the file once no mapping holds the page:
+        // trim_file_pages)
         let mut file = None;
         if !anon {
             let Some(Desc { kind, .. }) = self.files.get(fd).cloned() else {
@@ -1722,15 +1719,13 @@ impl Process {
         v(at as i64)
     }
 
+    /// munmap: a start on a page and an end in the address space, as Linux checks them (rounding
+    /// a start down would take the page before it with it)
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
-        if len == 0 {
+        if len == 0 || !addr.is_multiple_of(PAGE) || addr >= VA_END || len > VA_END - addr {
             return -EINVAL;
         }
-        let a = addr & !(PAGE - 1);
-        let b = page_up(addr.saturating_add(len).min(VA_END));
-        if a >= b {
-            return 0;
-        }
+        let (a, b) = (addr, page_up(addr + len));
         {
             let mut mm = self.p.mm.borrow_mut();
             let mut f = self.frames.borrow_mut();
@@ -1757,11 +1752,20 @@ impl Process {
         0
     }
 
-    /// madvise: DONTNEED and FREE give the pages of anonymous memory back.
+    /// madvise: DONTNEED and FREE give the pages of anonymous memory back. A start off a page or
+    /// a range that wraps is EINVAL, and one past the address space ENOMEM, as on Linux.
     pub(crate) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64) -> i64 {
+        let end = len
+            .checked_add(PAGE - 1)
+            .and_then(|l| addr.checked_add(l & !(PAGE - 1)));
+        let Some(end) = end.filter(|_| addr.is_multiple_of(PAGE)) else {
+            return -EINVAL;
+        };
+        if end > VA_END {
+            return -ENOMEM;
+        }
         if advice == 4 || advice == 8 {
-            let a = addr & !(PAGE - 1);
-            let b = page_up(addr.saturating_add(len).min(VA_END));
+            let (a, b) = (addr, end);
             self.p
                 .mm
                 .borrow_mut()

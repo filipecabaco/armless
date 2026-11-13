@@ -40,15 +40,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::errno::{EAGAIN, EFAULT, EINVAL, EOPNOTSUPP};
 use crate::host::Instant;
 use crate::ser::{R, W};
 use crate::signal::{SI_KERNEL, SI_TIMER};
 use crate::{Process, Ret};
 
-const EFAULT: i64 = 14;
-const EAGAIN: i64 = 11;
-const EINVAL: i64 = 22;
-const EOPNOTSUPP: i64 = 95;
 
 const NS: u64 = 1_000_000_000;
 /// The longest a timer is set for (an `Instant` can't go much further): about 68 years

@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use crate::errno::{EAGAIN, EBADF, EFAULT, EINVAL};
 use crate::files::{Desc, Kind};
 use crate::host::Instant;
 use crate::ser::{R, W};
@@ -25,10 +26,6 @@ const TFD_CLOEXEC: u64 = 0o2000000;
 const TFD_TIMER_ABSTIME: u64 = 1;
 const TFD_TIMER_CANCEL_ON_SET: u64 = 2;
 
-const EBADF: i64 = 9;
-const EAGAIN: i64 = 11;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
 
 /// A timerfd's timer: its clock, when it fires next (None: disarmed), every how long after (zero:
 /// once), and the expirations not read yet.
@@ -101,7 +98,7 @@ impl Process {
             Kind::TimerFd(Timer { clock, next: None, every: Duration::ZERO, ticks: 0 }),
             2 | (flags & TFD_NONBLOCK) as u32,
         );
-        Ret::Val(self.files.install(d, 0, flags & TFD_CLOEXEC != 0) as i64)
+        Ret::Val(self.new_fd(d, 0, flags & TFD_CLOEXEC != 0))
     }
 
     /// timerfd_settime(fd, flags, new, old): struct itimerspec { interval, value }
@@ -123,7 +120,8 @@ impl Process {
         } else if flags & TFD_TIMER_ABSTIME != 0 {
             Some(self.deadline_at(t.clock, value))
         } else {
-            Some(Instant::now() + value)
+            // (One too far off to say never comes)
+            Instant::now().checked_add(value)
         };
         self.set_timerfd(fd, Timer { clock: t.clock, next, every, ticks: 0 });
         self.poke();

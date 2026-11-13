@@ -15,14 +15,10 @@
 //! deadline parameters (EINVAL) and `sched_setattr` with EPERM, the error for a policy the
 //! caller may not use. `sched_rr_get_interval` says 100 ms for SCHED_RR and 0 for the rest.
 
+use crate::errno::{E2BIG, EFAULT, EINVAL, EPERM, ESRCH};
 use crate::ser::{R, W};
 use crate::{Process, Ret};
 
-const EPERM: i64 = 1;
-const ESRCH: i64 = 3;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-const E2BIG: i64 = 7;
 
 pub(crate) const SCHED_OTHER: u32 = 0;
 const SCHED_FIFO: u32 = 1;

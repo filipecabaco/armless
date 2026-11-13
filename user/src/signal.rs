@@ -22,6 +22,7 @@
 //! as SIGSEGV would, whatever its handler), and the sender's pid in a handler's siginfo (the
 //! first process's, 1000, for kill, tkill and the like; none for SIGCHLD).
 
+use crate::errno::{EAGAIN, EBADF, EFAULT, EINTR, EINVAL, ENOMEM, EPERM, ESRCH};
 use crate::host::Instant;
 use std::collections::BTreeMap;
 
@@ -37,6 +38,7 @@ pub(crate) const SIGINT: u32 = 2;
 pub(crate) const SIGILL: u32 = 4;
 pub(crate) const SIGBUS: u32 = 7;
 pub(crate) const SIGSEGV: u32 = 11;
+pub(crate) const SIGPIPE: u32 = 13;
 pub(crate) const SIGQUIT: u32 = 3;
 pub(crate) const SIGKILL: u32 = 9;
 pub(crate) const SIGCHLD: u32 = 17;
@@ -74,13 +76,6 @@ pub(crate) const SI_KERNEL: i32 = 0x80;
 /// ... and by a POSIX timer (timer.rs): its siginfo has the timer's id, overrun count and value
 pub(crate) const SI_TIMER: i32 = -2;
 
-const EINTR: i64 = 4;
-const EINVAL: i64 = 22;
-const EFAULT: i64 = 14;
-const ENOMEM: i64 = 12;
-const EPERM: i64 = 1;
-const EAGAIN: i64 = 11;
-const ESRCH: i64 = 3;
 
 // The frame (arch/arm64/kernel/signal.c): siginfo, then the ucontext, whose sigcontext is at 176
 // and its __reserved records at 288 of that; a frame record (fp, lr) above it all.
@@ -967,9 +962,9 @@ impl Process {
             (Some(d), _) => Some(d),
             (None, 0) => None,
             (None, t) => match self.timespec(t) {
-                Some(d) if d.is_zero() => return Ret::Val(-EAGAIN),
-                Some(d) => Some(Instant::now() + d),
-                None => return Ret::Val(-EFAULT),
+                Ok(d) if d.is_zero() => return Ret::Val(-EAGAIN),
+                Ok(d) => Instant::now().checked_add(d),
+                Err(e) => return Ret::Val(e),
             },
         };
         Ret::Retry {
@@ -1044,12 +1039,11 @@ impl Process {
     /// With an fd that is one already, its mask is changed.
     pub(crate) fn sys_signalfd(&mut self, fd: i32, mask: u64, size: u64, flags: u64) -> Ret {
         let v = Ret::Val;
-        const EINVAL: i64 = 22;
         if size != 8 || flags & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
             return v(-EINVAL);
         }
         let Some(mask) = self.u64_at(mask) else {
-            return v(-14); // EFAULT
+            return v(-EFAULT);
         };
         let mask = mask & !UNBLOCKABLE;
         if fd != -1 {
@@ -1060,14 +1054,14 @@ impl Process {
                     v(fd as i64)
                 },
                 Some(_) => v(-EINVAL),
-                None => v(-9), // EBADF
+                None => v(-EBADF),
             };
         }
         let d = self.files.add(
             crate::files::Kind::Signal { mask },
             2 | (flags & SFD_NONBLOCK) as u32,
         );
-        v(self.files.install(d, 0, flags & SFD_CLOEXEC != 0) as i64)
+        v(self.new_fd(d, 0, flags & SFD_CLOEXEC != 0))
     }
 
     /// Whether a signal of `mask` is pending for the current thread or its process
@@ -1080,7 +1074,7 @@ impl Process {
     /// signal of `mask` it takes (the thread's first, then its process's), or the wait.
     pub(crate) fn read_signalfd(&mut self, mask: u64, max: usize, nonblock: bool) -> Result<Vec<u8>, Ret> {
         if max < SIGNALFD_SIGINFO {
-            return Err(Ret::Val(-22)); // EINVAL
+            return Err(Ret::Val(-EINVAL));
         }
         let mut out = Vec::new();
         let cur = self.cur;
@@ -1112,7 +1106,7 @@ impl Process {
             return Ok(out);
         }
         Err(if nonblock {
-            Ret::Val(-11) // EAGAIN
+            Ret::Val(-EAGAIN)
         } else {
             Ret::Retry {
                 deadline: None,

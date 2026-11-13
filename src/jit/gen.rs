@@ -1373,6 +1373,14 @@ impl Gen<'_> {
         let l = *self.l;
         self.xs(rn);
         self.c.set(VA);
+        // Unaligned to its size: the interpreter, which raises the Alignment fault
+        if size > 1 {
+            self.c.get(VA);
+            self.c.i64c(size as i64 - 1);
+            self.c.i64_and();
+            self.c.i64_eqz();
+            self.c.if_(EMPTY);
+        }
         if o2 {
             // LDAR/STLR: ordinary accesses on one core; with several, fenced
             let smp = l.smp != 0;
@@ -1391,9 +1399,7 @@ impl Gen<'_> {
                 }
                 self.store(size);
             }
-            return true;
-        }
-        if load {
+        } else if load {
             self.tlb_probe(l.read_tag, size);
             self.c.if_(EMPTY);
             self.host_addr(l.read_base);
@@ -1437,6 +1443,11 @@ impl Gen<'_> {
             self.c.i32c(0);
             self.c.i32c(0);
             self.c.i32_store8(l.excl_armed);
+            self.c.else_();
+            self.interp(insn);
+            self.c.end();
+        }
+        if size > 1 {
             self.c.else_();
             self.interp(insn);
             self.c.end();
