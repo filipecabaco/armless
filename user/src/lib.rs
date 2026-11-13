@@ -43,6 +43,7 @@ mod mm;
 mod net;
 mod netlink;
 mod proc;
+mod procfs;
 mod sched;
 mod ser;
 mod shm;
@@ -228,6 +229,8 @@ pub(crate) struct Proc {
     pub umask: u32,
     /// The executable's path, for /proc/self/exe
     pub exe: Vec<u8>,
+    /// Its arguments, each followed by a NUL, as /proc/<pid>/cmdline gives them (ps, pgrep)
+    pub cmdline: Vec<u8>,
     pub sig: Signals,
     pub creds: Creds,
     /// Supplementary groups (creds.rs)
@@ -686,6 +689,7 @@ impl Process {
                 cwd: ROOT,
                 umask: 0o022,
                 exe: exe.to_vec(),
+                cmdline: Vec::new(),
                 sig: Signals::default(),
                 creds: Creds::default(),
                 groups: Vec::new(),
@@ -821,6 +825,8 @@ impl Process {
         if !ok.get() {
             return Err(fail("no memory for the stack".into()));
         }
+        // (Every program image is loaded here: the first, execve's, the host's own processes)
+        self.p.cmdline = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
         Ok((entry, sp))
     }
 
@@ -1364,6 +1370,7 @@ impl Process {
             self.timers.save_real(&mut w, p.pid, now);
             creds::save_groups(&p.groups, &mut w);
             aio::save(&p.aio, &mut w);
+            w.b(&p.cmdline);
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1442,7 +1449,7 @@ impl Process {
         board: Option<Arc<Board>>,
         data: &[u8],
     ) -> Result<Process, String> {
-        // Which format it is (MAGIC says what each adds): 5, 6 or 7
+        // Which format it is (MAGIC says what each adds): 5 to 9
         let Some((ver, rest)) = MAGICS
             .iter()
             .enumerate()
@@ -1506,6 +1513,8 @@ impl Process {
             // Before ARMLUSR7 there were no groups nor AIO contexts
             let groups = if ver >= 7 { creds::load_groups(&mut r)? } else { Vec::new() };
             let aio = if ver >= 7 { aio::load(&mut r)? } else { BTreeMap::new() };
+            // Before ARMLUSR9 no command line was kept: /proc gives the executable's path
+            let cmdline = if ver >= 9 { r.b()?.to_vec() } else { Vec::new() };
             all.insert(
                 pid,
                 Proc {
@@ -1521,6 +1530,7 @@ impl Process {
                     cwd,
                     umask,
                     exe,
+                    cmdline,
                     sig,
                     creds,
                     groups,
@@ -1703,12 +1713,14 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-/// The process state's format: ARMLUSR7 (0.16) has each thread's scheduling (sched.rs) and the
-/// timers but ITIMER_REAL, with the CPU time they count (timer.rs, at the end); ARMLUSR6
-/// (0.15) has none of that; ARMLUSR5 (0.14) has neither the ids, timers, shared memory, shared
-/// file pages nor descriptors in flight of 0.15. Each still loads.
-const MAGIC: &[u8; 8] = b"ARMLUSR8";
-const MAGICS: [&[u8; 8]; 4] = [b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", MAGIC];
+/// The process state's format: ARMLUSR9 (0.19) has each process's command line (after its AIO
+/// contexts); ARMLUSR8 (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
+/// each thread's scheduling (sched.rs) and the timers but ITIMER_REAL, with the CPU time they
+/// count (timer.rs, at the end); ARMLUSR6 (0.15) has none of that; ARMLUSR5 (0.14) has neither
+/// the ids, timers, shared memory, shared file pages nor descriptors in flight of 0.15. Each
+/// still loads.
+const MAGIC: &[u8; 8] = b"ARMLUSR9";
+const MAGICS: [&[u8; 8]; 5] = [b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", MAGIC];
 
 const _: () = {
     const fn send<T: Send>() {}

@@ -776,23 +776,39 @@ pub(crate) fn dtype(mode: u32) -> u8 {
 /// Returns the bytes and the next position.
 pub(crate) fn dirents(fs: &Fs, dir: Ino, pos: u64, max: usize) -> Result<(Vec<u8>, u64), i64> {
     let entries = fs.list(dir).map_err(|_| -ENOTDIR)?;
+    let typed = entries
+        .into_iter()
+        .enumerate()
+        .skip(pos as usize)
+        .map(|(i, (name, ino))| (ino, i as u64 + 1, fs.get(ino).map_or(0, |i| dtype(i.mode)), name));
+    encode_dirents(typed, pos, max)
+}
+
+/// linux_dirent64 records of `entries` (inode, the position after it, type, name), as many as
+/// `max` bytes hold, and the position to go on from: the one place they are made, for the
+/// filesystem's directories and for /proc's processes (procfs.rs).
+pub(crate) fn encode_dirents(
+    entries: impl IntoIterator<Item = (Ino, u64, u8, Vec<u8>)>,
+    pos: u64,
+    max: usize,
+) -> Result<(Vec<u8>, u64), i64> {
     let mut out = Vec::new();
     let mut next = pos;
-    for (name, ino) in entries.iter().skip(pos as usize) {
+    for (ino, off, typ, name) in entries {
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
         if out.len() + reclen > max {
+            if out.is_empty() {
+                return Err(-EINVAL); // the buffer can't hold even one entry
+            }
             break;
         }
-        next += 1;
+        next = off;
         out.extend_from_slice(&ino.to_le_bytes());
-        out.extend_from_slice(&(next as i64).to_le_bytes());
+        out.extend_from_slice(&(off as i64).to_le_bytes());
         out.extend_from_slice(&(reclen as u16).to_le_bytes());
-        out.push(fs.get(*ino).map_or(0, |i| dtype(i.mode)));
-        out.extend_from_slice(name);
+        out.push(typ);
+        out.extend_from_slice(&name);
         out.resize(out.len() + reclen - 19 - name.len(), 0);
-    }
-    if next == pos && pos < entries.len() as u64 {
-        return Err(-EINVAL); // the buffer can't hold even one entry
     }
     Ok((out, next))
 }
@@ -897,5 +913,17 @@ mod tests {
         assert_eq!((b1.len(), n1), (24, 1));
         assert_eq!(dirents(&fs, usr, 0, 8), Err(-EINVAL));
         assert_eq!(dirents(&fs, usr, 4, 4096).unwrap().0.len(), 0, "the end");
+    }
+
+    #[test]
+    fn dirents_carry_the_positions_they_are_given() {
+        // /proc's go on by pid (procfs.rs): d_off is the entry's own, the next call's start
+        let entries = [(7, 3, 4, b"a".to_vec()), (8, 1 << 32 | 1000, 4, b"1000".to_vec())];
+        let (b, next) = encode_dirents(entries.clone(), 2, 4096).unwrap();
+        assert_eq!(next, 1 << 32 | 1000);
+        assert_eq!(i64::from_le_bytes(b[8..16].try_into().unwrap()), 3);
+        assert_eq!(&b[24 + 19..24 + 23], b"1000");
+        assert_eq!(encode_dirents(entries.clone(), 2, 24).unwrap(), (b[..24].to_vec(), 3));
+        assert_eq!(encode_dirents(entries, 2, 16), Err(-EINVAL));
     }
 }

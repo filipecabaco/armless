@@ -796,6 +796,9 @@ impl Process {
             }
             return Some(s.into_bytes());
         }
+        if let Some(f) = self.pid_file(path) {
+            return Some(f);
+        }
         Some(match path {
             b"/proc/cpuinfo" => (0..self.ncpus_reported())
                 .map(|i| format!("processor\t: {i}\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd aes pmull sha1 sha2 crc32 atomics sha3 sm3 sm4 sha512\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n"))
@@ -805,11 +808,6 @@ impl Process {
                 let kb = self.ram_size / 1024;
                 format!("MemTotal:       {kb} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\n", kb / 2, kb / 2).into_bytes()
             },
-            b"/proc/self/stat" | b"/proc/thread-self/stat" => {
-                let (pid, ppid, pgid, sid) = (self.p.pid, self.p.ppid, self.p.pgid, self.p.sid);
-                format!("{pid} (program) R {ppid} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n").into_bytes()
-            },
-            b"/proc/self/cmdline" => self.p.exe.iter().copied().chain([0]).collect(),
             b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
             // The interfaces netlink.rs has, with nothing counted (ifconfig reads their list here)
             b"/proc/net/dev" | b"/proc/self/net/dev" => {
@@ -864,6 +862,15 @@ impl Process {
     fn openat(&mut self, dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Ret {
         if let Some(full) = self.under_special(dirfd, path) {
             return self.openat(AT_FDCWD, &full, flags, mode);
+        }
+        // /proc, to list the processes (procfs.rs): a directory of the filesystem, made if the
+        // image has none. (musl's glob opens it as "/proc/".)
+        let path = match path.strip_prefix(b"/proc") {
+            Some(slashes) if !slashes.is_empty() && slashes.iter().all(|&b| b == b'/') => b"/proc",
+            _ => path,
+        };
+        if path == b"/proc" {
+            self.make_proc_dir();
         }
         let cloexec = flags & O_CLOEXEC != 0;
         let status = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
@@ -991,8 +998,14 @@ impl Process {
                 ..Stat::device(S_IFREG | 0o444, 0)
             });
         }
-        if path == b"/proc" || path == b"/proc/self" || path == b"/dev" {
+        if path == b"/proc" || path == b"/dev" {
             return Ok(Stat::device(S_IFDIR | 0o555, 0));
+        }
+        // A process's directory, while there is that process
+        match self.pid_dir(path) {
+            Some(true) => return Ok(Stat::device(S_IFDIR | 0o555, 0)),
+            Some(false) => return Err(-ENOENT),
+            None => {},
         }
         if flags & AT_SYMLINK_NOFOLLOW == 0 {
             let start = self.start_dir(dirfd)?;
@@ -1424,7 +1437,12 @@ impl Process {
                 else {
                     return v(if self.files.get(fd0).is_some() { -ENOTDIR } else { -EBADF });
                 };
-                match self.fs(|fs| files::dirents(fs, ino, pos, a[2] as usize)) {
+                let listed = if self.is_proc_dir(ino) {
+                    Some(self.proc_dirents(ino, pos, a[2] as usize))
+                } else {
+                    self.fs(|fs| files::dirents(fs, ino, pos, a[2] as usize))
+                };
+                match listed {
                     Some(Ok((bytes, next))) => {
                         if !self.write(a[1], &bytes) {
                             return v(-EFAULT);

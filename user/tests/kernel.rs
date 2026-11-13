@@ -1413,3 +1413,156 @@ fn the_host_starts_a_process_with_pipes_and_takes_its_output_and_status() {
     assert_eq!(proc.processes(), 1);
     assert!(proc.waiting_for_input());
 }
+
+const ENOENT: i64 = -2;
+/// O_RDONLY | O_DIRECTORY | O_CLOEXEC
+const O_DIR: u64 = 0o2_200_000;
+
+/// read(fd, data[at..], 256), then write(1) of what it read
+fn cat(p: &mut Prog, fd: u64, at: u32) {
+    p.sys(63, &[I(fd), D(at), I(256)]).save(0x180);
+    p.sys(64, &[I(1), D(at), W(0x180)]);
+}
+
+/// The names and types of the linux_dirent64 records in `b`, and the position each says is next
+fn dirents(mut b: &[u8]) -> Vec<(String, u8, u64)> {
+    let mut out = Vec::new();
+    while b.len() >= 19 {
+        let off = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let reclen = u16::from_le_bytes([b[16], b[17]]) as usize;
+        let name = b[19..reclen].split(|&c| c == 0).next().unwrap();
+        out.push((String::from_utf8_lossy(name).into_owned(), b[18], off));
+        b = &b[reclen..];
+    }
+    out
+}
+
+#[test]
+fn proc_lists_every_process_with_its_command_line_and_state() {
+    // busybox's ps and pgrep, and snowglobe's `for f in /proc/[0-9]*/cmdline`: the first
+    // process (1000, run as `/usr/bin/prog sleep 4167`) forks 1001, which waits on a pipe
+    let mut p = Prog::default();
+    p.put(0x200, b"/proc/\0").put(0x210, b"/proc/1001/cmdline\0");
+    p.put(0x230, b"/proc/1001/stat\0").put(0x240, b"/proc/self/stat\0");
+    p.put(0x250, b"/proc/1001/status\0").put(0x270, b"/proc/1001\0");
+    p.put(0x280, b"/proc/1002\0").put(0x290, b"\n--\n");
+    // struct pollfd for descriptor 10, POLLIN
+    p.put(0x1a0, &10u32.to_le_bytes()).put(0x1a4, &1u16.to_le_bytes());
+    p.sys(59, &[D(0x100), I(0)]).expect(0); // a pipe: 3, 4
+    let child = p.fork();
+    p.sys(63, &[I(3), D(0x300), I(1)]); // waits for the parent
+    p.parent(child);
+    p.expect(1001);
+    // The image has no /proc: opening it (as musl's glob does, with its slash) still lists
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_DIR), I(0)]).expect(5);
+    p.sys(61, &[I(5), D(0x800), I(8)]).expect(EINVAL); // no room for one
+    // One entry a call (each is 24 bytes), to the end
+    for _ in 0..6 {
+        p.sys(61, &[I(5), D(0x800), I(24)]).save(0x180);
+        p.sys(64, &[I(1), D(0x800), W(0x180)]);
+    }
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x210), I(0), I(0)]).expect(6);
+    cat(&mut p, 6, 0x900);
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x230), I(0), I(0)]).expect(7);
+    cat(&mut p, 7, 0x900);
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x240), I(0), I(0)]).expect(8);
+    cat(&mut p, 8, 0x900);
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x250), I(0), I(0)]).expect(9);
+    cat(&mut p, 9, 0x900);
+    // /proc/1001 is a directory; there is no 1002
+    p.sys(79, &[I(AT_FDCWD), D(0x270), D(0xa00), I(0)]).expect(0);
+    p.arg(0, W(0xa00 + 16)); // st_mode
+    p.code.push(0xd34c_fc00); // lsr x0, x0, #12: the file type
+    p.expect(4); // S_IFDIR >> 12
+    p.sys(79, &[I(AT_FDCWD), D(0x280), D(0xa00), I(0)]).expect(ENOENT);
+    // The child goes on and ends; nobody has waited for it yet
+    p.sys(64, &[I(4), D(0x290), I(1)]).expect(1);
+    p.sys(434, &[I(1001), I(0)]).expect(10); // pidfd_open
+    p.sys(73, &[D(0x1a0), I(1), I(0), I(0), I(8)]).expect(1);
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x230), I(0), I(0)]).expect(11);
+    cat(&mut p, 11, 0x900);
+    // A zombie's command line is empty, and its directory is there until it is waited for
+    p.sys(56, &[I(AT_FDCWD), D(0x210), I(0), I(0)]).expect(12);
+    p.sys(63, &[I(12), D(0x900), I(256)]).expect(0);
+    p.sys(79, &[I(AT_FDCWD), D(0x270), D(0xa00), I(0)]).expect(0);
+    p.sys(260, &[I(1001), D(0x380), I(0), I(0)]).expect(1001); // wait4
+    p.sys(79, &[I(AT_FDCWD), D(0x270), D(0xa00), I(0)]).expect(ENOENT);
+    p.sys(56, &[I(AT_FDCWD), D(0x210), I(0), I(0)]).expect(ENOENT);
+    let mut vm = machine_with_prog(&p.elf());
+    let board = vm.board.clone();
+    let args = ["/usr/bin/prog".into(), "sleep".into(), "4167".into()];
+    let mut proc = Process::exec(&mut vm.cpus[0], board, &args, &[], "/").unwrap();
+    let (out, status) = run(&mut proc, &mut vm);
+    ok(&status);
+    // (The terminal wrote each \n as \r\n: back, for the records' bytes)
+    let mut text = Vec::new();
+    for (i, &c) in out.iter().enumerate() {
+        if !(c == b'\r' && out.get(i + 1) == Some(&b'\n')) {
+            text.push(c);
+        }
+    }
+    let mut parts = Vec::new();
+    let mut rest = &text[..];
+    while let Some(i) = rest.windows(4).position(|w| w == b"\n--\n") {
+        parts.push(&rest[..i]);
+        rest = &rest[i + 4..];
+    }
+    parts.push(rest);
+    assert_eq!(parts.len(), 6, "{:?}", String::from_utf8_lossy(&text));
+    // ".", "..", self, then a directory for each process, each with where the next starts
+    let listed = dirents(parts[0]);
+    let names: Vec<&str> = listed.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(names, [".", "..", "self", "1000", "1001"]);
+    assert_eq!((listed[4].1, listed[2].1), (4, 10), "DT_DIR, DT_LNK");
+    assert!(listed.windows(2).all(|w| w[0].2 < w[1].2), "{listed:?}");
+    assert_eq!(parts[1], b"/usr/bin/prog\0sleep\x004167\0");
+    let stat = String::from_utf8_lossy(parts[2]);
+    // Waiting on its pipe (or, on another CPU, not there yet)
+    assert!(stat.starts_with("1001 (prog) S 1000 1000 ") || stat.starts_with("1001 (prog) R 1000 1000 "), "{stat}");
+    assert_eq!(stat.split_whitespace().count(), 52, "{stat}");
+    assert_eq!(stat.split_whitespace().nth(19), Some("1"), "num_threads");
+    assert!(String::from_utf8_lossy(parts[3]).starts_with("1000 (prog) R 1 1000 "));
+    let status = String::from_utf8_lossy(parts[4]);
+    for line in ["Name:\tprog\n", "Pid:\t1001\n", "Tgid:\t1001\n", "PPid:\t1000\n", "Uid:\t0\t0\t0\t0\n", "Threads:\t1\n"] {
+        assert!(status.contains(line), "{line:?} in {status}");
+    }
+    assert!(String::from_utf8_lossy(parts[5]).starts_with("1001 (prog) Z 1000 "));
+}
+
+#[test]
+fn a_restored_process_keeps_its_command_line() {
+    // Saved while it waits for a key; restored, it reads its /proc/self/cmdline
+    let mut p = Prog::default();
+    p.put(0x200, b"/proc/self/cmdline\0");
+    p.sys(63, &[I(0), D(0x380), I(1)]).expect(1);
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(0), I(0)]).expect(3);
+    cat(&mut p, 3, 0x900);
+    let elf = p.elf();
+    let mut vm = machine_with_prog(&elf);
+    let board = vm.board.clone();
+    let args = ["/usr/bin/prog".into(), "-c".into(), "a b".into()];
+    let mut proc = Process::exec(&mut vm.cpus[0], board, &args, &[], "/").unwrap();
+    let status = loop {
+        match proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20)) {
+            armless_user::Status::Running => {},
+            s => break s,
+        }
+    };
+    assert!(matches!(status, armless_user::Status::Idle(None)), "{status:?}");
+    let process = proc.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((proc, vm));
+
+    let mut vm = machine_with_prog(&elf);
+    vm.load_state(&state).unwrap();
+    let mut proc = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    proc.input(b"\n");
+    let (out, status) = run(&mut proc, &mut vm);
+    ok(&status);
+    assert!(out.ends_with(b"/usr/bin/prog\0-c\0a b\0"), "{:?}", String::from_utf8_lossy(&out));
+}
