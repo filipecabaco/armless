@@ -637,7 +637,7 @@ impl Process {
         args: &[String],
         env: &[String],
     ) -> Result<Process, ExecError> {
-        let ram = cpu.mem.alias();
+        let ram = cpu.mem().alias();
         let ram_size = ram.len() as u64;
         let layout = Layout::of(&image, board.as_deref())?;
         // What the CPUs decoded from a page of RAM is dropped when its frame is freed or the host
@@ -1430,7 +1430,7 @@ impl Process {
         };
         let v6 = ver >= 6;
         let mut r = R(rest);
-        let ram = cpu.mem.alias();
+        let ram = cpu.mem().alias();
         let ram_size = r.u()?;
         if ram_size != ram.len() as u64 {
             return Err(format!(

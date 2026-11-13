@@ -200,8 +200,9 @@ pub struct Cpu<H: Host> {
     pub vreg: [u128; 32],
 
     /// Guest physical RAM, starting at physical address 0.
-    /// An alias of `machine.mem`.
-    pub mem: crate::ram::Ram,
+    /// An alias of `machine.mem`. Crate-private: the fast-TLB hit paths access it
+    /// unchecked, so it must not be replaced behind their back (see `mem()`).
+    pub(crate) mem: crate::ram::Ram,
     /// What the CPUs share (GIC, RTC, timer, power and TLB coordination).
     pub machine: Arc<Machine>,
     /// This CPU's number (MPIDR Aff0, GIC CPU interface).
@@ -451,6 +452,13 @@ impl<H: Host> Cpu<H> {
         } else {
             None
         }
+    }
+
+    /// Guest physical RAM. Read-only from outside the crate: replacing it would
+    /// leave fast-TLB entries pointing into the old RAM.
+    #[inline]
+    pub fn mem(&self) -> &crate::ram::Ram {
+        &self.mem
     }
 
     /// A single-CPU machine.
