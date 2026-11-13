@@ -237,6 +237,8 @@ impl Process {
         self.p.exe = real.unwrap_or(exe);
         self.p.sig.exec();
         self.p.aio.clear();
+        // (Interval timers stay; POSIX timers go)
+        self.timers.exec(pid);
         for (i, t) in self.threads.iter_mut().enumerate() {
             if t.pid == pid && i != cur {
                 t.exited = true;

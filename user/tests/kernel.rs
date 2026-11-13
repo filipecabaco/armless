@@ -715,3 +715,406 @@ fn preadv2_and_pwritev2_take_a_position_or_the_descriptors_and_their_flags() {
     ok(&status);
     assert_eq!(out, b"XYYdefZ");
 }
+
+// ---------------------------------------------------------------- timers
+
+const SIGVTALRM: u64 = 26;
+const SIGPROF: u64 = 27;
+const SI_KERNEL: i64 = 0x80;
+const SI_TIMER: i64 = -2;
+const CLOCK_MONOTONIC: u64 = 1;
+const SIGEV_SIGNAL: u32 = 0;
+const SIGEV_NONE: u32 = 1;
+const SIGEV_THREAD: u32 = 2;
+const SIGEV_THREAD_ID: u32 = 4;
+const TIMER_ABSTIME: u64 = 1;
+/// Conditions of b.cond
+const NE: u32 = 1;
+const HS: u32 = 2;
+const LO: u32 = 3;
+
+/// A signal mask of `sigs`
+fn mask(sigs: &[u64]) -> [u8; 8] {
+    sigs.iter().fold(0u64, |m, s| m | 1 << (s - 1)).to_le_bytes()
+}
+
+/// struct itimerval or itimerspec: {interval, value}, each {seconds, us or ns}
+fn pair(interval: (u64, u64), value: (u64, u64)) -> Vec<u8> {
+    [interval.0, interval.1, value.0, value.1]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect()
+}
+
+/// struct sigevent: sigev_value, sigev_signo, sigev_notify (the thread for SIGEV_THREAD_ID at
+/// 16, put there by the program)
+fn sigevent(value: u64, sig: u64, notify: u32) -> Vec<u8> {
+    let mut b = value.to_le_bytes().to_vec();
+    b.extend_from_slice(&(sig as u32).to_le_bytes());
+    b.extend_from_slice(&notify.to_le_bytes());
+    b.resize(64, 0);
+    b
+}
+
+/// Exits with 100 + the check's number unless x0 `cond` `v` (unsigned)
+fn check(p: &mut Prog, cond: u32, v: u64) {
+    p.checks += 1;
+    p.li(1, v);
+    p.code.push(0xeb01_001f); // cmp x0, x1
+    p.code.push(0x5400_0080 | cond); // b.cond +16
+    p.li(0, 100 + p.checks as u64);
+    p.li(8, 94);
+    p.code.push(0xd400_0001);
+}
+
+/// x0 = the signed 32-bit value at this offset of the data (a siginfo's si_code)
+fn signed(p: &mut Prog, off: u32) {
+    p.arg(0, W(off));
+    p.code.push(0x9340_7c00); // sxtw x0, w0
+}
+
+#[test]
+fn the_interval_timer_signals_at_every_interval_and_is_quiet_once_disarmed() {
+    let mut p = Prog::default();
+    p.put(0x100, &mask(&[SIGALRM]));
+    p.put(0x200, &pair((0, 10_000), (0, 10_000))).put(0x220, &[0; 32]);
+    p.put(0x240, &pair((0, 40_000_000), (0, 0))); // a 40 ms timespec
+    p.sys(135, &[I(SIG_BLOCK), D(0x100), I(0), I(8)]).expect(0);
+    p.sys(103, &[I(0), D(0x200), I(0)]).expect(0);
+    // rt_sigtimedwait: each comes from the kernel
+    for _ in 0..3 {
+        p.sys(137, &[D(0x100), D(0x400), I(0), I(8)]).expect(SIGALRM as i64);
+        signed(&mut p, 0x408);
+        p.expect(SI_KERNEL);
+    }
+    p.sys(103, &[I(0), D(0x220), I(0)]).expect(0);
+    p.sys(137, &[D(0x100), I(0), D(0x240), I(8)]).expect(EAGAIN);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn getitimer_counts_down_and_setitimer_gives_back_the_old_timer() {
+    let mut p = Prog::default();
+    p.put(0x200, &pair((0, 7_000), (0, 40_000))).put(0x220, &[0; 32]);
+    p.put(0x240, &pair((0, 5_000_000), (0, 0))); // a 5 ms timespec
+    p.put(0x260, &pair((0, 0), (0, 1_000_000)));
+    // ITIMER_VIRTUAL counts CPU time, of which the program has used little: it is armed
+    p.sys(103, &[I(1), D(0x200), I(0)]).expect(0);
+    p.sys(102, &[I(1), D(0x300)]).expect(0);
+    p.arg(0, X(0x318));
+    check(&mut p, NE, 0);
+    p.sys(103, &[I(1), D(0x220), I(0)]).expect(0);
+    // ITIMER_REAL, 5 ms on: 0 < what is left < 40 ms, and the interval is the one set
+    p.sys(103, &[I(0), D(0x200), I(0)]).expect(0);
+    p.sys(101, &[D(0x240), I(0)]).expect(0);
+    p.sys(102, &[I(0), D(0x300)]).expect(0);
+    p.arg(0, X(0x300));
+    p.expect(0);
+    p.arg(0, X(0x308));
+    check(&mut p, 0, 7_000);
+    p.arg(0, X(0x310));
+    p.expect(0);
+    p.arg(0, X(0x318));
+    check(&mut p, NE, 0);
+    p.arg(0, X(0x318));
+    check(&mut p, LO, 40_000);
+    // The old timer comes back from the next setitimer, which disarms it
+    p.sys(103, &[I(0), D(0x220), D(0x340)]).expect(0);
+    p.arg(0, X(0x358));
+    check(&mut p, NE, 0);
+    p.arg(0, X(0x358));
+    check(&mut p, LO, 40_000);
+    p.sys(102, &[I(0), D(0x300)]).expect(0);
+    p.arg(0, X(0x318));
+    p.expect(0);
+    // A bad timer, or a microsecond count of a million, is EINVAL
+    p.sys(103, &[I(0), D(0x260), I(0)]).expect(EINVAL);
+    p.sys(103, &[I(3), D(0x220), I(0)]).expect(EINVAL);
+    p.sys(102, &[I(3), D(0x300)]).expect(EINVAL);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn the_cpu_time_interval_timers_fire_as_the_program_runs() {
+    // ITIMER_VIRTUAL and ITIMER_PROF at 1 ms of CPU time: a program that spins gets both
+    let mut p = Prog::default();
+    p.put(0x100, &mask(&[SIGVTALRM, SIGPROF]));
+    p.put(0x200, &pair((0, 0), (0, 1_000)));
+    p.sys(135, &[I(SIG_BLOCK), D(0x100), I(0), I(8)]).expect(0);
+    p.sys(103, &[I(1), D(0x200), I(0)]).expect(0);
+    p.sys(103, &[I(2), D(0x200), I(0)]).expect(0);
+    // Until rt_sigpending has both
+    let top = p.code.len();
+    p.sys(136, &[D(0x300), I(8)]);
+    p.arg(0, X(0x300));
+    p.arg(1, X(0x100));
+    p.code.push(0xeb01_001f); // cmp x0, x1
+    let back = (top as i32 - p.code.len() as i32) as u32 & 0x7ffff;
+    p.code.push(0x5400_0000 | back << 5 | NE); // b.ne top
+    // Their CPU time clocks have counted it
+    p.sys(113, &[I(2), D(0x340)]).expect(0); // CLOCK_PROCESS_CPUTIME_ID
+    p.arg(0, X(0x348));
+    check(&mut p, NE, 0);
+    p.sys(113, &[I(3), D(0x360)]).expect(0); // CLOCK_THREAD_CPUTIME_ID
+    p.arg(0, X(0x368));
+    check(&mut p, NE, 0);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+/// A program whose POSIX timer (its second, id 1) signals SIGUSR1 as `notify` says once, after
+/// 10 ms: rt_sigtimedwait has its siginfo
+fn posix_timer(notify: u32) -> Prog {
+    let mut p = Prog::default();
+    p.put(0x100, &mask(&[SIGUSR1]));
+    p.put(0x200, &sigevent(0x123, SIGUSR1, notify));
+    p.put(0x2a0, &pair((0, 0), (0, 10_000_000)));
+    p.sys(135, &[I(SIG_BLOCK), D(0x100), I(0), I(8)]).expect(0);
+    p.sys(178, &[]).save(0x210); // gettid, for SIGEV_THREAD_ID
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x200), D(0x280)]).expect(0);
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x200), D(0x284)]).expect(0);
+    p.arg(0, W(0x280));
+    p.expect(0);
+    p.arg(0, W(0x284));
+    p.expect(1);
+    p.sys(110, &[W(0x284), I(0), D(0x2a0), I(0)]).expect(0);
+    p.sys(137, &[D(0x100), D(0x400), I(0), I(8)]).expect(SIGUSR1 as i64);
+    // si_code, si_timerid, si_overrun, si_value
+    signed(&mut p, 0x408);
+    p.expect(SI_TIMER);
+    p.arg(0, W(0x410));
+    p.expect(1);
+    p.arg(0, W(0x414));
+    p.expect(0);
+    p.arg(0, X(0x418));
+    p.expect(0x123);
+    p.sys(109, &[W(0x284)]).expect(0); // timer_getoverrun
+    p.sys(111, &[W(0x284)]).expect(0); // timer_delete
+    p.sys(110, &[W(0x284), I(0), D(0x2a0), I(0)]).expect(EINVAL); // gone
+    p
+}
+
+#[test]
+fn a_posix_timer_signals_with_its_id_and_value() {
+    for notify in [SIGEV_SIGNAL, SIGEV_THREAD] {
+        let mut vm = machine();
+        let mut proc = start(&mut vm, posix_timer(notify));
+        let (_, status) = run(&mut proc, &mut vm);
+        ok(&status);
+    }
+}
+
+#[test]
+fn a_posix_timer_can_signal_a_thread() {
+    // SIGEV_THREAD_ID, the way glibc's SIGEV_THREAD has it
+    let mut vm = machine();
+    let mut proc = start(&mut vm, posix_timer(SIGEV_THREAD_ID));
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn a_deleted_posix_timer_is_quiet_and_so_is_one_with_no_notification() {
+    let mut p = Prog::default();
+    p.put(0x100, &mask(&[SIGUSR1]));
+    p.put(0x200, &sigevent(0, SIGUSR1, SIGEV_SIGNAL));
+    p.put(0x240, &pair((0, 40_000_000), (0, 0))); // a 40 ms timespec
+    p.put(0x2a0, &pair((0, 0), (0, 10_000_000)));
+    p.put(0x2e0, &sigevent(0, SIGUSR1, SIGEV_NONE));
+    p.sys(135, &[I(SIG_BLOCK), D(0x100), I(0), I(8)]).expect(0);
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x200), D(0x280)]).expect(0);
+    p.sys(110, &[W(0x280), I(0), D(0x2a0), I(0)]).expect(0);
+    p.sys(111, &[W(0x280)]).expect(0);
+    p.sys(137, &[D(0x100), I(0), D(0x240), I(8)]).expect(EAGAIN);
+    // SIGEV_NONE: it runs down, and nothing is signalled
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x2e0), D(0x284)]).expect(0);
+    p.sys(110, &[W(0x284), I(0), D(0x2a0), I(0)]).expect(0);
+    p.sys(101, &[D(0x240), I(0)]).expect(0);
+    p.sys(108, &[W(0x284), D(0x300)]).expect(0); // timer_gettime: not armed any more
+    p.arg(0, X(0x310));
+    p.expect(0);
+    p.arg(0, X(0x318));
+    p.expect(0);
+    p.sys(136, &[D(0x340), I(8)]).expect(0);
+    p.arg(0, X(0x340));
+    p.expect(0);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn a_posix_timer_counts_the_expiries_a_blocked_signal_missed() {
+    // Every 5 ms for 60 ms with the signal blocked: one signal, which says how many more there
+    // were; a signalfd reads it with the timer's id and value
+    let mut p = Prog::default();
+    p.put(0x100, &mask(&[SIGUSR1]));
+    p.put(0x200, &sigevent(0x123, SIGUSR1, SIGEV_SIGNAL));
+    p.put(0x240, &pair((0, 60_000_000), (0, 0))); // a 60 ms timespec
+    p.put(0x2a0, &pair((0, 5_000_000), (0, 5_000_000)));
+    p.sys(135, &[I(SIG_BLOCK), D(0x100), I(0), I(8)]).expect(0);
+    p.sys(74, &[I(0xffff_ffff), D(0x100), I(8), I(0)]).expect(3);
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x200), D(0x280)]).expect(0);
+    p.sys(110, &[W(0x280), I(0), D(0x2a0), I(0)]).expect(0);
+    p.sys(101, &[D(0x240), I(0)]).expect(0);
+    p.sys(63, &[I(3), D(0x400), I(128)]).expect(128);
+    // ssi_code, ssi_tid (the timer), ssi_overrun, ssi_ptr
+    signed(&mut p, 0x408);
+    p.expect(SI_TIMER);
+    p.arg(0, W(0x418));
+    p.expect(0);
+    p.arg(0, W(0x420));
+    check(&mut p, HS, 4);
+    p.arg(0, X(0x430));
+    p.expect(0x123);
+    p.sys(109, &[W(0x280)]);
+    check(&mut p, HS, 4);
+    p.sys(111, &[W(0x280)]).expect(0);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn an_absolute_posix_timer_is_due_when_its_clock_reads_that_time() {
+    let mut p = Prog::default();
+    p.put(0x100, &mask(&[SIGUSR1]));
+    p.put(0x200, &sigevent(0, SIGUSR1, SIGEV_SIGNAL));
+    p.put(0x2a0, &[0; 32]);
+    p.sys(135, &[I(SIG_BLOCK), D(0x100), I(0), I(8)]).expect(0);
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x200), D(0x280)]).expect(0);
+    p.sys(113, &[I(CLOCK_MONOTONIC), D(0x300)]).expect(0);
+    // 1000 s from now on the monotonic clock: 999 and some left
+    p.arg(0, X(0x300));
+    p.code.push(0x910f_a000); // add x0, x0, #1000
+    p.save(0x2b0);
+    p.arg(0, X(0x308));
+    p.save(0x2b8);
+    p.sys(110, &[W(0x280), I(TIMER_ABSTIME), D(0x2a0), I(0)]).expect(0);
+    p.sys(108, &[W(0x280), D(0x340)]).expect(0);
+    p.arg(0, X(0x350));
+    p.expect(999);
+    // A time that has gone by: due at once (and the old setting comes back)
+    p.arg(0, X(0x300));
+    p.save(0x2b0);
+    p.sys(110, &[W(0x280), I(TIMER_ABSTIME), D(0x2a0), D(0x380)]).expect(0);
+    p.arg(0, X(0x390));
+    p.expect(999);
+    p.sys(137, &[D(0x100), I(0), I(0), I(8)]).expect(SIGUSR1 as i64);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn a_forked_child_has_no_timers() {
+    let mut p = Prog::default();
+    p.put(0x200, &sigevent(0, SIGUSR1, SIGEV_SIGNAL));
+    p.put(0x220, &pair((0, 0), (5, 0))).put(0x260, &[0; 32]);
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x200), D(0x280)]).expect(0);
+    p.sys(103, &[I(0), D(0x220), I(0)]).expect(0);
+    let child = p.fork();
+    p.sys(102, &[I(0), D(0x300)]).expect(0);
+    for off in [0x300, 0x308, 0x310, 0x318] {
+        p.arg(0, X(off));
+        p.expect(0);
+    }
+    p.sys(108, &[W(0x280), D(0x340)]).expect(EINVAL); // the parent's POSIX timer isn't here
+    p.parent(child);
+    p.sys(260, &[I(0xffff_ffff), D(0x380), I(0), I(0)]);
+    p.arg(0, W(0x380));
+    p.expect(0); // the child's checks passed
+    // The parent's are still there
+    p.sys(102, &[I(0), D(0x300)]).expect(0);
+    p.arg(0, X(0x310));
+    p.expect(4);
+    p.sys(108, &[W(0x280), D(0x340)]).expect(0);
+    p.sys(103, &[I(0), D(0x260), I(0)]).expect(0);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn execve_keeps_the_interval_timers_and_deletes_the_posix_timers() {
+    // The program runs twice: first (argc 1) it arms both and execs itself with an argument;
+    // then (argc 2) it looks
+    let mut p = Prog::default();
+    p.put(0x200, b"/usr/bin/prog\0").put(0x210, b"x\0");
+    let at = |off: u64| (DATA + off).to_le_bytes();
+    p.put(0x300, &at(0x200)).put(0x308, &at(0x210)).put(0x310, &[0; 8]);
+    p.put(0x320, &sigevent(0, SIGUSR1, SIGEV_SIGNAL));
+    p.put(0x380, &pair((0, 0), (5, 0))).put(0x3a0, &[0; 32]);
+    p.code.push(0xf940_03e0); // ldr x0, [sp]: argc
+    p.code.push(0xf100_041f); // cmp x0, #1
+    let branch = p.code.len();
+    p.code.push(0);
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x320), D(0x3c0)]).expect(0);
+    p.sys(103, &[I(0), D(0x380), I(0)]).expect(0);
+    p.sys(221, &[D(0x200), D(0x300), D(0x310)]);
+    p.sys(94, &[I(99)]);
+    let skip = (p.code.len() - branch) as u32;
+    p.code[branch] = 0x5400_0000 | skip << 5 | NE; // b.ne: the second run
+    p.sys(102, &[I(0), D(0x400)]).expect(0);
+    p.arg(0, X(0x410));
+    p.expect(4);
+    p.sys(108, &[I(0), D(0x440)]).expect(EINVAL);
+    p.sys(103, &[I(0), D(0x3a0), I(0)]).expect(0);
+    let (_, status) = run_linked(p);
+    ok(&status);
+}
+
+#[test]
+fn armed_timers_go_on_in_a_restored_process() {
+    // Saved while the program waits for its interval timer (60 ms), with a POSIX timer (80 ms)
+    // and a CPU-time one armed: another machine restores it, and each signal comes at its time
+    let mut p = Prog::default();
+    p.put(0x100, &mask(&[SIGALRM])).put(0x108, &mask(&[SIGUSR1]));
+    p.put(0x110, &mask(&[SIGALRM, SIGUSR1]));
+    p.put(0x200, &sigevent(0x55, SIGUSR1, SIGEV_SIGNAL));
+    p.put(0x260, &pair((0, 0), (0, 60_000))).put(0x280, &pair((0, 0), (100, 0)));
+    p.put(0x2a0, &pair((0, 0), (0, 80_000_000)));
+    p.sys(135, &[I(SIG_BLOCK), D(0x110), I(0), I(8)]).expect(0);
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x200), D(0x2f0)]).expect(0);
+    p.sys(110, &[W(0x2f0), I(0), D(0x2a0), I(0)]).expect(0);
+    p.sys(103, &[I(1), D(0x280), I(0)]).expect(0);
+    p.sys(103, &[I(0), D(0x260), I(0)]).expect(0);
+    p.sys(137, &[D(0x100), I(0), I(0), I(8)]).expect(SIGALRM as i64);
+    p.sys(137, &[D(0x108), D(0x400), I(0), I(8)]).expect(SIGUSR1 as i64);
+    p.arg(0, X(0x418));
+    p.expect(0x55);
+    p.sys(102, &[I(1), D(0x300)]).expect(0);
+    p.arg(0, X(0x310));
+    p.expect(99);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let status = loop {
+        match proc.run(&mut vm.cpus[0], std::time::Duration::from_millis(20)) {
+            armless_user::Status::Running => {},
+            s => break s,
+        }
+    };
+    // Waiting, with nothing but the timer to wake it
+    assert!(matches!(status, armless_user::Status::Idle(Some(_))), "{status:?}");
+    let process = proc.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((proc, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut proc = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+}

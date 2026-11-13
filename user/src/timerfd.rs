@@ -115,7 +115,7 @@ impl Process {
         let (Some(every), Some(value)) = (self.timespec_checked(new), self.timespec_checked(new + 16)) else {
             return Ret::Val(-EINVAL);
         };
-        if old != 0 && !self.put_itimerspec(old, &t) {
+        if old != 0 && !self.put_timerfd_spec(old, &t) {
             return Ret::Val(-EFAULT);
         }
         let next = if value.is_zero() {
@@ -135,7 +135,7 @@ impl Process {
         let Some(t) = self.timerfd(fd) else {
             return Ret::Val(if self.files.get(fd).is_some() { -EINVAL } else { -EBADF });
         };
-        Ret::Val(if self.put_itimerspec(cur, &t) { 0 } else { -EFAULT })
+        Ret::Val(if self.put_timerfd_spec(cur, &t) { 0 } else { -EFAULT })
     }
 
     /// A read of timerfd `fd`: its expirations since the last read, or the wait for the next.
@@ -211,14 +211,12 @@ impl Process {
         (s >= 0 && (0..1_000_000_000).contains(&ns)).then(|| Duration::new(s as u64, ns as u32))
     }
 
-    /// struct itimerspec { interval, value } of `t` at `at`
-    fn put_itimerspec(&self, at: u64, t: &Timer) -> bool {
-        let left = t.next.map_or(Duration::ZERO, |n| {
-            n.saturating_duration_since(Instant::now()).max(Duration::from_nanos(1))
+    /// struct itimerspec { interval, value } of `t` at `at` (a value of at least 1 ns while it
+    /// is armed, as Linux's)
+    fn put_timerfd_spec(&self, at: u64, t: &Timer) -> bool {
+        let left = t.next.map_or(0, |n| {
+            (n.saturating_duration_since(Instant::now()).as_nanos() as u64).max(1)
         });
-        [t.every, left].iter().enumerate().all(|(i, d)| {
-            let o = at + 16 * i as u64;
-            self.put_u64(o, d.as_secs()) && self.put_u64(o + 8, d.subsec_nanos() as u64)
-        })
+        self.put_itimerspec(at, t.every.as_nanos() as u64, left)
     }
 }

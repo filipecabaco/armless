@@ -243,6 +243,13 @@ impl Process {
         }
         drop(mm);
         self.p.sig.pending.clear();
+        let tids: Vec<i64> = self
+            .threads
+            .iter()
+            .filter(|t| t.pid == pid)
+            .map(|t| t.tid)
+            .collect();
+        self.timers.end(pid, &tids);
         self.release_vfork(pid);
         for q in self.procs.values_mut() {
             if q.ppid == pid {
@@ -637,7 +644,6 @@ impl Process {
             creds: self.p.creds,
             groups: self.p.groups.clone(),
             aio: BTreeMap::new(),
-            alarm: None,
         };
         self.procs.insert(id, child);
         self.threads.push(Thread {
