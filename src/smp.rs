@@ -255,6 +255,9 @@ pub struct PerCpu {
     /// The CPU's hardware vCPU plus one, when it runs in hardware (`cpu::hv`): a kick makes it leave the
     /// guest. 0: none.
     pub hv_vcpu: AtomicU64,
+    /// Set by `Machine::preempt`: the CPU's `run` returns (`Exit::Budget`) at its next instruction
+    /// boundary, for whoever runs it to look at what changed (user mode: a thread that ended).
+    pub preempt: AtomicBool,
 }
 
 /// Instruction-cache invalidations kept for CPUs that have not applied them yet. A CPU further
@@ -415,6 +418,29 @@ impl Machine {
     }
 
     /// Ask CPU `cpu` to look at shared state, waking it if it is idle.
+    /// `cpu` is on, as CPU_ON leaves it: for a host that runs programs on the CPUs itself (user
+    /// mode), with no guest kernel to start them.
+    pub fn power_on(&self, cpu: usize) {
+        self.cpus[cpu].power.store(POWER_ON, Ordering::SeqCst);
+    }
+
+    /// `cpu` runs no guest code (as `Cpu::left_guest` says of it): for a CPU that hasn't run since
+    /// the machine was made or restored, which TLB shootdowns would otherwise wait for.
+    pub fn out_of_guest(&self, cpu: usize) {
+        self.cpus[cpu].run_state.store(RUN_IDLE, Ordering::SeqCst);
+    }
+
+    /// Whether `cpu` is running guest code (in its `run`, and not since `Cpu::left_guest`).
+    pub fn in_guest(&self, cpu: usize) -> bool {
+        self.cpus[cpu].run_state.load(Ordering::SeqCst) == RUN_RUNNING
+    }
+
+    /// Have `cpu`'s `run` return at its next instruction boundary (`PerCpu::preempt`).
+    pub fn preempt(&self, cpu: usize) {
+        self.cpus[cpu].preempt.store(true, Ordering::SeqCst);
+        self.kick(cpu);
+    }
+
     pub fn kick(&self, cpu: usize) {
         self.stats[3].fetch_add(1, Ordering::Relaxed);
         let c = &self.cpus[cpu];

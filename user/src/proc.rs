@@ -25,9 +25,7 @@
 //! it is waited for; `pidfd_send_signal` signals it, `pidfd_getfd` takes a description of its
 //! table, and `waitid(P_PIDFD)` waits for it (one with PIDFD_NONBLOCK never waits).
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use armless::cpu::Cpu;
 use armless::Host;
@@ -163,7 +161,9 @@ impl Process {
             .map(|i| (self.cur + i) % n)
             .find_map(|i| moved[i])
             .unwrap_or(0);
-        self.loaded = self.loaded.and_then(|l| moved[l]);
+        for l in self.on_cpu.iter_mut() {
+            *l = l.and_then(|l| moved[l]);
+        }
         self.threads.retain(|t| !t.exited);
     }
 
@@ -178,8 +178,8 @@ impl Process {
             self.futex_wake(self.futex_key(ct, false), 1, u32::MAX);
         }
         self.threads[i].exited = true;
-        if self.loaded == Some(i) {
-            self.loaded = None;
+        if self.on_cpu[self.cpu] == Some(i) {
+            self.on_cpu[self.cpu] = None;
         }
         // What it had pending goes to the threads left
         let left = std::mem::take(&mut self.threads[i].sig.pending);
@@ -218,11 +218,13 @@ impl Process {
         if self.p.pid != pid || self.p.zombie.is_some() {
             return;
         }
+        // Its threads that run on other CPUs stop there before its memory goes
+        self.take_off_cpus(|t| t.pid == pid);
         for (i, t) in self.threads.iter_mut().enumerate() {
             if t.pid == pid {
                 t.exited = true;
-                if self.loaded == Some(i) {
-                    self.loaded = None;
+                if self.on_cpu[self.cpu] == Some(i) {
+                    self.on_cpu[self.cpu] = None;
                 }
             }
         }
@@ -231,8 +233,8 @@ impl Process {
             self.close_fd(fd);
         }
         // The address space goes with its last user (a vfork parent may still have it)
-        let mm = std::mem::replace(&mut self.p.mm, Rc::new(RefCell::new(Mm::husk())));
-        if Rc::strong_count(&mm) == 1 {
+        let mm = std::mem::replace(&mut self.p.mm, crate::mm::SharedMm::new(Mm::husk()));
+        if crate::mm::SharedMm::strong_count(&mm) == 1 {
             let refs = {
                 let mut m = mm.borrow_mut();
                 m.destroy(&mut self.frames.borrow_mut());
@@ -366,7 +368,8 @@ impl Process {
         if self.threads.iter().any(|t| t.tid == pid && t.pid != pid) {
             return Ret::Val(-EINVAL);
         }
-        if self.proc_ref(pid).is_none_or(|p| p.zombie.is_some()) {
+        // (An ended process nobody has waited for yet has one: Linux's task is there until then)
+        if self.proc_ref(pid).is_none() {
             return Ret::Val(-ESRCH);
         }
         let d = self
@@ -385,13 +388,14 @@ impl Process {
             Some(crate::files::Kind::Pidfd { pid }) => *pid,
             _ => return Ret::Val(-EBADF),
         };
-        if self.proc_ref(pid).is_none_or(|p| p.zombie.is_some()) {
+        // (An ended process nobody has waited for takes a signal, which does nothing, as kill's)
+        let Some(ended) = self.proc_ref(pid).map(|p| p.zombie.is_some()) else {
             return Ret::Val(-ESRCH);
-        }
+        };
         if sig > 64 {
             return Ret::Val(-EINVAL);
         }
-        if sig != 0 {
+        if sig != 0 && !ended {
             self.raise_in(pid, sig, None, 0); // SI_USER
         }
         Ret::Val(0)
@@ -607,7 +611,7 @@ impl Process {
         }
         // A process
         let mm = if f & CLONE_VM != 0 {
-            Rc::clone(&self.p.mm)
+            self.p.mm.clone()
         } else {
             let child = self.p.mm.borrow_mut().fork(&mut self.frames.borrow_mut());
             let Some(mut child) = child else {
@@ -615,7 +619,7 @@ impl Process {
             };
             let refs = child.take_refs();
             self.settle_refs(refs);
-            Rc::new(RefCell::new(child))
+            crate::mm::SharedMm::new(child)
         };
         let parent = &self.threads[cur].sig;
         // A copy of the address space has its alternate stack; one that is shared (except for

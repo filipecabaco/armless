@@ -445,7 +445,7 @@ fn sockets_survive_a_snapshot() {
     p.out(0x340, 4);
     let mut p = start(&mut vm, p);
     let status = loop {
-        let status = p.run(&mut vm.cpus[0], Duration::from_millis(20));
+        let status = p.run_on(&mut vm.cpus, Duration::from_millis(20));
         if !matches!(status, Status::Running) {
             break status;
         }
@@ -515,7 +515,7 @@ fn processes_with_sockets_survive_a_snapshot() {
     let mut vm = machine();
     let mut p = start(&mut vm, forked_sockets(true));
     let status = loop {
-        let status = p.run(&mut vm.cpus[0], Duration::from_millis(20));
+        let status = p.run_on(&mut vm.cpus, Duration::from_millis(20));
         if !matches!(status, Status::Running) {
             break status;
         }
@@ -943,7 +943,7 @@ fn descriptors_in_flight_survive_a_snapshot() {
     p.out(0x340, 4);
     let mut p = start(&mut vm, p);
     let status = loop {
-        let status = p.run(&mut vm.cpus[0], Duration::from_millis(20));
+        let status = p.run_on(&mut vm.cpus, Duration::from_millis(20));
         if !matches!(status, Status::Running) {
             break status;
         }

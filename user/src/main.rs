@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use armless::vm::Config;
 use armless::Ram;
-use armless_user::{Process, Status};
+use armless_user::{Process, Smp, Status};
 
 fn usage() -> ! {
     eprintln!(
@@ -22,6 +22,7 @@ fn usage() -> ! {
   --env NAME=VALUE   an environment variable (repeatable; default PATH, HOME and TERM)
   --keys TEXT        type TEXT into its terminal once it waits for input (\\n, \\r and \\x03 escapes)
   -m MB              RAM (default 1024; untouched RAM costs nothing)
+  --cpus N           CPUs (default 1, at most 8): threads run on them at the same time
   --stop-after TEXT  stop once the program printed TEXT
   --save DIR         when it stops, write the machine (machine.bin) and the process (process.bin)
   --restore DIR      start from what --save wrote instead of an ELF
@@ -49,6 +50,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
 fn main() {
     let start = Instant::now();
     let mut mem_mb = 1024u64;
+    let mut cpus = 1usize;
     let mut stop_after: Option<String> = None;
     let mut save: Option<PathBuf> = None;
     let mut restore: Option<PathBuf> = None;
@@ -71,6 +73,12 @@ fn main() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
             "-m" => mem_mb = val().parse().unwrap_or_else(|_| usage()),
+            "--cpus" => {
+                cpus = val().parse().unwrap_or_else(|_| usage());
+                if !(1..=8).contains(&cpus) {
+                    usage()
+                }
+            },
             "--stop-after" => stop_after = Some(val()),
             "--save" => save = Some(PathBuf::from(val())),
             "--restore" => restore = Some(PathBuf::from(val())),
@@ -113,7 +121,7 @@ fn main() {
     // process can then give the host back the pages the program unmaps.
     let config = Config {
         memory_size: (mem_mb << 20) as usize,
-        cpus: 1,
+        cpus,
         devices: armless::dev::DeviceConfig {
             console: false,
             net,
@@ -237,48 +245,77 @@ fn main() {
         printed.iter().filter(|&&b| b == b'\n').count()
     });
 
-    // Run, forwarding its output, until it exits, faults, prints what we wait for, or times out
-    let cpu = &mut vm.cpus[0];
+    // Run, forwarding its output, until it exits, faults, prints what we wait for, or times out:
+    // CPU 0 on this thread, the others on threads of their own
+    let smp = Smp::new(&mut p);
     let mut first_output = None;
     let mut stopped_at = None;
-    let status = loop {
-        let status = p.run(cpu, Duration::from_millis(20));
-        let out = p.take_output();
-        if !out.is_empty() {
-            first_output.get_or_insert(start.elapsed());
-            let mut o = std::io::stdout();
-            let _ = o.write_all(&out);
-            let _ = o.flush();
-            printed.extend_from_slice(&out);
+    let (cpu0, others) = vm.cpus.split_at_mut(1);
+    let workers = others.len();
+    let cpu = &mut cpu0[0];
+    let status = std::thread::scope(|s| {
+        for (i, c) in others.iter_mut().enumerate() {
+            let smp = &smp;
+            s.spawn(move || smp.serve(i + 1, c));
         }
-        let seen = stop_after
-            .as_ref()
-            .is_some_and(|t| printed.windows(t.len()).any(|w| w == t.as_bytes()))
-            || lines_before.is_some_and(|n| printed.iter().filter(|&&b| b == b'\n').count() > n);
-        if seen {
-            stopped_at = Some(start.elapsed());
-            break status;
+        let status = loop {
+            let status = smp.run(0, cpu, Duration::from_millis(20));
+            let out = smp.lock().take_output();
+            if !out.is_empty() {
+                first_output.get_or_insert(start.elapsed());
+                let mut o = std::io::stdout();
+                let _ = o.write_all(&out);
+                let _ = o.flush();
+                printed.extend_from_slice(&out);
+            }
+            let seen = stop_after
+                .as_ref()
+                .is_some_and(|t| printed.windows(t.len()).any(|w| w == t.as_bytes()))
+                || lines_before
+                    .is_some_and(|n| printed.iter().filter(|&&b| b == b'\n').count() > n);
+            if seen {
+                stopped_at = Some(start.elapsed());
+                break status;
+            }
+            match status {
+                Status::Running => {},
+                Status::Idle(_) if keys.is_some() => {
+                    smp.lock().input(keys.take().unwrap().as_bytes());
+                    smp.poke();
+                },
+                // Blobs come from the host thread soon
+                Status::Idle(_) if smp.lock().waiting_on_blobs() => {
+                    std::thread::sleep(Duration::from_millis(1))
+                },
+                Status::Idle(wake) => {
+                    let wait = wake.map_or(Duration::from_millis(20), |w| {
+                        w.saturating_duration_since(Instant::now())
+                    });
+                    std::thread::sleep(wait.min(Duration::from_millis(20)));
+                },
+                Status::Exited(_) | Status::Fault(_) => break status,
+            }
+            if start.elapsed() > timeout {
+                eprintln!("armless-exec: timed out");
+                break status;
+            }
+        };
+        // The other CPUs' threads back in the process, for a snapshot to have them
+        smp.pause(workers);
+        for (i, t) in smp.times().iter().enumerate().take(workers + 1) {
+            eprintln!(
+                "cpu{i}: guest {:.2}s, waiting for the lock {:.2}s, holding it {:.2}s",
+                t[0] as f64 / 1e9,
+                t[1] as f64 / 1e9,
+                t[2] as f64 / 1e9
+            );
         }
-        match status {
-            Status::Running => {},
-            Status::Idle(_) if keys.is_some() => p.input(keys.take().unwrap().as_bytes()),
-            // Blobs come from the host thread soon
-            Status::Idle(_) if p.waiting_on_blobs() => std::thread::sleep(Duration::from_millis(1)),
-            Status::Idle(wake) => {
-                let wait = wake.map_or(Duration::from_millis(20), |w| {
-                    w.saturating_duration_since(Instant::now())
-                });
-                std::thread::sleep(wait.min(Duration::from_millis(20)));
-            },
-            Status::Exited(_) | Status::Fault(_) => break status,
-        }
-        if start.elapsed() > timeout {
-            eprintln!("armless-exec: timed out");
-            break status;
-        }
-    };
-    p.park(cpu);
-    let insns = cpu.insn_count;
+        smp.stop();
+        status
+    });
+    drop(smp);
+    p.park(&vm.cpus[0]);
+    let insns: u64 = vm.cpus.iter().map(|c| c.insn_count).sum();
     let footprint = footprint();
     let threads = p.threads();
     let stats = std::mem::take(&mut p.stats);
@@ -303,7 +340,10 @@ fn main() {
         "stopped_ms: {:?}",
         stopped_at.map(|d| d.as_secs_f64() * 1e3)
     );
-    eprintln!("instructions: {insns}");
+    eprintln!(
+        "instructions: {insns} (per cpu {:?})",
+        vm.cpus.iter().map(|c| c.insn_count).collect::<Vec<_>>()
+    );
     eprintln!("threads: {threads} (switches {})", stats.switches);
     eprintln!("host_footprint_mib: {:.1}", footprint as f64 / 1048576.0);
     eprintln!("saved_bytes (machine, process): {saved:?}");

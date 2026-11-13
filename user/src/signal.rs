@@ -449,6 +449,7 @@ impl Process {
                 }
             }
         }
+        let mut again = false;
         for i in 0..self.threads.len() {
             loop {
                 let t = &self.threads[i];
@@ -461,6 +462,15 @@ impl Process {
                     break;
                 };
                 let pid = t.pid;
+                if self.on_other_cpu(i) {
+                    // Its registers are on another CPU: that CPU delivers it, once it has
+                    // stopped (it looks at signals before it runs its thread again)
+                    if let Some(c) = self.on_cpu.iter().position(|&t| t == Some(i)) {
+                        self.machine.preempt(c);
+                    }
+                    again = true;
+                    break;
+                }
                 self.threads[i].sig.pending.remove(&sig);
                 let tid = self.threads[i].tid;
                 let timer = (code == SI_TIMER)
@@ -482,7 +492,7 @@ impl Process {
                         break;
                     },
                     Disposition::Handle(act) => {
-                        if self.loaded == Some(i) {
+                        if self.on_cpu[self.cpu] == Some(i) {
                             self.park(cpu);
                         }
                         self.switch_to(pid);
@@ -494,6 +504,9 @@ impl Process {
                     },
                 }
             }
+        }
+        if again {
+            self.sig_dirty = true;
         }
     }
 

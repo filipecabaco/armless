@@ -200,10 +200,24 @@ pub fn sa_un(name: &[u8]) -> Vec<u8> {
     b
 }
 
+/// The CPUs a test's machine has: ARMLESS_TEST_CPUS (default 1), for the tests to run on several
+pub fn test_cpus() -> usize {
+    std::env::var("ARMLESS_TEST_CPUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
 pub fn machine() -> Vm<armless::platform::NativePlatform> {
+    machine_with_cpus(test_cpus())
+}
+
+/// A machine of `cpus` CPUs: one for a program that orders its processes with sched_yield or
+/// by which runs first after a fork, which only one CPU makes an order
+pub fn machine_with_cpus(cpus: usize) -> Vm<armless::platform::NativePlatform> {
     let config = Config {
         memory_size: 128 << 20,
-        cpus: 1,
+        cpus,
         devices: armless::dev::DeviceConfig {
             console: false,
             net: true,
@@ -230,7 +244,7 @@ pub fn drive(
     let begun = Instant::now();
     let mut out = Vec::new();
     loop {
-        let status = p.run(&mut vm.cpus[0], Duration::from_millis(20));
+        let status = p.run_on(&mut vm.cpus, Duration::from_millis(20));
         out.extend(p.take_output());
         let idle = matches!(status, Status::Idle(_));
         for e in board.events() {
