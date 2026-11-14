@@ -4,9 +4,8 @@
 //! Wasm and native hosts decode with the C decoder: `build-wasm.sh` links `lib/zstd/zstddeclib.c`
 //! into the wasm module, native hosts use the `zstd-sys` crate (built from its bundled libzstd).
 //! `sys` is the only part that differs (the wasm ABI passes pointers and sizes as `u32`, and the
-//! native decoder is given `malloc` and `free` as a `ZSTD_customMem`); everything else is shared.
+//! native decoder is given its own allocator as a `ZSTD_customMem`); everything else is shared.
 
-use std::alloc;
 use std::io::Read;
 
 /// What the C decoder is asked for and gives back, over the target's ABI.
@@ -76,8 +75,7 @@ mod sys {
     /// Called by C code only.
     #[no_mangle]
     pub unsafe extern "C" fn v86_malloc(size: u32) -> u32 {
-        // SAFETY: as malloc: any size.
-        unsafe { super::malloc(size as usize) as u32 }
+        super::heap_block::malloc(size as usize) as u32
     }
 
     /// # Safety
@@ -85,47 +83,144 @@ mod sys {
     #[no_mangle]
     pub unsafe extern "C" fn v86_free(addr: u32) {
         // SAFETY: `addr` came from `v86_malloc` (the caller's promise).
-        unsafe { super::free(addr as *mut u8) }
+        unsafe { super::heap_block::free(addr as *mut u8) }
     }
 }
 
+/// The native decoder, and the memory it allocates.
+///
+/// Every block the decoder allocates is owned by its context's `Blocks`, a map from the address
+/// handed to the decoder to the block: `free` takes the block out of the map, which drops it. From
+/// `MAP_FROM` bytes (the decoder's windows, up to 8 MiB) a block is an anonymous mapping of its own,
+/// which dropping unmaps, so a freed window goes back to the system; glibc's `free` would keep the
+/// pages it touched resident (its mmap threshold grows to the size of the blocks it frees). Smaller
+/// blocks are `Vec<u128>`s: 16-byte-aligned, as `malloc` would give (zstd needs no more), and
+/// moving the `Vec` into the map moves none of its memory. memmap2 maps anonymous memory on every
+/// native target (Windows too), so this is the same everywhere.
 #[cfg(not(target_arch = "wasm32"))]
 mod sys {
+    use memmap2::MmapMut;
+    use std::collections::HashMap;
     use std::ffi::c_void;
+    use std::sync::{Arc, Mutex, PoisonError};
     use zstd_sys::{
         ZSTD_DStream, ZSTD_createDStream_advanced, ZSTD_customMem, ZSTD_decompressStream,
         ZSTD_freeDStream, ZSTD_inBuffer, ZSTD_isError, ZSTD_outBuffer,
     };
 
+    /// From this size a block is its own anonymous mapping.
+    pub const MAP_FROM: usize = 128 << 10;
+
+    /// A block of the decoder's.
+    pub enum Block {
+        Heap(Vec<u128>),
+        Map(MmapMut),
+    }
+
+    impl Block {
+        /// At least `size` bytes, 16-byte-aligned (a mapping is page-aligned). None if it could not
+        /// allocate them.
+        fn new(size: usize) -> Option<Block> {
+            if size >= MAP_FROM {
+                return MmapMut::map_anon(size).ok().map(Block::Map);
+            }
+            // (one element at least: every block has an address of its own)
+            let n = size.div_ceil(size_of::<u128>()).max(1);
+            let mut v = Vec::new();
+            v.try_reserve_exact(n).ok()?;
+            v.resize(n, 0);
+            Some(Block::Heap(v))
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut c_void {
+            match self {
+                Block::Heap(v) => v.as_mut_ptr().cast(),
+                Block::Map(m) => m.as_mut_ptr().cast(),
+            }
+        }
+    }
+
+    /// The blocks a context's decoder holds, by their address. A mutex rather than a `RefCell` so
+    /// that `Blocks` is `Sync` (and an `Arc` of it `Send`): the decoder calls in on the thread that
+    /// is using the context, so it is never contended.
+    #[derive(Default)]
+    pub struct Blocks(Mutex<HashMap<usize, Block>>);
+
+    impl Blocks {
+        pub fn alloc(&self, size: usize) -> *mut c_void {
+            let Some(mut block) = Block::new(size) else {
+                return std::ptr::null_mut(); // (zstd checks)
+            };
+            let ptr = block.as_mut_ptr();
+            self.map().insert(ptr as usize, block);
+            ptr
+        }
+
+        pub fn free(&self, ptr: *mut c_void) {
+            if ptr.is_null() {
+                return;
+            }
+            let block = self.map().remove(&(ptr as usize));
+            debug_assert!(
+                block.is_some(),
+                "zstd freed a block it was not given: {ptr:?}"
+            );
+            drop(block); // (outside the lock)
+        }
+
+        pub fn map(&self) -> std::sync::MutexGuard<'_, HashMap<usize, Block>> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    /// The decoder's malloc: a block of `Blocks`.
+    ///
+    /// # Safety
+    /// `opaque` is the `Blocks` of the context, which outlives the decoder (zstd passes back the
+    /// `opaque` of the `ZSTD_customMem` it was made with).
+    unsafe extern "C" fn alloc(opaque: *mut c_void, size: usize) -> *mut c_void {
+        // SAFETY: a live `Blocks` (the caller's promise), only ever shared.
+        let blocks = unsafe { &*(opaque as *const Blocks) };
+        blocks.alloc(size)
+    }
+
+    /// The decoder's free (null is fine).
+    ///
+    /// # Safety
+    /// As `alloc`.
+    unsafe extern "C" fn dealloc(opaque: *mut c_void, ptr: *mut c_void) {
+        // SAFETY: a live `Blocks` (the caller's promise), only ever shared.
+        let blocks = unsafe { &*(opaque as *const Blocks) };
+        blocks.free(ptr);
+    }
+
     /// A decompression context of the C decoder.
-    pub struct Ctx(*mut ZSTD_DStream);
+    pub struct Ctx {
+        stream: *mut ZSTD_DStream,
+        /// What the decoder allocated: dropped after `stream` is freed (`drop` frees it, and the
+        /// fields are dropped after `drop`). An `Arc` because the decoder holds its address: what an
+        /// `Arc` points at does not move, and moving the `Arc` asserts nothing about it (as moving a
+        /// `Box` would).
+        blocks: Arc<Blocks>,
+    }
 
-    // SAFETY: a context holds no thread-local state and is used by one thread at a time (`&mut`).
+    // SAFETY: a context holds no thread-local state and is used by one thread at a time (`&mut`);
+    // `Blocks` is Send and Sync.
     unsafe impl Send for Ctx {}
-
-    /// The library's malloc: `super::malloc`.
-    unsafe extern "C" fn alloc(_opaque: *mut c_void, size: usize) -> *mut c_void {
-        // SAFETY: as malloc: any size.
-        unsafe { super::malloc(size) as *mut c_void }
-    }
-
-    /// The library's free: `super::free` (null is fine).
-    unsafe extern "C" fn dealloc(_opaque: *mut c_void, ptr: *mut c_void) {
-        // SAFETY: `ptr` came from `alloc`, or is null (the library's promise).
-        unsafe { super::free(ptr as *mut u8) }
-    }
 
     impl Ctx {
         /// None if the decoder could not allocate one.
         pub fn new() -> Option<Ctx> {
+            let blocks = Arc::new(Blocks::default());
             let mem = ZSTD_customMem {
                 customAlloc: Some(alloc),
                 customFree: Some(dealloc),
-                opaque: std::ptr::null_mut(),
+                opaque: Arc::as_ptr(&blocks) as *mut c_void,
             };
-            // SAFETY: the allocator functions are valid for the library's whole use of them.
-            let ctx = unsafe { ZSTD_createDStream_advanced(mem) };
-            (!ctx.is_null()).then_some(Ctx(ctx))
+            // SAFETY: `alloc` and `dealloc` with the context's `Blocks`, which lives until the
+            // stream is freed (`Ctx`'s field, or dropped here if there is no stream).
+            let stream = unsafe { ZSTD_createDStream_advanced(mem) };
+            (!stream.is_null()).then_some(Ctx { stream, blocks })
         }
 
         /// One call of the streaming decoder: `(written, read, hint)`, or None on corrupt data.
@@ -142,124 +237,80 @@ mod sys {
             };
             // SAFETY: a live context; the buffers describe `dst` and `src` with their lengths, and
             // are this frame's own variables.
-            let r = unsafe { ZSTD_decompressStream(self.0, &mut output, &mut input) };
+            let r = unsafe { ZSTD_decompressStream(self.stream, &mut output, &mut input) };
             // SAFETY: takes no pointers and has no preconditions.
             (unsafe { ZSTD_isError(r) } == 0).then_some((output.pos, input.pos, r))
+        }
+
+        /// The context's blocks, which outlive it in the `Arc` (the tests look at them).
+        #[cfg(test)]
+        pub fn blocks(&self) -> Arc<Blocks> {
+            self.blocks.clone()
         }
     }
 
     impl Drop for Ctx {
         fn drop(&mut self) {
-            // SAFETY: this context, freed once.
+            // SAFETY: this context, freed once, while `blocks` is alive.
             unsafe {
-                ZSTD_freeDStream(self.0);
+                ZSTD_freeDStream(self.stream);
             }
+            // (what it did not free would go with `blocks` all the same)
+            debug_assert!(
+                self.blocks.map().is_empty(),
+                "the decoder kept blocks it was given"
+            );
         }
     }
 }
 
-const MALLOC_ALIGN: usize = 16;
+/// The wasm decoder's malloc and free (`v86_malloc`, `v86_free`): a block of `std::alloc` with a
+/// 16-byte header that holds its size. (Built natively for the tests.)
+#[cfg(any(target_arch = "wasm32", test))]
+mod heap_block {
+    use std::alloc::{self, Layout};
 
-/// What `malloc` records in the header before a block: its size, and how it was allocated.
-const KIND_HEAP: usize = 0;
-#[cfg(unix)]
-const KIND_MMAP: usize = 1;
+    /// The alignment of a block, and the size of its header.
+    pub const ALIGN: usize = 16;
 
-/// From this size a block is its own anonymous mapping, which `free` unmaps: the pages go back to
-/// the system (glibc's `free` keeps what a decoder window touched resident).
-#[cfg(unix)]
-const MMAP_FROM: usize = 128 << 10;
-
-/// The size of the mapping of a block of `size` bytes (header included, whole pages).
-#[cfg(unix)]
-fn mapping_len(size: usize) -> Option<usize> {
-    // SAFETY: sysconf takes no pointers.
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-    size.checked_add(MALLOC_ALIGN)?
-        .checked_next_multiple_of(page)
-}
-
-/// malloc for the C decoder: a 16-byte-aligned block, a header before it with its size and how it
-/// was allocated (`std::alloc`, or on unix an anonymous mapping from `MMAP_FROM` bytes). Null if it
-/// could not allocate (zstd checks).
-///
-/// # Safety
-/// The result is for `free` only.
-unsafe fn malloc(size: usize) -> *mut u8 {
-    #[cfg(unix)]
-    let mut kind = KIND_HEAP;
-    #[allow(unused_mut)]
-    let mut base: *mut u8 = std::ptr::null_mut();
-    #[cfg(unix)]
-    if size >= MMAP_FROM {
-        let Some(len) = mapping_len(size) else {
-            return std::ptr::null_mut();
-        };
-        // SAFETY: a new private anonymous mapping, at an address the system chooses.
-        let addr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if addr == libc::MAP_FAILED {
-            return std::ptr::null_mut();
-        }
-        kind = KIND_MMAP;
-        base = addr as *mut u8; // (page-aligned)
+    fn layout(size: usize) -> Option<Layout> {
+        Layout::from_size_align(size.checked_add(ALIGN)?, ALIGN).ok()
     }
-    #[cfg(not(unix))]
-    let kind = KIND_HEAP;
-    if base.is_null() {
-        let Some(total) = size.checked_add(MALLOC_ALIGN) else {
+
+    /// A 16-byte-aligned block of `size` bytes, for `free`. Null if it could not allocate it (zstd
+    /// checks).
+    pub fn malloc(size: usize) -> *mut u8 {
+        let Some(layout) = layout(size) else {
             return std::ptr::null_mut();
         };
-        let Ok(layout) = alloc::Layout::from_size_align(total, MALLOC_ALIGN) else {
-            return std::ptr::null_mut();
-        };
-        // SAFETY: the layout is never zero-sized (MALLOC_ALIGN bytes of header at least).
-        base = unsafe { alloc::alloc(layout) };
+        // SAFETY: the layout is never zero-sized (ALIGN bytes of header at least).
+        let base = unsafe { alloc::alloc(layout) };
         if base.is_null() {
             return base;
         }
+        // SAFETY: the header, at the start of what was just allocated, aligned for a usize; the
+        // block starts ALIGN bytes in, inside the allocation.
+        unsafe {
+            (base as *mut usize).write(size);
+            base.add(ALIGN)
+        }
     }
-    // SAFETY: the header (two usizes), at the start of what was just allocated, aligned for a
-    // usize; the block the caller gets starts MALLOC_ALIGN bytes in, inside the allocation.
-    unsafe {
-        (base as *mut usize).write(size);
-        (base as *mut usize).add(1).write(kind);
-        base.add(MALLOC_ALIGN)
-    }
-}
 
-/// # Safety
-/// `ptr` must come from `malloc`, or be null.
-unsafe fn free(ptr: *mut u8) {
-    if ptr.is_null() {
-        return;
+    /// # Safety
+    /// `ptr` must come from `malloc` (and not be freed yet), or be null.
+    pub unsafe fn free(ptr: *mut u8) {
+        if ptr.is_null() {
+            return;
+        }
+        // SAFETY: `ptr` came from `malloc` (the caller's promise), so its header is before it.
+        let (base, size) = unsafe {
+            let base = ptr.sub(ALIGN);
+            (base, (base as *const usize).read())
+        };
+        let layout = layout(size).expect("the layout malloc made");
+        // SAFETY: allocated by `malloc` with this layout.
+        unsafe { alloc::dealloc(base, layout) }
     }
-    // SAFETY: `ptr` came from `malloc` (the caller's promise), so its header is before it.
-    let (base, size, kind) = unsafe {
-        let base = ptr.sub(MALLOC_ALIGN);
-        let header = base as *const usize;
-        (base, header.read(), header.add(1).read())
-    };
-    #[cfg(unix)]
-    if kind == KIND_MMAP {
-        let len = mapping_len(size).expect("the mapping malloc made");
-        // SAFETY: the mapping `malloc` made at `base`, with this length, unmapped once.
-        unsafe { libc::munmap(base as *mut libc::c_void, len) };
-        return;
-    }
-    debug_assert_eq!(kind, KIND_HEAP);
-    let layout = alloc::Layout::from_size_align(size + MALLOC_ALIGN, MALLOC_ALIGN)
-        .expect("the layout malloc made");
-    // SAFETY: allocated by `malloc` with this layout.
-    unsafe { alloc::dealloc(base, layout) }
 }
 
 /// Bytes decompressed before each call of the sink, at most (and the size of the output buffer).
@@ -473,329 +524,4 @@ pub fn is_zstd(data: &[u8]) -> bool {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-
-    /// `zstd -19 --no-check` of `pattern()`: one frame.
-    const BIG: [u8; 297] = [
-        0x28, 0xb5, 0x2f, 0xfd, 0xa0, 0xe0, 0x93, 0x04, 0x00, 0x2c, 0x08, 0x00, 0xb4, 0x0f, 0x00,
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
-        0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
-        0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
-        0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b,
-        0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a,
-        0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
-        0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
-        0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
-        0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96,
-        0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
-        0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4,
-        0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0, 0xc1, 0xc2, 0xc3,
-        0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2,
-        0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf, 0xe0, 0xe1,
-        0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xf0,
-        0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0x01, 0x00, 0x7b, 0x81, 0x7f,
-        0x7f, 0x6e, 0xa4, 0x54, 0x00, 0x00, 0x00, 0x01, 0x00, 0xfd, 0xff, 0xd1, 0xff, 0xb9, 0x06,
-        0x02, 0x45, 0x00, 0x00, 0x00, 0x01, 0x00, 0xdd, 0x13, 0x1d, 0x00, 0x01,
-    ];
-
-    /// `zstd -19 --no-check` of `HELLO`: one frame.
-    const SMALL: [u8; 21] = [
-        0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x0c, 0x61, 0x00, 0x00, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2c,
-        0x20, 0x7a, 0x73, 0x74, 0x64, 0x0a,
-    ];
-
-    const HELLO: &[u8] = b"hello, zstd\n";
-
-    /// 300000 bytes (more than two output pieces) that compress to a few hundred.
-    fn pattern() -> Vec<u8> {
-        (0..300_000).map(|i| (i % 251) as u8).collect()
-    }
-
-    fn frames() -> (Vec<u8>, Vec<u8>) {
-        let input = [&BIG[..], &SMALL, &BIG].concat();
-        let want = [pattern(), HELLO.to_vec(), pattern()].concat();
-        (input, want)
-    }
-
-    #[test]
-    fn round_trip_and_multi_frame() {
-        assert!(is_zstd(&BIG) && !is_zstd(b"nope"));
-        assert_eq!(decompress(&BIG).unwrap(), pattern());
-        assert_eq!(decompress(&SMALL).unwrap(), HELLO);
-        let (input, want) = frames();
-        assert_eq!(decompress(&input).unwrap(), want);
-        assert_eq!(decompress(&[]).unwrap(), b"");
-    }
-
-    /// One zstd frame (RFC 8878) of raw blocks of at most 128 KiB each, no checksum: a window of
-    /// 128 KiB, so the largest block is 128 KiB.
-    fn raw_frame(data: &[u8]) -> Vec<u8> {
-        let mut f = vec![0x28, 0xb5, 0x2f, 0xfd]; // magic
-        f.push(0x00); // Frame_Header_Descriptor: no size, no checksum, no dictionary
-        f.push(0x38); // Window_Descriptor: exponent 7, mantissa 0: a 128 KiB window
-        let blocks: Vec<&[u8]> =
-            if data.is_empty() { vec![data] } else { data.chunks(128 << 10).collect() };
-        for (i, block) in blocks.iter().enumerate() {
-            let last = u32::from(i + 1 == blocks.len());
-            // Block_Header: Last_Block bit, Block_Type 0 (raw) in 2 bits, Block_Size in 21 bits
-            let header = last | ((block.len() as u32) << 3);
-            f.extend_from_slice(&header.to_le_bytes()[..3]);
-            f.extend_from_slice(block);
-        }
-        f
-    }
-
-    fn bytes(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i % 251) as u8).collect()
-    }
-
-    /// Frames whose decompressed size is a multiple of the output buffer, alone and followed by
-    /// another frame, with what they decompress to.
-    fn boundary_cases() -> Vec<(String, Vec<u8>, Vec<u8>)> {
-        let k = 128 << 10;
-        let mut cases = Vec::new();
-        for len in [k, 2 * k, 3 * k] {
-            cases.push((format!("{len} bytes"), raw_frame(&bytes(len)), bytes(len)));
-        }
-        let tails = [
-            ("raw 100", raw_frame(&bytes(100)), bytes(100)),
-            ("small", SMALL.to_vec(), HELLO.to_vec()),
-            ("raw 128 KiB", raw_frame(&bytes(k)), bytes(k)),
-        ];
-        for (name, frame, want) in tails {
-            for len in [k, 2 * k] {
-                cases.push((
-                    format!("{len} bytes, then {name}"),
-                    [raw_frame(&bytes(len)), frame.clone()].concat(),
-                    [bytes(len), want.clone()].concat(),
-                ));
-            }
-        }
-        cases
-    }
-
-    #[test]
-    fn a_frame_that_ends_on_a_full_output_buffer_is_complete() {
-        for (name, input, want) in boundary_cases() {
-            assert_eq!(decompress(&input).as_deref(), Some(&want[..]), "{name}");
-
-            let mut got = Vec::new();
-            let ended = decompress_each(&input, &mut |piece| {
-                assert!(piece.len() <= 128 << 10);
-                got.extend_from_slice(piece);
-                true
-            });
-            assert_eq!(ended, Ended::Done, "{name}");
-            assert_eq!(got, want, "{name}");
-
-            for step in [1000, 128 << 10, input.len()] {
-                let mut r = reader(Dribble(&input, step, false)).unwrap();
-                let mut got = Vec::new();
-                r.read_to_end(&mut got)
-                    .unwrap_or_else(|e| panic!("{name}, step {step}: {e}"));
-                assert_eq!(got, want, "{name}, step {step}");
-
-                let mut s = Stream::new();
-                let mut got = Vec::new();
-                for chunk in input.chunks(step) {
-                    assert!(
-                        s.feed(chunk, &mut |b| got.extend_from_slice(b)),
-                        "{name}, step {step}"
-                    );
-                }
-                assert_eq!(got, want, "{name}, step {step}");
-                assert!(!s.mid_frame, "{name}, step {step}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_frame_cut_off_on_a_full_output_buffer_is_refused() {
-        let k = 128 << 10;
-        let two = raw_frame(&bytes(2 * k));
-        let first_block = 6 + 3 + k; // header of the frame, then the first block
-        let boundary = raw_frame(&bytes(k));
-        let cuts = [
-            // the first of two blocks is out (a full buffer), the frame goes on
-            two[..first_block].to_vec(),
-            // the last block's header, none of its data
-            two[..first_block + 3].to_vec(),
-            // inside the last block
-            two[..two.len() - 1].to_vec(),
-            // a frame that ended on a full buffer, then the start of the next one
-            [&boundary[..], &SMALL[..2]].concat(),
-            [&boundary[..], &SMALL[..SMALL.len() - 1]].concat(),
-            // a single block frame cut off inside its data
-            boundary[..boundary.len() - 1].to_vec(),
-        ];
-        for (i, bad) in cuts.iter().enumerate() {
-            assert_eq!(decompress(bad), None, "cut {i}");
-            assert_eq!(
-                decompress_each(bad, &mut |_| true),
-                Ended::Corrupt,
-                "cut {i}"
-            );
-            let mut r = reader(Dribble(bad, 4096, false)).unwrap();
-            let e = r.read_to_end(&mut Vec::new()).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "cut {i}");
-        }
-    }
-
-    #[test]
-    fn malloc_serves_small_and_large_blocks() {
-        for size in [
-            0,
-            1,
-            100,
-            (128 << 10) - 1,
-            128 << 10,
-            8 << 20,
-            (8 << 20) + 1,
-        ] {
-            // SAFETY: blocks from `malloc`, written within their size, freed once.
-            unsafe {
-                let p = malloc(size);
-                assert!(
-                    !p.is_null() && (p as usize).is_multiple_of(MALLOC_ALIGN),
-                    "size {size}"
-                );
-                std::ptr::write_bytes(p, 0xa5, size);
-                assert!(std::slice::from_raw_parts(p, size)
-                    .iter()
-                    .all(|&b| b == 0xa5));
-                free(p);
-            }
-        }
-        // SAFETY: null is allowed.
-        unsafe { free(std::ptr::null_mut()) };
-    }
-
-    #[test]
-    fn corrupt_input_is_refused() {
-        assert_eq!(decompress(b"not zstd at all"), None);
-        // cut off inside a frame, and a frame after a good one cut off
-        assert_eq!(decompress(&BIG[..BIG.len() - 1]), None);
-        assert_eq!(decompress(&BIG[..100]), None);
-        assert_eq!(decompress(&[&SMALL[..], &BIG[..100]].concat()), None);
-        // garbage after a good frame
-        assert_eq!(decompress(&[&SMALL[..], b"garbage!"].concat()), None);
-        // a flipped byte, anywhere: an error or other output (the last bytes of a frame with no
-        // checksum may not matter), never UB
-        for at in 0..BIG.len() {
-            let mut bad = BIG;
-            bad[at] = !bad[at];
-            let _ = decompress(&bad);
-            let _ = decompress_each(&bad, &mut |_| true);
-        }
-        let mut sink = |_: &[u8]| true;
-        assert_eq!(
-            decompress_each(b"not zstd at all", &mut sink),
-            Ended::Corrupt
-        );
-        assert_eq!(
-            decompress_each(&BIG[..BIG.len() - 1], &mut sink),
-            Ended::Corrupt
-        );
-        assert_eq!(decompress_each(&[], &mut sink), Ended::Done);
-    }
-
-    #[test]
-    fn each_gives_pieces_of_at_most_128_kib() {
-        let (input, want) = frames();
-        let mut got = Vec::new();
-        let mut sizes = Vec::new();
-        let ended = decompress_each(&input, &mut |piece| {
-            sizes.push(piece.len());
-            got.extend_from_slice(piece);
-            true
-        });
-        assert_eq!(ended, Ended::Done);
-        assert_eq!(got, want);
-        assert!(sizes.iter().all(|&n| n > 0 && n <= 128 << 10), "{sizes:?}");
-        // 300000 bytes are three pieces (two full ones), twice, and the small frame's one
-        assert_eq!(
-            sizes.iter().filter(|&&n| n == 128 << 10).count(),
-            4,
-            "{sizes:?}"
-        );
-        assert_eq!(sizes.len(), 7, "{sizes:?}");
-    }
-
-    #[test]
-    fn each_stops_when_the_sink_says_so() {
-        let (input, _) = frames();
-        let mut calls = 0;
-        let ended = decompress_each(&input, &mut |_| {
-            calls += 1;
-            calls < 2
-        });
-        assert_eq!(ended, Ended::Stopped);
-        assert_eq!(calls, 2);
-    }
-
-    #[test]
-    fn stream_takes_input_split_anywhere() {
-        let (input, want) = frames();
-        for step in [1, 7, 100, input.len()] {
-            let mut s = Stream::new();
-            let mut got = Vec::new();
-            for chunk in input.chunks(step) {
-                assert!(
-                    s.feed(chunk, &mut |b| got.extend_from_slice(b)),
-                    "step {step}"
-                );
-            }
-            assert_eq!(got, want, "step {step}");
-        }
-        let mut s = Stream::new();
-        assert!(!s.feed(b"not zstd at all", &mut |_| {}));
-    }
-
-    /// A reader that gives at most `n` bytes per read, and fails with Interrupted once first.
-    struct Dribble<'a>(&'a [u8], usize, bool);
-
-    impl Read for Dribble<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if !std::mem::replace(&mut self.2, true) {
-                return Err(std::io::ErrorKind::Interrupted.into());
-            }
-            let n = buf.len().min(self.1).min(self.0.len());
-            buf[..n].copy_from_slice(&self.0[..n]);
-            self.0 = &self.0[n..];
-            Ok(n)
-        }
-    }
-
-    #[test]
-    fn reader_reads_every_frame() {
-        let (input, want) = frames();
-        for step in [1, 13, 4096, input.len()] {
-            let mut r = reader(Dribble(&input, step, false)).unwrap();
-            let mut got = Vec::new();
-            r.read_to_end(&mut got).unwrap();
-            assert_eq!(got, want, "step {step}");
-        }
-        // small reads from the caller too
-        let mut r = reader(&input[..]).unwrap();
-        let mut got = Vec::new();
-        let mut buf = [0u8; 1000];
-        loop {
-            match r.read(&mut buf).unwrap() {
-                0 => break,
-                n => got.extend_from_slice(&buf[..n]),
-            }
-        }
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn reader_reports_corrupt_and_cut_off_input() {
-        for bad in [&b"not zstd at all"[..], &BIG[..BIG.len() - 1], &BIG[..100]] {
-            let mut r = reader(bad).unwrap();
-            let e = r.read_to_end(&mut Vec::new()).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
-        }
-    }
-}
+mod tests;
