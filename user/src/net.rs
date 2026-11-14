@@ -931,6 +931,21 @@ impl Process {
         }
     }
 
+    /// The most a send on stream socket `id` could take now (`sock_send` takes no more), so
+    /// that a write copies no more of the program's buffer than that; None: no bound (a
+    /// datagram goes whole).
+    pub(crate) fn sock_send_room(&self, id: u32) -> Option<usize> {
+        let s = self.files.net.socks.get(&id)?;
+        if s.ty != SOCK_STREAM || s.domain as u16 == AF_NETLINK {
+            return None;
+        }
+        if s.host.is_some() {
+            return Some(HOST_WRITE_MAX);
+        }
+        let p = s.peer.and_then(|p| self.files.net.socks.get(&p))?;
+        Some(STREAM_MAX.saturating_sub(p.rx.len()))
+    }
+
     // ------------------------------------------------------------ reading and writing
 
     /// Up to `max` bytes (a whole datagram: cut if longer, with the rest lost) that arrived at

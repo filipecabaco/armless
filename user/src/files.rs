@@ -72,9 +72,9 @@ pub(crate) enum Kind {
         ino: Ino,
         pos: u64,
     },
-    /// Contents made here (/proc files), read-only
+    /// Contents made here (/proc files), read-only (shared: a description is cloned on each read)
     Mem {
-        data: Vec<u8>,
+        data: std::sync::Arc<[u8]>,
         pos: u64,
     },
     PipeRead(u32),
@@ -131,6 +131,27 @@ pub(crate) struct Pipe {
     pub writers: u32,
 }
 
+/// What a call parked to run again (`Wait::Retry`) waits on, when that is one thing whose
+/// changes are told apart (`Process::poke_on`): a pipe (either end), or an eventfd description.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WaitOn {
+    Pipe(u32),
+    Desc(u32),
+}
+
+/// What changed for the calls parked to run again, since they were last looked at
+/// (`Process::wake`), so that a change wakes only the calls it may let complete.
+#[derive(Default)]
+pub(crate) struct Woken {
+    /// Pipes and eventfds that changed (`Process::poke_on`)
+    pub changed: Vec<WaitOn>,
+    /// A pipe lost its last reader or writer: every parked call runs again (as on a `poke`)
+    pub all: bool,
+    /// tid -> the one thing its parked call waits on. A call with none here runs again on any
+    /// change. Not saved: a restore runs every parked call again.
+    pub parked: BTreeMap<i64, WaitOn>,
+}
+
 /// A pipe holds at most this before a write waits.
 pub(crate) const PIPE_BUF_MAX: usize = 64 << 10;
 
@@ -149,6 +170,8 @@ pub(crate) struct Files {
     pub net: Net,
     /// fcntl's and flock's locks (locks.rs)
     pub locks: crate::locks::Locks,
+    /// Not saved (see `Woken`)
+    pub woken: Woken,
     next_desc: u32,
     next_pipe: u32,
 }
@@ -261,6 +284,8 @@ impl Files {
     }
 
     fn pipe_end(&mut self, p: u32, reader: bool) {
+        // (A read past the last writer ends; a write past the last reader fails)
+        self.woken.all = true;
         if let Some(pipe) = self.pipes.get_mut(&p) {
             if reader {
                 pipe.readers = pipe.readers.saturating_sub(1);
@@ -417,7 +442,7 @@ impl Files {
                     pos: r.u()?,
                 },
                 6 => Kind::Mem {
-                    data: r.b()?.to_vec(),
+                    data: r.b()?.into(),
                     pos: r.u()?,
                 },
                 7 => Kind::PipeRead(r.u()? as u32),

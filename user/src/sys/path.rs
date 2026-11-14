@@ -139,7 +139,13 @@ impl Process {
                 return Ret::Val(self.new_fd(d, 0, cloexec));
             }
             if let Some(data) = self.proc_file(path) {
-                let d = self.files.add(Kind::Mem { data, pos: 0 }, status);
+                let d = self.files.add(
+                    Kind::Mem {
+                        data: data.into(),
+                        pos: 0,
+                    },
+                    status,
+                );
                 return Ret::Val(self.new_fd(d, 0, cloexec));
             }
             if path.starts_with(b"/proc/")

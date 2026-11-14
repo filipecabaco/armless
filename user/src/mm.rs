@@ -54,6 +54,8 @@ const AP_EL0: u64 = 1 << 6;
 const AP_RO: u64 = 1 << 7;
 const UXN: u64 = 1 << 54;
 const ADDR: u64 = 0x0000_ffff_ffff_f000;
+/// The most pages `sync_mmu` flushes one by one: past this, the whole TLB goes
+const FLUSH_PAGES_MAX: usize = 64;
 /// TCR_EL1: a 39-bit space from level 1 (T0SZ 25), write-back walks, inner shareable, 4 KiB
 /// granule, 16-bit ASIDs, no walks from TTBR1 (EPD1), 40-bit physical addresses.
 const TCR: u64 = 25 | (1 << 8) | (1 << 10) | (3 << 12) | (1 << 23) | (1 << 36) | (2 << 32);
@@ -387,6 +389,20 @@ impl Mm {
         true
     }
 
+    /// The CPUs' translations of the pages at `vas` (pages that were mapped) are to go: page by
+    /// page while they are few (a small munmap, madvise or mprotect keeps the rest of the TLB),
+    /// else all of them.
+    fn forget(&mut self, vas: &[u64]) {
+        if self.stale {
+            return;
+        }
+        if self.flush.len() + vas.len() > FLUSH_PAGES_MAX {
+            self.stale = true;
+            return;
+        }
+        self.flush.extend(vas.iter().map(|va| va >> 12));
+    }
+
     /// The frames `frames` mapped from `a` on, page after page, as `prot` (a shared area's: System
     /// V shared memory, whose segment holds the frames), each counted once more. False when there
     /// is no frame for a table.
@@ -582,14 +598,14 @@ impl Mm {
 
     /// `a..b` unmapped: its areas gone, its frames given back, and the tables left with nothing.
     pub(crate) fn unmap(&mut self, f: &mut Frames, a: u64, b: u64) {
-        let mut taken = false;
+        let mut gone = Vec::new();
         for (s, v) in self.cut(a, b) {
             let data_end = v.file.map_or(0, |b| page_up(b.data_end));
             let mut filled = 0;
             for (va, slot, d) in self.leaves(f, s, v.end) {
                 f.put(slot, 0);
                 f.decref(d & ADDR);
-                taken = true;
+                gone.push(va);
                 if va < data_end {
                     filled += 1;
                 }
@@ -598,10 +614,11 @@ impl Mm {
                 self.lazy_less(bk.ino, Mm::data_pages(&v, s).saturating_sub(filled));
             }
         }
-        if taken {
+        if !gone.is_empty() {
             self.trim(f, a, b);
         }
-        self.stale = true;
+        // (Only pages that were mapped can be in a TLB)
+        self.forget(&gone);
         f.reap();
     }
 
@@ -617,16 +634,19 @@ impl Mm {
 
     /// The pages of the anonymous areas in `a..b` given back: they read as zeros again.
     pub(crate) fn discard(&mut self, f: &mut Frames, a: u64, b: u64) {
-        for (&s, v) in self.vmas.range(..b) {
-            if v.end <= a || v.file.is_some() || v.shared {
+        let mut gone = Vec::new();
+        // The areas do not overlap: going down from `b`, the first that ends before `a` is the last
+        for (&s, v) in self.vmas.range(..b).rev().take_while(|(_, v)| v.end > a) {
+            if v.file.is_some() || v.shared {
                 continue;
             }
-            for (_, slot, d) in self.leaves(f, s.max(a), v.end.min(b)) {
+            for (va, slot, d) in self.leaves(f, s.max(a), v.end.min(b)) {
                 f.put(slot, 0);
                 f.decref(d & ADDR);
+                gone.push(va);
             }
         }
-        self.stale = true;
+        self.forget(&gone);
         f.reap();
     }
 
@@ -635,15 +655,17 @@ impl Mm {
         self.split(a);
         self.split(b);
         let keys: Vec<u64> = self.vmas.range(a..b).map(|(&s, _)| s).collect();
+        let mut changed = Vec::new();
         for s in keys {
             let v = self.vmas.get_mut(&s).unwrap();
             v.prot = prot;
             let (end, shared) = (v.end, v.shared);
-            for (_, slot, d) in self.leaves(f, s, end) {
+            for (va, slot, d) in self.leaves(f, s, end) {
                 f.put(slot, (d & ADDR) | bits(prot, shared || writable(d)));
+                changed.push(va);
             }
         }
-        self.stale = true;
+        self.forget(&changed);
         self.merge(a, b);
     }
 
@@ -694,6 +716,8 @@ impl Mm {
         for &(_, slot, _) in &leaves {
             f.put(slot, 0);
         }
+        // (The pages at `new` were not mapped: only the old ones can be in a TLB)
+        let moved: Vec<u64> = leaves.iter().map(|&(va, _, _)| va).collect();
         for (s, v) in self.cut(old, old + len) {
             self.vmas.insert(
                 new + (s - old),
@@ -707,7 +731,7 @@ impl Mm {
                 },
             );
         }
-        self.stale = true;
+        self.forget(&moved);
         self.merge(new, new + len);
         true
     }
