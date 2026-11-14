@@ -1,0 +1,92 @@
+name: bench
+
+# How a pull request changes what armless costs the host: the criterion benchmarks (benches/ and
+# user/benches/) on the pull request's base, then on the pull request merged into that base, on the
+# same runner, and a table of the two. The table goes to the job summary and, for a pull request from
+# a branch of this repository, to a comment on it (one, updated by each run; a pull request from a
+# fork gets a token that can't comment). Informational: a regression never fails the run, a build
+# that fails does.
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: The branch, tag or commit to compare with
+        default: main
+
+# A new push to a pull request cancels the run it supersedes
+concurrency:
+  group: bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
+      # Shorter than criterion's own (3 s of warm-up and 5 s of samples a benchmark), so that the
+      # base and the head fit in about 20 minutes; changes under 3% are noise on a shared runner
+      CRITERION_ARGS: --warm-up-time 1 --measurement-time 3 --noise-threshold 0.03
+      # Both runs: one target dir (the dependencies are built once) and one criterion dir (the
+      # head's run compares with the base's)
+      CARGO_TARGET_DIR: ${{ github.workspace }}/build
+      CRITERION_HOME: ${{ github.workspace }}/.criterion
+    steps:
+      # The head: for a pull request, the commit GitHub merged it into its base, so that the
+      # comparison is of the pull request's changes alone
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE }}
+          path: .bench-base
+      # The dependencies, compiled (build/ is the target dir); saved by this workflow under its own key
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build"
+      # A base that doesn't build (or has no benchmarks yet) leaves the head's numbers alone
+      - name: Benchmarks on the base
+        continue-on-error: true
+        working-directory: .bench-base
+        run: |
+          git log -1 --format='%h %s'
+          # shellcheck disable=SC2086 # (CRITERION_ARGS is several arguments)
+          cargo bench --workspace --bench '*' -- $CRITERION_ARGS --save-baseline base
+      - name: Benchmarks on the head, compared with the base
+        run: |
+          git log -1 --format='%h %s'
+          # shellcheck disable=SC2086 # (CRITERION_ARGS is several arguments)
+          cargo bench --workspace --bench '*' -- $CRITERION_ARGS --baseline-lenient base
+      - name: Table
+        env:
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo '<!-- armless-bench -->'
+            echo '### Benchmarks: this change against its base'
+            echo
+            echo "Base \`$(git -C .bench-base rev-parse --short HEAD)\`, head \`$(git rev-parse --short HEAD)\`, on the same $(uname -m) runner ([run]($RUN)). Means of criterion's samples (1 s of warm-up, 3 s of samples each); a change is one when its 95% interval leaves out 0 and it is 3% or more. Shared runners are noisy: a few percent either way can be the runner."
+            echo
+            bash .github/scripts/bench-table.sh "$CRITERION_HOME" 0.03
+          } > "$RUNNER_TEMP/bench.md"
+          cat "$RUNNER_TEMP/bench.md" >> "$GITHUB_STEP_SUMMARY"
+      # One comment on the pull request, edited by every run after the first
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.body | startswith("<!-- armless-bench -->")) | .id' | head -n 1)
+          jq -Rs '{body: .}' "$RUNNER_TEMP/bench.md" > "$RUNNER_TEMP/comment.json"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" --input "$RUNNER_TEMP/comment.json" > /dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --input "$RUNNER_TEMP/comment.json" > /dev/null
+          fi

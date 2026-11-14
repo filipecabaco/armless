@@ -120,6 +120,15 @@ instruction interpreted and compiled (a fixed loop, as instructions per second),
 page, and saving and restoring a 64 MiB machine. `-- --save-baseline NAME` and
 `-- --baseline NAME` compare runs, with criterion's statistics.
 
+`cargo bench --bench zstd` times the zstd decoder (`decompress` and `decompress_each`) on frames
+of 64 KiB, 4 MiB and 32 MiB with an 8 MiB window, and `cargo bench -p armless-user --bench
+syscalls` what user mode's system calls cost.
+
+Every pull request runs all of them on its base and then on itself, on one runner
+([`.github/workflows/bench.yml`](../.github/workflows/bench.yml)), and puts a table of the two in
+the run's summary and in a comment on the pull request (`.github/scripts/bench-table.sh` makes it
+from criterion's results). It is for information: a regression doesn't fail the run.
+
 ## In tests
 
 The fuzzers in `src/jit/native.rs` and the bare-metal suite under the native JIT
