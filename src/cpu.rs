@@ -200,8 +200,9 @@ pub struct Cpu<H: Host> {
     pub vreg: [u128; 32],
 
     /// Guest physical RAM, starting at physical address 0.
-    /// An alias of `machine.mem`.
-    pub mem: crate::ram::Ram,
+    /// An alias of `machine.mem`. Crate-private: the fast-TLB hit paths access it
+    /// unchecked, so it must not be replaced behind their back (see `mem()`).
+    pub(crate) mem: crate::ram::Ram,
     /// What the CPUs share (GIC, RTC, timer, power and TLB coordination).
     pub machine: Arc<Machine>,
     /// This CPU's number (MPIDR Aff0, GIC CPU interface).
@@ -298,6 +299,10 @@ fn each_filled(filled: &[u16], chunks: u64, mut f: impl FnMut(usize)) {
         (c * CHUNK..(c + 1) * CHUNK).for_each(&mut f);
     }
 }
+
+/// The fast table's RAM offsets are u32: RAM never reaches 4 GiB (board::RAM_MAX), so every
+/// page's offset fits, and none aliases a lower one.
+const _: () = assert!(board::RAM_MAX <= 1 << 32);
 
 /// Virtual page -> offset of the page in `mem`, for pages known to be RAM
 /// with the needed permission at one exception level.
@@ -451,6 +456,13 @@ impl<H: Host> Cpu<H> {
         } else {
             None
         }
+    }
+
+    /// Guest physical RAM. Read-only from outside the crate: replacing it would
+    /// leave fast-TLB entries pointing into the old RAM.
+    #[inline]
+    pub fn mem(&self) -> &crate::ram::Ram {
+        &self.mem
     }
 
     /// A single-CPU machine.
@@ -1476,6 +1488,35 @@ impl<H: Host> Cpu<H> {
         self.mem.store(a, size, value)
     }
 
+    /// `ram_load` for a fast read entry's page: `a` is the entry's base plus an offset with the
+    /// access inside the page.
+    ///
+    /// # Safety
+    ///
+    /// `a + size` must not pass the end of the page of a fast read entry. `fill_read` only
+    /// takes pages with `page + 0x1000 <= mem.len()`, and RAM's length never changes, so the
+    /// access is then in RAM.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn ram_load_in_page(&self, a: usize, size: u32) -> u64 {
+        // SAFETY: in RAM (the caller's promise).
+        unsafe { self.mem.load_in_page(a, size) }
+    }
+
+    /// `ram_store` for a fast write entry's page, without `mark_written`.
+    ///
+    /// # Safety
+    ///
+    /// `a + size` must not pass the end of the page of a fast write entry, as for
+    /// `ram_load_in_page`. `write_slow` marks RAM written when it fills a write entry, before any
+    /// store can go through it.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn ram_store_in_page(&mut self, a: usize, size: u32, value: u64) {
+        // SAFETY: in RAM (the caller's promise), and marked written when the entry was filled.
+        unsafe { self.mem.store_in_page(a, size, value) }
+    }
+
     /// WFE with several CPUs: wait until something may have changed what the
     /// guest waits for (the location it load-exclusived was written, an
     /// interrupt or other request, SEV), polling briefly. Returning early is
@@ -1602,17 +1643,24 @@ impl<H: Host> Cpu<H> {
         Ok(old)
     }
 
-    /// The Data Abort for an unaligned atomic access.
+    /// The Data Abort for an unaligned atomic access (a write, as a read-modify-write is).
     pub(crate) fn alignment_fault(&self, va: u64) -> Event {
+        self.alignment_fault_as(va, true)
+    }
+
+    /// The Data Abort for an unaligned access that must be aligned (exclusives, acquire and
+    /// release): DFSC 0x21, and WnR for a write.
+    pub(crate) fn alignment_fault_as(&self, va: u64, write: bool) -> Event {
         Event::Sync {
             ec: if self.el == 0 { ec::DABT_LOW } else { ec::DABT_CUR },
-            iss: 0x21 | (1 << 6),
+            iss: 0x21 | (write as u32) << 6,
             far: Some(va),
             ret_next: false,
         }
     }
 
     /// Virtual read of `size` bytes with the current (or EL0, if `unpriv`) permissions.
+    #[allow(unsafe_code)]
     #[inline(always)]
     pub fn read(&mut self, va: u64, size: u32, unpriv: bool) -> Res<u64> {
         let off = va & 0xfff;
@@ -1620,7 +1668,10 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.read_tag[i] == va >> 12 {
-                return Ok(self.ram_load(f.read_base[i] as usize + off as usize, size));
+                // SAFETY: a read hit, with `off + size <= 0x1000` checked above.
+                return Ok(unsafe {
+                    self.ram_load_in_page(f.read_base[i] as usize + off as usize, size)
+                });
             }
         }
         self.read_slow(va, size, unpriv)
@@ -1628,6 +1679,7 @@ impl<H: Host> Cpu<H> {
 
     /// `read` if the fast tables serve it (not unprivileged, in one page, the page in them): the value. Else
     /// None, and nothing is done.
+    #[allow(unsafe_code)]
     #[inline(always)]
     pub(crate) fn read_hit(&self, va: u64, size: u32) -> Option<u64> {
         let off = va & 0xfff;
@@ -1635,13 +1687,17 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.read_tag[i] == va >> 12 {
-                return Some(self.ram_load(f.read_base[i] as usize + off as usize, size));
+                // SAFETY: a read hit, with `off + size <= 0x1000` checked above.
+                return Some(unsafe {
+                    self.ram_load_in_page(f.read_base[i] as usize + off as usize, size)
+                });
             }
         }
         None
     }
 
     /// Two reads of `size` bytes, at `va` and right after it, if the fast tables serve both with one page.
+    #[allow(unsafe_code)]
     #[inline(always)]
     pub(crate) fn read_pair_hit(&self, va: u64, size: u32) -> Option<(u64, u64)> {
         let off = va & 0xfff;
@@ -1650,10 +1706,13 @@ impl<H: Host> Cpu<H> {
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.read_tag[i] == va >> 12 {
                 let a = f.read_base[i] as usize + off as usize;
-                return Some((
-                    self.ram_load(a, size),
-                    self.ram_load(a + size as usize, size),
-                ));
+                // SAFETY: a read hit, with `off + 2 * size <= 0x1000` checked above.
+                return Some(unsafe {
+                    (
+                        self.ram_load_in_page(a, size),
+                        self.ram_load_in_page(a + size as usize, size),
+                    )
+                });
             }
         }
         None
@@ -1684,6 +1743,7 @@ impl<H: Host> Cpu<H> {
         Ok(v)
     }
 
+    #[allow(unsafe_code)]
     #[inline(always)]
     pub fn write(&mut self, va: u64, size: u32, value: u64, unpriv: bool) -> Res<()> {
         let off = va & 0xfff;
@@ -1692,7 +1752,8 @@ impl<H: Host> Cpu<H> {
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
                 let a = f.write_base[i] as usize + off as usize;
-                self.ram_store(a, size, value);
+                // SAFETY: a write hit, with `off + size <= 0x1000` checked above.
+                unsafe { self.ram_store_in_page(a, size, value) };
                 return Ok(());
             }
         }
@@ -1701,6 +1762,7 @@ impl<H: Host> Cpu<H> {
 
     /// `write` if the fast tables serve it (not unprivileged, in one page, the page in them, no exclusive monitor
     /// armed): true once it is done. Else false, and nothing is done.
+    #[allow(unsafe_code)]
     #[inline(always)]
     pub(crate) fn write_hit(&mut self, va: u64, size: u32, value: u64) -> bool {
         let off = va & 0xfff;
@@ -1709,7 +1771,8 @@ impl<H: Host> Cpu<H> {
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
                 let a = f.write_base[i] as usize + off as usize;
-                self.ram_store(a, size, value);
+                // SAFETY: a write hit, with `off + size <= 0x1000` checked above.
+                unsafe { self.ram_store_in_page(a, size, value) };
                 return true;
             }
         }
@@ -1718,6 +1781,7 @@ impl<H: Host> Cpu<H> {
 
     /// Two writes of `size` bytes, at `va` and right after it, if the fast tables serve both with one page: true
     /// once they are done. Else false, and nothing is done.
+    #[allow(unsafe_code)]
     #[inline(always)]
     pub(crate) fn write_pair_hit(&mut self, va: u64, size: u32, first: u64, second: u64) -> bool {
         let off = va & 0xfff;
@@ -1726,8 +1790,11 @@ impl<H: Host> Cpu<H> {
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
                 let a = f.write_base[i] as usize + off as usize;
-                self.ram_store(a, size, first);
-                self.ram_store(a + size as usize, size, second);
+                // SAFETY: a write hit, with `off + 2 * size <= 0x1000` checked above.
+                unsafe {
+                    self.ram_store_in_page(a, size, first);
+                    self.ram_store_in_page(a + size as usize, size, second);
+                }
                 return true;
             }
         }
@@ -1747,6 +1814,9 @@ impl<H: Host> Cpu<H> {
                     .checked_add(0x1000)
                     .is_some_and(|end| end <= self.mem.len())
             {
+                // Stores through the entry skip `mark_written` (`ram_store_in_page`): mark it
+                // here, before the first one. RAM never becomes fresh again.
+                self.mem.mark_written();
                 self.fast[self.el as usize].fill_write(va >> 12, page);
             }
             if let Some(e) = self.excl() {

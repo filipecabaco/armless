@@ -9,6 +9,8 @@
 //! Changing anything (RTM_NEWADDR and the like) is EPERM, as for a process without
 //! CAP_NET_ADMIN.
 
+use crate::errno::{EADDRNOTAVAIL, ENODEV, EOPNOTSUPP, EPERM};
+
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
@@ -26,8 +28,6 @@ const RTM_GETROUTE: u16 = 26;
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
-const EPERM: i32 = 1;
-const EOPNOTSUPP: i32 = 95;
 
 /// An interface: its index, name, hardware type, flags, MTU, hardware address, and addresses
 /// (family, address, prefix length, scope)
@@ -116,7 +116,7 @@ pub(crate) fn answer(req: &[u8], pid: u32, network: bool, guest: [u8; 4], router
         if len < 16 || at + len > req.len() {
             break;
         }
-        let (ty, flags, seq) = (u16_at(at + 4), u16_at(at + 6), u32_at(at + 8));
+        let (ty, flags, seq) = (u16_at(at.wrapping_add(4)), u16_at(at.wrapping_add(6)), u32_at(at.wrapping_add(8)));
         let body = &req[at + 16..at + len];
         let family = body.first().copied().unwrap_or(AF_UNSPEC);
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
@@ -189,7 +189,7 @@ pub(crate) fn answer(req: &[u8], pid: u32, network: bool, guest: [u8; 4], router
             // CAP_NET_ADMIN; the rest isn't here
             _ if flags & NLM_F_REQUEST != 0 => {
                 let errno = if matches!(ty, 16 | 17 | 19 | 20 | 21 | 24 | 25) { EPERM } else { EOPNOTSUPP };
-                error(&mut out, -errno, &req[at..at + 16], seq, pid);
+                error(&mut out, -errno as i32, &req[at..at + 16], seq, pid);
             },
             _ => {},
         }
@@ -212,8 +212,6 @@ fn error(out: &mut Vec<u8>, errno: i32, header: &[u8], seq: u32, pid: u32) {
 
 // ---------------------------------------------------------------- the SIOCGIF* ioctls
 
-const ENODEV: i64 = 19;
-const EADDRNOTAVAIL: i64 = 99;
 
 /// What an interface ioctl on a socket answers in `ifr` (struct ifreq: a name of 16 bytes, then
 /// what is asked: an address, flags, an index, the MTU or the queue length), from the same table
@@ -271,8 +269,8 @@ pub(crate) fn ifreq(req: u32, ifr: &mut [u8; 40], network: bool, guest: [u8; 4])
         0x8933 => put32(ifr, l.index),
         0x8942 => put32(ifr, 1000),
         // Setting anything needs CAP_NET_ADMIN
-        0x8914 | 0x8916 | 0x8918 | 0x891a | 0x891c | 0x8922 | 0x8924 | 0x8943 => return -(EPERM as i64),
-        _ => return -(EOPNOTSUPP as i64),
+        0x8914 | 0x8916 | 0x8918 | 0x891a | 0x891c | 0x8922 | 0x8924 | 0x8943 => return -EPERM,
+        _ => return -EOPNOTSUPP,
     }
     0
 }
@@ -334,6 +332,6 @@ mod tests {
         // A change is refused
         let set = messages(&answer(&message(RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK, 1, 0, &[0; 8]), 5, true, g, r));
         assert_eq!(set[0].0, NLMSG_ERROR);
-        assert_eq!(i32::from_le_bytes(set[0].1[..4].try_into().unwrap()), -EPERM);
+        assert_eq!(i32::from_le_bytes(set[0].1[..4].try_into().unwrap()), -EPERM as i32);
     }
 }

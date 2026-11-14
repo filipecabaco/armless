@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use armless::dev::fs::{self, Content, Fail, Fs, Ino, ROOT, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
+use crate::errno::{EEXIST, EINVAL, ELOOP, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR};
 use crate::net::Net;
 use crate::ser::{R, W};
 
@@ -26,15 +27,6 @@ pub(crate) const O_DIRECTORY: u32 = 0o40000;
 pub(crate) const O_NOFOLLOW: u32 = 0o100000;
 pub(crate) const O_CLOEXEC: u32 = 0o2000000;
 
-pub(crate) const ENOENT: i64 = 2;
-pub(crate) const EBADF: i64 = 9;
-pub(crate) const EACCES: i64 = 13;
-pub(crate) const EEXIST: i64 = 17;
-pub(crate) const ENOTDIR: i64 = 20;
-pub(crate) const EISDIR: i64 = 21;
-pub(crate) const EINVAL: i64 = 22;
-pub(crate) const ENAMETOOLONG: i64 = 36;
-pub(crate) const ELOOP: i64 = 40;
 
 /// What a call into the filesystem gave: a value, an errno, or blobs to wait for.
 pub(crate) enum Got<T> {
@@ -48,6 +40,17 @@ pub(crate) fn got<T>(r: fs::Res<T>) -> Got<T> {
         Ok(v) => Got::Ok(v),
         Err(Fail::Errno(e)) => Got::Err(-(e as i64)),
         Err(Fail::Need(b)) => Got::Need(b),
+    }
+}
+
+impl<T> Got<T> {
+    /// `f` of what it got, if it got it
+    pub(crate) fn map_ok<U>(self, f: impl FnOnce(T) -> U) -> Got<U> {
+        match self {
+            Got::Ok(v) => Got::Ok(f(v)),
+            Got::Err(e) => Got::Err(e),
+            Got::Need(b) => Got::Need(b),
+        }
     }
 }
 
@@ -69,9 +72,9 @@ pub(crate) enum Kind {
         ino: Ino,
         pos: u64,
     },
-    /// Contents made here (/proc files), read-only
+    /// Contents made here (/proc files), read-only (shared: a description is cloned on each read)
     Mem {
-        data: Vec<u8>,
+        data: std::sync::Arc<[u8]>,
         pos: u64,
     },
     PipeRead(u32),
@@ -128,8 +131,33 @@ pub(crate) struct Pipe {
     pub writers: u32,
 }
 
+/// What a call parked to run again (`Wait::Retry`) waits on, when that is one thing whose
+/// changes are told apart (`Process::poke_on`): a pipe (either end), or an eventfd description.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WaitOn {
+    Pipe(u32),
+    Desc(u32),
+}
+
+/// What changed for the calls parked to run again, since they were last looked at
+/// (`Process::wake`), so that a change wakes only the calls it may let complete.
+#[derive(Default)]
+pub(crate) struct Woken {
+    /// Pipes and eventfds that changed (`Process::poke_on`)
+    pub changed: Vec<WaitOn>,
+    /// A pipe lost its last reader or writer: every parked call runs again (as on a `poke`)
+    pub all: bool,
+    /// tid -> the one thing its parked call waits on. A call with none here runs again on any
+    /// change. Not saved: a restore runs every parked call again.
+    pub parked: BTreeMap<i64, WaitOn>,
+}
+
 /// A pipe holds at most this before a write waits.
 pub(crate) const PIPE_BUF_MAX: usize = 64 << 10;
+
+/// The descriptors a process may have (RLIMIT_NOFILE, soft and hard, as getrlimit says it):
+/// each is below this
+pub(crate) const NOFILE: u64 = 4096;
 
 /// The descriptor table and what it refers to.
 #[derive(Default)]
@@ -142,6 +170,8 @@ pub(crate) struct Files {
     pub net: Net,
     /// fcntl's and flock's locks (locks.rs)
     pub locks: crate::locks::Locks,
+    /// Not saved (see `Woken`)
+    pub woken: Woken,
     next_desc: u32,
     next_pipe: u32,
 }
@@ -186,11 +216,14 @@ impl Files {
         p
     }
 
-    /// The lowest free descriptor at or above `min`, for description `d`.
-    pub fn install(&mut self, d: u32, min: i32, cloexec: bool) -> i32 {
-        let fd = (min..).find(|n| !self.fds.contains_key(n)).unwrap();
+    /// The lowest free descriptor at or above `min` and below NOFILE, for description `d`; or
+    /// -EMFILE, with `d` left as it was (`Process::new_fd` lets go of it).
+    pub fn install(&mut self, d: u32, min: i32, cloexec: bool) -> Result<i32, i64> {
+        let fd = (min.max(0)..NOFILE as i32)
+            .find(|n| !self.fds.contains_key(n))
+            .ok_or(-EMFILE)?;
         self.put(fd, d, cloexec);
-        fd
+        Ok(fd)
     }
 
     /// Descriptor `fd` refers to description `d` (closing what it referred to).
@@ -235,7 +268,7 @@ impl Files {
     /// that nobody took): it goes when it has none, as `close` says.
     pub fn release(&mut self, d: u32) -> Option<Option<Ino>> {
         let desc = self.descs.get_mut(&d)?;
-        desc.refs -= 1;
+        desc.refs = desc.refs.saturating_sub(1);
         if desc.refs > 0 {
             return Some(None);
         }
@@ -251,11 +284,13 @@ impl Files {
     }
 
     fn pipe_end(&mut self, p: u32, reader: bool) {
+        // (A read past the last writer ends; a write past the last reader fails)
+        self.woken.all = true;
         if let Some(pipe) = self.pipes.get_mut(&p) {
             if reader {
-                pipe.readers -= 1;
+                pipe.readers = pipe.readers.saturating_sub(1);
             } else {
-                pipe.writers -= 1;
+                pipe.writers = pipe.writers.saturating_sub(1);
             }
             if pipe.readers == 0 && pipe.writers == 0 {
                 self.pipes.remove(&p);
@@ -407,7 +442,7 @@ impl Files {
                     pos: r.u()?,
                 },
                 6 => Kind::Mem {
-                    data: r.b()?.to_vec(),
+                    data: r.b()?.into(),
                     pos: r.u()?,
                 },
                 7 => Kind::PipeRead(r.u()? as u32),
@@ -438,6 +473,46 @@ impl Files {
         }
         f.net = Net::load(r)?;
         Ok(f)
+    }
+
+    /// Checks a restored state's counts against the descriptor `tables` of its processes: each
+    /// description counts at least the descriptors that refer to it, each pipe at least the ends
+    /// it has, and none is near overflowing when counted once more.
+    pub fn check_refs<'a>(
+        &self,
+        tables: impl Iterator<Item = &'a BTreeMap<i32, (u32, bool)>>,
+    ) -> Result<(), String> {
+        let bad = || Err("bad descriptor counts".to_string());
+        let mut uses: BTreeMap<u32, u64> = BTreeMap::new();
+        for &(d, _) in tables.flat_map(|t| t.values()) {
+            *uses.entry(d).or_default() += 1;
+        }
+        let mut ends: BTreeMap<(u32, bool), u64> = BTreeMap::new();
+        for (id, d) in &self.descs {
+            if d.refs > u32::MAX / 2 || (d.refs as u64) < uses.get(id).copied().unwrap_or(0) {
+                return bad();
+            }
+            match d.kind {
+                Kind::PipeRead(p) => *ends.entry((p, true)).or_default() += 1,
+                Kind::PipeWrite(p) => *ends.entry((p, false)).or_default() += 1,
+                _ => {},
+            }
+        }
+        for p in self.pipes.values() {
+            if p.readers > u32::MAX / 2 || p.writers > u32::MAX / 2 {
+                return bad();
+            }
+        }
+        for ((p, reader), n) in ends {
+            let Some(pipe) = self.pipes.get(&p) else {
+                continue;
+            };
+            let have = if reader { pipe.readers } else { pipe.writers };
+            if (have as u64) < n {
+                return bad();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -776,23 +851,39 @@ pub(crate) fn dtype(mode: u32) -> u8 {
 /// Returns the bytes and the next position.
 pub(crate) fn dirents(fs: &Fs, dir: Ino, pos: u64, max: usize) -> Result<(Vec<u8>, u64), i64> {
     let entries = fs.list(dir).map_err(|_| -ENOTDIR)?;
+    let typed = entries
+        .into_iter()
+        .enumerate()
+        .skip(pos as usize)
+        .map(|(i, (name, ino))| (ino, i as u64 + 1, fs.get(ino).map_or(0, |i| dtype(i.mode)), name));
+    encode_dirents(typed, pos, max)
+}
+
+/// linux_dirent64 records of `entries` (inode, the position after it, type, name), as many as
+/// `max` bytes hold, and the position to go on from: the one place they are made, for the
+/// filesystem's directories and for /proc's processes (procfs.rs).
+pub(crate) fn encode_dirents(
+    entries: impl IntoIterator<Item = (Ino, u64, u8, Vec<u8>)>,
+    pos: u64,
+    max: usize,
+) -> Result<(Vec<u8>, u64), i64> {
     let mut out = Vec::new();
     let mut next = pos;
-    for (name, ino) in entries.iter().skip(pos as usize) {
+    for (ino, off, typ, name) in entries {
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
         if out.len() + reclen > max {
+            if out.is_empty() {
+                return Err(-EINVAL); // the buffer can't hold even one entry
+            }
             break;
         }
-        next += 1;
+        next = off;
         out.extend_from_slice(&ino.to_le_bytes());
-        out.extend_from_slice(&(next as i64).to_le_bytes());
+        out.extend_from_slice(&(off as i64).to_le_bytes());
         out.extend_from_slice(&(reclen as u16).to_le_bytes());
-        out.push(fs.get(*ino).map_or(0, |i| dtype(i.mode)));
-        out.extend_from_slice(name);
+        out.push(typ);
+        out.extend_from_slice(&name);
         out.resize(out.len() + reclen - 19 - name.len(), 0);
-    }
-    if next == pos && pos < entries.len() as u64 {
-        return Err(-EINVAL); // the buffer can't hold even one entry
     }
     Ok((out, next))
 }
@@ -897,5 +988,43 @@ mod tests {
         assert_eq!((b1.len(), n1), (24, 1));
         assert_eq!(dirents(&fs, usr, 0, 8), Err(-EINVAL));
         assert_eq!(dirents(&fs, usr, 4, 4096).unwrap().0.len(), 0, "the end");
+    }
+
+    #[test]
+    fn dirents_carry_the_positions_they_are_given() {
+        // /proc's go on by pid (procfs.rs): d_off is the entry's own, the next call's start
+        let entries = [(7, 3, 4, b"a".to_vec()), (8, 1 << 32 | 1000, 4, b"1000".to_vec())];
+        let (b, next) = encode_dirents(entries.clone(), 2, 4096).unwrap();
+        assert_eq!(next, 1 << 32 | 1000);
+        assert_eq!(i64::from_le_bytes(b[8..16].try_into().unwrap()), 3);
+        assert_eq!(&b[24 + 19..24 + 23], b"1000");
+        assert_eq!(encode_dirents(entries.clone(), 2, 24).unwrap(), (b[..24].to_vec(), 3));
+        assert_eq!(encode_dirents(entries, 2, 16), Err(-EINVAL));
+    }
+
+    #[test]
+    fn a_restored_states_descriptions_count_every_descriptor_and_pipe_end() {
+        let mut f = Files::default();
+        let p = f.new_pipe();
+        let (r, w) = (f.add(Kind::PipeRead(p), 0), f.add(Kind::PipeWrite(p), 1));
+        let table = BTreeMap::from([(3, (r, false)), (4, (w, false)), (5, (w, false))]);
+        f.descs.get_mut(&r).unwrap().refs = 1;
+        f.descs.get_mut(&w).unwrap().refs = 2;
+        assert!(f.check_refs([&table].into_iter()).is_ok());
+        // A description referred to more than it counts, or counted near overflowing
+        f.descs.get_mut(&w).unwrap().refs = 1;
+        assert!(f.check_refs([&table].into_iter()).is_err());
+        f.descs.get_mut(&w).unwrap().refs = u32::MAX;
+        assert!(f.check_refs([&table].into_iter()).is_err());
+        f.descs.get_mut(&w).unwrap().refs = 2;
+        // A pipe with fewer readers than read ends
+        f.pipes.get_mut(&p).unwrap().readers = 0;
+        assert!(f.check_refs([&table].into_iter()).is_err());
+        // Letting go of more than was counted (a description at 0, a pipe without the reader it
+        // counted) is the end of them, not a panic
+        f.descs.get_mut(&w).unwrap().refs = 0;
+        assert_eq!(f.release(w), Some(None));
+        assert_eq!(f.release(r), Some(None));
+        assert!(f.release(r).is_none() && f.pipes.is_empty());
     }
 }

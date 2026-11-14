@@ -6,12 +6,10 @@
 //! process's supplementary groups (setgroups, getgroups): a child has its parent's, exec keeps
 //! them.
 
+use crate::errno::{EFAULT, EINVAL, EPERM};
 use crate::ser::{R, W};
 use crate::{Process, Ret};
 
-const EPERM: i64 = 1;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = crate::files::EINVAL;
 /// How many supplementary groups a process may have
 const NGROUPS_MAX: u64 = 65536;
 /// -1: an id the call leaves as it is

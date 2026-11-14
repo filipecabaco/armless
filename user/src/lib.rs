@@ -35,6 +35,7 @@
 mod aio;
 mod creds;
 mod elf;
+mod errno;
 mod exec;
 mod files;
 mod locks;
@@ -43,12 +44,14 @@ mod mm;
 mod net;
 mod netlink;
 mod proc;
+mod procfs;
 mod sched;
 mod ser;
 mod shm;
 mod timerfd;
 mod signal;
 mod smp;
+mod spawn;
 mod sys;
 mod timer;
 mod tty;
@@ -66,9 +69,11 @@ use armless::cpu::{Cpu, Exit, StopReason};
 use armless::dev::fs::{Fs, Ino, ROOT};
 use armless::{Board, Host, Ram};
 
+use errno::{EFAULT, EINVAL, ETIMEDOUT};
 use files::Files;
 use host::Instant;
 pub use smp::Smp;
+pub use spawn::SpawnPoll;
 use ser::{R, W};
 use signal::{Signals, ThreadSig};
 use timer::Timers;
@@ -81,6 +86,10 @@ pub(crate) const INIT: i64 = 1000;
 pub(crate) const SLICE: u64 = 1 << 20;
 const STACK_SIZE: u64 = 8 << 20;
 const BRK_SIZE: u64 = 64 << 20;
+/// The most one read or write moves, as Linux's: a page short of 2 GiB
+pub(crate) const MAX_RW_COUNT: u64 = 0x7fff_f000;
+/// The most iovecs one call takes (UIO_MAXIOV)
+pub(crate) const UIO_MAXIOV: u64 = 1024;
 /// Where a position-independent executable is loaded
 const PIE_BASE: u64 = 0x10_0000;
 
@@ -160,6 +169,11 @@ pub(crate) struct Thread {
     /// poll, select or epoll with it in its set (`waiting_for_input`). Not kept in a snapshot: a
     /// restore runs every such call again, which says it anew.
     pub tty_wait: bool,
+    /// A call parked to run again (`Wait::Retry`) that was woken for it and hasn't run yet: its pc
+    /// is still at its svc. A signal delivered meanwhile interrupts that call, as one delivered
+    /// while it waited would (sigsuspend returns EINTR rather than waiting again for a signal the
+    /// handler took). Cleared when the thread runs.
+    pub rerun: Option<(Wait, Option<Instant>)>,
     pub sig: ThreadSig,
     pub sched: sched::Sched,
 }
@@ -221,6 +235,8 @@ pub(crate) struct Proc {
     pub umask: u32,
     /// The executable's path, for /proc/self/exe
     pub exe: Vec<u8>,
+    /// Its arguments, each followed by a NUL, as /proc/<pid>/cmdline gives them (ps, pgrep)
+    pub cmdline: Vec<u8>,
     pub sig: Signals,
     pub creds: Creds,
     /// Supplementary groups (creds.rs)
@@ -331,7 +347,11 @@ pub struct Process {
     pub(crate) shm: shm::Shm,
     /// The interval and POSIX timers, and the CPU time they count (timer.rs)
     pub(crate) timers: Timers,
+    /// The processes the host started (spawn.rs), and its ends of their pipes. Not saved.
+    pub(crate) spawned: BTreeMap<i64, spawn::Spawned>,
     pub trace: bool,
+    /// With `trace`, only these system calls (empty: all of them)
+    pub trace_only: Vec<u64>,
     pub stats: Stats,
 }
 
@@ -362,7 +382,8 @@ pub enum Status {
 }
 
 pub(crate) fn page_up(v: u64) -> u64 {
-    (v + PAGE - 1) & !(PAGE - 1)
+    // (A length a program got wrong saturates: what uses it then finds it past everything)
+    v.saturating_add(PAGE - 1) & !(PAGE - 1)
 }
 
 /// Where an executable's pieces go: its segments, the stack, the break and the mmap area.
@@ -448,9 +469,20 @@ pub(crate) fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
 impl Process {
     // ------------------------------------------------------------ guest memory
 
+    /// `len` bytes of the program's at `addr`: never more than its RAM, which no buffer of the
+    /// program's can be past (a length from a program is not an allocation to make)
     pub(crate) fn bytes_at(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+        if len as u64 > self.ram_size {
+            return None;
+        }
         let mut b = vec![0; len];
         self.read(addr, &mut b).then_some(b)
+    }
+
+    /// The count a read or write of `n` bytes moves at most: MAX_RW_COUNT, as Linux, and no more
+    /// than the RAM, which bounds what a call holds on the host while it copies
+    pub(crate) fn rw_count(&self, n: u64) -> usize {
+        n.min(MAX_RW_COUNT).min(self.ram_size) as usize
     }
 
     pub(crate) fn u32_at(&self, addr: u64) -> Option<u32> {
@@ -511,16 +543,24 @@ impl Process {
         }
     }
 
-    pub(crate) fn timespec(&self, addr: u64) -> Option<Duration> {
-        let s = self.u64_at(addr)?;
-        let ns = self.u64_at(addr + 8)?;
-        Some(Duration::new(s, (ns % 1_000_000_000) as u32))
+    /// The struct timespec at `addr`: -EFAULT where nothing is mapped, and -EINVAL for negative
+    /// seconds or nanoseconds outside a second, as Linux checks them.
+    pub(crate) fn timespec(&self, addr: u64) -> Result<Duration, i64> {
+        let (Some(s), Some(ns)) = (self.u64_at(addr), self.u64_at(addr.wrapping_add(8))) else {
+            return Err(-EFAULT);
+        };
+        if (s as i64) < 0 || ns >= 1_000_000_000 {
+            return Err(-EINVAL);
+        }
+        Ok(Duration::new(s, ns as u32))
     }
 
-    /// The host instant at which `clock` reads `abs`.
+    /// The host instant at which `clock` reads `abs` (one far enough to be never, past what
+    /// a u64 of nanoseconds holds).
     pub(crate) fn deadline_at(&self, clock: u64, abs: Duration) -> Instant {
         let now = self.now_ns(clock);
-        Instant::now() + Duration::from_nanos((abs.as_nanos() as u64).saturating_sub(now))
+        let abs = abs.as_nanos().min(u64::MAX as u128) as u64;
+        Instant::now() + Duration::from_nanos(abs.saturating_sub(now))
     }
 
     /// The filesystem's time now, for what a program creates or writes
@@ -637,7 +677,7 @@ impl Process {
         args: &[String],
         env: &[String],
     ) -> Result<Process, ExecError> {
-        let ram = cpu.mem.alias();
+        let ram = cpu.mem().alias();
         let ram_size = ram.len() as u64;
         let layout = Layout::of(&image, board.as_deref())?;
         // What the CPUs decoded from a page of RAM is dropped when its frame is freed or the host
@@ -675,6 +715,7 @@ impl Process {
                 cwd: ROOT,
                 umask: 0o022,
                 exe: exe.to_vec(),
+                cmdline: Vec::new(),
                 sig: Signals::default(),
                 creds: Creds::default(),
                 groups: Vec::new(),
@@ -700,9 +741,11 @@ impl Process {
             machine: cpu.machine.clone(),
             resume_deadline: None,
             trace: false,
+            trace_only: Vec::new(),
             stats: Stats::default(),
             shm: shm::Shm::default(),
             timers: Timers::default(),
+            spawned: BTreeMap::new(),
         };
         p.net_attach();
         let (entry, sp) = match p.load_image(&image, &layout, args, env, exe) {
@@ -730,6 +773,7 @@ impl Process {
             resume_deadline: None,
             exited: false,
             tty_wait: false,
+            rerun: None,
             sig: ThreadSig::default(),
             sched: Default::default(),
         });
@@ -807,6 +851,8 @@ impl Process {
         if !ok.get() {
             return Err(fail("no memory for the stack".into()));
         }
+        // (Every program image is loaded here: the first, execve's, the host's own processes)
+        self.p.cmdline = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
         Ok((entry, sp))
     }
 
@@ -842,6 +888,53 @@ impl Process {
     pub(crate) fn poke(&mut self) {
         self.poked = true;
         self.epoch += 1;
+    }
+
+    /// `what` changed (data in or out of a pipe, an eventfd's count): it wakes the parked calls
+    /// that wait on it, and those that may wait on anything (a poll, an epoll wait), not every
+    /// call (`Woken`).
+    pub(crate) fn poke_on(&mut self, what: files::WaitOn) {
+        self.epoch += 1;
+        if !self.files.woken.changed.contains(&what) {
+            self.files.woken.changed.push(what);
+        }
+    }
+
+    /// What system call `nr` with `a`, parked to run again, waits on, if that is one thing
+    /// `poke_on` tells: a read or write of a pipe or an eventfd.
+    fn waits_on(&self, nr: u64, a: [u64; 5]) -> Option<files::WaitOn> {
+        if !matches!(
+            nr,
+            sys::nr::READ | sys::nr::READV | sys::nr::WRITE | sys::nr::WRITEV
+        ) {
+            return None;
+        }
+        let d = self.files.desc_of(i32::try_from(a[0] as i64).ok()?)?;
+        match self.files.descs.get(&d)?.kind {
+            files::Kind::PipeRead(p) | files::Kind::PipeWrite(p) => Some(files::WaitOn::Pipe(p)),
+            files::Kind::Event { .. } => Some(files::WaitOn::Desc(d)),
+            _ => None,
+        }
+    }
+
+    /// Whether a change parked calls may wait on is not looked at yet (`wake`), and a parked
+    /// call it would wake: something for an idle CPU to do.
+    pub(crate) fn retry_due(&self) -> bool {
+        let all = self.poked || self.files.woken.all;
+        if !all && self.files.woken.changed.is_empty() {
+            return false;
+        }
+        self.threads.iter().any(|t| {
+            !t.exited
+                && matches!(t.wait, Some((Wait::Retry { .. }, _)))
+                && (all
+                    || self
+                        .files
+                        .woken
+                        .parked
+                        .get(&t.tid)
+                        .is_none_or(|k| self.files.woken.changed.contains(k)))
+        })
     }
 
     /// A signal for the first process from outside it (`kill`: SIGINT for an interrupt the
@@ -1036,6 +1129,8 @@ impl Process {
                         .min(),
                 ));
             };
+            // (It runs: a call woken to run again does, so no signal interrupts it in between)
+            self.threads[next].rerun = None;
             if self.on_cpu[self.cpu] != Some(next) {
                 self.park(cpu);
                 self.threads[next].ctx.load(cpu);
@@ -1080,11 +1175,17 @@ impl Process {
                 self.resume_deadline = self.threads[cur].resume_deadline.take();
                 let (nr, a0, a1, a2) = (cpu.x[8], cpu.x[0], cpu.x[1], cpu.x[2]);
                 // (A call on a path: its path, read before the call, which may change it)
-                let path = (self.trace && matches!(nr, 34 | 35 | 38 | 48 | 53 | 54 | 56 | 78 | 79 | 276 | 291 | 437))
-                    .then(|| String::from_utf8_lossy(&self.cstr(a1)).into_owned());
+                let path = match nr {
+                    _ if !self.trace => None,
+                    34 | 35 | 38 | 48 | 53 | 54 | 56 | 78 | 79 | 276 | 291 | 437 => Some(self.cstr(a1)),
+                    // execve: its path is the first argument
+                    221 => Some(self.cstr(a0)),
+                    _ => None,
+                }
+                .map(|p| String::from_utf8_lossy(&p).into_owned());
                 let ret = self.syscall_lazily(cpu, cur);
                 self.flush_net();
-                if self.trace {
+                if self.trace && (self.trace_only.is_empty() || self.trace_only.contains(&nr)) {
                     let r = match &ret {
                         Ret::Val(r) => format!("{r:#x}"),
                         Ret::Block(w, d) => format!(
@@ -1141,6 +1242,11 @@ impl Process {
                         cpu.pc = elr - 4;
                         let args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4]];
                         self.threads[cur].tty_wait = self.waits_on_tty(cpu.x[8], args);
+                        let tid = self.threads[cur].tid;
+                        match self.waits_on(cpu.x[8], args) {
+                            Some(k) => self.files.woken.parked.insert(tid, k),
+                            None => self.files.woken.parked.remove(&tid),
+                        };
                         self.park(cpu);
                         self.threads[cur].wait = Some((Wait::Retry { on_timeout }, deadline));
                         self.cur = next;
@@ -1179,7 +1285,8 @@ impl Process {
         if self.net_changed() {
             self.poke();
         }
-        let poked = std::mem::take(&mut self.poked);
+        let poked = std::mem::take(&mut self.poked) | std::mem::take(&mut self.files.woken.all);
+        let changed = std::mem::take(&mut self.files.woken.changed);
         let blobs_in: Vec<bool> = self
             .threads
             .iter()
@@ -1190,6 +1297,7 @@ impl Process {
                 _ => false,
             })
             .collect();
+        let parked = &mut self.files.woken.parked;
         for (t, blobs_in) in self.threads.iter_mut().zip(blobs_in) {
             let Some((w, deadline)) = t.wait.clone() else {
                 continue;
@@ -1197,7 +1305,7 @@ impl Process {
             let expired = deadline.is_some_and(|d| d <= now);
             match w {
                 Wait::Futex { .. } if expired => {
-                    t.ctx.x[0] = (-110i64) as u64; // ETIMEDOUT
+                    t.ctx.x[0] = -ETIMEDOUT as u64;
                     t.wait = None;
                 },
                 Wait::Sleep if expired => {
@@ -1210,13 +1318,28 @@ impl Process {
                     t.ctx.x[0] = on_timeout as u64;
                     t.wait = None;
                 },
-                Wait::Retry { .. } if poked || expired => {
+                Wait::Retry { .. }
+                    if poked
+                        || expired
+                        || !changed.is_empty()
+                            && parked.get(&t.tid).is_none_or(|k| changed.contains(k)) =>
+                {
                     t.resume_deadline = deadline;
-                    t.wait = None;
+                    t.rerun = t.wait.take();
                 },
                 Wait::Blobs(_) if blobs_in => t.wait = None,
                 _ => {},
             }
+        }
+        // (What threads that are gone, or now wait otherwise, were parked on)
+        if parked.len() > self.threads.len() {
+            let retrying: std::collections::BTreeSet<i64> = self
+                .threads
+                .iter()
+                .filter(|t| matches!(t.wait, Some((Wait::Retry { .. }, _))))
+                .map(|t| t.tid)
+                .collect();
+            parked.retain(|tid, _| retrying.contains(tid));
         }
     }
 
@@ -1342,6 +1465,7 @@ impl Process {
             self.timers.save_real(&mut w, p.pid, now);
             creds::save_groups(&p.groups, &mut w);
             aio::save(&p.aio, &mut w);
+            w.b(&p.cmdline);
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1420,7 +1544,7 @@ impl Process {
         board: Option<Arc<Board>>,
         data: &[u8],
     ) -> Result<Process, String> {
-        // Which format it is (MAGIC says what each adds): 5, 6 or 7
+        // Which format it is (MAGIC says what each adds): 5 to 9
         let Some((ver, rest)) = MAGICS
             .iter()
             .enumerate()
@@ -1430,7 +1554,7 @@ impl Process {
         };
         let v6 = ver >= 6;
         let mut r = R(rest);
-        let ram = cpu.mem.alias();
+        let ram = cpu.mem().alias();
         let ram_size = r.u()?;
         if ram_size != ram.len() as u64 {
             return Err(format!(
@@ -1484,6 +1608,8 @@ impl Process {
             // Before ARMLUSR7 there were no groups nor AIO contexts
             let groups = if ver >= 7 { creds::load_groups(&mut r)? } else { Vec::new() };
             let aio = if ver >= 7 { aio::load(&mut r)? } else { BTreeMap::new() };
+            // Before ARMLUSR9 no command line was kept: /proc gives the executable's path
+            let cmdline = if ver >= 9 { r.b()?.to_vec() } else { Vec::new() };
             all.insert(
                 pid,
                 Proc {
@@ -1499,6 +1625,7 @@ impl Process {
                     cwd,
                     umask,
                     exe,
+                    cmdline,
                     sig,
                     creds,
                     groups,
@@ -1569,6 +1696,7 @@ impl Process {
                 resume_deadline,
                 exited,
                 tty_wait: false,
+                rerun: None,
                 sig: ThreadSig::load(&mut r)?,
                 sched: if ver >= 7 { sched::Sched::load(&mut r)? } else { sched::Sched::default() },
             });
@@ -1583,6 +1711,13 @@ impl Process {
             }
             files.net.load_rights(&mut r, ver)?;
         }
+        let held: Vec<_> = spaces.iter().map(|m| m.borrow()).collect();
+        mm::check_frames(
+            &frames,
+            held.iter().map(|m| &**m),
+            shm.frames().chain(file_pages.values().copied()),
+        )?;
+        drop(held);
         files.net.load_cm(&mut r, ver)?;
         // Before ARMLUSR7 only ITIMER_REAL was kept
         if ver >= 7 {
@@ -1592,6 +1727,7 @@ impl Process {
         if ver >= 8 {
             files.locks = locks::Locks::load(&mut r)?;
         }
+        files.check_refs(all.values().map(|p| &p.fds))?;
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);
@@ -1628,9 +1764,11 @@ impl Process {
             machine: cpu.machine.clone(),
             resume_deadline: None,
             trace: false,
+            trace_only: Vec::new(),
             stats: Stats::default(),
             shm,
             timers,
+            spawned: BTreeMap::new(),
         };
         p.net_attach();
         let wanted: Vec<String> = p
@@ -1678,12 +1816,14 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-/// The process state's format: ARMLUSR7 (0.16) has each thread's scheduling (sched.rs) and the
-/// timers but ITIMER_REAL, with the CPU time they count (timer.rs, at the end); ARMLUSR6
-/// (0.15) has none of that; ARMLUSR5 (0.14) has neither the ids, timers, shared memory, shared
-/// file pages nor descriptors in flight of 0.15. Each still loads.
-const MAGIC: &[u8; 8] = b"ARMLUSR8";
-const MAGICS: [&[u8; 8]; 4] = [b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", MAGIC];
+/// The process state's format: ARMLUSR9 (0.19) has each process's command line (after its AIO
+/// contexts); ARMLUSR8 (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
+/// each thread's scheduling (sched.rs) and the timers but ITIMER_REAL, with the CPU time they
+/// count (timer.rs, at the end); ARMLUSR6 (0.15) has none of that; ARMLUSR5 (0.14) has neither
+/// the ids, timers, shared memory, shared file pages nor descriptors in flight of 0.15. Each
+/// still loads.
+const MAGIC: &[u8; 8] = b"ARMLUSR9";
+const MAGICS: [&[u8; 8]; 5] = [b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", MAGIC];
 
 const _: () = {
     const fn send<T: Send>() {}

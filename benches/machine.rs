@@ -66,7 +66,7 @@ const LOOP: [u32; 8] = [
 fn cpu() -> Cpu<NoDevices> {
     let mut c = Cpu::new(RAM, NoDevices);
     for (i, w) in LOOP.iter().enumerate() {
-        c.mem.write(CODE as usize + 4 * i, &w.to_le_bytes());
+        c.mem().write(CODE as usize + 4 * i, &w.to_le_bytes());
     }
     (c.el, c.spsel, c.daif) = (1, true, 0x3c0);
     c.x[4] = DATA;
@@ -79,7 +79,7 @@ fn cpu() -> Cpu<NoDevices> {
 #[cfg(feature = "native-jit")]
 fn profile(c: &Cpu<NoDevices>) -> Page {
     let mut page = [0u8; 0x1000];
-    c.mem.read(CODE as usize, &mut page);
+    c.mem().read(CODE as usize, &mut page);
     Page {
         key: (CODE << 2) | 0b11,
         hash: profile::hash(&page),
@@ -146,7 +146,7 @@ fn snapshot(c: &mut Criterion) {
     // 256 pages the guest wrote (1 MiB), spread over RAM
     for p in 0..256usize {
         vm.cpus[0]
-            .mem
+            .mem()
             .write(p * (64 << 20) / 256, &(p as u64 + 1).to_le_bytes());
     }
     let state = vm.save_state();

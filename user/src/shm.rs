@@ -9,7 +9,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::mm::{PROT_READ, PROT_WRITE};
+use crate::errno::{EACCES, EEXIST, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSPC, EPERM};
+use crate::mm::{PROT_READ, PROT_WRITE, VA_END};
 use crate::ser::{R, W};
 use crate::{page_up, Process, Ret, PAGE};
 
@@ -27,20 +28,14 @@ const SHM_STAT_ANY: u64 = 15;
 const IPC_64: u64 = 0x100;
 const SHM_RDONLY: u64 = 0o10000;
 const SHM_RND: u64 = 0o20000;
+/// SHM_REMAP: an attach at an address may replace what is mapped there
+const SHM_REMAP: u64 = 0o40000;
 /// SHMLBA on arm64
 const SHMLBA: u64 = 4 * PAGE;
 /// The most a segment may be (SHMMAX), and how many there may be (SHMMNI)
 const SHMMAX: u64 = 1 << 36;
 const SHMMNI: usize = 4096;
 
-const EPERM: i64 = 1;
-const ENOENT: i64 = 2;
-const ENOMEM: i64 = 12;
-const EACCES: i64 = 13;
-const EFAULT: i64 = 14;
-const EEXIST: i64 = 17;
-const EINVAL: i64 = 22;
-const ENOSPC: i64 = 28;
 
 #[derive(Clone, Debug, Default)]
 struct Segment {
@@ -99,6 +94,11 @@ impl Shm {
         }
     }
 
+    /// The frames the segments hold
+    pub(crate) fn frames(&self) -> impl Iterator<Item = u64> + '_ {
+        self.segs.values().flat_map(|s| s.frames.iter().copied())
+    }
+
     pub(crate) fn load(r: &mut R) -> Result<Shm, String> {
         let mut shm = Shm {
             next: r.u()? as i32,
@@ -125,6 +125,14 @@ impl Shm {
             };
             for _ in 0..r.u()? {
                 s.frames.push(r.u()?);
+            }
+            // No frames yet (never attached), or one for each of its pages (`Shm::frames` are
+            // checked against the frame pool by the restore)
+            if s.size == 0
+                || s.size > SHMMAX
+                || !(s.frames.is_empty() || s.frames.len() as u64 == page_up(s.size) / PAGE)
+            {
+                return Err("bad shared memory segment".into());
             }
             shm.segs.insert(id, s);
         }
@@ -193,6 +201,18 @@ impl Process {
             return v(-EINVAL);
         };
         let len = page_up(s.size);
+        // An address given is where it goes, as MAP_FIXED, but within the address space and (as
+        // Linux has it) over nothing already mapped unless SHM_REMAP
+        let fixed = (addr != 0).then_some(if flags & SHM_RND != 0 { addr & !(SHMLBA - 1) } else { addr });
+        if let Some(at) = fixed {
+            if !at.is_multiple_of(PAGE)
+                || at < PAGE
+                || at.checked_add(len).is_none_or(|e| e > VA_END)
+                || (flags & SHM_REMAP == 0 && self.p.mm.borrow().overlaps(at, at + len))
+            {
+                return v(-EINVAL);
+            }
+        }
         let mut frames = s.frames.clone();
         if frames.is_empty() {
             let mut f = self.frames.borrow_mut();
@@ -208,17 +228,12 @@ impl Process {
                 }
             }
         }
-        let at = if addr == 0 {
-            match self.p.mm.borrow_mut().alloc(len) {
+        let at = match fixed {
+            Some(at) => at,
+            None => match self.p.mm.borrow_mut().alloc(len) {
                 Some(at) => at,
                 None => return v(-ENOMEM),
-            }
-        } else {
-            let at = if flags & SHM_RND != 0 { addr & !(SHMLBA - 1) } else { addr };
-            if !at.is_multiple_of(PAGE) {
-                return v(-EINVAL);
-            }
-            at
+            },
         };
         let prot = if flags & SHM_RDONLY != 0 { PROT_READ } else { PROT_READ | PROT_WRITE };
         self.map_area(at, at + len, prot, true, None);
@@ -346,4 +361,33 @@ fn shmid_ds(s: &Segment) -> [u8; 112] {
     put(84, &(s.lpid as i32).to_le_bytes());
     put(88, &s.nattch.to_le_bytes());
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(size: u64, frames: Vec<u64>) -> Result<Shm, String> {
+        let mut shm = Shm::default();
+        shm.segs.insert(
+            0,
+            Segment {
+                size,
+                frames,
+                ..Segment::default()
+            },
+        );
+        let mut w = W(Vec::new());
+        shm.save(&mut w);
+        Shm::load(&mut R(&w.0))
+    }
+
+    #[test]
+    fn a_restored_segment_has_a_frame_for_each_of_its_pages_or_none() {
+        assert!(with(PAGE + 1, vec![]).is_ok());
+        assert!(with(PAGE + 1, vec![0, PAGE]).is_ok());
+        assert!(with(PAGE, vec![0, PAGE]).is_err());
+        assert!(with(0, vec![]).is_err());
+        assert!(with(u64::MAX, vec![]).is_err());
+    }
 }

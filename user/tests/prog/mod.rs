@@ -39,10 +39,13 @@ pub struct Prog {
 
 impl Prog {
     pub fn li(&mut self, rd: u32, v: u64) {
-        assert!(v < 1 << 32);
         self.code.push(0xd280_0000 | (v as u32 & 0xffff) << 5 | rd);
-        if v >> 16 != 0 {
-            self.code.push(0xf2a0_0000 | (v as u32 >> 16) << 5 | rd);
+        // movk for each higher halfword that isn't zero
+        for hw in 1..4u32 {
+            let part = (v >> (16 * hw)) as u32 & 0xffff;
+            if part != 0 {
+                self.code.push(0xf280_0000 | hw << 21 | part << 5 | rd);
+            }
         }
     }
 
@@ -89,10 +92,49 @@ impl Prog {
         self.code
             .push(if v < 0 { 0xb100_001f } else { 0xf100_001f } | imm << 10);
         self.code.push(0x5400_0080); // b.eq +16
+        self.fail();
+        self
+    }
+
+    /// `expect` for any value: it goes through x1
+    pub fn expect_wide(&mut self, v: u64) -> &mut Self {
+        self.checks += 1;
+        self.li(1, v);
+        self.code.push(0xeb01_001f); // cmp x0, x1
+        self.code.push(0x5400_0080); // b.eq +16
+        self.fail();
+        self
+    }
+
+    /// Exits with 100 + the check's number unless x0 is not negative (a call that succeeded)
+    pub fn expect_ok(&mut self) -> &mut Self {
+        self.checks += 1;
+        self.code.push(0xb6f8_0080); // tbz x0, #63, +16
+        self.fail();
+        self
+    }
+
+    /// Exits with 100 + the check's number unless x0 is a result a system call may give: not
+    /// negative, or an errno (-4095..-1)
+    pub fn expect_valid(&mut self) -> &mut Self {
+        self.checks += 1;
+        self.code.push(0xb13f_fc1f); // cmn x0, #4095
+        self.code.push(0x5400_008a); // b.ge +16
+        self.fail();
+        self
+    }
+
+    /// rt_sigaction(sig) to SIG_IGN, its struct sigaction kept at the data's end (0x3fe0)
+    pub fn ignore_signal(&mut self, sig: u64) -> &mut Self {
+        self.put(0x3fe0, &[1u64, 0, 0, 0].map(u64::to_le_bytes).concat());
+        self.sys(134, &[I(sig), D(0x3fe0), I(0), I(8)]).expect(0)
+    }
+
+    /// exit_group(100 + the check's number), in three instructions
+    fn fail(&mut self) {
         self.li(0, 100 + self.checks as u64);
         self.li(8, 94);
         self.code.push(0xd400_0001);
-        self
     }
 
     /// write(1, data[off..off + len])

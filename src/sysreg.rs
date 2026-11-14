@@ -70,6 +70,12 @@ pub const DC_ZVA: u32 = sr(1, 3, 7, 4, 1);
 pub const IC_IALLUIS: u32 = sr(1, 0, 7, 1, 0);
 pub const IC_IALLU: u32 = sr(1, 0, 7, 5, 0);
 pub const IC_IVAU: u32 = sr(1, 3, 7, 5, 1);
+// Cache maintenance by address that EL0 may make when SCTLR_EL1.UCI is set
+pub const DC_CVAC: u32 = sr(1, 3, 7, 10, 1);
+pub const DC_CVAU: u32 = sr(1, 3, 7, 11, 1);
+pub const DC_CVAP: u32 = sr(1, 3, 7, 12, 1);
+pub const DC_CVADP: u32 = sr(1, 3, 7, 13, 1);
+pub const DC_CIVAC: u32 = sr(1, 3, 7, 14, 1);
 pub const AT_S1E1R: u32 = sr(1, 0, 7, 8, 0);
 pub const AT_S1E1W: u32 = sr(1, 0, 7, 8, 1);
 pub const AT_S1E0R: u32 = sr(1, 0, 7, 8, 2);

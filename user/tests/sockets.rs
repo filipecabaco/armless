@@ -47,7 +47,8 @@ fn a_socketpair_carries_bytes_both_ways_and_messages() {
     p.sys(57, &[W(0x100)]).expect(0);
     p.sys(63, &[W(0x104), D(0x300 + 0x80), I(16)]).expect(2);
     p.sys(63, &[W(0x104), D(0x300 + 0x80), I(16)]).expect(0);
-    p.sys(64, &[W(0x104), D(0x200), I(2)]).expect(-32); // EPIPE
+    // EPIPE (sendto with MSG_NOSIGNAL: a write would end the program by SIGPIPE)
+    p.sys(206, &[W(0x104), D(0x200), I(2), I(0x4000), I(0), I(0)]).expect(-32);
     let mut p = start(&mut vm, p);
     let (out, status) = run(&mut p, &mut vm);
     ok(&status);
@@ -767,6 +768,8 @@ fn received_descriptors_are_close_on_exec_when_asked_and_a_short_buffer_truncate
 fn a_description_in_flight_keeps_its_pipe_open_until_it_is_received_or_its_socket_closes() {
     let mut vm = machine();
     let mut p = Prog::default();
+    // (A write to a pipe with no reader is EPIPE then, not the end of the program)
+    p.ignore_signal(13);
     p.put(0x200, b"x");
     pipe_and_pair(&mut p, 1);
     p.msg(M1, 0x200, 1, &rights(&[3]), 24);
@@ -797,6 +800,8 @@ fn a_description_in_flight_keeps_its_pipe_open_until_it_is_received_or_its_socke
 fn datagrams_carry_descriptors_and_a_peek_gives_copies() {
     let mut vm = machine();
     let mut p = Prog::default();
+    // (A write to a pipe with no reader is EPIPE then, not the end of the program)
+    p.ignore_signal(13);
     p.put(0x200, b"dg").put(0x210, b"hi");
     pipe_and_pair(&mut p, 2);
     p.msg(M1, 0x200, 2, &rights(&[3]), 24);

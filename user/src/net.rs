@@ -23,6 +23,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
+use crate::errno::{
+    EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EALREADY, EBADF, ECONNREFUSED, ECONNRESET,
+    EDESTADDRREQ, EEXIST, EFAULT, EINPROGRESS, EINVAL, EISCONN, EMFILE, EMSGSIZE, ENETUNREACH,
+    ENOBUFS, ENOPROTOOPT, ENOSYS, ENOTCONN, ENOTSOCK, EOPNOTSUPP, EPERM, EPIPE, EPROTONOSUPPORT,
+    ESOCKTNOSUPPORT, ESRCH,
+};
 use crate::files::{self, Desc, Got, Kind, O_NONBLOCK, S_IFSOCK};
 use crate::host::Instant;
 use crate::ser::{R, W};
@@ -45,33 +51,11 @@ fn messages(ty: u8) -> bool {
     matches!(ty, SOCK_DGRAM | SOCK_SEQPACKET)
 }
 
-const EPERM: i64 = 1;
-const ESRCH: i64 = 3;
-const EAGAIN: i64 = 11;
-const EFAULT: i64 = 14;
-const ENOTSOCK: i64 = 88;
-const EDESTADDRREQ: i64 = 89;
-const EMSGSIZE: i64 = 90;
-const ENOPROTOOPT: i64 = 92;
-const EPROTONOSUPPORT: i64 = 93;
-const ESOCKTNOSUPPORT: i64 = 94;
-const EOPNOTSUPP: i64 = 95;
-const EAFNOSUPPORT: i64 = 97;
-const EADDRINUSE: i64 = 98;
-const EADDRNOTAVAIL: i64 = 99;
-const ENETUNREACH: i64 = 101;
-const ECONNRESET: i64 = 104;
-const EISCONN: i64 = 106;
-const ENOTCONN: i64 = 107;
-const ECONNREFUSED: i64 = 111;
-const EALREADY: i64 = 114;
-const EINPROGRESS: i64 = 115;
-const EPIPE: i64 = 32;
-const EINVAL: i64 = 22;
 
 const MSG_PEEK: u64 = 0x2;
 const MSG_TRUNC: u64 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
+const MSG_NOSIGNAL: u64 = 0x4000;
 const MSG_CTRUNC: u32 = 0x8;
 const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 
@@ -81,6 +65,8 @@ const SCM_RIGHTS: u32 = 1;
 const SCM_CREDENTIALS: u32 = 2;
 /// Descriptors one message carries at most (the kernel's SCM_MAX_FD)
 const SCM_MAX_FD: usize = 253;
+/// The control data one sendmsg may carry at most (Linux's optmem_max): more is ENOBUFS
+const OPTMEM_MAX: u64 = 128 << 10;
 /// sizeof(struct cmsghdr)
 const CMSG_HDR: usize = 16;
 /// The credentials of bytes nobody is known to have sent (from a state that did not keep them):
@@ -448,6 +434,35 @@ impl Net {
     }
 
     /// Closes the socket: its peer sees it go, its name is free.
+    /// A socket in a few words, for a host looking at what a program waits on: its type, its
+    /// address and its peer's, what is buffered, and how it stands
+    pub(crate) fn brief(&self, id: u32) -> String {
+        let Some(s) = self.socks.get(&id) else {
+            return format!("sock {id} gone");
+        };
+        let addr = |sa: &[u8]| match sa {
+            [2, 0, p0, p1, a, b, c, d, ..] => format!("{a}.{b}.{c}.{d}:{}", u16::from_be_bytes([*p0, *p1])),
+            [1, 0, rest @ ..] => format!("unix:{}", String::from_utf8_lossy(rest).trim_end_matches('\0')),
+            [] => "-".into(),
+            _ => "?".into(),
+        };
+        format!(
+            "sock{id}[{} {}->{} peer={:?} host={:?} rx={} msgs={} backlog={}{}{}{}{}]",
+            s.ty,
+            addr(&s.name),
+            addr(&s.peer_name),
+            s.peer,
+            s.host,
+            s.rx.len(),
+            s.msgs.len(),
+            s.backlog.len(),
+            if s.listening { " listening" } else { "" },
+            if s.connecting { " connecting" } else { "" },
+            if s.fin { " fin" } else { "" },
+            if s.gone { " gone" } else { "" },
+        )
+    }
+
     pub fn close(&mut self, id: u32) {
         let Some(s) = self.socks.remove(&id) else {
             return;
@@ -767,7 +782,7 @@ impl Process {
 
     fn sock_id(&self, fd: i32) -> Result<u32, Ret> {
         match self.files.get(fd) {
-            None => Err(e(9)),
+            None => Err(e(EBADF)),
             Some(Desc {
                 kind: Kind::Sock(id),
                 ..
@@ -802,7 +817,7 @@ impl Process {
         Ret::Retry {
             deadline: self
                 .resume_deadline
-                .or_else(|| timeout.map(|t| Instant::now() + t)),
+                .or_else(|| timeout.and_then(|t| Instant::now().checked_add(t))),
             on_timeout: -EAGAIN,
         }
     }
@@ -916,6 +931,21 @@ impl Process {
         }
     }
 
+    /// The most a send on stream socket `id` could take now (`sock_send` takes no more), so
+    /// that a write copies no more of the program's buffer than that; None: no bound (a
+    /// datagram goes whole).
+    pub(crate) fn sock_send_room(&self, id: u32) -> Option<usize> {
+        let s = self.files.net.socks.get(&id)?;
+        if s.ty != SOCK_STREAM || s.domain as u16 == AF_NETLINK {
+            return None;
+        }
+        if s.host.is_some() {
+            return Some(HOST_WRITE_MAX);
+        }
+        let p = s.peer.and_then(|p| self.files.net.socks.get(&p))?;
+        Some(STREAM_MAX.saturating_sub(p.rx.len()))
+    }
+
     // ------------------------------------------------------------ reading and writing
 
     /// Up to `max` bytes (a whole datagram: cut if longer, with the rest lost) that arrived at
@@ -937,7 +967,7 @@ impl Process {
         let peek = flags & MSG_PEEK != 0;
         let board = self.board.clone();
         let Some(s) = self.files.net.socks.get_mut(&id) else {
-            return Err(e(9));
+            return Err(e(EBADF));
         };
         if s.listening {
             return Err(e(EINVAL));
@@ -1065,8 +1095,28 @@ impl Process {
     }
 
     /// Sends `data` on socket `id` (to `dest` for a datagram socket with no address of its own):
-    /// how much it took, or what the call must do.
+    /// how much it took, or what the call must do. A stream whose other end is gone is EPIPE
+    /// with SIGPIPE for the thread, as Linux's TCP and unix streams send it, unless the call
+    /// says MSG_NOSIGNAL.
     pub(crate) fn sock_send(
+        &mut self,
+        fd: i32,
+        id: u32,
+        data: &[u8],
+        flags: u64,
+        dest: Option<Vec<u8>>,
+        cm: &Cm,
+    ) -> Result<usize, Ret> {
+        let stream = self.files.net.socks.get(&id).is_some_and(|s| s.ty == SOCK_STREAM);
+        match self.sock_send_now(fd, id, data, flags, dest, cm) {
+            Err(Ret::Val(e)) if e == -EPIPE && stream && flags & MSG_NOSIGNAL == 0 => {
+                Err(self.broken_pipe())
+            },
+            r => r,
+        }
+    }
+
+    fn sock_send_now(
         &mut self,
         fd: i32,
         id: u32,
@@ -1083,7 +1133,7 @@ impl Process {
         let who = cm.cred.unwrap_or([self.p.pid as u32, c.uid[0], c.gid[0]]);
         let rights = &cm.rights[..];
         let Some(s) = self.files.net.socks.get_mut(&id) else {
-            return Err(e(9));
+            return Err(e(EBADF));
         };
         // Descriptors go only between unix sockets, which are all in memory
         if !rights.is_empty() && (s.host.is_some() || s.inet()) {
@@ -1281,7 +1331,7 @@ impl Process {
                 .map_or_else(|r| r, |n| Ret::Val(n as i64)),
             243 => self.sys_mmsg(fd, a, true),
             269 => self.sys_mmsg(fd, a, false),
-            _ => e(38),
+            _ => e(ENOSYS),
         };
         if matches!(r, Ret::Val(_)) && !matches!(nr, 198 | 204 | 205 | 208 | 209) {
             self.poke();
@@ -1292,8 +1342,7 @@ impl Process {
     fn install_sock(&mut self, id: u32, flags: u64) -> i64 {
         let nb = if flags & O_NONBLOCK as u64 != 0 { O_NONBLOCK } else { 0 };
         let d = self.files.add(Kind::Sock(id), 2 | nb);
-        self.files
-            .install(d, 0, flags & files::O_CLOEXEC as u64 != 0) as i64
+        self.new_fd(d, 0, flags & files::O_CLOEXEC as u64 != 0)
     }
 
     fn sys_socket(&mut self, domain: u64, ty: u64, proto: u64) -> Ret {
@@ -1356,6 +1405,12 @@ impl Process {
             (s.peer, s.connected) = (Some(other), true);
         }
         let (fx, fy) = (self.install_sock(x, flags), self.install_sock(y, flags));
+        if fx < 0 || fy < 0 {
+            for fd in [fx, fy].into_iter().filter(|&f| f >= 0) {
+                self.files.close(fd as i32);
+            }
+            return e(EMFILE);
+        }
         let mut b = [0u8; 8];
         b[..4].copy_from_slice(&(fx as u32).to_le_bytes());
         b[4..].copy_from_slice(&(fy as u32).to_le_bytes());
@@ -1447,7 +1502,7 @@ impl Process {
             let (dir, name) = files::resolve_parent(fs, cwd, path).map_err(Got::Err)?;
             let ino = match files::got(fs.create(dir, &name, mode, uid, gid, now)) {
                 Got::Ok(i) => i,
-                Got::Err(n) if n == -files::EEXIST => return Err(Got::Err(-EADDRINUSE)),
+                Got::Err(n) if n == -EEXIST => return Err(Got::Err(-EADDRINUSE)),
                 Got::Err(n) => return Err(Got::Err(n)),
                 Got::Need(b) => return Err(Got::Need(b)),
             };
@@ -1548,6 +1603,9 @@ impl Process {
         };
         let peer = net.socks[&child].peer_name.clone();
         let fd = self.install_sock(child, flags);
+        if fd < 0 {
+            return Ret::Val(fd);
+        }
         if addr != 0 && len != 0 && !self.put_sockaddr(addr, len, &peer) {
             self.files.close(fd as i32);
             return e(EFAULT);
@@ -1729,7 +1787,7 @@ impl Process {
             Ok(i) => i,
             Err(r) => return r,
         };
-        let Some(data) = self.bytes_at(a[1], a[2] as usize) else {
+        let Some(data) = self.bytes_at(a[1], self.rw_count(a[2])) else {
             return e(EFAULT);
         };
         let dest = if a[4] != 0 && a[5] != 0 {
@@ -1751,7 +1809,7 @@ impl Process {
             Ok(i) => i,
             Err(r) => return r,
         };
-        let got = self.sock_recv(fd, id, a[2] as usize, a[3]);
+        let got = self.sock_recv(fd, id, self.rw_count(a[2]), a[3]);
         // recvfrom takes no control data: descriptors that came are closed, as Linux's
         self.drop_taken();
         match got {
@@ -1773,16 +1831,16 @@ impl Process {
         let id = self.sock_id(fd)?;
         let (Some(name), Some(namelen), Some(iov), Some(n), Some(ctl), Some(ctllen)) = (
             self.u64_at(at),
-            self.u32_at(at + 8),
-            self.u64_at(at + 16),
-            self.u64_at(at + 24),
-            self.u64_at(at + 32),
-            self.u64_at(at + 40),
+            self.u32_at(at.wrapping_add(8)),
+            self.u64_at(at.wrapping_add(16)),
+            self.u64_at(at.wrapping_add(24)),
+            self.u64_at(at.wrapping_add(32)),
+            self.u64_at(at.wrapping_add(40)),
         ) else {
             return Err(e(EFAULT));
         };
         let cm = self.cmsgs_in(id, ctl, ctllen)?;
-        let iov = self.iovecs(iov, n).ok_or(e(EFAULT))?;
+        let iov = self.iovecs(iov, n).map_err(Ret::Val)?;
         let mut data = Vec::new();
         for (base, len) in iov {
             data.extend_from_slice(&self.bytes_at(base, len as usize).ok_or(e(EFAULT))?);
@@ -1804,28 +1862,32 @@ impl Process {
     fn cmsgs_in(&self, id: u32, ctl: u64, ctllen: u64) -> Result<Cm, Ret> {
         let unix = self.files.net.socks.get(&id).is_some_and(|s| !s.inet());
         let mut cm = Cm::default();
+        if ctllen > OPTMEM_MAX {
+            return Err(e(ENOBUFS));
+        }
         let mut off = 0;
         while off + CMSG_HDR as u64 <= ctllen {
             let (Some(l), Some(level), Some(ty)) = (
-                self.u64_at(ctl + off),
-                self.u32_at(ctl + off + 8),
-                self.u32_at(ctl + off + 12),
+                self.u64_at(ctl.wrapping_add(off)),
+                self.u32_at(ctl.wrapping_add(off + 8)),
+                self.u32_at(ctl.wrapping_add(off + 12)),
             ) else {
                 return Err(e(EFAULT));
             };
-            if l < CMSG_HDR as u64 || off + l > ctllen {
+            // off is within OPTMEM_MAX, l is anything the program wrote
+            let Some(end) = off.checked_add(l).filter(|&end| l >= CMSG_HDR as u64 && end <= ctllen) else {
                 return Err(e(EINVAL));
-            }
-            let at = ctl + off + CMSG_HDR as u64;
+            };
+            let at = ctl.wrapping_add(off + CMSG_HDR as u64);
             let len = l - CMSG_HDR as u64;
             match (level, ty) {
                 (SOL_SOCKET, SCM_RIGHTS) if unix => {
-                    for i in 0..len / 4 {
-                        let f = self.u32_at(at + 4 * i).ok_or(e(EFAULT))? as i32;
-                        cm.rights.push(self.files.desc_of(f).ok_or(e(9))?); // EBADF
-                    }
-                    if cm.rights.len() > SCM_MAX_FD {
+                    if (cm.rights.len() as u64).saturating_add(len / 4) > SCM_MAX_FD as u64 {
                         return Err(e(EINVAL));
+                    }
+                    for i in 0..len / 4 {
+                        let f = self.u32_at(at.wrapping_add(4 * i)).ok_or(e(EFAULT))? as i32;
+                        cm.rights.push(self.files.desc_of(f).ok_or(e(EBADF))?);
                     }
                 },
                 (SOL_SOCKET, SCM_CREDENTIALS) if unix => {
@@ -1834,7 +1896,7 @@ impl Process {
                         return Err(e(EINVAL));
                     }
                     let (Some(pid), Some(uid), Some(gid)) =
-                        (self.u32_at(at), self.u32_at(at + 4), self.u32_at(at + 8))
+                        (self.u32_at(at), self.u32_at(at.wrapping_add(4)), self.u32_at(at.wrapping_add(8)))
                     else {
                         return Err(e(EFAULT));
                     };
@@ -1858,7 +1920,7 @@ impl Process {
                 (SOL_SOCKET, SCM_RIGHTS | SCM_CREDENTIALS) => return Err(e(EINVAL)),
                 _ => {},
             }
-            off += (l + 7) & !7;
+            off = end.next_multiple_of(8);
         }
         Ok(cm)
     }
@@ -1867,14 +1929,14 @@ impl Process {
         let id = self.sock_id(fd)?;
         let (Some(name), Some(iov), Some(n), Some(ctl), Some(ctllen)) = (
             self.u64_at(at),
-            self.u64_at(at + 16),
-            self.u64_at(at + 24),
-            self.u64_at(at + 32),
-            self.u64_at(at + 40),
+            self.u64_at(at.wrapping_add(16)),
+            self.u64_at(at.wrapping_add(24)),
+            self.u64_at(at.wrapping_add(32)),
+            self.u64_at(at.wrapping_add(40)),
         ) else {
             return Err(e(EFAULT));
         };
-        let iov = self.iovecs(iov, n).ok_or(e(EFAULT))?;
+        let iov = self.iovecs(iov, n).map_err(Ret::Val)?;
         let total: u64 = iov.iter().map(|&(_, l)| l).sum();
         let (data, from, trunc) = self.sock_recv(fd, id, total as usize, flags)?;
         let mut off = 0;
@@ -1886,9 +1948,9 @@ impl Process {
             off += n;
         }
         if name != 0 {
-            let cap = self.u32_at(at + 8).unwrap_or(0) as usize;
+            let cap = self.u32_at(at.wrapping_add(8)).unwrap_or(0) as usize;
             self.write(name, &from[..from.len().min(cap)]);
-            self.put_u32(at + 8, from.len() as u32);
+            self.put_u32(at.wrapping_add(8), from.len() as u32);
         }
         // The control data, as Linux puts it: who sent the bytes (with SO_PASSCRED), then the
         // descriptors that came with them, new ones in this process, as many as the room left
@@ -1905,9 +1967,11 @@ impl Process {
         let fit = if left > CMSG_HDR { (left - CMSG_HDR) / 4 } else { 0 };
         let mut fds = Vec::new();
         for (i, &d) in taken.iter().enumerate() {
+            // (One the table has no room for is dropped, and the control data is cut short)
             if i < fit {
-                let fd = self.files.install(d, 0, flags & MSG_CMSG_CLOEXEC != 0);
-                fds.extend_from_slice(&fd.to_le_bytes());
+                if let Ok(fd) = self.files.install(d, 0, flags & MSG_CMSG_CLOEXEC != 0) {
+                    fds.extend_from_slice(&fd.to_le_bytes());
+                }
             }
             // The reference it had on its way
             self.release_desc(d);
@@ -1920,12 +1984,12 @@ impl Process {
             return Err(e(EFAULT));
         }
         let used = out.len() as u64;
-        self.put_u64(at + 40, used);
+        self.put_u64(at.wrapping_add(40), used);
         let mut mflags = if trunc { MSG_TRUNC as u32 } else { 0 };
         if ctrunc {
             mflags |= MSG_CTRUNC;
         }
-        self.put_u32(at + 48, mflags);
+        self.put_u32(at.wrapping_add(48), mflags);
         Ok(data.len())
     }
 
@@ -1944,7 +2008,7 @@ impl Process {
             };
             match r {
                 Ok(len) => {
-                    if !self.put_u32(at + 56, len as u32) {
+                    if !self.put_u32(at.wrapping_add(56), len as u32) {
                         return e(EFAULT);
                     }
                     done += 1;

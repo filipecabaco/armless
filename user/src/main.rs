@@ -21,6 +21,8 @@ fn usage() -> ! {
   --cwd DIR          the working directory in that filesystem (default /)
   --env NAME=VALUE   an environment variable (repeatable; default PATH, HOME and TERM)
   --keys TEXT        type TEXT into its terminal once it waits for input (\\n, \\r and \\x03 escapes)
+  --spawn CMD        once it waits, run /bin/sh -c CMD beside it as a process of its own (a job of
+                     snowglobe's), print what it printed and its status, and stop
   -m MB              RAM (default 1024; untouched RAM costs nothing)
   --cpus N           CPUs (default 1, at most 8): threads run on them at the same time
   --stop-after TEXT  stop once the program printed TEXT
@@ -37,7 +39,7 @@ fn usage() -> ! {
                      a TCP connection to it (tcp://HOST:PORT) instead (repeatable; needs --net)
   --allow-private    let the program reach loopback, private and link-local addresses at
                      this host (a local tunnel endpoint, say)
-  ARMLESS_EXEC_TRACE=1 prints every syscall"
+  ARMLESS_EXEC_TRACE=1 prints every syscall, ARMLESS_EXEC_TRACE_NR=131,133 only those"
     );
     std::process::exit(2)
 }
@@ -60,6 +62,7 @@ fn main() {
     let mut cwd = "/".to_string();
     let mut env: Vec<String> = Vec::new();
     let mut keys: Option<String> = None;
+    let mut spawn: Option<String> = None;
     let mut net = false;
     let mut publish: Vec<(String, u16)> = Vec::new();
     let mut tunnels = Vec::new();
@@ -101,6 +104,7 @@ fn main() {
             },
             "--allow-private" => allow_private = true,
             "--env" => env.push(val()),
+            "--spawn" => spawn = Some(val()),
             "--keys" => {
                 keys = Some(
                     val()
@@ -227,6 +231,14 @@ fn main() {
     };
     let ready = start.elapsed();
     p.trace = std::env::var_os("ARMLESS_EXEC_TRACE").is_some();
+    // ARMLESS_EXEC_TRACE_NR=129,131,133: only those system calls
+    if let Ok(nrs) = std::env::var("ARMLESS_EXEC_TRACE_NR") {
+        p.trace = true;
+        p.trace_only = nrs
+            .split(',')
+            .filter_map(|n| n.trim().parse().ok())
+            .collect();
+    }
     // The line, and its echo, which isn't the answer waited for
     let mut printed = Vec::new();
     let lines_before = input.as_ref().map(|line| {
@@ -269,6 +281,35 @@ fn main() {
             }
             match status {
                 Status::Running => {},
+                Status::Idle(_) if spawn.is_some() => {
+                    let cmd = spawn.take().unwrap();
+                    let argv = ["/bin/sh".to_string(), "-c".into(), cmd];
+                    let pid = loop {
+                        match smp.lock().spawn(&argv, &env, &cwd, None) {
+                            Ok(pid) => break pid,
+                            Err(armless_user::ExecError::Need(_)) => {
+                                std::thread::sleep(Duration::from_millis(5))
+                            },
+                            Err(e) => die(e),
+                        }
+                    };
+                    smp.lock().spawn_close_input(pid);
+                    let exit = loop {
+                        smp.run(0, cpu, Duration::from_millis(20));
+                        let r = smp.lock().spawn_poll(pid).unwrap();
+                        let _ = std::io::stdout().write_all(&r.stdout);
+                        let _ = std::io::stderr().write_all(&r.stderr);
+                        if let Some(e) = r.exit {
+                            break e;
+                        }
+                        if start.elapsed() > timeout {
+                            die("the spawned command timed out")
+                        }
+                    };
+                    smp.lock().spawn_release(pid);
+                    eprintln!("armless-exec: spawned command exited {exit}");
+                    break status;
+                },
                 Status::Idle(_) if keys.is_some() => {
                     smp.lock().input(keys.take().unwrap().as_bytes());
                     smp.poke();
@@ -292,6 +333,9 @@ fn main() {
         };
         // The other CPUs' threads back in the process, for a snapshot to have them
         smp.pause(workers);
+        if std::env::var_os("ARMLESS_EXEC_WAITS").is_some() {
+            eprint!("--- waits\n{}", smp.lock().describe_waits());
+        }
         for (i, t) in smp.times().iter().enumerate().take(workers + 1) {
             eprintln!(
                 "cpu{i}: guest {:.2}s, waiting for the lock {:.2}s, holding it {:.2}s",
@@ -345,6 +389,10 @@ fn main() {
     );
     eprintln!("syscalls: {:?}", stats.syscalls);
     eprintln!("unknown_syscalls: {:?}", stats.unknown);
+    eprintln!(
+        "faults (processes that died of SIGSEGV): {:?}",
+        stats.faults
+    );
     eprintln!("opens: {:?}", stats.opens);
     std::process::exit(match status {
         Status::Exited(c) => c,

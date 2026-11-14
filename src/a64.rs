@@ -571,12 +571,12 @@ impl<H: Host> Cpu<H> {
                     // SYSL: nothing implemented
                     return Err(Event::undefined());
                 }
-                self.sys_insn(sr::key_of(insn), rt, op1, crn)
+                self.sys_insn(insn, sr::key_of(insn), rt, crn)
             },
             _ => {
                 let key = sr::key_of(insn);
-                if self.el == 0 && op1 != 3 {
-                    return Err(Event::undefined());
+                if self.el == 0 {
+                    self.el0_sysreg(insn, key, l)?;
                 }
                 if l {
                     let v = self.read_sysreg(key)?;
@@ -590,8 +590,60 @@ impl<H: Host> Cpu<H> {
         }
     }
 
+    /// Whether EL0 may make the MRS (`read`) or MSR of system register `key` (by `insn`), as the
+    /// architecture says: the registers EL0 has always (NZCV, FPCR, FPSR, TPIDR_EL0, and reads of
+    /// TPIDRRO_EL0 and DCZID_EL0), the ones SCTLR_EL1 and CNTKCTL_EL1 let it have (a trap to EL1
+    /// when they don't), and UNDEFINED for every other.
+    fn el0_sysreg(&self, insn: u32, key: u32, read: bool) -> Res<()> {
+        const UMA: u64 = 1 << 9; // SCTLR_EL1: DAIF
+        const UCT: u64 = 1 << 15; // SCTLR_EL1: CTR_EL0
+        const EL0PCTEN: u64 = 1 << 0; // CNTKCTL_EL1: the physical counter (and CNTFRQ)
+        const EL0VCTEN: u64 = 1 << 1; // the virtual counter (and CNTFRQ)
+        const EL0VTEN: u64 = 1 << 8; // the virtual timer
+        const EL0PTEN: u64 = 1 << 9; // the physical timer
+        let (sctlr, cntkctl) = (self.sys.sctlr, self.sys.cntkctl);
+        let allowed = match key {
+            sr::NZCV | sr::FPCR | sr::FPSR | sr::TPIDR_EL0 => true,
+            sr::TPIDRRO_EL0 | sr::DCZID_EL0 if read => true,
+            sr::DAIF => sctlr & UMA != 0,
+            sr::CTR_EL0 if read => sctlr & UCT != 0,
+            sr::CNTFRQ_EL0 if read => cntkctl & (EL0PCTEN | EL0VCTEN) != 0,
+            sr::CNTPCT_EL0 | sr::CNTPCTSS_EL0 if read => cntkctl & EL0PCTEN != 0,
+            sr::CNTVCT_EL0 | sr::CNTVCTSS_EL0 if read => cntkctl & EL0VCTEN != 0,
+            sr::CNTP_TVAL_EL0 | sr::CNTP_CTL_EL0 | sr::CNTP_CVAL_EL0 => cntkctl & EL0PTEN != 0,
+            sr::CNTV_TVAL_EL0 | sr::CNTV_CTL_EL0 | sr::CNTV_CVAL_EL0 => cntkctl & EL0VTEN != 0,
+            _ => return Err(Event::undefined()),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Self::sys_trap(insn))
+        }
+    }
+
+    /// The exception of an MRS, MSR or SYS that EL1 keeps from EL0: EC 0x18, with the
+    /// instruction's fields in the ISS (Op0, Op2, Op1, CRn, Rt, CRm, and 1 for a read), which is
+    /// what a kernel decodes to emulate it (Linux does CTR_EL0 and the counters so).
+    fn sys_trap(insn: u32) -> Event {
+        let iss = field(insn, 19, 2) << 20
+            | field(insn, 5, 3) << 17
+            | field(insn, 16, 3) << 14
+            | field(insn, 12, 4) << 10
+            | (insn & 31) << 5
+            | field(insn, 8, 4) << 1
+            | bit(insn, 21) as u32;
+        Event::Sync {
+            ec: ec::SYS64,
+            iss,
+            far: None,
+            ret_next: false,
+        }
+    }
+
     /// SYS instructions: cache maintenance, TLB invalidation, address translation.
-    fn sys_insn(&mut self, key: u32, rt: u32, op1: u32, crn: u32) -> Res<()> {
+    fn sys_insn(&mut self, insn: u32, key: u32, rt: u32, crn: u32) -> Res<()> {
+        // (DC ZVA is EL0's whatever SCTLR_EL1.DZE says: the JIT zeroes the block inline, and
+        // Linux and user mode both set DZE)
         if key == sr::DC_ZVA {
             let va = self.xr(rt) & !63;
             for i in 0..8 {
@@ -599,8 +651,23 @@ impl<H: Host> Cpu<H> {
             }
             return Ok(());
         }
-        if self.el == 0 && op1 != 3 {
-            return Err(Event::undefined());
+        if self.el == 0 {
+            // Cache maintenance to the point of coherency or unification, by address, as
+            // SCTLR_EL1.UCI lets EL0 make it; nothing else
+            const UCI: u64 = 1 << 26;
+            match key {
+                sr::IC_IVAU
+                | sr::DC_CVAC
+                | sr::DC_CVAU
+                | sr::DC_CVAP
+                | sr::DC_CVADP
+                | sr::DC_CIVAC => {
+                    if self.sys.sctlr & UCI == 0 {
+                        return Err(Self::sys_trap(insn));
+                    }
+                },
+                _ => return Err(Event::undefined()),
+            }
         }
         match crn {
             8 => {
@@ -1116,6 +1183,11 @@ impl<H: Host> Cpu<H> {
                 // LDLAR/STLLR (LORegions): not implemented.
                 return Err(Event::undefined());
             }
+            // Unaligned to its size: an Alignment fault, whatever SCTLR_EL1.A says (without
+            // FEAT_LSE2, which ID_AA64MMFR2_EL1 doesn't claim)
+            if !addr.is_multiple_of(bytes as u64) {
+                return Err(self.alignment_fault_as(addr, !load));
+            }
             // LDAR/STLR: ordinary accesses on a single core; with several, a
             // fence after the load-acquire and before the store-release.
             let smp = self.machine.ncpus > 1;
@@ -1136,6 +1208,12 @@ impl<H: Host> Cpu<H> {
         }
         if o1 && size_log < 2 {
             return Err(Event::undefined());
+        }
+        // An exclusive unaligned to all it accesses (a pair: both registers) is an Alignment
+        // fault, before the monitor is looked at: a store-exclusive raises it too
+        let span = if o1 { 2 * bytes } else { bytes } as u64;
+        if !addr.is_multiple_of(span) {
+            return Err(self.alignment_fault_as(addr, !load));
         }
         let smp = self.machine.ncpus > 1;
         if load {
@@ -1202,7 +1280,7 @@ impl<H: Host> Cpu<H> {
                     Ok(ok)
                 },
                 None => {
-                    // Not RAM or unaligned: no atomicity to offer, just store.
+                    // Not RAM: no atomicity to offer, just store (unaligned faulted already)
                     self.write(addr, bytes, new, false)?;
                     Ok(true)
                 },
@@ -1545,3 +1623,6 @@ impl<H: Host> Cpu<H> {
 fn smp_code_all() -> u32 {
     crate::smp::CODE_ALL
 }
+
+#[cfg(test)]
+mod tests;

@@ -177,9 +177,11 @@ impl Runner {
         }
     }
 
-    /// Start (or restart) a thread per CPU.
+    /// Start (or restart) a thread per CPU. The threads of a machine that stopped wait for it to
+    /// be restored, and go on then: a stop from before, when the machine runs again, is not one.
     pub fn start(&mut self) {
         if !self.threads.is_empty() {
+            self.restored();
             return;
         }
         self.ctl.quit.store(false, Ordering::SeqCst);
@@ -224,6 +226,16 @@ impl Runner {
         crate::vm::save_state_cpus(&self.board, &mut cpus, n)
     }
 
+    /// The stop `wait` gives dropped, unless the machine is still stopped: a restore runs it
+    /// again. (A CPU that stops says so to the machine before it says so here, so a stop that
+    /// the machine doesn't have is one from before.)
+    fn restored(&self) {
+        let mut s = self.ctl.stopped.lock().unwrap();
+        if self.board.machine().stop.load(Ordering::SeqCst) == smp::STOP_NONE {
+            *s = None;
+        }
+    }
+
     /// Restore a snapshot (raw or zstd); the CPUs must not be running yet,
     /// or are paused for it. The machine is seeded afresh, as after every restore (`Board::seed`):
     /// otherwise each restore of a snapshot would draw the same "random" numbers.
@@ -232,6 +244,7 @@ impl Runner {
         let mut cpus = p.cpus();
         crate::vm::load_state(&self.board, &mut cpus, data)?;
         self.board.seed(&os_entropy());
+        self.restored();
         Ok(())
     }
 
@@ -250,6 +263,7 @@ impl Runner {
         }
         loader.finish(&self.board, &mut cpus)?;
         self.board.seed(&os_entropy());
+        self.restored();
         Ok(())
     }
 
@@ -448,8 +462,9 @@ fn vcpu_thread(
                         )
                     },
                 };
-                finish(s);
+                // The machine first, for `restored` to tell a stop from one before a restore
                 machine.request_stop(kind);
+                finish(s);
                 me.run_state.store(smp::RUN_IDLE, Ordering::SeqCst);
                 // Stay parked until shut down (or restarted after a load).
                 let mut parked = ctl.parked.lock().unwrap();
@@ -492,5 +507,34 @@ mod tests {
             ids[0], ids[1],
             "each restore of the same snapshot has its own generation"
         );
+    }
+
+    #[test]
+    fn a_restored_machine_has_not_stopped_until_it_stops_again() {
+        let config = crate::vm::Config {
+            memory_size: 16 << 20,
+            ..Default::default()
+        };
+        let (vm, clock) = new_vm(config).unwrap();
+        let mut runner = Runner::new(vm, clock, false);
+        // HLT #1 at 0x1000, where the CPU starts; `b .` at 0x2000
+        runner.with_cpu(0, |c| {
+            c.mem.write(0x1000, &(0xd440_0000u32 | 1 << 5).to_le_bytes());
+            c.mem.write(0x2000, &0x1400_0000u32.to_le_bytes());
+            c.pc = 0x1000;
+        });
+        runner.start();
+        let stop = runner.wait(Some(Duration::from_secs(5)));
+        assert!(matches!(stop, Some(Stopped::Halt(1))), "{stop:?}");
+        // The snapshot resumes at the loop: set before saving, since a restore lets the parked
+        // CPU run at once (from the HLT, it would stop again before a later `with_cpu`)
+        runner.with_cpu(0, |c| c.pc = 0x2000);
+        let state = runner.save_state();
+        // Restored, it runs on (from the loop): no stop to wait for, the old one least of all
+        runner.load_state(&state).unwrap();
+        runner.start();
+        let stop = runner.wait(Some(Duration::from_millis(200)));
+        assert!(stop.is_none(), "{stop:?}");
+        assert!(runner.stopped().is_none());
     }
 }

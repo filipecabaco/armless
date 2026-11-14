@@ -1366,3 +1366,341 @@ fn a_device_opened_from_a_descriptor_of_dev_is_the_device() {
     let (_, status) = run_linked(p);
     ok(&status);
 }
+
+#[test]
+fn the_host_starts_a_process_with_pipes_and_takes_its_output_and_status() {
+    // snowglobe's jobs on a site with no kernel: a shell command run beside the program
+    let mut p = Prog::default();
+    p.put(0x200, b"out\n").put(0x210, b"err\n");
+    p.sys(173, &[]); // getppid: 0 for the one the host started
+    let at = p.code.len();
+    p.code.push(0); // cbnz x0: the first process's part
+    p.out(0x200, 4);
+    p.sys(64, &[I(2), D(0x210), I(4)]);
+    p.sys(63, &[I(0), D(0x300), I(4)]).expect(4);
+    p.sys(64, &[I(1), D(0x300), I(4)]);
+    p.sys(63, &[I(0), D(0x300), I(4)]).expect(0); // its stdin closed: the end
+    p.sys(94, &[I(3)]);
+    p.code[at] = 0xb500_0000 | ((p.code.len() - at) as u32) << 5;
+    // The first process waits on the terminal
+    p.sys(63, &[I(0), D(0x300), I(1)]);
+    let mut vm = machine_with_prog(&p.elf());
+    let board = vm.board.clone();
+    let mut proc = Process::exec(&mut vm.cpus[0], board, &["/usr/bin/prog".into()], &[], "/").unwrap();
+    let mut step = |proc: &mut Process| proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20));
+    step(&mut proc);
+    let pid = proc.spawn(&["prog".into()], &["PATH=/usr/bin".into()], "/tmp", None).unwrap();
+    assert_ne!(pid, 1000);
+    assert!(proc.spawn_input(pid, b"ping"));
+    proc.spawn_close_input(pid);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let begun = std::time::Instant::now();
+    let exit = loop {
+        step(&mut proc);
+        let r = proc.spawn_poll(pid).unwrap();
+        out.extend(r.stdout);
+        err.extend(r.stderr);
+        if let Some(e) = r.exit {
+            break e;
+        }
+        assert!(begun.elapsed() < std::time::Duration::from_secs(10), "still running");
+    };
+    assert_eq!((out.as_slice(), err.as_slice(), exit), (&b"out\nping"[..], &b"err\n"[..], 3));
+    // Released: gone, and the first process goes on waiting
+    proc.spawn_release(pid);
+    assert!(proc.spawned().is_empty());
+    assert!(proc.spawn_poll(pid).is_none());
+    assert_eq!(proc.processes(), 1);
+    assert!(proc.waiting_for_input());
+}
+
+const ENOENT: i64 = -2;
+/// O_RDONLY | O_DIRECTORY | O_CLOEXEC
+const O_DIR: u64 = 0o2_200_000;
+
+/// read(fd, data[at..], 256), then write(1) of what it read
+fn cat(p: &mut Prog, fd: u64, at: u32) {
+    p.sys(63, &[I(fd), D(at), I(256)]).save(0x180);
+    p.sys(64, &[I(1), D(at), W(0x180)]);
+}
+
+/// The names and types of the linux_dirent64 records in `b`, and the position each says is next
+fn dirents(mut b: &[u8]) -> Vec<(String, u8, u64)> {
+    let mut out = Vec::new();
+    while b.len() >= 19 {
+        let off = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let reclen = u16::from_le_bytes([b[16], b[17]]) as usize;
+        let name = b[19..reclen].split(|&c| c == 0).next().unwrap();
+        out.push((String::from_utf8_lossy(name).into_owned(), b[18], off));
+        b = &b[reclen..];
+    }
+    out
+}
+
+#[test]
+fn proc_lists_every_process_with_its_command_line_and_state() {
+    // busybox's ps and pgrep, and snowglobe's `for f in /proc/[0-9]*/cmdline`: the first
+    // process (1000, run as `/usr/bin/prog sleep 4167`) forks 1001, which waits on a pipe
+    let mut p = Prog::default();
+    p.put(0x200, b"/proc/\0").put(0x210, b"/proc/1001/cmdline\0");
+    p.put(0x230, b"/proc/1001/stat\0").put(0x240, b"/proc/self/stat\0");
+    p.put(0x250, b"/proc/1001/status\0").put(0x270, b"/proc/1001\0");
+    p.put(0x280, b"/proc/1002\0").put(0x290, b"\n--\n");
+    // struct pollfd for descriptor 10, POLLIN
+    p.put(0x1a0, &10u32.to_le_bytes()).put(0x1a4, &1u16.to_le_bytes());
+    p.sys(59, &[D(0x100), I(0)]).expect(0); // a pipe: 3, 4
+    let child = p.fork();
+    p.sys(63, &[I(3), D(0x300), I(1)]); // waits for the parent
+    p.parent(child);
+    p.expect(1001);
+    // The image has no /proc: opening it (as musl's glob does, with its slash) still lists
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_DIR), I(0)]).expect(5);
+    p.sys(61, &[I(5), D(0x800), I(8)]).expect(EINVAL); // no room for one
+    // One entry a call (each is 24 bytes), to the end
+    for _ in 0..6 {
+        p.sys(61, &[I(5), D(0x800), I(24)]).save(0x180);
+        p.sys(64, &[I(1), D(0x800), W(0x180)]);
+    }
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x210), I(0), I(0)]).expect(6);
+    cat(&mut p, 6, 0x900);
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x230), I(0), I(0)]).expect(7);
+    cat(&mut p, 7, 0x900);
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x240), I(0), I(0)]).expect(8);
+    cat(&mut p, 8, 0x900);
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x250), I(0), I(0)]).expect(9);
+    cat(&mut p, 9, 0x900);
+    // /proc/1001 is a directory; there is no 1002
+    p.sys(79, &[I(AT_FDCWD), D(0x270), D(0xa00), I(0)]).expect(0);
+    p.arg(0, W(0xa00 + 16)); // st_mode
+    p.code.push(0xd34c_fc00); // lsr x0, x0, #12: the file type
+    p.expect(4); // S_IFDIR >> 12
+    p.sys(79, &[I(AT_FDCWD), D(0x280), D(0xa00), I(0)]).expect(ENOENT);
+    // The child goes on and ends; nobody has waited for it yet
+    p.sys(64, &[I(4), D(0x290), I(1)]).expect(1);
+    p.sys(434, &[I(1001), I(0)]).expect(10); // pidfd_open
+    p.sys(73, &[D(0x1a0), I(1), I(0), I(0), I(8)]).expect(1);
+    p.out(0x290, 4);
+    p.sys(56, &[I(AT_FDCWD), D(0x230), I(0), I(0)]).expect(11);
+    cat(&mut p, 11, 0x900);
+    // A zombie's command line is empty, and its directory is there until it is waited for
+    p.sys(56, &[I(AT_FDCWD), D(0x210), I(0), I(0)]).expect(12);
+    p.sys(63, &[I(12), D(0x900), I(256)]).expect(0);
+    p.sys(79, &[I(AT_FDCWD), D(0x270), D(0xa00), I(0)]).expect(0);
+    p.sys(260, &[I(1001), D(0x380), I(0), I(0)]).expect(1001); // wait4
+    p.sys(79, &[I(AT_FDCWD), D(0x270), D(0xa00), I(0)]).expect(ENOENT);
+    p.sys(56, &[I(AT_FDCWD), D(0x210), I(0), I(0)]).expect(ENOENT);
+    let mut vm = machine_with_prog(&p.elf());
+    let board = vm.board.clone();
+    let args = ["/usr/bin/prog".into(), "sleep".into(), "4167".into()];
+    let mut proc = Process::exec(&mut vm.cpus[0], board, &args, &[], "/").unwrap();
+    let (out, status) = run(&mut proc, &mut vm);
+    ok(&status);
+    // (The terminal wrote each \n as \r\n: back, for the records' bytes)
+    let mut text = Vec::new();
+    for (i, &c) in out.iter().enumerate() {
+        if !(c == b'\r' && out.get(i + 1) == Some(&b'\n')) {
+            text.push(c);
+        }
+    }
+    let mut parts = Vec::new();
+    let mut rest = &text[..];
+    while let Some(i) = rest.windows(4).position(|w| w == b"\n--\n") {
+        parts.push(&rest[..i]);
+        rest = &rest[i + 4..];
+    }
+    parts.push(rest);
+    assert_eq!(parts.len(), 6, "{:?}", String::from_utf8_lossy(&text));
+    // ".", "..", self, then a directory for each process, each with where the next starts
+    let listed = dirents(parts[0]);
+    let names: Vec<&str> = listed.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(names, [".", "..", "self", "1000", "1001"]);
+    assert_eq!((listed[4].1, listed[2].1), (4, 10), "DT_DIR, DT_LNK");
+    assert!(listed.windows(2).all(|w| w[0].2 < w[1].2), "{listed:?}");
+    assert_eq!(parts[1], b"/usr/bin/prog\0sleep\x004167\0");
+    let stat = String::from_utf8_lossy(parts[2]);
+    // Waiting on its pipe (or, on another CPU, not there yet)
+    assert!(stat.starts_with("1001 (prog) S 1000 1000 ") || stat.starts_with("1001 (prog) R 1000 1000 "), "{stat}");
+    assert_eq!(stat.split_whitespace().count(), 52, "{stat}");
+    assert_eq!(stat.split_whitespace().nth(19), Some("1"), "num_threads");
+    assert!(String::from_utf8_lossy(parts[3]).starts_with("1000 (prog) R 1 1000 "));
+    let status = String::from_utf8_lossy(parts[4]);
+    for line in ["Name:\tprog\n", "Pid:\t1001\n", "Tgid:\t1001\n", "PPid:\t1000\n", "Uid:\t0\t0\t0\t0\n", "Threads:\t1\n"] {
+        assert!(status.contains(line), "{line:?} in {status}");
+    }
+    assert!(String::from_utf8_lossy(parts[5]).starts_with("1001 (prog) Z 1000 "));
+}
+
+#[test]
+fn a_restored_process_keeps_its_command_line() {
+    // Saved while it waits for a key; restored, it reads its /proc/self/cmdline
+    let mut p = Prog::default();
+    p.put(0x200, b"/proc/self/cmdline\0");
+    p.sys(63, &[I(0), D(0x380), I(1)]).expect(1);
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(0), I(0)]).expect(3);
+    cat(&mut p, 3, 0x900);
+    let elf = p.elf();
+    let mut vm = machine_with_prog(&elf);
+    let board = vm.board.clone();
+    let args = ["/usr/bin/prog".into(), "-c".into(), "a b".into()];
+    let mut proc = Process::exec(&mut vm.cpus[0], board, &args, &[], "/").unwrap();
+    let status = loop {
+        match proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20)) {
+            armless_user::Status::Running => {},
+            s => break s,
+        }
+    };
+    assert!(matches!(status, armless_user::Status::Idle(None)), "{status:?}");
+    let process = proc.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((proc, vm));
+
+    let mut vm = machine_with_prog(&elf);
+    vm.load_state(&state).unwrap();
+    let mut proc = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    proc.input(b"\n");
+    let (out, status) = run(&mut proc, &mut vm);
+    ok(&status);
+    assert!(out.ends_with(b"/usr/bin/prog\0-c\0a b\0"), "{:?}", String::from_utf8_lossy(&out));
+}
+
+const SIGPIPE: u64 = 13;
+const EPIPE: i64 = -32;
+const MSG_NOSIGNAL: u64 = 0x4000;
+
+/// Runs `p` on a machine of its own: how it ended
+fn ends(p: Prog) -> armless_user::Status {
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    run(&mut proc, &mut vm).1
+}
+
+#[test]
+fn a_write_to_a_pipe_nobody_reads_ends_the_program_by_sigpipe_unless_it_ignores_it() {
+    // pipe2: 3 and 4; the read end closed, a write ends the program (as a shell says it, 141)
+    let mut p = Prog::default();
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x200), I(1)]);
+    let status = ends(p);
+    assert!(matches!(status, armless_user::Status::Exited(141)), "{status:?}");
+
+    // Ignored: the write is EPIPE
+    let mut p = Prog::default();
+    p.ignore_signal(SIGPIPE);
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x200), I(1)]).expect(EPIPE);
+    ok(&ends(p));
+
+    // Blocked: EPIPE, and the signal pending for the thread
+    let mut p = Prog::default();
+    p.put(0x180, &(1u64 << (SIGPIPE - 1)).to_le_bytes());
+    p.sys(135, &[I(SIG_BLOCK), D(0x180), I(0), I(8)]).expect(0);
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    p.sys(57, &[I(3)]).expect(0);
+    p.sys(64, &[I(4), D(0x200), I(1)]).expect(EPIPE);
+    p.sys(136, &[D(0x190), I(8)]).expect(0); // rt_sigpending
+    p.arg(0, W(0x190));
+    p.expect_wide(1 << (SIGPIPE - 1));
+    ok(&ends(p));
+}
+
+#[test]
+fn a_send_to_a_closed_stream_raises_sigpipe_unless_msg_nosignal() {
+    // socketpair(AF_UNIX, SOCK_STREAM): 3 and 4; 4 closed
+    let mut p = Prog::default();
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0);
+    p.sys(57, &[I(4)]).expect(0);
+    // sendto with MSG_NOSIGNAL: EPIPE and nothing else; then a write: the signal
+    p.sys(206, &[I(3), D(0x200), I(1), I(MSG_NOSIGNAL), I(0), I(0)]).expect(EPIPE);
+    p.sys(64, &[I(3), D(0x200), I(1)]);
+    let status = ends(p);
+    assert!(matches!(status, armless_user::Status::Exited(141)), "{status:?}");
+
+    let mut p = Prog::default();
+    p.ignore_signal(SIGPIPE);
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0);
+    p.sys(57, &[I(4)]).expect(0);
+    p.sys(206, &[I(3), D(0x200), I(1), I(0), I(0), I(0)]).expect(EPIPE);
+    ok(&ends(p));
+}
+
+#[test]
+fn sendfile_to_a_full_pipe_leaves_what_it_could_not_write_in_the_file() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/s\0").put(0x220, b"0123456789abcdef");
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_RDWR_CREAT), I(0o644)]).expect(3);
+    p.sys(64, &[I(3), D(0x220), I(16)]).expect(16);
+    p.sys(62, &[I(3), I(0), I(0)]).expect(0);
+    // pipe2(O_NONBLOCK): 4 and 5, filled with 64 KiB of zeros
+    p.sys(59, &[D(0x110), I(SFD_NONBLOCK)]).expect(0);
+    p.sys(222, &[I(0), I(1 << 16), I(3), I(0x22), I(u64::MAX), I(0)]).save(0x100);
+    p.sys(64, &[I(5), X(0x100), I(1 << 16)]).expect_wide(1 << 16);
+    // No room: EAGAIN, and the file's position where it was
+    p.sys(71, &[I(5), I(3), I(0), I(16)]).expect(EAGAIN);
+    p.sys(62, &[I(3), I(0), I(1)]).expect(0);
+    // Room for 8: 8 go, and the position moves by 8
+    p.sys(63, &[I(4), D(0x600), I(8)]).expect(8);
+    p.sys(71, &[I(5), I(3), I(0), I(16)]).expect(8);
+    p.sys(62, &[I(3), I(0), I(1)]).expect(8);
+    // At an offset (0) with room for 4: the offset moves by 4, the position not at all
+    p.sys(63, &[I(4), D(0x600), I(4)]).expect(4);
+    p.sys(71, &[I(5), I(3), D(0x1c0), I(16)]).expect(4);
+    p.is(0x1c0, 4);
+    p.sys(62, &[I(3), I(0), I(1)]).expect(8);
+    // What the pipe has after the zeros: each byte sent once
+    p.sys(63, &[I(4), X(0x100), I((1 << 16) - 12)]).expect_wide((1 << 16) - 12);
+    p.sys(63, &[I(4), D(0x600), I(64)]).expect(12);
+    p.out(0x600, 12);
+    let (out, status) = run_linked(p);
+    ok(&status);
+    assert_eq!(out, b"012345670123");
+}
+
+#[test]
+fn a_process_state_whose_frames_are_not_counted_is_refused() {
+    // Saved while it waits for a key, with a page of its own and a System V segment attached
+    // (each read into once): with any of the frames the state counts taken out, something holds
+    // a frame it doesn't count, and the restore says so (rather than a panic later, or a frame
+    // freed while still mapped)
+    let mut p = Prog::default();
+    p.sys(194, &[I(0), I(4096), I(0o1600)]).expect(0);
+    p.sys(196, &[I(0), I(0), I(0)]).save(0x100);
+    p.sys(222, &[I(0), I(4096), I(3), I(0x22), I(u64::MAX), I(0)]).save(0x108);
+    p.sys(63, &[I(0), X(0x100), I(1)]).expect(1);
+    p.sys(63, &[I(0), X(0x108), I(1)]).expect(1);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    proc.input(b"a");
+    let status = loop {
+        match proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20)) {
+            armless_user::Status::Running => {},
+            s => break s,
+        }
+    };
+    assert!(matches!(status, armless_user::Status::Idle(None)), "{status:?}");
+    let process = proc.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((proc, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    // MAGIC, RAM's size, the frames handed out so far, then (frame, count) for each counted
+    let word = |at: usize| u64::from_le_bytes(process[at..at + 8].try_into().unwrap());
+    let n = word(24) as usize;
+    assert!(n > 4, "{n} frames");
+    for i in 0..n {
+        let mut bad = process[..24].to_vec();
+        bad.extend_from_slice(&(n as u64 - 1).to_le_bytes());
+        bad.extend_from_slice(&process[32..32 + 16 * i]);
+        bad.extend_from_slice(&process[32 + 16 * (i + 1)..]);
+        let got = Process::restore(&mut vm.cpus[0], None, &bad);
+        assert!(got.is_err(), "frame {} taken out", word(32 + 16 * i));
+    }
+    // As saved, it is restored
+    assert!(Process::restore(&mut vm.cpus[0], None, &process).is_ok());
+}

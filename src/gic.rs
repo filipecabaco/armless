@@ -472,11 +472,14 @@ impl Gic {
             Some(a.to_vec())
         };
         let h = take(2)?;
-        if h[1] as usize != self.ncpus {
-            return None; // snapshot from a machine with another CPU count
+        // A machine of as many CPUs, or of more: the first are the snapshot's, the others are
+        // as a new machine's are (powered off, `save_cpus`)
+        let n = h[1] as usize;
+        if n == 0 || n > self.ncpus {
+            return None; // snapshot from a machine with more CPUs
         }
         self.dist_enabled = h[0] != 0;
-        for c in self.cpu.iter_mut() {
+        for c in self.cpu.iter_mut().take(n) {
             let b = take(9)?;
             c.enabled = b[0] != 0;
             c.pmr = u32::from_le_bytes(b[1..5].try_into().ok()?);
@@ -492,6 +495,10 @@ impl Gic {
                 c.active_stack
                     .push(u32::from_le_bytes(take(4)?.try_into().ok()?));
             }
+        }
+        // The CPUs the snapshot lacks: as a new machine's, whatever they held before
+        for c in self.cpu.iter_mut().skip(n) {
+            *c = CpuIf::new();
         }
         for k in 0..NUM_SHARED {
             let b = take(3)?;
@@ -524,10 +531,34 @@ mod tests {
         let mut out = Vec::new();
         g.save_cpus(&mut out, 1);
         assert!(Gic::new(1).load(&mut out.as_slice()).is_some());
+        // Onto a machine of more CPUs: the first is the snapshot's, the others are new
+        let mut four = Gic::new(4);
+        assert!(four.load(&mut out.as_slice()).is_some(), "a 4-CPU GIC loads a 1-CPU one");
+        assert_eq!(four.targets[40 - 32], 0b0001);
+        // Not onto fewer
+        let mut out = Vec::new();
+        g.save_cpus(&mut out, 4);
         assert!(
-            Gic::new(4).load(&mut out.as_slice()).is_none(),
-            "the CPU count is checked"
+            Gic::new(2).load(&mut out.as_slice()).is_none(),
+            "a snapshot of more CPUs than the machine has"
         );
+    }
+
+    #[test]
+    fn the_cpus_a_snapshot_lacks_load_as_a_new_machine_has_them() {
+        // A 1-CPU snapshot onto a 2-CPU GIC whose second CPU interface was in use: it is reset
+        let mut out = Vec::new();
+        Gic::new(1).save(&mut out);
+        let mut two = Gic::new(2);
+        two.cpu_write(1, 0x00, 1);
+        two.cpu_write(1, 0x04, 0xf0);
+        two.dist_write(1, 0x100, 4, 0xffff);
+        two.load(&mut out.as_slice()).unwrap();
+        let fresh = CpuIf::new();
+        let c = &two.cpu[1];
+        assert_eq!((c.enabled, c.pmr, c.bpr), (fresh.enabled, fresh.pmr, fresh.bpr));
+        assert!(c.active_stack.is_empty());
+        assert!(c.banked.iter().zip(&fresh.banked).all(|(a, b)| a.flags() == b.flags()));
     }
 
     #[test]

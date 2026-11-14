@@ -1,6 +1,6 @@
 [package]
 name = "armless-user"
-version = "0.17.3"
+version = "0.19.2"
 edition = "2021"
 publish = false
 description = "User mode for armless: run a static aarch64 Linux ELF with no guest kernel, its syscalls answered by the host"
@@ -20,3 +20,10 @@ wasm-api = ["armless/wasm-api"]
 [lib]
 name = "armless_user"
 path = "src/lib.rs"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "rayon"] }
+
+[[bench]]
+name = "syscalls"
+harness = false
