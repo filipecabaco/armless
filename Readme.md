@@ -312,12 +312,15 @@ for armless 0.2.10 and older.
 | `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node) |
 | `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands |
 | `cargo bench --bench machine` | host-side costs with criterion: an instruction interpreted and compiled, a page's compile, a snapshot |
+| `cargo bench --bench zstd` | the zstd decoder's throughput, whole and in pieces |
 
 [docs/profiling.md](docs/profiling.md) explains the benchmarks and profiles. CI
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the unit tests (with and
 without overflow checks), clippy natively and for wasm32, the KVM backend's lints, the wasm
 builds, and a Linux job that boots a kernel and compares userspace and SMP output with
-qemu-aarch64, natively, with the native JIT and through `armless.js`.
+qemu-aarch64, natively, with the native JIT and through `armless.js`. On pull requests,
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml) runs the criterion benchmarks on the
+base and on the change, and comments with how they compare.
 
 ## Releases
 

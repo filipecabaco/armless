@@ -3,7 +3,7 @@ members = ["user"]
 
 [package]
 name = "armless"
-version = "0.19.2"
+version = "0.19.3"
 edition = "2021"
 # Cranelift (the native-jit feature) needs 1.97
 rust-version = "1.97"
@@ -28,11 +28,15 @@ sha2 = { version = "0.11", default-features = false }
 x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 # Native egress: HTTPS out of the machine (system roots, so TLS-intercepting proxies work)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1"
+# zstd decoding on native hosts (the bundled libzstd; `experimental` for ZSTD_customMem, which hands
+# the decoder src/zstd.rs's allocator)
+zstd-sys = { version = "2", default-features = false, features = ["experimental"] }
+# The zstd decoder's large blocks (its windows) as anonymous mappings, unmapped when freed
+memmap2 = "0.9.12"
 # The native JIT: the blocks the JIT translates to wasm, compiled to host code instead (src/jit/native.rs)
 cranelift-codegen = { version = "=0.137.1", optional = true }
 cranelift-frontend = { version = "=0.137.1", optional = true }
@@ -59,6 +63,10 @@ hypervisor = []
 
 [[bench]]
 name = "machine"
+harness = false
+
+[[bench]]
+name = "zstd"
 harness = false
 
 [[bin]]
