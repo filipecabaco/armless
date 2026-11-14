@@ -26,7 +26,7 @@ use std::time::Duration;
 use crate::errno::{
     EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EALREADY, EBADF, ECONNREFUSED, ECONNRESET,
     EDESTADDRREQ, EEXIST, EFAULT, EINPROGRESS, EINVAL, EISCONN, EMFILE, EMSGSIZE, ENETUNREACH,
-    ENOPROTOOPT, ENOSYS, ENOTCONN, ENOTSOCK, EOPNOTSUPP, EPERM, EPIPE, EPROTONOSUPPORT,
+    ENOBUFS, ENOPROTOOPT, ENOSYS, ENOTCONN, ENOTSOCK, EOPNOTSUPP, EPERM, EPIPE, EPROTONOSUPPORT,
     ESOCKTNOSUPPORT, ESRCH,
 };
 use crate::files::{self, Desc, Got, Kind, O_NONBLOCK, S_IFSOCK};
@@ -65,6 +65,8 @@ const SCM_RIGHTS: u32 = 1;
 const SCM_CREDENTIALS: u32 = 2;
 /// Descriptors one message carries at most (the kernel's SCM_MAX_FD)
 const SCM_MAX_FD: usize = 253;
+/// The control data one sendmsg may carry at most (Linux's optmem_max): more is ENOBUFS
+const OPTMEM_MAX: u64 = 128 << 10;
 /// sizeof(struct cmsghdr)
 const CMSG_HDR: usize = 16;
 /// The credentials of bytes nobody is known to have sent (from a state that did not keep them):
@@ -1845,6 +1847,9 @@ impl Process {
     fn cmsgs_in(&self, id: u32, ctl: u64, ctllen: u64) -> Result<Cm, Ret> {
         let unix = self.files.net.socks.get(&id).is_some_and(|s| !s.inet());
         let mut cm = Cm::default();
+        if ctllen > OPTMEM_MAX {
+            return Err(e(ENOBUFS));
+        }
         let mut off = 0;
         while off + CMSG_HDR as u64 <= ctllen {
             let (Some(l), Some(level), Some(ty)) = (
@@ -1854,19 +1859,20 @@ impl Process {
             ) else {
                 return Err(e(EFAULT));
             };
-            if l < CMSG_HDR as u64 || off + l > ctllen {
+            // off is within OPTMEM_MAX, l is anything the program wrote
+            let Some(end) = off.checked_add(l).filter(|&end| l >= CMSG_HDR as u64 && end <= ctllen) else {
                 return Err(e(EINVAL));
-            }
-            let at = ctl + off + CMSG_HDR as u64;
+            };
+            let at = ctl.wrapping_add(off + CMSG_HDR as u64);
             let len = l - CMSG_HDR as u64;
             match (level, ty) {
                 (SOL_SOCKET, SCM_RIGHTS) if unix => {
+                    if (cm.rights.len() as u64).saturating_add(len / 4) > SCM_MAX_FD as u64 {
+                        return Err(e(EINVAL));
+                    }
                     for i in 0..len / 4 {
                         let f = self.u32_at(at.wrapping_add(4 * i)).ok_or(e(EFAULT))? as i32;
                         cm.rights.push(self.files.desc_of(f).ok_or(e(EBADF))?);
-                    }
-                    if cm.rights.len() > SCM_MAX_FD {
-                        return Err(e(EINVAL));
                     }
                 },
                 (SOL_SOCKET, SCM_CREDENTIALS) if unix => {
@@ -1899,7 +1905,7 @@ impl Process {
                 (SOL_SOCKET, SCM_RIGHTS | SCM_CREDENTIALS) => return Err(e(EINVAL)),
                 _ => {},
             }
-            off += (l + 7) & !7;
+            off = end.next_multiple_of(8);
         }
         Ok(cm)
     }

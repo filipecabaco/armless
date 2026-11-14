@@ -419,23 +419,60 @@ impl Process {
         self.rw_iov(fd0, true, &iov, at, if nr == 287 { a[5] } else { 0 })
     }
 
-    /// sendfile(out, in, offset*, count)
+    /// sendfile(out, in, offset*, count). What is read and not written goes back: the input's
+    /// position (or *offset) moves by what was written, and a pipe out is read for no more than
+    /// its room (an input that can't seek back, a pipe or socket, would lose the rest).
     pub(super) fn sys_sendfile(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
-        let fd0 = a[0] as i32;
-        let off = (a[2] != 0).then(|| self.u64_at(a[2])).flatten();
-        match self.read_fd(a[1] as i32, a[3].min(1 << 20) as usize, off) {
-            Ok(b) => match self.write_fd(fd0, &b, None) {
-                Ok(n) => {
-                    if let Some(o) = off {
-                        self.put_u64(a[2], o + n as u64);
-                    }
-                    v(n as i64)
-                },
-                Err(r) => r,
+        let (fd0, fd1) = (a[0] as i32, a[1] as i32);
+        let off = match a[2] {
+            0 => None,
+            at => match self.u64_at(at) {
+                Some(o) => Some(o),
+                None => return v(-EFAULT),
             },
-            Err(r) => r,
+        };
+        let mut max = a[3].min(1 << 20) as usize;
+        if let Some(Desc {
+            kind: Kind::PipeWrite(p),
+            ..
+        }) = self.files.get(fd0)
+        {
+            let room = self
+                .files
+                .pipes
+                .get(p)
+                .map_or(0, |p| PIPE_BUF_MAX.saturating_sub(p.buf.len()));
+            if room == 0 {
+                // Nothing read: the write waits, or fails, as it would with no room
+                return self.write_fd(fd0, &[], None).map_or_else(|r| r, |n| v(n as i64));
+            }
+            max = max.min(room);
         }
+        let b = match self.read_fd(fd1, max, off) {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
+        let wrote = self.write_fd(fd0, &b, None);
+        let unwritten = (b.len() - wrote.as_ref().map_or(0, |&n| n.min(b.len()))) as u64;
+        match off {
+            Some(o) => {
+                if let Ok(n) = wrote {
+                    self.put_u64(a[2], o.wrapping_add(n as u64));
+                }
+            },
+            None if unwritten > 0 => {
+                if let Some(Desc {
+                    kind: Kind::File { pos, .. } | Kind::Mem { pos, .. },
+                    ..
+                }) = self.files.get_mut(fd1)
+                {
+                    *pos = pos.saturating_sub(unwritten);
+                }
+            },
+            None => {},
+        }
+        wrote.map_or_else(|r| r, |n| v(n as i64))
     }
 
     /// lseek

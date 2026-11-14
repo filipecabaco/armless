@@ -245,7 +245,7 @@ impl Files {
     /// that nobody took): it goes when it has none, as `close` says.
     pub fn release(&mut self, d: u32) -> Option<Option<Ino>> {
         let desc = self.descs.get_mut(&d)?;
-        desc.refs -= 1;
+        desc.refs = desc.refs.saturating_sub(1);
         if desc.refs > 0 {
             return Some(None);
         }
@@ -263,9 +263,9 @@ impl Files {
     fn pipe_end(&mut self, p: u32, reader: bool) {
         if let Some(pipe) = self.pipes.get_mut(&p) {
             if reader {
-                pipe.readers -= 1;
+                pipe.readers = pipe.readers.saturating_sub(1);
             } else {
-                pipe.writers -= 1;
+                pipe.writers = pipe.writers.saturating_sub(1);
             }
             if pipe.readers == 0 && pipe.writers == 0 {
                 self.pipes.remove(&p);
@@ -448,6 +448,46 @@ impl Files {
         }
         f.net = Net::load(r)?;
         Ok(f)
+    }
+
+    /// Checks a restored state's counts against the descriptor `tables` of its processes: each
+    /// description counts at least the descriptors that refer to it, each pipe at least the ends
+    /// it has, and none is near overflowing when counted once more.
+    pub fn check_refs<'a>(
+        &self,
+        tables: impl Iterator<Item = &'a BTreeMap<i32, (u32, bool)>>,
+    ) -> Result<(), String> {
+        let bad = || Err("bad descriptor counts".to_string());
+        let mut uses: BTreeMap<u32, u64> = BTreeMap::new();
+        for &(d, _) in tables.flat_map(|t| t.values()) {
+            *uses.entry(d).or_default() += 1;
+        }
+        let mut ends: BTreeMap<(u32, bool), u64> = BTreeMap::new();
+        for (id, d) in &self.descs {
+            if d.refs > u32::MAX / 2 || (d.refs as u64) < uses.get(id).copied().unwrap_or(0) {
+                return bad();
+            }
+            match d.kind {
+                Kind::PipeRead(p) => *ends.entry((p, true)).or_default() += 1,
+                Kind::PipeWrite(p) => *ends.entry((p, false)).or_default() += 1,
+                _ => {},
+            }
+        }
+        for p in self.pipes.values() {
+            if p.readers > u32::MAX / 2 || p.writers > u32::MAX / 2 {
+                return bad();
+            }
+        }
+        for ((p, reader), n) in ends {
+            let Some(pipe) = self.pipes.get(&p) else {
+                continue;
+            };
+            let have = if reader { pipe.readers } else { pipe.writers };
+            if (have as u64) < n {
+                return bad();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -935,5 +975,31 @@ mod tests {
         assert_eq!(&b[24 + 19..24 + 23], b"1000");
         assert_eq!(encode_dirents(entries.clone(), 2, 24).unwrap(), (b[..24].to_vec(), 3));
         assert_eq!(encode_dirents(entries, 2, 16), Err(-EINVAL));
+    }
+
+    #[test]
+    fn a_restored_states_descriptions_count_every_descriptor_and_pipe_end() {
+        let mut f = Files::default();
+        let p = f.new_pipe();
+        let (r, w) = (f.add(Kind::PipeRead(p), 0), f.add(Kind::PipeWrite(p), 1));
+        let table = BTreeMap::from([(3, (r, false)), (4, (w, false)), (5, (w, false))]);
+        f.descs.get_mut(&r).unwrap().refs = 1;
+        f.descs.get_mut(&w).unwrap().refs = 2;
+        assert!(f.check_refs([&table].into_iter()).is_ok());
+        // A description referred to more than it counts, or counted near overflowing
+        f.descs.get_mut(&w).unwrap().refs = 1;
+        assert!(f.check_refs([&table].into_iter()).is_err());
+        f.descs.get_mut(&w).unwrap().refs = u32::MAX;
+        assert!(f.check_refs([&table].into_iter()).is_err());
+        f.descs.get_mut(&w).unwrap().refs = 2;
+        // A pipe with fewer readers than read ends
+        f.pipes.get_mut(&p).unwrap().readers = 0;
+        assert!(f.check_refs([&table].into_iter()).is_err());
+        // Letting go of more than was counted (a description at 0, a pipe without the reader it
+        // counted) is the end of them, not a panic
+        f.descs.get_mut(&w).unwrap().refs = 0;
+        assert_eq!(f.release(w), Some(None));
+        assert_eq!(f.release(r), Some(None));
+        assert!(f.release(r).is_none() && f.pipes.is_empty());
     }
 }

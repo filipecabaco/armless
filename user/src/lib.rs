@@ -1642,6 +1642,13 @@ impl Process {
             }
             files.net.load_rights(&mut r, ver)?;
         }
+        let held: Vec<_> = spaces.iter().map(|m| m.borrow()).collect();
+        mm::check_frames(
+            &frames,
+            held.iter().map(|m| &**m),
+            shm.frames().chain(file_pages.values().copied()),
+        )?;
+        drop(held);
         files.net.load_cm(&mut r, ver)?;
         // Before ARMLUSR7 only ITIMER_REAL was kept
         if ver >= 7 {
@@ -1651,6 +1658,7 @@ impl Process {
         if ver >= 8 {
             files.locks = locks::Locks::load(&mut r)?;
         }
+        files.check_refs(all.values().map(|p| &p.fds))?;
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);

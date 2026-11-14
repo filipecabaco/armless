@@ -28,7 +28,7 @@
 //! The CPU's TLB is told of what a call changes after it (`sync_mmu`): the whole of it when pages
 //! went away or lost permissions, the pages of a break of sharing otherwise.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use armless::cpu::Cpu;
 use armless::dev::fs::{Ino, EIO};
@@ -140,21 +140,36 @@ impl Frames {
         Some(f * PAGE)
     }
 
+    /// The index in `refs` of the frame at `pa`, if it is one of RAM's. (A restored state's
+    /// frames are checked by `check_frames`, so this only keeps a bad one from being a panic.)
+    fn frame(&self, pa: u64) -> Option<usize> {
+        usize::try_from(pa / PAGE).ok().filter(|&i| i < self.refs.len())
+    }
+
     pub(crate) fn incref(&mut self, pa: u64) {
-        self.refs[(pa / PAGE) as usize] += 1;
+        if let Some(i) = self.frame(pa) {
+            self.refs[i] = self.refs[i].saturating_add(1);
+        }
     }
 
     pub(crate) fn decref(&mut self, pa: u64) {
-        let r = &mut self.refs[(pa / PAGE) as usize];
-        *r -= 1;
-        if *r == 0 {
+        let Some(i) = self.frame(pa).filter(|&i| self.refs[i] > 0) else {
+            return;
+        };
+        self.refs[i] -= 1;
+        if self.refs[i] == 0 {
             self.dying.push(pa / PAGE);
             self.live -= 1;
         }
     }
 
     pub(crate) fn count(&self, pa: u64) -> u32 {
-        self.refs[(pa / PAGE) as usize]
+        self.frame(pa).map_or(0, |i| self.refs[i])
+    }
+
+    /// Whether `pa` is the address of a frame in use: in RAM, page aligned and counted.
+    fn held(&self, pa: u64) -> bool {
+        pa.is_multiple_of(PAGE) && self.count(pa) > 0
     }
 
     /// The frames freed so far zeroed, their memory given back to the host, and what was decoded
@@ -488,7 +503,7 @@ impl Mm {
         true
     }
 
-    fn overlaps(&self, a: u64, b: u64) -> bool {
+    pub(crate) fn overlaps(&self, a: u64, b: u64) -> bool {
         self.find(a).is_some() || self.vmas.range(a..b).next().is_some()
     }
 
@@ -916,7 +931,13 @@ impl Mm {
             per_file: BTreeMap::new(),
             refs: Vec::new(),
         };
-        if root >= ram_size || mmap_top > VA_END || mmap_floor > mmap_top {
+        if root >= ram_size
+            || !root.is_multiple_of(PAGE)
+            || brk_start > brk
+            || brk > VA_END
+            || mmap_top > VA_END
+            || mmap_floor > mmap_top
+        {
             return Err(bad());
         }
         for _ in 0..r.u()? {
@@ -955,6 +976,54 @@ impl Mm {
         }
         Ok(m)
     }
+}
+
+/// Checks a restored state's frames before anything uses them: the tables and pages of every
+/// space in `spaces`, and the frames `others` hold (System V segments, shared file pages), are
+/// each a frame of RAM, page aligned, and counted at least once for everything that holds it.
+/// (The tables themselves are in the state's RAM: a descriptor out of RAM, or two for a frame
+/// counted once, would be a panic, or a frame freed while still mapped.)
+pub(crate) fn check_frames<'a>(
+    f: &Frames,
+    spaces: impl Iterator<Item = &'a Mm>,
+    mut others: impl Iterator<Item = u64>,
+) -> Result<(), String> {
+    let mut seen: HashMap<u64, u64> = HashMap::new();
+    let mut hold = |pa: u64| {
+        let n = seen.entry(pa).or_default();
+        *n += 1;
+        if f.held(pa) && *n <= f.count(pa) as u64 {
+            Ok(())
+        } else {
+            Err(format!("bad frame {pa:#x} in the state"))
+        }
+    };
+    for m in spaces {
+        hold(m.root)?;
+        for i in 0..512 {
+            let d1 = f.get(m.root + 8 * i);
+            if d1 & 1 == 0 {
+                continue;
+            }
+            let t2 = d1 & ADDR;
+            hold(t2)?;
+            for j in 0..512 {
+                let d2 = f.get(t2 + 8 * j);
+                if d2 & 1 == 0 {
+                    continue;
+                }
+                let t3 = d2 & ADDR;
+                hold(t3)?;
+                for k in 0..512 {
+                    let d = f.get(t3 + 8 * k);
+                    if d & 1 != 0 {
+                        hold(d & ADDR)?;
+                    }
+                }
+            }
+        }
+    }
+    others.try_for_each(hold)
 }
 
 // ---------------------------------------------------------------- the process's side
@@ -2015,5 +2084,77 @@ impl SharedMm {
 
     pub(crate) fn strong_count(m: &SharedMm) -> usize {
         std::sync::Arc::strong_count(&m.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RAM: u64 = 64 * PAGE;
+
+    fn frames() -> Frames {
+        Frames::new(Ram::zeroed(RAM as usize), Box::new(|_| {}))
+    }
+
+    /// A space with a page mapped at 0x1000: the space, and the page's frame
+    fn space(f: &mut Frames) -> (Mm, u64) {
+        let m = Mm::new(f, 0x10_0000, 0x1000_0000, 0x2000_0000).unwrap();
+        let pa = f.alloc().unwrap();
+        assert!(m.set(f, 0x1000, pa | bits(PROT_READ, true)));
+        (m, pa)
+    }
+
+    #[test]
+    fn a_frame_out_of_ram_or_not_counted_is_no_panic() {
+        let mut f = frames();
+        for pa in [RAM, 1 << 40, !(PAGE - 1)] {
+            f.incref(pa);
+            f.decref(pa);
+            assert_eq!(f.count(pa), 0);
+        }
+        f.decref(5 * PAGE);
+        assert_eq!((f.count(5 * PAGE), f.live), (0, 0));
+    }
+
+    #[test]
+    fn a_restored_states_frames_are_each_in_ram_and_counted_for_all_that_hold_them() {
+        let mut f = frames();
+        let (m, pa) = space(&mut f);
+        let check = |f: &Frames, other: &[u64]| check_frames(f, [&m].into_iter(), other.iter().copied());
+        assert!(check(&f, &[]).is_ok());
+        // Held twice (the space, and a shared file page), counted once; then twice
+        assert!(check(&f, &[pa]).is_err());
+        f.incref(pa);
+        assert!(check(&f, &[pa]).is_ok());
+        // Past RAM, off a page, never handed out
+        for bad in [1 << 40, pa + 8, 40 * PAGE] {
+            assert!(check(&f, &[bad]).is_err(), "{bad:#x}");
+        }
+        // A page's descriptor in the tables (the state's RAM) past RAM, or at a frame not counted
+        let slot = m.slot(&f, 0x1000).unwrap();
+        for bad in [1 << 40, 40 * PAGE] {
+            f.put(slot, bad | bits(PROT_READ, true));
+            assert!(check(&f, &[]).is_err(), "{bad:#x}");
+        }
+        // A table's
+        f.put(slot, 0);
+        f.put(m.root + 8 * idx(0x1000, 1), (1 << 40) | VALID);
+        assert!(check(&f, &[]).is_err());
+    }
+
+    #[test]
+    fn a_memory_map_with_its_root_off_a_page_or_its_break_out_of_the_space_is_refused() {
+        let mut f = frames();
+        let (m, _) = space(&mut f);
+        let mut w = W(Vec::new());
+        m.save(&mut w);
+        assert!(Mm::load(&mut R(&w.0), RAM).is_ok());
+        // root, brk_start and brk are its first words
+        for (i, v) in [(0, m.root + 8), (0, RAM), (1, u64::MAX - 1), (2, VA_END + PAGE)] {
+            let mut b = w.0.clone();
+            b[8 * i..8 * i + 8].copy_from_slice(&v.to_le_bytes());
+            assert!(Mm::load(&mut R(&b), RAM).is_err(), "word {i}: {v:#x}");
+        }
     }
 }

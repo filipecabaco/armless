@@ -300,6 +300,10 @@ fn each_filled(filled: &[u16], chunks: u64, mut f: impl FnMut(usize)) {
     }
 }
 
+/// The fast table's RAM offsets are u32: RAM never reaches 4 GiB (board::RAM_MAX), so every
+/// page's offset fits, and none aliases a lower one.
+const _: () = assert!(board::RAM_MAX <= 1 << 32);
+
 /// Virtual page -> offset of the page in `mem`, for pages known to be RAM
 /// with the needed permission at one exception level.
 pub(crate) struct FastTlb {

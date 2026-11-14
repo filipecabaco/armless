@@ -42,6 +42,7 @@ pub(crate) const EADDRINUSE: i64 = 98;
 pub(crate) const EADDRNOTAVAIL: i64 = 99;
 pub(crate) const ENETUNREACH: i64 = 101;
 pub(crate) const ECONNRESET: i64 = 104;
+pub(crate) const ENOBUFS: i64 = 105;
 pub(crate) const EISCONN: i64 = 106;
 pub(crate) const ENOTCONN: i64 = 107;
 pub(crate) const ETIMEDOUT: i64 = 110;
