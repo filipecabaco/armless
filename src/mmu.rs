@@ -39,10 +39,15 @@ struct Entry {
     /// Matches under any ASID (a global mapping), else only under `asid`.
     global: bool,
     asid: u16,
+    /// The `Tlb::gen` it was made in: an entry of an earlier one is invalid.
+    gen: u16,
 }
 
 pub struct Tlb {
     entries: Vec<Entry>,
+    /// Bumped by a flush, which so drops every entry at once (and clears them all only when it
+    /// wraps).
+    gen: u16,
     /// Cached entries for user (TTBR0) addresses that come from block
     /// mappings: those cover many 4 KiB slots, so per-page TLBI can't be used.
     user_blocks: u32,
@@ -65,16 +70,22 @@ impl Tlb {
                     level: 0,
                     global: false,
                     asid: 0,
+                    gen: 0,
                 };
                 TLB_SIZE
             ],
+            gen: 0,
             user_blocks: 0,
         }
     }
 
     pub fn flush(&mut self) {
-        for e in self.entries.iter_mut() {
-            e.tag = u64::MAX;
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            // Entries of the generation that had this number are still there
+            for e in self.entries.iter_mut() {
+                e.tag = u64::MAX;
+            }
         }
         self.user_blocks = 0;
     }
@@ -133,7 +144,7 @@ impl<H: Host> Cpu<H> {
         let idx = (key as usize) & (TLB_SIZE - 1);
         let e = self.tlb.entries[idx];
         let asid = self.asid();
-        if e.tag == key && (e.global || e.asid == asid) {
+        if e.tag == key && e.gen == self.tlb.gen && (e.global || e.asid == asid) {
             if e.perms & need != 0 {
                 return Ok((e.pa_page << 12) | (va & 0xfff));
             }
@@ -151,6 +162,7 @@ impl<H: Host> Cpu<H> {
                     level: w.level,
                     global: w.global,
                     asid,
+                    gen: self.tlb.gen,
                 };
                 if w.perms & need != 0 {
                     Ok(w.pa)

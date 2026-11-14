@@ -261,3 +261,70 @@ fn munmap_and_madvise_refuse_a_start_off_a_page_and_lengths_past_the_address_spa
     p.sys(233, &[D(0), I(u64::MAX), I(4)]).expect(EINVAL);
     passes(p);
 }
+
+/// A struct cmsghdr (len, level, type) and its data
+fn cmsg(len: u64, level: u32, ty: u32, data: &[u8]) -> Vec<u8> {
+    let mut b = len.to_le_bytes().to_vec();
+    b.extend_from_slice(&level.to_le_bytes());
+    b.extend_from_slice(&ty.to_le_bytes());
+    b.extend_from_slice(data);
+    b
+}
+
+#[test]
+fn sendmsg_refuses_control_data_whose_lengths_overflow_or_run_short() {
+    const ENOBUFS: i64 = -105;
+    let mut p = Prog::default();
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0); // socketpair: 3 and 4
+    p.put(0x300, b"x");
+    // A second header whose length wraps the sum of where it starts and its length to 0 (it
+    // would pass the check against controllen, then go back to the start, for ever)
+    let mut ctl = cmsg(16, 41, 0, &[]);
+    ctl.extend_from_slice(&cmsg(0u64.wrapping_sub(16), 41, 0, &[]));
+    p.msg(0x400, 0x300, 1, &ctl, 32);
+    p.sys(211, &[I(3), D(0x400), I(0)]).expect(EINVAL);
+    // One shorter than its own header
+    p.msg(0x500, 0x300, 1, &cmsg(8, 41, 0, &[]), 16);
+    p.sys(211, &[I(3), D(0x500), I(0)]).expect(EINVAL);
+    // More control data than a socket takes (optmem_max): ENOBUFS, before any of it is read
+    p.msg(0x600, 0x300, 1, &[], 16);
+    p.put(0x600 + 40, &(1u64 << 30).to_le_bytes());
+    p.sys(211, &[I(3), D(0x600), I(0)]).expect(ENOBUFS);
+    passes(p);
+}
+
+#[test]
+fn scm_rights_takes_at_most_scm_max_fd_descriptors() {
+    // SOL_SOCKET, SCM_RIGHTS: 253 descriptors (all fd 0) go; 254 are EINVAL before any is read,
+    // as Linux checks (the last, not open, would be EBADF)
+    let mut p = Prog::default();
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0);
+    p.put(0x300, b"x");
+    let rights = |n: usize| cmsg(16 + 4 * n as u64, 1, 1, &vec![0; 4 * n]);
+    let mut over = rights(254);
+    over[16 + 4 * 253..].copy_from_slice(&999u32.to_le_bytes());
+    p.msg(0x400, 0x300, 1, &over, 16 + 4 * 254);
+    p.sys(211, &[I(3), D(0x400), I(0)]).expect(EINVAL);
+    p.msg(0x900, 0x300, 1, &rights(253), 16 + 4 * 253);
+    p.sys(211, &[I(3), D(0x900), I(0)]).expect(1);
+    passes(p);
+}
+
+#[test]
+fn shmat_refuses_an_address_out_of_the_address_space_or_over_a_mapping() {
+    const SHM_RND: u64 = 0o20000;
+    const SHM_REMAP: u64 = 0o40000;
+    let mut p = Prog::default();
+    // shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600)
+    p.sys(194, &[I(0), I(4096), I(0o1600)]).expect(0);
+    // Its end wraps; far past the address space; at its end; rounded down to page 0
+    p.sys(196, &[I(0), I(0xffff_ffff_ffff_f000), I(0)]).expect(EINVAL);
+    p.sys(196, &[I(0), I(1 << 60), I(0)]).expect(EINVAL);
+    p.sys(196, &[I(0), I(1 << 39), I(0)]).expect(EINVAL);
+    p.sys(196, &[I(0), I(0x1234), I(SHM_RND)]).expect(EINVAL);
+    // Over a mapping: only with SHM_REMAP, which replaces it
+    p.sys(222, &[I(0), I(4096), I(3), I(0x22), I(u64::MAX), I(0)]).save(0x100);
+    p.sys(196, &[I(0), X(0x100), I(0)]).expect(EINVAL);
+    p.sys(196, &[I(0), X(0x100), I(SHM_REMAP)]).expect_ok();
+    passes(p);
+}

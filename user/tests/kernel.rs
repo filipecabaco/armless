@@ -1628,3 +1628,79 @@ fn a_send_to_a_closed_stream_raises_sigpipe_unless_msg_nosignal() {
     p.sys(206, &[I(3), D(0x200), I(1), I(0), I(0), I(0)]).expect(EPIPE);
     ok(&ends(p));
 }
+
+#[test]
+fn sendfile_to_a_full_pipe_leaves_what_it_could_not_write_in_the_file() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/s\0").put(0x220, b"0123456789abcdef");
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(O_RDWR_CREAT), I(0o644)]).expect(3);
+    p.sys(64, &[I(3), D(0x220), I(16)]).expect(16);
+    p.sys(62, &[I(3), I(0), I(0)]).expect(0);
+    // pipe2(O_NONBLOCK): 4 and 5, filled with 64 KiB of zeros
+    p.sys(59, &[D(0x110), I(SFD_NONBLOCK)]).expect(0);
+    p.sys(222, &[I(0), I(1 << 16), I(3), I(0x22), I(u64::MAX), I(0)]).save(0x100);
+    p.sys(64, &[I(5), X(0x100), I(1 << 16)]).expect_wide(1 << 16);
+    // No room: EAGAIN, and the file's position where it was
+    p.sys(71, &[I(5), I(3), I(0), I(16)]).expect(EAGAIN);
+    p.sys(62, &[I(3), I(0), I(1)]).expect(0);
+    // Room for 8: 8 go, and the position moves by 8
+    p.sys(63, &[I(4), D(0x600), I(8)]).expect(8);
+    p.sys(71, &[I(5), I(3), I(0), I(16)]).expect(8);
+    p.sys(62, &[I(3), I(0), I(1)]).expect(8);
+    // At an offset (0) with room for 4: the offset moves by 4, the position not at all
+    p.sys(63, &[I(4), D(0x600), I(4)]).expect(4);
+    p.sys(71, &[I(5), I(3), D(0x1c0), I(16)]).expect(4);
+    p.is(0x1c0, 4);
+    p.sys(62, &[I(3), I(0), I(1)]).expect(8);
+    // What the pipe has after the zeros: each byte sent once
+    p.sys(63, &[I(4), X(0x100), I((1 << 16) - 12)]).expect_wide((1 << 16) - 12);
+    p.sys(63, &[I(4), D(0x600), I(64)]).expect(12);
+    p.out(0x600, 12);
+    let (out, status) = run_linked(p);
+    ok(&status);
+    assert_eq!(out, b"012345670123");
+}
+
+#[test]
+fn a_process_state_whose_frames_are_not_counted_is_refused() {
+    // Saved while it waits for a key, with a page of its own and a System V segment attached
+    // (each read into once): with any of the frames the state counts taken out, something holds
+    // a frame it doesn't count, and the restore says so (rather than a panic later, or a frame
+    // freed while still mapped)
+    let mut p = Prog::default();
+    p.sys(194, &[I(0), I(4096), I(0o1600)]).expect(0);
+    p.sys(196, &[I(0), I(0), I(0)]).save(0x100);
+    p.sys(222, &[I(0), I(4096), I(3), I(0x22), I(u64::MAX), I(0)]).save(0x108);
+    p.sys(63, &[I(0), X(0x100), I(1)]).expect(1);
+    p.sys(63, &[I(0), X(0x108), I(1)]).expect(1);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    proc.input(b"a");
+    let status = loop {
+        match proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20)) {
+            armless_user::Status::Running => {},
+            s => break s,
+        }
+    };
+    assert!(matches!(status, armless_user::Status::Idle(None)), "{status:?}");
+    let process = proc.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((proc, vm));
+
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    // MAGIC, RAM's size, the frames handed out so far, then (frame, count) for each counted
+    let word = |at: usize| u64::from_le_bytes(process[at..at + 8].try_into().unwrap());
+    let n = word(24) as usize;
+    assert!(n > 4, "{n} frames");
+    for i in 0..n {
+        let mut bad = process[..24].to_vec();
+        bad.extend_from_slice(&(n as u64 - 1).to_le_bytes());
+        bad.extend_from_slice(&process[32..32 + 16 * i]);
+        bad.extend_from_slice(&process[32 + 16 * (i + 1)..]);
+        let got = Process::restore(&mut vm.cpus[0], None, &bad);
+        assert!(got.is_err(), "frame {} taken out", word(32 + 16 * i));
+    }
+    // As saved, it is restored
+    assert!(Process::restore(&mut vm.cpus[0], None, &process).is_ok());
+}

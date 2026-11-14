@@ -90,19 +90,29 @@ impl<'a> Smp<'a> {
     /// CPU `i`'s turn at the process: `f` answers for it. CPUs waiting for a thread are woken if
     /// it left one for them.
     fn answering<R>(&self, i: usize, f: impl FnOnce(&mut Process) -> R) -> R {
-        let t = std::time::Instant::now();
+        self.answering_since(i, std::time::Instant::now(), f).0
+    }
+
+    /// `answering`, its wait for the lock counted from `t`; and when it was done (for the time
+    /// after it to count from, without reading the clock again)
+    fn answering_since<R>(
+        &self,
+        i: usize,
+        t: std::time::Instant,
+        f: impl FnOnce(&mut Process) -> R,
+    ) -> (R, std::time::Instant) {
         let mut g = self.lock();
         let t = self.count(i, 1, t);
         g.enter(i);
         let r = f(&mut g);
         g.leave(i);
-        self.count(i, 2, t);
+        let done = self.count(i, 2, t);
         let wake = self.idle.load(Ordering::SeqCst) > 0 && g.has_work();
         drop(g);
         if wake {
             self.work.notify_all();
         }
-        r
+        (r, done)
     }
 
     /// Run CPU `i`'s share of the program for up to `budget` of wall time (as `Process::run` runs
@@ -155,19 +165,22 @@ impl<'a> Smp<'a> {
             if wake {
                 self.work.notify_all();
             }
+            // (Each time read once: the end of one span is the start of the next)
+            let mut t = std::time::Instant::now();
             loop {
                 let used = cpu.insn_count - start;
                 if used >= SLICE {
                     self.answering(i, |p| p.end_slice());
                     break;
                 }
-                let t = std::time::Instant::now();
                 let exit = cpu.run(SLICE - used);
                 cpu.left_guest();
-                self.count(i, 0, t);
-                if !self.answering(i, |p| p.answer(cpu, exit, until)) {
+                let ran = self.count(i, 0, t);
+                let (go, done) = self.answering_since(i, ran, |p| p.answer(cpu, exit, until));
+                if !go {
                     break;
                 }
+                t = done;
             }
         }
     }
@@ -310,7 +323,7 @@ impl Process {
     /// Whether a CPU with no thread may find one: a thread that can run and no CPU has, or
     /// something changed that parked calls or signals look at.
     pub(crate) fn has_work(&self) -> bool {
-        self.poked
+        self.retry_due()
             || self.sig_dirty
             || self.exit_code.is_some()
             || self

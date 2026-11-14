@@ -526,10 +526,12 @@ mod tests {
         runner.start();
         let stop = runner.wait(Some(Duration::from_secs(5)));
         assert!(matches!(stop, Some(Stopped::Halt(1))), "{stop:?}");
+        // The snapshot resumes at the loop: set before saving, since a restore lets the parked
+        // CPU run at once (from the HLT, it would stop again before a later `with_cpu`)
+        runner.with_cpu(0, |c| c.pc = 0x2000);
         let state = runner.save_state();
         // Restored, it runs on (from the loop): no stop to wait for, the old one least of all
         runner.load_state(&state).unwrap();
-        runner.with_cpu(0, |c| c.pc = 0x2000);
         runner.start();
         let stop = runner.wait(Some(Duration::from_millis(200)));
         assert!(stop.is_none(), "{stop:?}");

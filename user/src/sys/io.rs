@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use crate::errno::{EAGAIN, EBADF, EFAULT, EINVAL, EISDIR, EOPNOTSUPP, EPIPE, ESPIPE};
-use crate::files::{got, Desc, Got, Kind, O_ACCMODE, O_APPEND, O_NONBLOCK, O_WRONLY, PIPE_BUF_MAX};
+use crate::files::{
+    got, Desc, Got, Kind, WaitOn, O_ACCMODE, O_APPEND, O_NONBLOCK, O_WRONLY, PIPE_BUF_MAX,
+};
 use crate::host::{self, Instant};
 use crate::{Process, Ret};
 
@@ -95,8 +97,13 @@ impl Process {
                     };
                 }
                 let n = pipe.buf.len().min(max);
-                let out = pipe.buf.drain(..n).collect();
-                self.poke();
+                // (Slice by slice: a memcpy each, where draining into a Vec goes byte by byte)
+                let (a, b) = pipe.buf.as_slices();
+                let mut out = Vec::with_capacity(n);
+                out.extend_from_slice(&a[..a.len().min(n)]);
+                out.extend_from_slice(&b[..n - out.len()]);
+                pipe.buf.drain(..n);
+                self.poke_on(WaitOn::Pipe(p));
                 Ok(out)
             },
             Kind::Signal { mask } => self.read_signalfd(mask, max, nonblock),
@@ -123,7 +130,7 @@ impl Process {
                 {
                     *count = 0;
                 }
-                self.poke();
+                self.poke_event(fd);
                 Ok(count.to_le_bytes().to_vec())
             },
             Kind::Sock(id) => {
@@ -136,6 +143,37 @@ impl Process {
             },
             Kind::PipeWrite(_) | Kind::Epoll { .. } => Err(Ret::Val(-EINVAL)),
         }
+    }
+
+    /// The count of eventfd `fd` changed
+    fn poke_event(&mut self, fd: i32) {
+        match self.files.desc_of(fd) {
+            Some(d) => self.poke_on(WaitOn::Desc(d)),
+            None => self.poke(),
+        }
+    }
+
+    /// The most a write to `fd` could take now (a pipe's room, a stream socket's), so that a
+    /// write copies no more of the program's buffer than that; None: whatever it is given. A
+    /// full one gives 1, so that the write still finds it full (EAGAIN, or waits) and a write
+    /// of nothing still writes nothing.
+    fn write_room(&self, fd: i32) -> Option<usize> {
+        let room = match self.files.get(fd)?.kind {
+            Kind::PipeWrite(p) => self
+                .files
+                .pipes
+                .get(&p)
+                .map_or(0, |pipe| PIPE_BUF_MAX.saturating_sub(pipe.buf.len())),
+            Kind::Sock(id) => self.sock_send_room(id)?,
+            _ => return None,
+        };
+        Some(room.max(1))
+    }
+
+    /// The count of a write of `count` bytes to `fd`, cut to what `fd` could take now.
+    fn write_count(&self, fd: i32, count: u64) -> usize {
+        let count = self.rw_count(count);
+        self.write_room(fd).map_or(count, |r| count.min(r))
     }
 
     /// Writes `data` to `fd` (at `at`, for pwrite): how much it took, or what the call must do.
@@ -215,7 +253,7 @@ impl Process {
                 }
                 let n = room.min(data.len());
                 pipe.buf.extend(&data[..n]);
-                self.poke();
+                self.poke_on(WaitOn::Pipe(p));
                 Ok(n)
             },
             Kind::Signal { .. } => Err(Ret::Val(-EINVAL)),
@@ -232,7 +270,7 @@ impl Process {
                 {
                     *count += add;
                 }
-                self.poke();
+                self.poke_event(fd);
                 Ok(8)
             },
             Kind::Sock(id) => {
@@ -277,12 +315,18 @@ impl Process {
             return Ret::Val(-EINVAL);
         }
         let r = if write {
+            // (Gathered up to what the descriptor could take now: `iovecs` keeps the sum within
+            // a write's count)
+            let mut left = self.write_count(fd, u64::MAX);
             let mut all = Vec::new();
             for &(base, len) in iov {
-                let Some(b) = self.bytes_at(base, len as usize) else {
+                let len = (len as usize).min(left);
+                let at = all.len();
+                all.resize(at + len, 0);
+                if !self.read(base, &mut all[at..]) {
                     return Ret::Val(-EFAULT);
-                };
-                all.extend_from_slice(&b);
+                }
+                left -= len;
             }
             let append = match flags & (RWF_APPEND | RWF_NOAPPEND) {
                 RWF_APPEND => Some(true),
@@ -383,7 +427,7 @@ impl Process {
     pub(super) fn sys_write(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
         let fd0 = a[0] as i32;
-        match self.bytes_at(a[1], self.rw_count(a[2])) {
+        match self.bytes_at(a[1], self.write_count(fd0, a[2])) {
             None => v(-EFAULT),
             Some(b) => self
                 .write_fd(fd0, &b, None)
@@ -395,7 +439,7 @@ impl Process {
     pub(super) fn sys_pwrite64(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
         let fd0 = a[0] as i32;
-        match self.bytes_at(a[1], self.rw_count(a[2])) {
+        match self.bytes_at(a[1], self.write_count(fd0, a[2])) {
             None => v(-EFAULT),
             Some(b) => self
                 .write_fd(fd0, &b, Some(a[3]))
@@ -419,23 +463,60 @@ impl Process {
         self.rw_iov(fd0, true, &iov, at, if nr == 287 { a[5] } else { 0 })
     }
 
-    /// sendfile(out, in, offset*, count)
+    /// sendfile(out, in, offset*, count). What is read and not written goes back: the input's
+    /// position (or *offset) moves by what was written, and a pipe out is read for no more than
+    /// its room (an input that can't seek back, a pipe or socket, would lose the rest).
     pub(super) fn sys_sendfile(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
-        let fd0 = a[0] as i32;
-        let off = (a[2] != 0).then(|| self.u64_at(a[2])).flatten();
-        match self.read_fd(a[1] as i32, a[3].min(1 << 20) as usize, off) {
-            Ok(b) => match self.write_fd(fd0, &b, None) {
-                Ok(n) => {
-                    if let Some(o) = off {
-                        self.put_u64(a[2], o + n as u64);
-                    }
-                    v(n as i64)
-                },
-                Err(r) => r,
+        let (fd0, fd1) = (a[0] as i32, a[1] as i32);
+        let off = match a[2] {
+            0 => None,
+            at => match self.u64_at(at) {
+                Some(o) => Some(o),
+                None => return v(-EFAULT),
             },
-            Err(r) => r,
+        };
+        let mut max = a[3].min(1 << 20) as usize;
+        if let Some(Desc {
+            kind: Kind::PipeWrite(p),
+            ..
+        }) = self.files.get(fd0)
+        {
+            let room = self
+                .files
+                .pipes
+                .get(p)
+                .map_or(0, |p| PIPE_BUF_MAX.saturating_sub(p.buf.len()));
+            if room == 0 {
+                // Nothing read: the write waits, or fails, as it would with no room
+                return self.write_fd(fd0, &[], None).map_or_else(|r| r, |n| v(n as i64));
+            }
+            max = max.min(room);
         }
+        let b = match self.read_fd(fd1, max, off) {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
+        let wrote = self.write_fd(fd0, &b, None);
+        let unwritten = (b.len() - wrote.as_ref().map_or(0, |&n| n.min(b.len()))) as u64;
+        match off {
+            Some(o) => {
+                if let Ok(n) = wrote {
+                    self.put_u64(a[2], o.wrapping_add(n as u64));
+                }
+            },
+            None if unwritten > 0 => {
+                if let Some(Desc {
+                    kind: Kind::File { pos, .. } | Kind::Mem { pos, .. },
+                    ..
+                }) = self.files.get_mut(fd1)
+                {
+                    *pos = pos.saturating_sub(unwritten);
+                }
+            },
+            None => {},
+        }
+        wrote.map_or_else(|r| r, |n| v(n as i64))
     }
 
     /// lseek

@@ -890,6 +890,53 @@ impl Process {
         self.epoch += 1;
     }
 
+    /// `what` changed (data in or out of a pipe, an eventfd's count): it wakes the parked calls
+    /// that wait on it, and those that may wait on anything (a poll, an epoll wait), not every
+    /// call (`Woken`).
+    pub(crate) fn poke_on(&mut self, what: files::WaitOn) {
+        self.epoch += 1;
+        if !self.files.woken.changed.contains(&what) {
+            self.files.woken.changed.push(what);
+        }
+    }
+
+    /// What system call `nr` with `a`, parked to run again, waits on, if that is one thing
+    /// `poke_on` tells: a read or write of a pipe or an eventfd.
+    fn waits_on(&self, nr: u64, a: [u64; 5]) -> Option<files::WaitOn> {
+        if !matches!(
+            nr,
+            sys::nr::READ | sys::nr::READV | sys::nr::WRITE | sys::nr::WRITEV
+        ) {
+            return None;
+        }
+        let d = self.files.desc_of(i32::try_from(a[0] as i64).ok()?)?;
+        match self.files.descs.get(&d)?.kind {
+            files::Kind::PipeRead(p) | files::Kind::PipeWrite(p) => Some(files::WaitOn::Pipe(p)),
+            files::Kind::Event { .. } => Some(files::WaitOn::Desc(d)),
+            _ => None,
+        }
+    }
+
+    /// Whether a change parked calls may wait on is not looked at yet (`wake`), and a parked
+    /// call it would wake: something for an idle CPU to do.
+    pub(crate) fn retry_due(&self) -> bool {
+        let all = self.poked || self.files.woken.all;
+        if !all && self.files.woken.changed.is_empty() {
+            return false;
+        }
+        self.threads.iter().any(|t| {
+            !t.exited
+                && matches!(t.wait, Some((Wait::Retry { .. }, _)))
+                && (all
+                    || self
+                        .files
+                        .woken
+                        .parked
+                        .get(&t.tid)
+                        .is_none_or(|k| self.files.woken.changed.contains(k)))
+        })
+    }
+
     /// A signal for the first process from outside it (`kill`: SIGINT for an interrupt the
     /// host's user asked for outside the terminal, say). Delivered when the process next runs: a
     /// thread waiting in a call is woken for it, so run it after.
@@ -1195,6 +1242,11 @@ impl Process {
                         cpu.pc = elr - 4;
                         let args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4]];
                         self.threads[cur].tty_wait = self.waits_on_tty(cpu.x[8], args);
+                        let tid = self.threads[cur].tid;
+                        match self.waits_on(cpu.x[8], args) {
+                            Some(k) => self.files.woken.parked.insert(tid, k),
+                            None => self.files.woken.parked.remove(&tid),
+                        };
                         self.park(cpu);
                         self.threads[cur].wait = Some((Wait::Retry { on_timeout }, deadline));
                         self.cur = next;
@@ -1233,7 +1285,8 @@ impl Process {
         if self.net_changed() {
             self.poke();
         }
-        let poked = std::mem::take(&mut self.poked);
+        let poked = std::mem::take(&mut self.poked) | std::mem::take(&mut self.files.woken.all);
+        let changed = std::mem::take(&mut self.files.woken.changed);
         let blobs_in: Vec<bool> = self
             .threads
             .iter()
@@ -1244,6 +1297,7 @@ impl Process {
                 _ => false,
             })
             .collect();
+        let parked = &mut self.files.woken.parked;
         for (t, blobs_in) in self.threads.iter_mut().zip(blobs_in) {
             let Some((w, deadline)) = t.wait.clone() else {
                 continue;
@@ -1264,13 +1318,28 @@ impl Process {
                     t.ctx.x[0] = on_timeout as u64;
                     t.wait = None;
                 },
-                Wait::Retry { .. } if poked || expired => {
+                Wait::Retry { .. }
+                    if poked
+                        || expired
+                        || !changed.is_empty()
+                            && parked.get(&t.tid).is_none_or(|k| changed.contains(k)) =>
+                {
                     t.resume_deadline = deadline;
                     t.rerun = t.wait.take();
                 },
                 Wait::Blobs(_) if blobs_in => t.wait = None,
                 _ => {},
             }
+        }
+        // (What threads that are gone, or now wait otherwise, were parked on)
+        if parked.len() > self.threads.len() {
+            let retrying: std::collections::BTreeSet<i64> = self
+                .threads
+                .iter()
+                .filter(|t| matches!(t.wait, Some((Wait::Retry { .. }, _))))
+                .map(|t| t.tid)
+                .collect();
+            parked.retain(|tid, _| retrying.contains(tid));
         }
     }
 
@@ -1642,6 +1711,13 @@ impl Process {
             }
             files.net.load_rights(&mut r, ver)?;
         }
+        let held: Vec<_> = spaces.iter().map(|m| m.borrow()).collect();
+        mm::check_frames(
+            &frames,
+            held.iter().map(|m| &**m),
+            shm.frames().chain(file_pages.values().copied()),
+        )?;
+        drop(held);
         files.net.load_cm(&mut r, ver)?;
         // Before ARMLUSR7 only ITIMER_REAL was kept
         if ver >= 7 {
@@ -1651,6 +1727,7 @@ impl Process {
         if ver >= 8 {
             files.locks = locks::Locks::load(&mut r)?;
         }
+        files.check_refs(all.values().map(|p| &p.fds))?;
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);

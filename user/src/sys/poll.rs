@@ -56,12 +56,19 @@ impl Process {
     /// ppoll: struct pollfd { int fd; short events; short revents }
     pub(super) fn ppoll(&mut self, fds: u64, n: u64, timeout: u64) -> Ret {
         let mut ready = 0;
-        for i in 0..n.min(4096) {
-            let at = fds + 8 * i;
-            let Some(fd) = self.u32_at(at).map(|v| v as i32) else {
-                return Ret::Val(-EFAULT);
-            };
-            let events = self.u32_at(at.wrapping_add(4)).map_or(0, |v| v & 0xffff) as u16;
+        // The array in one read, and back in one write (not two reads and a write a descriptor)
+        let n = n.min(4096) as usize;
+        let mut pfds = if n == 0 {
+            Vec::new()
+        } else {
+            match self.bytes_at(fds, 8 * n) {
+                Some(b) => b,
+                None => return Ret::Val(-EFAULT),
+            }
+        };
+        for pfd in pfds.as_chunks_mut::<8>().0 {
+            let fd = i32::from_le_bytes(pfd[..4].try_into().unwrap());
+            let events = u16::from_le_bytes(pfd[4..6].try_into().unwrap());
             let revents: u16 = if fd < 0 {
                 0
             } else {
@@ -82,10 +89,13 @@ impl Process {
                     },
                 }
             };
-            self.write(at.wrapping_add(6), &revents.to_le_bytes());
+            pfd[6..].copy_from_slice(&revents.to_le_bytes());
             if revents != 0 {
                 ready += 1;
             }
+        }
+        if n > 0 {
+            self.write(fds, &pfds);
         }
         if ready > 0 {
             return Ret::Val(ready);
