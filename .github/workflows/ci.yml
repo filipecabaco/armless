@@ -90,6 +90,10 @@ jobs:
           OUT="$RUNNER_TEMP/guest" sh guest/build.sh
           node tests/js/run-bare.mjs "$RUNNER_TEMP/guest/tests.bin" -m 512 --no-jit
           node tests/js/run-bare.mjs "$RUNNER_TEMP/guest/tests.bin" -m 512 --jit-threshold 1 --jit-sync
+      # armless.js's user-mode API (argv and env, exec options, reap_orphans, user_asleep_ms) on
+      # armless.wasm: the test makes its programs as machine code and its filesystem in memory
+      - name: User mode through armless.js
+        run: node --test 'tests/js/*.test.mjs'
       - uses: actions/upload-artifact@v7
         with:
           name: armless-web

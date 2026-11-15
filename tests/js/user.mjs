@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// User mode (no guest kernel) through armless.js, in Node.
+// User mode (no guest kernel) through armless.js, in Node, with a real program: run by hand, not
+// in CI (it needs a snowglobe site or a filesystem image). CI runs user-api.test.mjs, which makes
+// its own programs.
 //
 //   node tests/js/user.mjs SITE [EXPR]
 //       SITE: a site snowglobe built with `--kernel none` (SITE/system: state.bin.zst, user.bin,
