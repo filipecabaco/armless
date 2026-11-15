@@ -186,7 +186,7 @@ fn a_saved_process_goes_on_in_another_machine() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process, Duration::ZERO).unwrap();
     p.input(b"after\n");
     let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"after\r\nafter\r\n");
@@ -199,8 +199,8 @@ fn a_saved_process_goes_on_in_another_machine() {
     })
     .unwrap()
     .0;
-    assert!(Process::restore(&mut other.cpus[0], None, &process).is_err());
-    assert!(Process::restore(&mut vm.cpus[0], None, b"nonsense").is_err());
+    assert!(Process::restore(&mut other.cpus[0], None, &process, Duration::ZERO).is_err());
+    assert!(Process::restore(&mut vm.cpus[0], None, b"nonsense", Duration::ZERO).is_err());
 }
 
 #[test]
@@ -550,7 +550,7 @@ fn a_pending_signal_and_the_handlers_survive_a_snapshot() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process, Duration::ZERO).unwrap();
     p.input(b"x\n");
     let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(
@@ -954,7 +954,7 @@ fn a_saved_process_keeps_its_untouched_pages_lazy() {
     let mut vm = lazy_machine(&prog);
     vm.load_state(&state).unwrap();
     let board = vm.board.clone();
-    let mut p = Process::restore(&mut vm.cpus[0], Some(board), &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(board), &process, Duration::ZERO).unwrap();
     assert_eq!(p.lazy_pages().0, 1, "the second page is still lazy");
     p.input(b"x\n");
     let (_, status, asked) = run_serving(&mut p, &mut vm);
@@ -1497,7 +1497,7 @@ fn processes_survive_a_snapshot_with_their_shared_pages() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process, Duration::ZERO).unwrap();
     p.input(b"x\n");
     let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"x\r\nA");
@@ -2473,7 +2473,7 @@ fn scheduling_survives_a_snapshot() {
     drop((p, vm));
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process, Duration::ZERO).unwrap();
     p.input(b"x\n");
     let (out, status) = run(&mut p, &mut vm.cpus);
     assert!(out.ends_with(b"A"), "{out:?}");
@@ -2813,7 +2813,7 @@ fn a_process_descriptor_survives_a_snapshot_and_its_poll_goes_on() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process, Duration::ZERO).unwrap();
     p.input(b"x\n");
     let (out, status) = run(&mut p, &mut vm.cpus);
     assert_eq!(out, b"x\r\nA");

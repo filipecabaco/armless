@@ -253,6 +253,10 @@ pub(crate) struct Proc {
     pub zombie: Option<i32>,
     /// Nobody will wait for it (its parent ignores its end): it goes once it is not the current one
     pub reap: bool,
+    /// Its parent ended and it went to the first process, which reaps such children
+    /// (`Process::reap_orphans`): the first process's wait does not see it, it gets no exit signal
+    /// and it goes as it ends
+    pub orphan: bool,
     pub cwd: Ino,
     pub umask: u32,
     /// The executable's path, for /proc/self/exe
@@ -375,6 +379,11 @@ pub struct Process {
     pub(crate) hostname: String,
     /// Whether there is a terminal (`ExecOptions::std`): with `Plain`, /dev/tty is no device
     pub(crate) std: StdStreams,
+    /// The first process reaps its orphans, as init does and a container's program must when it
+    /// is pid 1: the children of a process that ended (not its own) go as they end, with no
+    /// SIGCHLD, and its `wait` and `waitid` never report them. Set it before the program runs; it
+    /// holds for those that end after. Saved.
+    pub reap_orphans: bool,
     pub trace: bool,
     /// With `trace`, only these system calls (empty: all of them)
     pub trace_only: Vec<u64>,
@@ -769,6 +778,7 @@ impl Process {
                 exit_signal: 0,
                 zombie: None,
                 reap: false,
+                orphan: false,
                 cwd: ROOT,
                 umask: 0o022,
                 exe: exe.to_vec(),
@@ -797,6 +807,7 @@ impl Process {
             cpu_cur: vec![0; cpu.machine.ncpus],
             machine: cpu.machine.clone(),
             resume_deadline: None,
+            reap_orphans: false,
             trace: false,
             trace_only: Vec::new(),
             stats: Stats::default(),
@@ -1525,6 +1536,7 @@ impl Process {
             creds::save_groups(&p.groups, &mut w);
             aio::save(&p.aio, &mut w);
             w.b(&p.cmdline);
+            w.u(p.orphan as u64);
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1593,19 +1605,25 @@ impl Process {
         self.files.net.save_cm(&mut w);
         self.timers.save(&mut w, now);
         self.files.locks.save(&mut w);
+        w.u(self.reap_orphans as u64);
         w.u((self.std == StdStreams::Plain) as u64);
         w.b(self.hostname.as_bytes());
         w.0
     }
 
     /// The process from its `save`, on a CPU the machine's snapshot was restored to (and the
-    /// machine, for its filesystem).
+    /// machine, for its filesystem). `asleep` is how long it was saved for: the monotonic clocks
+    /// have gone on by that much, and what was due in it is due now (a timer that repeats counts
+    /// each period it missed). The wall clock is the host's, and the CPU time stands still.
     pub fn restore<H: Host>(
         cpu: &mut Cpu<H>,
         board: Option<Arc<Board>>,
         data: &[u8],
+        asleep: Duration,
     ) -> Result<Process, String> {
-        // Which format it is (MAGIC says what each adds): 5 to 10
+        // (At most the longest a timer is set for, so the clocks it moves don't overflow)
+        let asleep = timer::clamp(asleep.as_nanos());
+        // Which format it is (MAGIC says what each adds): 5 to 11
         let Some((ver, rest)) = MAGICS
             .iter()
             .enumerate()
@@ -1636,9 +1654,9 @@ impl Process {
         let _asid = r.u()?;
         let filled = r.u()?;
         let next_id = r.u()? as i64;
-        let mono_base = r.u()?;
+        let mono_base = r.u()?.saturating_add(asleep);
         let cur = r.u()? as usize;
-        let mut files = Files::load(&mut r)?;
+        let mut files = Files::load(&mut r, asleep)?;
         let tty = Tty::load(&mut r)?;
         let mut spaces = Vec::new();
         for _ in 0..r.u()? {
@@ -1664,13 +1682,15 @@ impl Process {
             // Before ARMLUSR6 every process was root
             let creds = if v6 { Creds::load(&mut r)? } else { Creds::default() };
             if v6 {
-                timers.load_real(&mut r, pid, Instant::now())?;
+                timers.load_real(&mut r, pid, Instant::now(), asleep)?;
             }
             // Before ARMLUSR7 there were no groups nor AIO contexts
             let groups = if ver >= 7 { creds::load_groups(&mut r)? } else { Vec::new() };
             let aio = if ver >= 7 { aio::load(&mut r)? } else { BTreeMap::new() };
             // Before ARMLUSR9 no command line was kept: /proc gives the executable's path
             let cmdline = if ver >= 9 { r.b()?.to_vec() } else { Vec::new() };
+            // Before ARMLUSRA nothing reaped orphans
+            let orphan = ver >= 10 && r.u()? != 0;
             all.insert(
                 pid,
                 Proc {
@@ -1683,6 +1703,7 @@ impl Process {
                     exit_signal,
                     zombie: ended.then_some(status),
                     reap: false,
+                    orphan,
                     cwd,
                     umask,
                     exe,
@@ -1695,7 +1716,9 @@ impl Process {
             );
         }
         let now = Instant::now();
-        let at = |left: u64| (left != u64::MAX).then(|| now + Duration::from_nanos(left));
+        let at = |left: u64| {
+            (left != u64::MAX).then(|| now + Duration::from_nanos(left.saturating_sub(asleep)))
+        };
         let mut threads = Vec::new();
         for _ in 0..r.u()? {
             let (tid, pid, clear_tid, exited) = (r.u()? as i64, r.u()? as i64, r.u()?, r.u()? != 0);
@@ -1782,20 +1805,21 @@ impl Process {
         files.net.load_cm(&mut r, ver)?;
         // Before ARMLUSR7 only ITIMER_REAL was kept
         if ver >= 7 {
-            timers.load(&mut r, now)?;
+            timers.load(&mut r, now, asleep)?;
         }
         // File locks from ARMLUSR8 (before, every lock was granted and none kept)
         if ver >= 8 {
             files.locks = locks::Locks::load(&mut r)?;
         }
-        // Whether it has a terminal, and the hostname, from ARMLUSRA (before, the terminal and
+        let reap_orphans = ver >= 10 && r.u()? != 0;
+        // Whether it has a terminal, and the hostname, from ARMLUSRB (before, the terminal and
         // "armless")
-        let std = match if ver >= 10 { r.u()? } else { 0 } {
+        let std = match if ver >= 11 { r.u()? } else { 0 } {
             0 => StdStreams::Terminal,
             1 => StdStreams::Plain,
             _ => return Err("bad standard streams".into()),
         };
-        let hostname = if ver >= 10 {
+        let hostname = if ver >= 11 {
             let name = String::from_utf8(r.b()?.to_vec()).map_err(|_| "bad hostname")?;
             if !valid_hostname(&name) {
                 return Err("bad hostname".into());
@@ -1840,6 +1864,7 @@ impl Process {
             cpu_cur: vec![0; cpu.machine.ncpus],
             machine: cpu.machine.clone(),
             resume_deadline: None,
+            reap_orphans,
             trace: false,
             trace_only: Vec::new(),
             stats: Stats::default(),
@@ -1901,16 +1926,18 @@ fn valid_hostname(name: &str) -> bool {
     name.len() <= 64 && !name.contains('\0')
 }
 
-/// The process state's format: ARMLUSRA (version 10) has the hostname (at the end, after the
-/// file locks); ARMLUSR9 (0.19) has each process's command line (after its AIO
-/// contexts); ARMLUSR8 (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
+/// The process state's format: ARMLUSRB (0.20) has whether there is a terminal and the hostname
+/// (at the end, after whether orphans are reaped); ARMLUSRA has whether the first process reaps
+/// orphans (at the end, after the file locks) and each process's orphan flag (after its command
+/// line); ARMLUSR9 (0.19) has each process's command line (after its AIO contexts); ARMLUSR8
+/// (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
 /// each thread's scheduling (sched.rs) and the timers but ITIMER_REAL, with the CPU time they
 /// count (timer.rs, at the end); ARMLUSR6 (0.15) has none of that; ARMLUSR5 (0.14) has neither
 /// the ids, timers, shared memory, shared file pages nor descriptors in flight of 0.15. Each
 /// still loads.
-const MAGIC: &[u8; 8] = b"ARMLUSRA";
-const MAGICS: [&[u8; 8]; 6] = [
-    b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", b"ARMLUSR9", MAGIC,
+const MAGIC: &[u8; 8] = b"ARMLUSRB";
+const MAGICS: [&[u8; 8]; 7] = [
+    b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", b"ARMLUSR9", b"ARMLUSRA", MAGIC,
 ];
 
 const _: () = {

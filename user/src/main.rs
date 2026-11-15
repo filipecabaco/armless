@@ -30,8 +30,11 @@ fn usage() -> ! {
   --cpus N           CPUs (default 1, at most 8): threads run on them at the same time
   --stop-after TEXT  stop once the program printed TEXT
   --save DIR         when it stops, write the machine (machine.bin) and the process (process.bin)
-  --restore DIR      start from what --save wrote instead of an ELF
+  --restore DIR      start from what --save wrote instead of an ELF (its clocks go on by the age of
+                     process.bin: what was due meanwhile is due at once)
   --input LINE       type LINE (and a newline) into its stdin, and stop at the next line it prints
+  --reap-orphans     reap the processes whose parent ended, as a container's pid 1 does: their
+                     statuses are not the program's to wait for, and they leave as they end
   --timeout SECS     stop after SECS of wall time
   --net              a network: connections to addresses that are not the loopback's are made
                      from here, and what the program listens on can be published
@@ -71,6 +74,7 @@ fn main() {
     let mut publish: Vec<(String, u16)> = Vec::new();
     let mut tunnels = Vec::new();
     let mut allow_private = false;
+    let mut reap_orphans = false;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.peek().cloned() {
         if !a.starts_with('-') {
@@ -110,6 +114,7 @@ fn main() {
             "--plain-std" => opts.std = StdStreams::Plain,
             // (an empty one is the default, as in the browser)
             "--hostname" => opts.hostname = Some(val()).filter(|h| !h.is_empty()),
+            "--reap-orphans" => reap_orphans = true,
             "--env" => env.push(val()),
             "--spawn" => spawn = Some(val()),
             "--keys" => {
@@ -214,8 +219,15 @@ fn main() {
         Some(dir) => {
             let machine = std::fs::read(dir.join("machine.bin")).unwrap_or_else(|e| die(e));
             vm.load_state(&machine).unwrap_or_else(|e| die(e));
-            let process = std::fs::read(dir.join("process.bin")).unwrap_or_else(|e| die(e));
-            Process::restore(&mut vm.cpus[0], board, &process).unwrap_or_else(|e| die(e))
+            let file = dir.join("process.bin");
+            let process = std::fs::read(&file).unwrap_or_else(|e| die(e));
+            // How long it has been saved: the process's clocks go on by that much
+            let asleep = std::fs::metadata(&file)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .unwrap_or_default();
+            Process::restore(&mut vm.cpus[0], board, &process, asleep).unwrap_or_else(|e| die(e))
         },
         None => match board {
             // Found in the filesystem; its blobs (and its loader's) come from the host meanwhile
@@ -237,6 +249,7 @@ fn main() {
         },
     };
     let ready = start.elapsed();
+    p.reap_orphans |= reap_orphans;
     p.trace = std::env::var_os("ARMLESS_EXEC_TRACE").is_some();
     // ARMLESS_EXEC_TRACE_NR=129,131,133: only those system calls
     if let Ok(nrs) = std::env::var("ARMLESS_EXEC_TRACE_NR") {

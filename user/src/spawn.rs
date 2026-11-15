@@ -122,6 +122,7 @@ impl Process {
                 exit_signal: 0,
                 zombie: None,
                 reap: false,
+                orphan: false,
                 cwd: cwd_ino,
                 umask: 0o022,
                 exe: exe.clone(),

@@ -288,6 +288,14 @@ x0–x5, answers it in x0, and resumes at ELR.
   `/dev/stderr` open the same; with no controlling terminal, `/dev/tty` is ENXIO.
   `ExecOptions::hostname` (`--hostname`, `hostname`) is what uname and
   `/proc/sys/kernel/hostname` say ("armless" by default). Both are in the saved state.
+- **Orphans:** a process whose parent ended is a child of the first process, which can wait for
+  it. A container's program is pid 1 and does not: `Process::reap_orphans` (`armless-exec
+  --reap-orphans`, `armless_user_reap_orphans`, `reap_orphans` in the JS options; saved) makes the
+  first process reap them as init does. They get no SIGCHLD for it, `wait4(-1)` and `waitid` never
+  report them (ECHILD once it has no children of its own), and they leave as they end, so nothing
+  piles up as zombies. Its own children are as before. Without it, as Linux reparents, an
+  orphan ends with SIGCHLD, and one that had ended already raises it in the first process then
+  (or goes, if that one ignores SIGCHLD).
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
 - **File locks** (user/src/locks.rs), as Linux keeps them: record locks (`fcntl` F_GETLK,
   F_SETLK, F_SETLKW) are a process's, on byte ranges, and go when it closes any descriptor of the
@@ -460,7 +468,7 @@ x0–x5, answers it in x0, and resumes at ELR.
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
 - **Clocks:** `clock_gettime`, `gettimeofday`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
-  across a snapshot and its restores.
+  across a snapshot and its restores, by the time it was asleep when the host says (below).
 - **Signals** (signal.rs): actions per process, a mask, a pending set and an alternate stack
   per thread, a pending set for the process (given to its first thread that doesn't block the
   signal, the main thread first). A handler runs on the `rt_sigframe` the kernel builds
@@ -487,6 +495,15 @@ x0–x5, answers it in x0, and resumes at ELR.
   pages, and the descriptors on their way over sockets. Both older ones load (what they lack
   starts as a new process has it); a state from before 0.14 does not (addresses are virtual,
   there are processes, and the sockets are in the machine's state).
+  A host that restores after a while says how long (`Process::restore`'s `asleep`,
+  `armless_user_asleep_ms` before `armless_user_restore`, armless-exec's `--restore` the age of `process.bin`): the
+  monotonic and boot-time clocks go on by that much, a wait or timer that came due in it is due
+  at once, and a timerfd that repeats counts every period it missed, as if it had been read all
+  along. A recurring signal timer (`setitimer`, `timer_create`) signals once, keeps its phase (its
+  next expiry is on the period it had) and counts the other periods it missed as the overrun of
+  a POSIX timer (but where the host's clock can't go back that far, as macOS's before it booted:
+  then no overrun is counted, and the phase is kept only if it can go back a period). The sleep
+  is at most about 68 years. The wall clock is the host's and the CPU-time clocks stand still.
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,
@@ -541,16 +558,18 @@ and then, instead of a boot:
 
 | export | |
 |---|---|
-| `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
+| `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated, each item ending with its NUL, an empty one kept as an empty argument): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
 | `armless_user_plain_std(on)` | the next `armless_user_exec` has no terminal (`StdStreams::Plain`) when `on` is nonzero |
 | `armless_user_hostname(len)` | room for the next exec's hostname (at most 64 bytes; 0 and `armless_error` otherwise): returns where to write its UTF-8 bytes, which `armless_user_exec` reads (empty: armless); the exec puts both options back to the defaults |
-| `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine |
+| `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine; for one restore, how long it was saved for is what `armless_user_asleep_ms` set |
+| `armless_user_asleep_ms(ms)` | how long the next restored state was saved for, in ms (0, the default: none), which its clocks and deadlines go on by |
 | `armless_user_run(budget_ms)` | 0 its time ran out, 1 idle, 2 exited, 3 faulted (the reason in `armless_error`), -1 no process |
 | `armless_user_wake_ms()` | after 1: the `microtick()` time of its next deadline, or -1 (only input or a blob wakes it) |
 | `armless_user_waiting_on_blobs()` | 1 when a thread waits on a blob rather than on input |
 | `armless_user_waiting_for_input()` | 1 when a thread waits in a call input could complete (read, poll, epoll) and none on a blob: a REPL at its prompt, not a program asleep |
 | `armless_user_exit_code()` | the exit status, -1 while it runs |
 | `armless_user_input(ptr, len)`, `armless_user_close_input()`, `armless_user_resize(cols, rows)` | the terminal |
+| `armless_user_reap_orphans(on)` | the first process reaps its orphans (after `armless_user_exec`, before it runs) |
 | `armless_user_kill(sig)` | a signal for the program, as kill(2) sends it (SIGINT for a stop button) |
 | `armless_user_save()` | the process's state, at `armless_buf` |
 
