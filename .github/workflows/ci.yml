@@ -69,6 +69,7 @@ jobs:
         run: |
           cargo check --features wasm-api
           cargo check -p armless-user --features wasm-api
+          cargo test -p armless-user --features wasm-api --lib wasm::
       - name: Lints (unsafe only where allowed, and documented), natively and for wasm32
         run: |
           rustup component add clippy

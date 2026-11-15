@@ -34,12 +34,14 @@ fn seed() {
     host::seed(&vm().board.boot_seed.lock());
 }
 
-/// A NUL-separated list ("a\0b\0"; empty items dropped).
+/// A NUL-separated list ("a\0b\0": each item ends with its NUL, so an empty one is kept, as
+/// execve keeps an empty argument; the last NUL may be left out, and "" is no items).
 fn list(s: &str) -> Vec<String> {
-    s.split('\0')
-        .filter(|a| !a.is_empty())
-        .map(str::to_string)
-        .collect()
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let items = s.strip_suffix('\0').unwrap_or(s);
+    items.split('\0').map(str::to_string).collect()
 }
 
 /// Start a program from the machine's filesystem as execve would (by PATH from `env` when
@@ -59,11 +61,15 @@ pub unsafe extern "C" fn armless_user_exec(
     cwd: u32,
     cwd_len: u32,
 ) -> i32 {
-    let (argv, env, cwd) = (
-        list(&string(argv, argv_len)),
-        list(&string(env, env_len)),
-        string(cwd, cwd_len),
-    );
+    // SAFETY: the caller's promise
+    let (argv, env, cwd) = unsafe {
+        (
+            string(argv, argv_len),
+            string(env, env_len),
+            string(cwd, cwd_len),
+        )
+    };
+    let (argv, env) = (list(&argv), list(&env));
     let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
     seed();
     let v = vm();
@@ -204,5 +210,26 @@ pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
             set_error(e);
             -1
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list;
+
+    #[test]
+    fn a_list_keeps_its_empty_items() {
+        let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(list(""), v(&[]));
+        assert_eq!(list("\0"), v(&[""]));
+        assert_eq!(
+            list("app\0--label\0\0next\0"),
+            v(&["app", "--label", "", "next"])
+        );
+        assert_eq!(list("app\0\0"), v(&["app", ""]));
+        assert_eq!(list("\0app\0"), v(&["", "app"]));
+        // The last NUL is the terminator of the last item, not an item of its own
+        assert_eq!(list("A=1\0B=\0"), v(&["A=1", "B="]));
+        assert_eq!(list("a\0b"), v(&["a", "b"]));
     }
 }

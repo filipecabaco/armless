@@ -533,7 +533,7 @@ and then, instead of a boot:
 
 | export | |
 |---|---|
-| `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
+| `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated, each item ending with its NUL, an empty one kept as an empty argument): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
 | `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine |
 | `armless_user_run(budget_ms)` | 0 its time ran out, 1 idle, 2 exited, 3 faulted (the reason in `armless_error`), -1 no process |
 | `armless_user_wake_ms()` | after 1: the `microtick()` time of its next deadline, or -1 (only input or a blob wakes it) |
