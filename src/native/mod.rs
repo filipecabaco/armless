@@ -490,8 +490,14 @@ fn event_loop(
             }
         }
     }
-    for (_, (_, s)) in conns.lock().unwrap().sockets.drain() {
+    // The host is going: its sockets close, and the threads working for a connection stop as if
+    // the guest had closed it (dropping the senders ends the WebSockets' and tunnels' queues)
+    let c = std::mem::take(&mut *conns.lock().unwrap());
+    for (_, s) in c.sockets.into_values() {
         let _ = s.shutdown(Shutdown::Both);
+    }
+    for f in c.open.into_values() {
+        f.store(true, Ordering::Release);
     }
 }
 
