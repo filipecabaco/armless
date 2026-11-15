@@ -213,6 +213,28 @@ impl std::fmt::Display for ExecError {
     }
 }
 
+/// What the first process's descriptors 0, 1 and 2 are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StdStreams {
+    /// The terminal, as a program started from a shell has them (`isatty` is true, `input` types
+    /// into it, `close_input` ends it)
+    #[default]
+    Terminal,
+    /// As a container started without a terminal has them: stdin is /dev/null (it reads end of
+    /// file), stdout and stderr are not terminals (no line discipline: no `\n` to `\r\n`) and
+    /// write to the same output (`take_output`)
+    Plain,
+}
+
+/// How `Process::exec_with` starts a program, beyond what execve takes. The default is what
+/// `Process::exec` does.
+#[derive(Clone, Debug, Default)]
+pub struct ExecOptions {
+    pub std: StdStreams,
+    /// What uname and /proc/sys/kernel/hostname say (at most 64 bytes; default "armless")
+    pub hostname: Option<String>,
+}
+
 /// What a process has of its own: its place in the process tree, address space, descriptors,
 /// working directory, signal actions. The process that runs (`Process::p`) has its descriptors in
 /// `Process::files`, the others in here (`Process::switch_to` swaps them).
@@ -353,6 +375,10 @@ pub struct Process {
     pub(crate) timers: Timers,
     /// The processes the host started (spawn.rs), and its ends of their pipes. Not saved.
     pub(crate) spawned: BTreeMap<i64, spawn::Spawned>,
+    /// The hostname, one for every process (`ExecOptions::hostname`)
+    pub(crate) hostname: String,
+    /// Whether there is a terminal (`ExecOptions::std`): with `Plain`, /dev/tty is no device
+    pub(crate) std: StdStreams,
     /// The first process reaps its orphans, as init does and a container's program must when it
     /// is pid 1: the children of a process that ended (not its own) go as they end, with no
     /// SIGCHLD, and its `wait` and `waitid` never report them. Set it before the program runs; it
@@ -603,15 +629,29 @@ impl Process {
         env: &[String],
         cwd: &str,
     ) -> Result<Process, ExecError> {
-        Process::exec_script(cpu, board, args, env, cwd, 0)
+        Process::exec_with(cpu, board, args, env, cwd, &ExecOptions::default())
     }
 
+    /// `exec` with `opts`: the standard streams and the hostname it starts with.
+    pub fn exec_with<H: Host>(
+        cpu: &mut Cpu<H>,
+        board: Arc<Board>,
+        args: &[String],
+        env: &[String],
+        cwd: &str,
+        opts: &ExecOptions,
+    ) -> Result<Process, ExecError> {
+        Process::exec_script(cpu, board, args, env, cwd, opts, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn exec_script<H: Host>(
         cpu: &mut Cpu<H>,
         board: Arc<Board>,
         args: &[String],
         env: &[String],
         cwd: &str,
+        opts: &ExecOptions,
         depth: usize,
     ) -> Result<Process, ExecError> {
         let fail = |s: String| ExecError::Fail(s);
@@ -650,12 +690,12 @@ impl Process {
             next.extend(arg.as_deref().map(s));
             next.push(path);
             next.extend(args[1..].iter().cloned());
-            return Process::exec_script(cpu, board, &next, env, cwd, depth + 1);
+            return Process::exec_script(cpu, board, &next, env, cwd, opts, depth + 1);
         }
         let exe = board
             .with_fs(|fs| files::canonical(fs, cwd_ino, path.as_bytes()).ok())
             .flatten();
-        let mut p = Process::start(cpu, Some(board), image, path.as_bytes(), args, env)?;
+        let mut p = Process::start(cpu, Some(board), image, path.as_bytes(), args, env, opts)?;
         p.p.cwd = cwd_ino;
         // /proc/self/exe: the file itself, symlinks resolved (exec.rs says why)
         if let Some(exe) = exe {
@@ -672,10 +712,22 @@ impl Process {
         args: &[String],
         env: &[String],
     ) -> Result<Process, ExecError> {
+        Process::exec_bytes_with(cpu, board, elf, args, env, &ExecOptions::default())
+    }
+
+    /// `exec_bytes` with `opts`.
+    pub fn exec_bytes_with<H: Host>(
+        cpu: &mut Cpu<H>,
+        board: Option<Arc<Board>>,
+        elf: &[u8],
+        args: &[String],
+        env: &[String],
+        opts: &ExecOptions,
+    ) -> Result<Process, ExecError> {
         let exe = args
             .first()
             .map_or(b"/program".to_vec(), |a| a.as_bytes().to_vec());
-        Process::start(cpu, board, mm::Image::Bytes(elf.into()), &exe, args, env)
+        Process::start(cpu, board, mm::Image::Bytes(elf.into()), &exe, args, env, opts)
     }
 
     fn start<H: Host>(
@@ -685,7 +737,12 @@ impl Process {
         exe: &[u8],
         args: &[String],
         env: &[String],
+        opts: &ExecOptions,
     ) -> Result<Process, ExecError> {
+        let hostname = opts.hostname.clone().unwrap_or_else(|| "armless".into());
+        if !valid_hostname(&hostname) {
+            return Err(ExecError::Fail(format!("{hostname:?}: not a hostname")));
+        }
         let ram = cpu.mem().alias();
         let ram_size = ram.len() as u64;
         let layout = Layout::of(&image, board.as_deref())?;
@@ -735,7 +792,7 @@ impl Process {
             threads: Vec::new(),
             next_id: INIT + 1,
             sig_dirty: false,
-            files: Files::standard(),
+            files: Files::standard(opts.std),
             tty: Tty::new(INIT),
             start: Instant::now(),
             mono_base: 1_000_000_000,
@@ -757,6 +814,8 @@ impl Process {
             shm: shm::Shm::default(),
             timers: Timers::default(),
             spawned: BTreeMap::new(),
+            hostname,
+            std: opts.std,
         };
         p.net_attach();
         let (entry, sp) = match p.load_image(&image, &layout, args, env, exe) {
@@ -1547,6 +1606,8 @@ impl Process {
         self.timers.save(&mut w, now);
         self.files.locks.save(&mut w);
         w.u(self.reap_orphans as u64);
+        w.u((self.std == StdStreams::Plain) as u64);
+        w.b(self.hostname.as_bytes());
         w.0
     }
 
@@ -1562,7 +1623,7 @@ impl Process {
     ) -> Result<Process, String> {
         // (At most the longest a timer is set for, so the clocks it moves don't overflow)
         let asleep = timer::clamp(asleep.as_nanos());
-        // Which format it is (MAGIC says what each adds): 5 to 10
+        // Which format it is (MAGIC says what each adds): 5 to 11
         let Some((ver, rest)) = MAGICS
             .iter()
             .enumerate()
@@ -1751,6 +1812,22 @@ impl Process {
             files.locks = locks::Locks::load(&mut r)?;
         }
         let reap_orphans = ver >= 10 && r.u()? != 0;
+        // Whether it has a terminal, and the hostname, from ARMLUSRB (before, the terminal and
+        // "armless")
+        let std = match if ver >= 11 { r.u()? } else { 0 } {
+            0 => StdStreams::Terminal,
+            1 => StdStreams::Plain,
+            _ => return Err("bad standard streams".into()),
+        };
+        let hostname = if ver >= 11 {
+            let name = String::from_utf8(r.b()?.to_vec()).map_err(|_| "bad hostname")?;
+            if !valid_hostname(&name) {
+                return Err("bad hostname".into());
+            }
+            name
+        } else {
+            "armless".into()
+        };
         files.check_refs(all.values().map(|p| &p.fds))?;
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
@@ -1794,6 +1871,8 @@ impl Process {
             shm,
             timers,
             spawned: BTreeMap::new(),
+            hostname,
+            std,
         };
         p.net_attach();
         let wanted: Vec<String> = p
@@ -1841,16 +1920,24 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-/// The process state's format: ARMLUSRA has whether the first process reaps orphans (at the
-/// end, after the file locks) and each process's orphan flag (after its command line); ARMLUSR9
-/// (0.19) has each process's command line (after its AIO contexts); ARMLUSR8 (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
+/// Whether `name` fits what a hostname is kept in: utsname's fields are 65 bytes, each with its
+/// NUL. Checked for the one `exec` is given and the one a saved state has.
+fn valid_hostname(name: &str) -> bool {
+    name.len() <= 64 && !name.contains('\0')
+}
+
+/// The process state's format: ARMLUSRB (0.20) has whether there is a terminal and the hostname
+/// (at the end, after whether orphans are reaped); ARMLUSRA has whether the first process reaps
+/// orphans (at the end, after the file locks) and each process's orphan flag (after its command
+/// line); ARMLUSR9 (0.19) has each process's command line (after its AIO contexts); ARMLUSR8
+/// (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
 /// each thread's scheduling (sched.rs) and the timers but ITIMER_REAL, with the CPU time they
 /// count (timer.rs, at the end); ARMLUSR6 (0.15) has none of that; ARMLUSR5 (0.14) has neither
 /// the ids, timers, shared memory, shared file pages nor descriptors in flight of 0.15. Each
 /// still loads.
-const MAGIC: &[u8; 8] = b"ARMLUSRA";
-const MAGICS: [&[u8; 8]; 6] = [
-    b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", b"ARMLUSR9", MAGIC,
+const MAGIC: &[u8; 8] = b"ARMLUSRB";
+const MAGICS: [&[u8; 8]; 7] = [
+    b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", b"ARMLUSR9", b"ARMLUSRA", MAGIC,
 ];
 
 const _: () = {

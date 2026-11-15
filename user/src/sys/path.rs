@@ -2,7 +2,9 @@
 
 use armless::dev::fs::{Ino, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
-use crate::errno::{EACCES, EBADF, EEXIST, EFAULT, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ERANGE};
+use crate::errno::{
+    EACCES, EBADF, EEXIST, EFAULT, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ENXIO, ERANGE,
+};
 use crate::files::{self, device, Desc, Kind, Stat, S_IFIFO};
 use crate::files::{
     O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_TRUNC,
@@ -77,6 +79,7 @@ impl Process {
                 s.into_bytes()
             },
             b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
+            b"/proc/sys/kernel/hostname" => format!("{}\n", self.hostname).into_bytes(),
             b"/sys/fs/cgroup/cpu.max" => b"max 100000\n".to_vec(),
             _ => return None,
         })
@@ -135,6 +138,42 @@ impl Process {
         let absolute = path.first() == Some(&b'/');
         if absolute {
             if let Some((kind, _, _)) = device(path) {
+                // /dev/stdin, /dev/stdout and /dev/stderr are what descriptors 0, 1 and 2 are
+                // (Linux's links to /proc/self/fd/N): a file is opened again (new offset, the
+                // flags asked), a pipe or socket is the same open object (as dup), a closed
+                // descriptor is no file
+                let mut kind = kind;
+                if let Some(fd) = std_fd(path) {
+                    let Some((d, desc)) = self.files.desc_of(fd).zip(self.files.get(fd)) else {
+                        return Ret::Val(-ENOENT);
+                    };
+                    match &desc.kind {
+                        Kind::Tty => {},
+                        k @ (Kind::Null | Kind::Out | Kind::Zero | Kind::Random) => kind = k.clone(),
+                        Kind::File { ino, .. } | Kind::Dir { ino, .. } => {
+                            let ino = *ino;
+                            // (A name that is a device's would open the descriptor again, and so
+                            // on for ever: a file renamed to /dev/stdin has no other)
+                            return match self.fs(|fs| files::find_path(fs, ino)).flatten() {
+                                Some(p) if device(&p).is_none() => {
+                                    self.openat(AT_FDCWD, &p, flags & !(O_CREAT | O_EXCL), mode)
+                                },
+                                _ => Ret::Val(-ENOENT),
+                            };
+                        },
+                        Kind::Mem { data, .. } => {
+                            kind = Kind::Mem {
+                                data: data.clone(),
+                                pos: 0,
+                            }
+                        },
+                        _ => return Ret::Val(self.new_fd(d, 0, cloexec)),
+                    }
+                }
+                // No terminal to open without one (`StdStreams::Plain`), as with no controlling tty
+                if matches!(kind, Kind::Tty) && self.std == crate::StdStreams::Plain {
+                    return Ret::Val(-ENXIO);
+                }
                 let d = self.files.add(kind, status);
                 return Ret::Val(self.new_fd(d, 0, cloexec));
             }
@@ -224,6 +263,8 @@ impl Process {
         Ok(match &d.kind {
             Kind::Tty => Stat::device(files::S_IFCHR | 0o620, 0x8800),
             Kind::Null => Stat::device(files::S_IFCHR | 0o666, 0x103),
+            // Not /dev/null's number: GNU grep, for one, writes nothing to what it takes for that
+            Kind::Out => Stat::device(files::S_IFCHR | 0o666, files::OUT_RDEV),
             Kind::Zero => Stat::device(files::S_IFCHR | 0o666, 0x105),
             Kind::Random => Stat::device(files::S_IFCHR | 0o666, 0x109),
             Kind::File { ino, .. } | Kind::Dir { ino, .. } => {
@@ -252,6 +293,10 @@ impl Process {
         }
         if let Some(full) = self.under_special(dirfd, path) {
             return self.stat_path(AT_FDCWD, &full, flags);
+        }
+        // /dev/stdin, /dev/stdout and /dev/stderr are what descriptors 0, 1 and 2 are
+        if let Some(fd) = std_fd(path) {
+            return self.stat_fd(fd).map_err(|_| -ENOENT);
         }
         if let Some((_, mode, rdev)) = device(path) {
             return Ok(Stat::device(mode, rdev));
@@ -357,6 +402,7 @@ impl Process {
                 Some(Kind::Sock(id)) => Ok(format!("socket:[{id}]").into_bytes()),
                 Some(Kind::Tty) => Ok(b"/dev/tty".to_vec()),
                 Some(Kind::Null) => Ok(b"/dev/null".to_vec()),
+                Some(Kind::Out) => Ok(b"/dev/stdout".to_vec()),
                 Some(Kind::Zero) => Ok(b"/dev/zero".to_vec()),
                 Some(Kind::Random) => Ok(b"/dev/urandom".to_vec()),
                 Some(Kind::Event { .. }) => Ok(b"anon_inode:[eventfd]".to_vec()),
@@ -462,5 +508,15 @@ impl Process {
             Some(_) => v(-ENOTDIR),
             None => v(-EBADF),
         }
+    }
+}
+
+/// The descriptor /dev/stdin, /dev/stdout or /dev/stderr is (Linux's links to /proc/self/fd/N)
+fn std_fd(path: &[u8]) -> Option<i32> {
+    match path {
+        b"/dev/stdin" => Some(0),
+        b"/dev/stdout" => Some(1),
+        b"/dev/stderr" => Some(2),
+        _ => None,
     }
 }

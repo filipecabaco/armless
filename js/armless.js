@@ -684,7 +684,11 @@
 
     // ------------------------------------------------------------ user mode
 
-    /** Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows, reap_orphans }. */
+    /**
+     * Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows, plain_std, hostname,
+     * reap_orphans }. `plain_std` gives it the standard streams of a container without a terminal (stdin reads end of
+     * file, stdout and stderr are no terminal); `hostname` is what uname says (default "armless").
+     */
     async _user_exec(user) {
       const e = this.exports;
       const argv = typeof user.argv === "string" ? [user.argv] : user.argv || [];
@@ -698,9 +702,20 @@
         return utf8.encode(s.map((x) => x + "\0").join(""));
       };
       const parts = [list(argv), list(user.env || []), utf8.encode(user.cwd || "/")];
+      const name = utf8.encode(user.hostname || "");
+      if ((user.plain_std && !e.armless_user_plain_std) || (name.length && !e.armless_user_hostname)) {
+        throw new Error("armless: this build has no exec options");
+      }
       const ptrs = parts.map((b) => this._copy_in(b));
       try {
-        // Its executable and loader may be fetched first
+        // The exec options stay set while its executable and loader are fetched
+        if (user.plain_std) e.armless_user_plain_std(1);
+        if (name.length) {
+          const at = e.armless_user_hostname(name.length);
+          if (!at) throw new Error("armless: user mode: " + this._error());
+          // read the memory after the call: it may have grown
+          new Uint8Array(this.memory.buffer, at, name.length).set(name);
+        }
         for (;;) {
           const r = e.armless_user_exec(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length);
           if (r === 0) break;
@@ -710,6 +725,9 @@
         }
       } finally {
         ptrs.forEach((p, i) => e.armless_free(p, parts[i].length));
+        // Back to the defaults however it ended (a fetch that failed leaves them set otherwise)
+        if (e.armless_user_plain_std) e.armless_user_plain_std(0);
+        if (e.armless_user_hostname) e.armless_user_hostname(0);
       }
       this.user = true;
       if (user.reap_orphans) e.armless_user_reap_orphans(1);

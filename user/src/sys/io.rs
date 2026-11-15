@@ -43,6 +43,8 @@ impl Process {
                 },
             },
             Kind::Null => Ok(Vec::new()),
+            // Nothing to read from an output
+            Kind::Out => Err(Ret::Val(-EBADF)),
             Kind::Zero => Ok(vec![0; max]),
             Kind::Random => Ok(host::random_bytes(max)),
             Kind::Dir { .. } => Err(Ret::Val(-EISDIR)),
@@ -202,6 +204,11 @@ impl Process {
             Kind::Tty => {
                 let shown = self.tty.output(data);
                 self.output.extend_from_slice(&shown);
+                Ok(data.len())
+            },
+            // Straight to the output: no line discipline (the terminal's `\n` to `\r\n`)
+            Kind::Out => {
+                self.output.extend_from_slice(data);
                 Ok(data.len())
             },
             Kind::Null | Kind::Zero | Kind::Random => Ok(data.len()),
@@ -559,7 +566,7 @@ impl Process {
                 }
                 v(off)
             },
-            Kind::Null | Kind::Zero | Kind::Random => v(0),
+            Kind::Null | Kind::Zero | Kind::Random | Kind::Out => v(0),
             _ => v(-ESPIPE),
         }
     }

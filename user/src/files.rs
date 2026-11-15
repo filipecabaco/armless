@@ -59,6 +59,9 @@ impl<T> Got<T> {
 pub(crate) enum Kind {
     /// The terminal (stdin, stdout, stderr, /dev/tty)
     Tty,
+    /// Standard output or error of a program with no terminal (`StdStreams::Plain`): written like
+    /// the terminal, but with none of its line discipline, and not a terminal (no ioctl)
+    Out,
     Null,
     Zero,
     Random,
@@ -177,13 +180,19 @@ pub(crate) struct Files {
 }
 
 impl Files {
-    /// stdin, stdout and stderr on the terminal
-    pub fn standard() -> Files {
+    /// stdin, stdout and stderr, on the terminal or (`StdStreams::Plain`) as a container without
+    /// one has them: /dev/null to read, one output to write
+    pub fn standard(std: crate::StdStreams) -> Files {
         let mut f = Files::default();
-        let tty = f.add(Kind::Tty, 2);
-        for fd in 0..3 {
-            f.fds.insert(fd, (tty, false));
-            f.descs.get_mut(&tty).unwrap().refs = 3;
+        let (input, output) = match std {
+            crate::StdStreams::Terminal => {
+                let tty = f.add(Kind::Tty, 2);
+                (tty, tty)
+            },
+            crate::StdStreams::Plain => (f.add(Kind::Null, 0), f.add(Kind::Out, 1)),
+        };
+        for (fd, d) in [(0, input), (1, output), (2, output)] {
+            f.put(fd, d, false);
         }
         f
     }
@@ -349,6 +358,7 @@ impl Files {
                 Kind::Null => w.u(1),
                 Kind::Zero => w.u(2),
                 Kind::Random => w.u(3),
+                Kind::Out => w.u(15),
                 Kind::File { ino, pos } => {
                     w.u(4);
                     w.u(*ino);
@@ -452,6 +462,7 @@ impl Files {
                 12 => Kind::Signal { mask: r.u()? },
                 13 => Kind::Pidfd { pid: r.u()? as i64 },
                 14 => Kind::TimerFd(crate::timerfd::Timer::load(r, asleep)?),
+                15 => Kind::Out,
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {
@@ -769,9 +780,11 @@ impl Stat {
         })
     }
 
+    /// What stat says of what is not in the filesystem: a device is an inode of its own (outside
+    /// the filesystem's numbers), as programs tell /dev/null from the others by st_dev and st_ino
     pub fn device(mode: u32, rdev: u64) -> Stat {
         Stat {
-            ino: 0,
+            ino: if rdev == 0 { 0 } else { 1 << 32 | rdev },
             mode,
             nlink: 1,
             uid: 0,
@@ -887,6 +900,10 @@ pub(crate) fn encode_dirents(
     }
     Ok((out, next))
 }
+
+/// The device number of `Kind::Out`: a character device of its own (major 240, for local use),
+/// not /dev/null's 1:3 nor a terminal's
+pub(crate) const OUT_RDEV: u64 = 0xf000;
 
 /// The devices a path may name, which the filesystem doesn't hold (the guest has no devtmpfs):
 /// the kind of description they open, and their mode and device number for stat.

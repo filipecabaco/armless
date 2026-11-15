@@ -6,6 +6,7 @@ pub(crate) const ENOENT: i64 = 2;
 pub(crate) const ESRCH: i64 = 3;
 pub(crate) const EINTR: i64 = 4;
 pub(crate) const EIO: i64 = 5;
+pub(crate) const ENXIO: i64 = 6;
 pub(crate) const E2BIG: i64 = 7;
 pub(crate) const ENOEXEC: i64 = 8;
 pub(crate) const EBADF: i64 = 9;

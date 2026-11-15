@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use armless::vm::Config;
 use armless::Ram;
-use armless_user::{Process, Smp, Status};
+use armless_user::{ExecOptions, Process, Smp, Status, StdStreams};
 
 fn usage() -> ! {
     eprintln!(
@@ -20,6 +20,9 @@ fn usage() -> ! {
                      is a static executable of this host's files
   --cwd DIR          the working directory in that filesystem (default /)
   --env NAME=VALUE   an environment variable (repeatable; default PATH, HOME and TERM)
+  --plain-std        stdin is /dev/null, stdout and stderr are no terminal (as in a container without
+                     one: no line discipline, isatty is false)
+  --hostname NAME    what uname says (default, or empty: armless)
   --keys TEXT        type TEXT into its terminal once it waits for input (\\n, \\r and \\x03 escapes)
   --spawn CMD        once it waits, run /bin/sh -c CMD beside it as a process of its own (a job of
                      snowglobe's), print what it printed and its status, and stop
@@ -67,6 +70,7 @@ fn main() {
     let mut keys: Option<String> = None;
     let mut spawn: Option<String> = None;
     let mut net = false;
+    let mut opts = ExecOptions::default();
     let mut publish: Vec<(String, u16)> = Vec::new();
     let mut tunnels = Vec::new();
     let mut allow_private = false;
@@ -107,6 +111,9 @@ fn main() {
                 tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
             },
             "--allow-private" => allow_private = true,
+            "--plain-std" => opts.std = StdStreams::Plain,
+            // (an empty one is the default, as in the browser)
+            "--hostname" => opts.hostname = Some(val()).filter(|h| !h.is_empty()),
             "--reap-orphans" => reap_orphans = true,
             "--env" => env.push(val()),
             "--spawn" => spawn = Some(val()),
@@ -225,7 +232,7 @@ fn main() {
         None => match board {
             // Found in the filesystem; its blobs (and its loader's) come from the host meanwhile
             Some(board) if fs_dir.is_some() => loop {
-                match Process::exec(&mut vm.cpus[0], board.clone(), &guest_args, &env, &cwd) {
+                match Process::exec_with(&mut vm.cpus[0], board.clone(), &guest_args, &env, &cwd, &opts) {
                     Ok(p) => break p,
                     Err(armless_user::ExecError::Need(_)) if start.elapsed() < timeout => {
                         std::thread::sleep(Duration::from_millis(5))
@@ -236,7 +243,7 @@ fn main() {
             board => {
                 let elf = std::fs::read(&guest_args[0])
                     .unwrap_or_else(|e| die(format!("{}: {e}", guest_args[0])));
-                Process::exec_bytes(&mut vm.cpus[0], board, &elf, &guest_args, &env)
+                Process::exec_bytes_with(&mut vm.cpus[0], board, &elf, &guest_args, &env, &opts)
                     .unwrap_or_else(|e| die(e))
             },
         },

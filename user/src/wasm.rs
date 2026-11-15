@@ -19,13 +19,17 @@ use armless::wasm::{now_ms, out, set_error, slice, string, vm};
 use armless::Event;
 
 use crate::host::{self, Instant};
-use crate::{ExecError, Process, Status};
+use crate::{ExecError, ExecOptions, Process, Status, StdStreams};
 
 std::thread_local! {
     /// The program, once `armless_user_exec` or `armless_user_restore` made it.
     static PROCESS: RefCell<Option<Process>> = const { RefCell::new(None) };
     /// When `armless_user_run` returned 1: when to run again, in `microtick()` ms, or -1.
     static WAKE_MS: Cell<f64> = const { Cell::new(-1.0) };
+    /// `armless_user_plain_std`: the next exec has no terminal.
+    static PLAIN_STD: Cell<bool> = const { Cell::new(false) };
+    /// `armless_user_hostname`: the bytes of the next exec's hostname.
+    static HOSTNAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// What `armless_user_asleep_ms` set for the next `armless_user_restore`.
     static ASLEEP: Cell<Duration> = const { Cell::new(Duration::ZERO) };
 }
@@ -50,7 +54,9 @@ fn list(s: &str) -> Vec<String> {
 /// `argv[0]` has no slash; a dynamically linked one with its loader): `argv` and `env` are
 /// NUL-separated lists, `cwd` the working directory. Returns 0 when it is ready to run, 1 when
 /// its files are still being fetched (blob events were raised: provide them, then call again),
-/// -1 on failure (see `armless_error`). It replaces any process there was.
+/// -1 on failure (see `armless_error`). It replaces any process there was. It starts with the
+/// options set by `armless_user_plain_std` and `armless_user_hostname` and, once it returns 0 or
+/// -1, goes back to the defaults (a 1 keeps them for the call that follows the blobs).
 ///
 /// # Safety
 /// Each pointer must reference its length of readable bytes.
@@ -71,11 +77,62 @@ pub unsafe extern "C" fn armless_user_exec(
             string(cwd, cwd_len),
         )
     };
-    let (argv, env) = (list(&argv), list(&env));
+    exec(list(&argv), list(&env), cwd)
+}
+
+/// The options the host set for this exec (`armless_user_plain_std`, `armless_user_hostname`).
+fn pending_options() -> Result<ExecOptions, String> {
+    // (Refused, not made UTF-8 by replacing bytes: that would be a name the host did not give)
+    let hostname = HOSTNAME
+        .with_borrow(|h| String::from_utf8(h.clone()))
+        .map_err(|_| "hostname: not UTF-8")?;
+    Ok(ExecOptions {
+        std: if PLAIN_STD.get() { StdStreams::Plain } else { StdStreams::Terminal },
+        hostname: (!hostname.is_empty()).then_some(hostname),
+    })
+}
+
+/// The next exec's standard streams: nonzero gives the program those of a container without a
+/// terminal (`StdStreams::Plain`: stdin reads end of file, stdout and stderr are no terminal),
+/// zero the terminal (the default). Call it before `armless_user_exec`; that exec (once it is not
+/// asking for blobs any more) puts it back to the default.
+#[no_mangle]
+pub extern "C" fn armless_user_plain_std(on: u32) {
+    PLAIN_STD.set(on != 0);
+}
+
+/// The next exec's hostname, which is what uname says (empty: "armless"): makes room for `len`
+/// bytes (at most 64, the longest name; a longer one fails with 0 and the reason in
+/// `armless_error`) and returns where they are in the module's memory. Write the UTF-8 bytes
+/// there, then call `armless_user_exec`, which reads them and puts the hostname back to the
+/// default. The pointer is only good until the next call of this function or the exec, and the
+/// memory may have grown since the module was last asked, so re-read it before writing.
+#[no_mangle]
+pub extern "C" fn armless_user_hostname(len: u32) -> u32 {
+    if len > 64 {
+        HOSTNAME.with_borrow_mut(Vec::clear);
+        set_error(format!("hostname: {len} bytes is longer than 64"));
+        return 0;
+    }
+    HOSTNAME.with_borrow_mut(|h| {
+        h.clear();
+        h.resize(len as usize, 0);
+        h.as_mut_ptr() as u32
+    })
+}
+
+fn exec(argv: Vec<String>, env: Vec<String>, cwd: String) -> i32 {
     let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
     seed();
     let v = vm();
-    match Process::exec(&mut v.cpus[0], v.board.clone(), &argv, &env, &cwd) {
+    let r = pending_options().map_err(ExecError::Fail).and_then(|opts| {
+        Process::exec_with(&mut v.cpus[0], v.board.clone(), &argv, &env, &cwd, &opts)
+    });
+    if !matches!(r, Err(ExecError::Need(_))) {
+        PLAIN_STD.set(false);
+        HOSTNAME.with_borrow_mut(Vec::clear);
+    }
+    match r {
         Ok(p) => {
             PROCESS.set(Some(p));
             0
@@ -266,6 +323,72 @@ mod tests {
         }
         e.extend_from_slice(&0x1400_0000u32.to_le_bytes()); // b .
         e
+    }
+
+    fn set_hostname(name: &[u8]) {
+        assert_ne!(armless_user_hostname(name.len() as u32), 0);
+        HOSTNAME.with_borrow_mut(|h| h.copy_from_slice(name));
+    }
+
+    #[test]
+    fn the_options_are_the_terminal_and_armless_unless_set() {
+        let opts = pending_options().unwrap();
+        assert_eq!((opts.std, opts.hostname), (StdStreams::Terminal, None));
+        armless_user_plain_std(1);
+        set_hostname(b"pod-7a");
+        let opts = pending_options().unwrap();
+        assert_eq!(
+            (opts.std, opts.hostname.as_deref()),
+            (StdStreams::Plain, Some("pod-7a"))
+        );
+        // Empty is the default, not an empty name
+        armless_user_plain_std(0);
+        armless_user_hostname(0);
+        let opts = pending_options().unwrap();
+        assert_eq!((opts.std, opts.hostname), (StdStreams::Terminal, None));
+    }
+
+    #[test]
+    fn a_hostname_longer_than_64_bytes_or_not_utf8_is_refused() {
+        set_hostname(&[b'x'; 64]);
+        assert_eq!(armless_user_hostname(65), 0);
+        assert_ne!(armless::wasm::armless_error_len(), 0);
+        // and the one set before is gone
+        assert_eq!(HOSTNAME.with_borrow(Vec::len), 0);
+        set_hostname(b"\xff");
+        assert!(pending_options().is_err());
+    }
+
+    #[test]
+    fn exec_takes_the_options_once_it_has_its_files_and_then_forgets_them() {
+        // SAFETY: no MAC to read (0)
+        assert_eq!(
+            unsafe { armless::wasm::armless_create(64, 1, armless::wasm::DEV_FS, 0) },
+            0
+        );
+        let json = br#"{"version":3,"fsroot":[["x",124,0,33261,0,0,"x"]]}"#;
+        vm().board.load_filesystem(json).unwrap();
+        let x = || exec(vec!["/x".into()], Vec::new(), String::new());
+        armless_user_plain_std(1);
+        set_hostname(b"pod-7a");
+        // Its blob is still to come: the options wait for the exec that follows
+        assert_eq!(x(), 1);
+        assert!(PLAIN_STD.get());
+        assert_eq!(HOSTNAME.with_borrow(Vec::clone), b"pod-7a");
+        vm().board.provide_raw_blob("x", elf()).unwrap();
+        assert_eq!(x(), 0);
+        PROCESS.with_borrow(|p| {
+            let p = p.as_ref().unwrap();
+            assert_eq!((p.std, p.hostname.as_str()), (StdStreams::Plain, "pod-7a"));
+        });
+        assert!(!PLAIN_STD.get());
+        assert!(HOSTNAME.with_borrow(Vec::is_empty));
+        // A failed exec forgets them too
+        armless_user_plain_std(1);
+        set_hostname(b"\xff");
+        assert_eq!(x(), -1);
+        assert!(!PLAIN_STD.get());
+        assert!(HOSTNAME.with_borrow(Vec::is_empty));
     }
 
     #[test]

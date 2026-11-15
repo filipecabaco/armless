@@ -272,7 +272,7 @@ impl Process {
         let mut u = [0u8; 65 * 6];
         for (i, s) in [
             "Linux",
-            "armless",
+            self.hostname.as_str(),
             "6.6.0-armless-user",
             "#1",
             "aarch64",
@@ -281,7 +281,9 @@ impl Process {
         .iter()
         .enumerate()
         {
-            u[65 * i..65 * i + s.len()].copy_from_slice(s.as_bytes());
+            // (Each field keeps its NUL, whatever state a process was restored from)
+            let s = &s.as_bytes()[..s.len().min(64)];
+            u[65 * i..65 * i + s.len()].copy_from_slice(s);
         }
         v(if self.write(a[0], &u) { 0 } else { -EFAULT })
     }

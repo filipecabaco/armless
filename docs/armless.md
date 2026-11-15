@@ -280,6 +280,14 @@ x0–x5, answers it in x0, and resumes at ELR.
   ISIG, Ctrl-C, Ctrl-\ and Ctrl-Z are SIGINT, SIGQUIT and SIGTSTP, flushing the input and the
   output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
   newlines start a line (ONLCR).
+- **Without a terminal:** `ExecOptions { std: StdStreams::Plain, .. }` (`Process::exec_with`;
+  `armless-exec --plain-std`; `armless_user_plain_std`; `plain_std` in the JS options) starts the
+  program as a container with no tty has it: stdin is `/dev/null` (end of file, `isatty` false),
+  stdout and stderr are character devices that are no terminal (no TCGETS, no ONLCR) and write to
+  the same output (`take_output`, console events), and `/dev/stdin`, `/dev/stdout` and
+  `/dev/stderr` open the same; with no controlling terminal, `/dev/tty` is ENXIO.
+  `ExecOptions::hostname` (`--hostname`, `hostname`) is what uname and
+  `/proc/sys/kernel/hostname` say ("armless" by default). Both are in the saved state.
 - **Orphans:** a process whose parent ended is a child of the first process, which can wait for
   it. A container's program is pid 1 and does not: `Process::reap_orphans` (`armless-exec
   --reap-orphans`, `armless_user_reap_orphans`, `reap_orphans` in the JS options; saved) makes the
@@ -551,6 +559,8 @@ and then, instead of a boot:
 | export | |
 |---|---|
 | `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated, each item ending with its NUL, an empty one kept as an empty argument): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
+| `armless_user_plain_std(on)` | the next `armless_user_exec` has no terminal (`StdStreams::Plain`) when `on` is nonzero |
+| `armless_user_hostname(len)` | room for the next exec's hostname (at most 64 bytes; 0 and `armless_error` otherwise): returns where to write its UTF-8 bytes, which `armless_user_exec` reads (empty: armless); the exec puts both options back to the defaults |
 | `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine; for one restore, how long it was saved for is what `armless_user_asleep_ms` set |
 | `armless_user_asleep_ms(ms)` | how long the next restored state was saved for, in ms (0, the default: none), which its clocks and deadlines go on by |
 | `armless_user_run(budget_ms)` | 0 its time ran out, 1 idle, 2 exited, 3 faulted (the reason in `armless_error`), -1 no process |
