@@ -64,6 +64,7 @@ Where to look to change something, and which tests say it still works. Each modu
 | `tests/web.rs` | the web relay against a real TLS client |
 | `tests/difftest/` (CI) | single instructions against qemu, natively and through the wasm JIT: int, fp, simd, ldst, crypto, lse |
 | `tests/linux/`, `tests/js/` (CI) | Linux userspace in the machine, the browser build |
+| `tests/js/*.test.mjs` (CI, `node --test`) | `armless.js`'s user-mode API on the wasm build, with programs as machine code (`tests/js/prog.mjs`, the twin of `user/tests/prog/`) |
 | `user/tests/exec.rs` | programs as aarch64 machine code: exec, files, memory, signals, the terminal |
 | `user/tests/kernel.rs` | what services rely on: ids, processes, /proc, locks, shared memory, saved and restored processes |
 | `user/tests/sockets.rs` | sockets |

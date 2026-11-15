@@ -310,7 +310,8 @@ for armless 0.2.10 and older.
 | `ARMLESS_9PFS=DIR cargo test --release --test vm` | the snowglobe flow natively: 9p root, console, snapshot, restore |
 | `node tests/js/flow.mjs DIR [CPUS]` | the same through `armless.js`, plus HTTP over fetch and port forwarding |
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
-| `node tests/js/user.mjs SITE` | user mode through `armless.js`: a `--kernel none` snowglobe site restored from its native snapshot, asked a question, saved and restored again; `--exec FSDIR PROGRAM ARGS` starts a program from a filesystem |
+| `node --test 'tests/js/*.test.mjs'` | user mode's API in `armless.js` on `build/armless.wasm` (build it first with `sh build-wasm.sh`): argv and env, `plain_std`, `hostname`, `reap_orphans`, `user_asleep_ms`, and their errors. Self-contained: the programs are machine code made by the test (`tests/js/prog.mjs`) and the filesystem is in memory |
+| `node tests/js/user.mjs SITE` | user mode through `armless.js` against a real program (not in CI, by hand): a `--kernel none` snowglobe site restored from its native snapshot, asked a question, saved and restored again; `--exec FSDIR PROGRAM ARGS` starts a program from a filesystem |
 | `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node) |
 | `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands |
 | `cargo bench --bench machine` | host-side costs with criterion: an instruction interpreted and compiled, a page's compile, a snapshot |
@@ -319,8 +320,8 @@ for armless 0.2.10 and older.
 [docs/profiling.md](docs/profiling.md) explains the benchmarks and profiles. CI
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the unit tests (with and
 without overflow checks), clippy natively and for wasm32, the KVM backend's lints, the wasm
-builds, and a Linux job that boots a kernel and compares userspace and SMP output with
-qemu-aarch64, natively, with the native JIT and through `armless.js`. On pull requests,
+builds and `armless.js`'s user-mode tests, and a Linux job that boots a kernel and compares
+userspace and SMP output with qemu-aarch64, natively, with the native JIT and through `armless.js`. On pull requests,
 [`.github/workflows/bench.yml`](.github/workflows/bench.yml) runs the criterion benchmarks on the
 base and on the change, and comments with how they compare.
 
