@@ -215,6 +215,145 @@ fn a_saved_state_with_a_hostname_that_does_not_fit_is_refused() {
     assert!(restore(&with(&[b'x'; 65])).is_err());
     assert!(restore(&with(&[b'x'; 326])).is_err());
     assert!(restore(&with(b"a\0b")).is_err());
+    // Not UTF-8
+    assert!(restore(&with(b"\xff")).is_err());
+    // Standard streams that are neither the terminal (0) nor plain (1): the field before the name
+    let at = process.len() - (8 + "pod-7a".len()) - 8;
+    for (std, good) in [(1u64, true), (2, false)] {
+        let mut forged = process.clone();
+        forged[at..at + 8].copy_from_slice(&std.to_le_bytes());
+        assert_eq!(restore(&forged).is_ok(), good, "{std}");
+    }
+}
+
+#[test]
+fn a_state_saved_before_the_options_has_the_terminal_and_armless() {
+    let mut p = Prog::default();
+    p.put(0x200, &[0u8; 8]);
+    p.put(0x208, &200_000_000u64.to_le_bytes());
+    p.put(0x310, b"/dev/tty\0");
+    p.sys(101, &[D(0x200), I(0)]).expect(0);
+    p.sys(160, &[D(0x400)]).expect(0);
+    p.out(0x400 + 65, 7);
+    // A terminal to open
+    p.sys(56, &[I(AT_FDCWD), D(0x310), I(2), I(0)]).expect_ok();
+    let mut vm = machine();
+    let opts = ExecOptions {
+        std: StdStreams::Plain,
+        hostname: Some("pod-7a".into()),
+    };
+    let mut p = start_with(&mut vm, p, &opts);
+    let (_, status) = run_until_idle(&mut p, &mut vm);
+    assert!(matches!(status, Status::Idle(Some(_))), "{status:?}");
+    let mut process = p.save(&vm.cpus[0]);
+    let state = vm.save_state();
+    drop((p, vm));
+    // ARMLUSR9: neither the standard streams nor the hostname at the end
+    process.truncate(process.len() - (8 + 8 + "pod-7a".len()));
+    process[..8].copy_from_slice(b"ARMLUSR9");
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"armless");
+}
+
+#[test]
+fn plain_stdout_reopened_for_reading_reads_nothing() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/dev/stdout\0");
+    // O_RDWR: it opens, but there is nothing to read from an output
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(2), I(0)])
+        .save(0x100)
+        .expect_ok();
+    p.sys(63, &[W(0x100), D(0x300), I(16)]).expect(EBADF);
+    let mut vm = machine();
+    let mut p = start_with(&mut vm, p, &plain());
+    ok(&run(&mut p, &mut vm).1);
+}
+
+#[test]
+fn proc_self_fd_of_plain_stdout_links_to_dev_stdout() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/proc/self/fd/1\0");
+    p.sys(78, &[I(AT_FDCWD), D(0x200), D(0x300), I(64)])
+        .expect(11);
+    p.out(0x300, 11);
+    let mut vm = machine();
+    let mut p = start_with(&mut vm, p, &plain());
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"/dev/stdout");
+}
+
+#[test]
+fn dev_stdin_on_a_proc_file_reads_it_from_the_start() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/proc/sys/kernel/hostname\0");
+    p.put(0x220, b"/dev/stdin\0");
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(0), I(0)])
+        .save(0x100)
+        .expect_ok();
+    p.sys(63, &[W(0x100), D(0x300), I(2)]).expect(2);
+    p.sys(24, &[W(0x100), I(0), I(0)]).expect(0);
+    // A description of its own: not where descriptor 0 was in it
+    p.sys(56, &[I(AT_FDCWD), D(0x220), I(0), I(0)])
+        .save(0x108)
+        .expect_ok();
+    p.sys(63, &[W(0x108), D(0x400), I(64)]).expect(7);
+    p.out(0x400, 7);
+    let mut vm = machine();
+    let opts = ExecOptions {
+        hostname: Some("pod-7a".into()),
+        ..ExecOptions::default()
+    };
+    let mut p = start_with(&mut vm, p, &opts);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"pod-7a\r\n");
+}
+
+#[test]
+fn armless_exec_takes_plain_std_and_a_hostname() {
+    let mut p = Prog::default();
+    p.put(0x200, b"\n");
+    p.sys(29, &[I(1), I(TCGETS), D(0x300)]).expect(ENOTTY);
+    p.sys(160, &[D(0x400)]).expect(0);
+    p.out(0x400 + 65, 6);
+    p.out(0x200, 1);
+    let elf = p.elf();
+    // The program as a file of this host's, and in a filesystem (--fs) as /p
+    let dir = std::env::temp_dir().join(format!("armless-exec-options-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("blobs")).unwrap();
+    std::fs::write(dir.join("p"), &elf).unwrap();
+    std::fs::write(dir.join("blobs/p"), &elf).unwrap();
+    let json = format!(
+        r#"{{"version":3,"fsroot":[["p",{},0,33261,0,0,"p"]]}}"#,
+        elf.len()
+    );
+    std::fs::write(dir.join("fs.json"), json).unwrap();
+    let exec = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_armless-exec"))
+            .args(["-m", "128"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let host = dir.join("p");
+    let host = host.to_str().unwrap();
+    let fs = dir.to_str().unwrap();
+    let good = exec(&["--plain-std", "--hostname", "pod-7a", host]);
+    let in_fs = exec(&["--fs", fs, "--plain-std", "--hostname", "pod-7a", "/p"]);
+    let long = exec(&["--hostname", &"x".repeat(65), host]);
+    std::fs::remove_dir_all(&dir).unwrap();
+    for out in [&good, &in_fs] {
+        assert_eq!(out.status.code(), Some(0));
+        // No "\r\n": no terminal
+        assert_eq!(out.stdout, b"pod-7a\n");
+    }
+    assert_eq!(long.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&long.stderr).contains("not a hostname"));
 }
 
 #[test]
@@ -370,12 +509,19 @@ fn without_a_terminal_dev_tty_is_no_device() {
     const ENXIO: i64 = -6;
     let program = |expect: i64| {
         let mut p = Prog::default();
-        p.put(0x200, b"/dev/tty\0");
-        p.sys(56, &[I(AT_FDCWD), D(0x200), I(2), I(0)]);
-        if expect < 0 {
-            p.expect(expect);
-        } else {
-            p.expect_ok();
+        // The terminal by each of its names
+        for (i, path) in [&b"/dev/tty\0"[..], b"/dev/console\0", b"/dev/pts/0\0"]
+            .into_iter()
+            .enumerate()
+        {
+            let at = 0x200 + 0x20 * i as u32;
+            p.put(at, path);
+            p.sys(56, &[I(AT_FDCWD), D(at), I(2), I(0)]);
+            if expect < 0 {
+                p.expect(expect);
+            } else {
+                p.expect_ok();
+            }
         }
         p
     };

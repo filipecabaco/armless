@@ -263,3 +263,97 @@ pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A static ELF whose one instruction is a branch to itself: enough to make a process
+    fn elf() -> Vec<u8> {
+        const BASE: u64 = 0x40_0000;
+        let mut e = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
+        e.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        e.extend_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        e.extend_from_slice(&1u32.to_le_bytes());
+        e.extend_from_slice(&(BASE + 120).to_le_bytes()); // entry, after the headers
+        e.extend_from_slice(&64u64.to_le_bytes());
+        e.extend_from_slice(&0u64.to_le_bytes());
+        e.extend_from_slice(&0u32.to_le_bytes());
+        for v in [64u16, 56, 1, 64, 0, 0] {
+            e.extend_from_slice(&v.to_le_bytes());
+        }
+        e.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD, R X
+        e.extend_from_slice(&5u32.to_le_bytes());
+        for v in [0, BASE, BASE, 124, 124, 0x1000] {
+            e.extend_from_slice(&v.to_le_bytes());
+        }
+        e.extend_from_slice(&0x1400_0000u32.to_le_bytes()); // b .
+        e
+    }
+
+    fn set_hostname(name: &[u8]) {
+        assert_ne!(armless_user_hostname(name.len() as u32), 0);
+        HOSTNAME.with_borrow_mut(|h| h.copy_from_slice(name));
+    }
+
+    #[test]
+    fn the_options_are_the_terminal_and_armless_unless_set() {
+        let opts = pending_options().unwrap();
+        assert_eq!((opts.std, opts.hostname), (StdStreams::Terminal, None));
+        armless_user_plain_std(1);
+        set_hostname(b"pod-7a");
+        let opts = pending_options().unwrap();
+        assert_eq!(
+            (opts.std, opts.hostname.as_deref()),
+            (StdStreams::Plain, Some("pod-7a"))
+        );
+        // Empty is the default, not an empty name
+        armless_user_plain_std(0);
+        armless_user_hostname(0);
+        let opts = pending_options().unwrap();
+        assert_eq!((opts.std, opts.hostname), (StdStreams::Terminal, None));
+    }
+
+    #[test]
+    fn a_hostname_longer_than_64_bytes_or_not_utf8_is_refused() {
+        set_hostname(&[b'x'; 64]);
+        assert_eq!(armless_user_hostname(65), 0);
+        assert_ne!(armless::wasm::armless_error_len(), 0);
+        // and the one set before is gone
+        assert_eq!(HOSTNAME.with_borrow(Vec::len), 0);
+        set_hostname(b"\xff");
+        assert!(pending_options().is_err());
+    }
+
+    #[test]
+    fn exec_takes_the_options_once_it_has_its_files_and_then_forgets_them() {
+        // SAFETY: no MAC to read (0)
+        assert_eq!(
+            unsafe { armless::wasm::armless_create(64, 1, armless::wasm::DEV_FS, 0) },
+            0
+        );
+        let json = br#"{"version":3,"fsroot":[["x",124,0,33261,0,0,"x"]]}"#;
+        vm().board.load_filesystem(json).unwrap();
+        let x = || exec(vec!["/x".into()], Vec::new(), String::new());
+        armless_user_plain_std(1);
+        set_hostname(b"pod-7a");
+        // Its blob is still to come: the options wait for the exec that follows
+        assert_eq!(x(), 1);
+        assert!(PLAIN_STD.get());
+        assert_eq!(HOSTNAME.with_borrow(Vec::clone), b"pod-7a");
+        vm().board.provide_raw_blob("x", elf()).unwrap();
+        assert_eq!(x(), 0);
+        PROCESS.with_borrow(|p| {
+            let p = p.as_ref().unwrap();
+            assert_eq!((p.std, p.hostname.as_str()), (StdStreams::Plain, "pod-7a"));
+        });
+        assert!(!PLAIN_STD.get());
+        assert!(HOSTNAME.with_borrow(Vec::is_empty));
+        // A failed exec forgets them too
+        armless_user_plain_std(1);
+        set_hostname(b"\xff");
+        assert_eq!(x(), -1);
+        assert!(!PLAIN_STD.get());
+        assert!(HOSTNAME.with_borrow(Vec::is_empty));
+    }
+}
