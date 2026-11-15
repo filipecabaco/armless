@@ -15,7 +15,8 @@
 // and its system calls are answered in armless, with the console as its terminal. Instead of
 // `boot`, `user: { argv: ["python3"], env: ["PATH=/usr/bin", ...], cwd: "/", cols, rows }`
 // starts one; `user_state` (URL or bytes, a process saved with save_process() or natively,
-// system/user.bin of a snowglobe site) restores one next to `initial_state`. The events and
+// system/user.bin of a snowglobe site) restores one next to `initial_state`, with `user_asleep_ms`
+// (default 0) the time it was saved for, which its clocks and deadlines go on by. The events and
 // console_input/console_resize are the same; "stop" says {reason: "exit", code} when it exits,
 // and "idle" when it has gone quiet waiting for input.
 //
@@ -499,7 +500,7 @@
       if (o.initial_state) {
         await this._restore(o.initial_state.url ?? o.initial_state);
         this._seed();
-        if (o.user_state) await this._user_restore(o.user_state.url ?? o.user_state);
+        if (o.user_state) await this._user_restore(o.user_state.url ?? o.user_state, o.user_asleep_ms);
       } else {
         this._seed();
         if (o.user) await this._user_exec(o.user);
@@ -713,10 +714,14 @@
       e.armless_user_resize(user.cols || 80, user.rows || 24);
     }
 
-    /** The process of a snapshot, on the machine `initial_state` restored (URL or bytes). */
-    async _user_restore(src) {
+    /**
+     * The process of a snapshot, on the machine `initial_state` restored (URL or bytes). `asleep_ms`
+     * is how long it was saved for: its clocks go on by that much, and what was due in it is due now.
+     */
+    async _user_restore(src, asleep_ms = 0) {
       const file = typeof src === "string" ? src : "user_state";
       const bytes = await load(src, (loaded, total) => this.emit("progress", { file, loaded, total }));
+      this.exports.armless_user_asleep_ms(asleep_ms ?? 0);
       if (this._with_bytes(bytes, (p, n) => this.exports.armless_user_restore(p, n)) !== 0) {
         throw new Error("armless: user state: " + this._error());
       }
@@ -1057,8 +1062,9 @@
     /**
      * Replace the machine's state with a snapshot (ArrayBuffer, bytes or URL), and in user mode the
      * process with `user_state`, saved with it (without one, no process runs: a kernel would).
+     * `user_asleep_ms` is how long they were saved for (see `user_state` above).
      */
-    async restore_state(src, { user_state } = {}) {
+    async restore_state(src, { user_state, user_asleep_ms } = {}) {
       await this.ready;
       const was_running = this.running;
       await this.stop();
@@ -1066,7 +1072,7 @@
       this._seed();
       this.user = false;
       this._user_idle = false;
-      if (user_state) await this._user_restore(user_state.url ?? user_state);
+      if (user_state) await this._user_restore(user_state.url ?? user_state, user_asleep_ms);
       this._drain();
       if (was_running) this.run();
     }

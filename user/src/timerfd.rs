@@ -14,6 +14,7 @@ use crate::errno::{EAGAIN, EBADF, EFAULT, EINVAL};
 use crate::files::{Desc, Kind};
 use crate::host::Instant;
 use crate::ser::{R, W};
+use crate::timer::{after_sleep, clamp};
 use crate::{Process, Ret};
 
 const CLOCK_REALTIME: u64 = 0;
@@ -67,16 +68,20 @@ impl Timer {
         w.u(self.ticks);
     }
 
-    pub fn load(r: &mut R) -> Result<Timer, String> {
+    /// The timer from its `save`, the process having been asleep `asleep` ns since: the
+    /// expirations in the sleep are counted, as if something had looked all along.
+    pub fn load(r: &mut R, asleep: u64) -> Result<Timer, String> {
         let now = Instant::now();
-        let clock = r.u()?;
-        let left = r.u()?;
-        Ok(Timer {
-            clock,
-            next: (left != u64::MAX).then(|| now + Duration::from_nanos(left)),
-            every: Duration::from_nanos(r.u()?),
-            ticks: r.u()?,
-        })
+        let (clock, left, every, ticks) = (r.u()?, r.u()?, r.u()?, r.u()?);
+        let mut t = Timer { clock, next: None, every: Duration::from_nanos(every), ticks };
+        if left != u64::MAX {
+            let (left, n) = after_sleep(left, every, asleep);
+            t.ticks = t.ticks.saturating_add(n);
+            // (One that does not repeat and came due is spent)
+            t.next =
+                (every != 0 || n == 0).then(|| now + Duration::from_nanos(clamp(left as u128)));
+        }
+        Ok(t)
     }
 }
 
@@ -216,5 +221,39 @@ impl Process {
             (n.saturating_duration_since(Instant::now()).as_nanos() as u64).max(1)
         });
         self.put_itimerspec(at, t.every.as_nanos() as u64, left)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_timerfd_restored_after_a_sleep_counts_what_came_due_and_one_disarmed_stays_so() {
+        let hour = Duration::from_secs(3600).as_nanos() as u64;
+        let now = Instant::now();
+        let restored = |next: Option<Duration>| {
+            let t = Timer {
+                clock: 1,
+                next: next.map(|d| now + d),
+                every: Duration::ZERO,
+                ticks: 2,
+            };
+            let mut w = W(Vec::new());
+            t.save(&mut w, now);
+            Timer::load(&mut R(&w.0), hour).unwrap()
+        };
+        // Disarmed: still, and its count kept
+        let t = restored(None);
+        assert!(t.next.is_none());
+        assert_eq!(t.ticks, 2);
+        // A one-shot due in the sleep: counted and spent
+        let t = restored(Some(Duration::from_secs(60)));
+        assert!(t.next.is_none());
+        assert_eq!(t.ticks, 3);
+        // Due after it: still to come
+        let t = restored(Some(Duration::from_secs(7200)));
+        assert!(t.next.is_some());
+        assert_eq!(t.ticks, 2);
     }
 }

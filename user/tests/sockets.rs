@@ -458,7 +458,7 @@ fn sockets_survive_a_snapshot() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process, Duration::ZERO).unwrap();
     p.input(b"\n");
     let (out, status) = run(&mut p, &mut vm);
     ok(&status);
@@ -528,7 +528,7 @@ fn processes_with_sockets_survive_a_snapshot() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process, Duration::ZERO).unwrap();
     p.input(b"\n");
     let (out, status) = run(&mut p, &mut vm);
     ok(&status);
@@ -960,7 +960,7 @@ fn descriptors_in_flight_survive_a_snapshot() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process, Duration::ZERO).unwrap();
     p.input(b"\n");
     let (out, status) = run(&mut p, &mut vm);
     ok(&status);

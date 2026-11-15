@@ -1538,12 +1538,17 @@ impl Process {
     }
 
     /// The process from its `save`, on a CPU the machine's snapshot was restored to (and the
-    /// machine, for its filesystem).
+    /// machine, for its filesystem). `asleep` is how long it was saved for: the monotonic clocks
+    /// have gone on by that much, and what was due in it is due now (a timer that repeats counts
+    /// each period it missed). The wall clock is the host's, and the CPU time stands still.
     pub fn restore<H: Host>(
         cpu: &mut Cpu<H>,
         board: Option<Arc<Board>>,
         data: &[u8],
+        asleep: Duration,
     ) -> Result<Process, String> {
+        // (At most the longest a timer is set for, so the clocks it moves don't overflow)
+        let asleep = timer::clamp(asleep.as_nanos());
         // Which format it is (MAGIC says what each adds): 5 to 9
         let Some((ver, rest)) = MAGICS
             .iter()
@@ -1575,9 +1580,9 @@ impl Process {
         let _asid = r.u()?;
         let filled = r.u()?;
         let next_id = r.u()? as i64;
-        let mono_base = r.u()?;
+        let mono_base = r.u()?.saturating_add(asleep);
         let cur = r.u()? as usize;
-        let mut files = Files::load(&mut r)?;
+        let mut files = Files::load(&mut r, asleep)?;
         let tty = Tty::load(&mut r)?;
         let mut spaces = Vec::new();
         for _ in 0..r.u()? {
@@ -1603,7 +1608,7 @@ impl Process {
             // Before ARMLUSR6 every process was root
             let creds = if v6 { Creds::load(&mut r)? } else { Creds::default() };
             if v6 {
-                timers.load_real(&mut r, pid, Instant::now())?;
+                timers.load_real(&mut r, pid, Instant::now(), asleep)?;
             }
             // Before ARMLUSR7 there were no groups nor AIO contexts
             let groups = if ver >= 7 { creds::load_groups(&mut r)? } else { Vec::new() };
@@ -1634,7 +1639,9 @@ impl Process {
             );
         }
         let now = Instant::now();
-        let at = |left: u64| (left != u64::MAX).then(|| now + Duration::from_nanos(left));
+        let at = |left: u64| {
+            (left != u64::MAX).then(|| now + Duration::from_nanos(left.saturating_sub(asleep)))
+        };
         let mut threads = Vec::new();
         for _ in 0..r.u()? {
             let (tid, pid, clear_tid, exited) = (r.u()? as i64, r.u()? as i64, r.u()?, r.u()? != 0);
@@ -1721,7 +1728,7 @@ impl Process {
         files.net.load_cm(&mut r, ver)?;
         // Before ARMLUSR7 only ITIMER_REAL was kept
         if ver >= 7 {
-            timers.load(&mut r, now)?;
+            timers.load(&mut r, now, asleep)?;
         }
         // File locks from ARMLUSR8 (before, every lock was granted and none kept)
         if ver >= 8 {

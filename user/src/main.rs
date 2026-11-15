@@ -27,7 +27,8 @@ fn usage() -> ! {
   --cpus N           CPUs (default 1, at most 8): threads run on them at the same time
   --stop-after TEXT  stop once the program printed TEXT
   --save DIR         when it stops, write the machine (machine.bin) and the process (process.bin)
-  --restore DIR      start from what --save wrote instead of an ELF
+  --restore DIR      start from what --save wrote instead of an ELF (its clocks go on by the age of
+                     process.bin: what was due meanwhile is due at once)
   --input LINE       type LINE (and a newline) into its stdin, and stop at the next line it prints
   --timeout SECS     stop after SECS of wall time
   --net              a network: connections to addresses that are not the loopback's are made
@@ -207,8 +208,15 @@ fn main() {
         Some(dir) => {
             let machine = std::fs::read(dir.join("machine.bin")).unwrap_or_else(|e| die(e));
             vm.load_state(&machine).unwrap_or_else(|e| die(e));
-            let process = std::fs::read(dir.join("process.bin")).unwrap_or_else(|e| die(e));
-            Process::restore(&mut vm.cpus[0], board, &process).unwrap_or_else(|e| die(e))
+            let file = dir.join("process.bin");
+            let process = std::fs::read(&file).unwrap_or_else(|e| die(e));
+            // How long it has been saved: the process's clocks go on by that much
+            let asleep = std::fs::metadata(&file)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .unwrap_or_default();
+            Process::restore(&mut vm.cpus[0], board, &process, asleep).unwrap_or_else(|e| die(e))
         },
         None => match board {
             // Found in the filesystem; its blobs (and its loader's) come from the host meanwhile

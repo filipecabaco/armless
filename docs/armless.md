@@ -452,7 +452,7 @@ x0–x5, answers it in x0, and resumes at ELR.
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
 - **Clocks:** `clock_gettime`, `gettimeofday`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
-  across a snapshot and its restores.
+  across a snapshot and its restores, by the time it was asleep when the host says (below).
 - **Signals** (signal.rs): actions per process, a mask, a pending set and an alternate stack
   per thread, a pending set for the process (given to its first thread that doesn't block the
   signal, the main thread first). A handler runs on the `rt_sigframe` the kernel builds
@@ -479,6 +479,15 @@ x0–x5, answers it in x0, and resumes at ELR.
   pages, and the descriptors on their way over sockets. Both older ones load (what they lack
   starts as a new process has it); a state from before 0.14 does not (addresses are virtual,
   there are processes, and the sockets are in the machine's state).
+  A host that restores after a while says how long (`Process::restore`'s `asleep`,
+  `armless_user_asleep_ms` before `armless_user_restore`, armless-exec's `--restore` the age of `process.bin`): the
+  monotonic and boot-time clocks go on by that much, a wait or timer that came due in it is due
+  at once, and a timerfd that repeats counts every period it missed, as if it had been read all
+  along. A recurring signal timer (`setitimer`, `timer_create`) signals once, keeps its phase (its
+  next expiry is on the period it had) and counts the other periods it missed as the overrun of
+  a POSIX timer (but where the host's clock can't go back that far, as macOS's before it booted:
+  then no overrun is counted, and the phase is kept only if it can go back a period). The sleep
+  is at most about 68 years. The wall clock is the host's and the CPU-time clocks stand still.
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,
@@ -534,7 +543,8 @@ and then, instead of a boot:
 | export | |
 |---|---|
 | `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated, each item ending with its NUL, an empty one kept as an empty argument): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
-| `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine |
+| `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine; for one restore, how long it was saved for is what `armless_user_asleep_ms` set |
+| `armless_user_asleep_ms(ms)` | how long the next restored state was saved for, in ms (0, the default: none), which its clocks and deadlines go on by |
 | `armless_user_run(budget_ms)` | 0 its time ran out, 1 idle, 2 exited, 3 faulted (the reason in `armless_error`), -1 no process |
 | `armless_user_wake_ms()` | after 1: the `microtick()` time of its next deadline, or -1 (only input or a blob wakes it) |
 | `armless_user_waiting_on_blobs()` | 1 when a thread waits on a blob rather than on input |
