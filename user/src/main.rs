@@ -22,7 +22,7 @@ fn usage() -> ! {
   --env NAME=VALUE   an environment variable (repeatable; default PATH, HOME and TERM)
   --plain-std        stdin is /dev/null, stdout and stderr are no terminal (as in a container without
                      one: no line discipline, isatty is false)
-  --hostname NAME    what uname says (default armless)
+  --hostname NAME    what uname says (default, or empty: armless)
   --keys TEXT        type TEXT into its terminal once it waits for input (\\n, \\r and \\x03 escapes)
   --spawn CMD        once it waits, run /bin/sh -c CMD beside it as a process of its own (a job of
                      snowglobe's), print what it printed and its status, and stop
@@ -108,7 +108,8 @@ fn main() {
             },
             "--allow-private" => allow_private = true,
             "--plain-std" => opts.std = StdStreams::Plain,
-            "--hostname" => opts.hostname = Some(val()),
+            // (an empty one is the default, as in the browser)
+            "--hostname" => opts.hostname = Some(val()).filter(|h| !h.is_empty()),
             "--env" => env.push(val()),
             "--spawn" => spawn = Some(val()),
             "--keys" => {

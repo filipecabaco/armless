@@ -346,12 +346,16 @@ fn armless_exec_takes_plain_std_and_a_hostname() {
     let good = exec(&["--plain-std", "--hostname", "pod-7a", host]);
     let in_fs = exec(&["--fs", fs, "--plain-std", "--hostname", "pod-7a", "/p"]);
     let long = exec(&["--hostname", &"x".repeat(65), host]);
+    let empty = exec(&["--plain-std", "--hostname", "", host]);
     std::fs::remove_dir_all(&dir).unwrap();
     for out in [&good, &in_fs] {
         assert_eq!(out.status.code(), Some(0));
         // No "\r\n": no terminal
         assert_eq!(out.stdout, b"pod-7a\n");
     }
+    // An empty name is the default, as in the browser (its first 6 bytes)
+    assert_eq!(empty.status.code(), Some(0));
+    assert_eq!(empty.stdout, b"armles\n");
     assert_eq!(long.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&long.stderr).contains("not a hostname"));
 }
