@@ -217,7 +217,7 @@ fn reaping_orphans_survives_a_save_and_restore_with_the_orphan_alive() {
 
     let mut vm = machine_with_cpus(1);
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], None, &process, Duration::ZERO).unwrap();
     assert!(p.reap_orphans);
     let (_, status) = run(&mut p, &mut vm);
     ok(&status);
@@ -322,7 +322,7 @@ fn save_when_idle(mut p: Process, mut vm: Machine) -> (Vec<u8>, Vec<u8>) {
 fn restore(state: &[u8], process: &[u8]) -> (Process, Machine) {
     let mut vm = machine_with_cpus(1);
     vm.load_state(state).unwrap();
-    let p = Process::restore(&mut vm.cpus[0], None, process).unwrap();
+    let p = Process::restore(&mut vm.cpus[0], None, process, Duration::ZERO).unwrap();
     (p, vm)
 }
 

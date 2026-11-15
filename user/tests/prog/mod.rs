@@ -106,6 +106,16 @@ impl Prog {
         self
     }
 
+    /// Exits with 100 + the check's number unless x0 is below `v` (unsigned, under 4096)
+    pub fn expect_below(&mut self, v: u32) -> &mut Self {
+        self.checks += 1;
+        assert!(v < 4096);
+        self.code.push(0xf100_001f | v << 10); // cmp x0, #v
+        self.code.push(0x5400_0083); // b.lo +16
+        self.fail();
+        self
+    }
+
     /// Exits with 100 + the check's number unless x0 is not negative (a call that succeeded)
     pub fn expect_ok(&mut self) -> &mut Self {
         self.checks += 1;

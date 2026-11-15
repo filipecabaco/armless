@@ -26,6 +26,8 @@ std::thread_local! {
     static PROCESS: RefCell<Option<Process>> = const { RefCell::new(None) };
     /// When `armless_user_run` returned 1: when to run again, in `microtick()` ms, or -1.
     static WAKE_MS: Cell<f64> = const { Cell::new(-1.0) };
+    /// What `armless_user_asleep_ms` set for the next `armless_user_restore`.
+    static ASLEEP: Cell<Duration> = const { Cell::new(Duration::ZERO) };
 }
 
 /// The process's randomness (getrandom, /dev/urandom, AT_RANDOM) from the host's: the machine's
@@ -34,12 +36,14 @@ fn seed() {
     host::seed(&vm().board.boot_seed.lock());
 }
 
-/// A NUL-separated list ("a\0b\0"; empty items dropped).
+/// A NUL-separated list ("a\0b\0": each item ends with its NUL, so an empty one is kept, as
+/// execve keeps an empty argument; the last NUL may be left out, and "" is no items).
 fn list(s: &str) -> Vec<String> {
-    s.split('\0')
-        .filter(|a| !a.is_empty())
-        .map(str::to_string)
-        .collect()
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let items = s.strip_suffix('\0').unwrap_or(s);
+    items.split('\0').map(str::to_string).collect()
 }
 
 /// Start a program from the machine's filesystem as execve would (by PATH from `env` when
@@ -59,11 +63,15 @@ pub unsafe extern "C" fn armless_user_exec(
     cwd: u32,
     cwd_len: u32,
 ) -> i32 {
-    let (argv, env, cwd) = (
-        list(&string(argv, argv_len)),
-        list(&string(env, env_len)),
-        string(cwd, cwd_len),
-    );
+    // SAFETY: the caller's promise
+    let (argv, env, cwd) = unsafe {
+        (
+            string(argv, argv_len),
+            string(env, env_len),
+            string(cwd, cwd_len),
+        )
+    };
+    let (argv, env) = (list(&argv), list(&env));
     let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
     seed();
     let v = vm();
@@ -193,9 +201,25 @@ pub extern "C" fn armless_user_save() -> u32 {
     })
 }
 
+/// How long the state the next `armless_user_restore` restores was saved for, in ms: the process's
+/// monotonic clocks go on by that much and what was due in it is due now (`Process::restore`). 0
+/// (the default) resumes where the process stopped, as does a negative, infinite or NaN value; one
+/// too long for a `Duration` is the longest (`Process::restore` caps it). It applies to one
+/// restore only.
+#[no_mangle]
+pub extern "C" fn armless_user_asleep_ms(ms: f64) {
+    let asleep = if ms.is_finite() && ms > 0.0 {
+        Duration::try_from_secs_f64(ms / 1e3).unwrap_or(Duration::MAX)
+    } else {
+        Duration::ZERO
+    };
+    ASLEEP.set(asleep);
+}
+
 /// The process from its saved state (`armless_user_save`, or `Process::save` natively), on the
 /// machine restored from the snapshot it was saved with (`armless_state_*` first). It asks again
-/// for blobs it was waiting on. Returns 0 or -1 (see `armless_error`).
+/// for blobs it was waiting on. How long the state sat saved is what `armless_user_asleep_ms` set
+/// before (once: 0 after). Returns 0 or -1 (see `armless_error`).
 ///
 /// # Safety
 /// `ptr` must reference `len` readable bytes.
@@ -203,7 +227,9 @@ pub extern "C" fn armless_user_save() -> u32 {
 pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
     seed();
     let v = vm();
-    match Process::restore(&mut v.cpus[0], Some(v.board.clone()), slice(ptr, len)) {
+    // SAFETY: the caller's promise
+    let state = unsafe { slice(ptr, len) };
+    match Process::restore(&mut v.cpus[0], Some(v.board.clone()), state, ASLEEP.take()) {
         Ok(p) => {
             PROCESS.set(Some(p));
             0
@@ -259,5 +285,36 @@ mod tests {
         assert!(PROCESS.with_borrow(|p| p.as_ref().unwrap().reap_orphans));
         armless_user_reap_orphans(0);
         assert!(PROCESS.with_borrow(|p| !p.as_ref().unwrap().reap_orphans));
+    }
+
+    #[test]
+    fn the_time_asleep_is_a_duration_or_none() {
+        let asleep = |ms: f64| {
+            armless_user_asleep_ms(ms);
+            ASLEEP.take()
+        };
+        assert_eq!(asleep(1500.0), Duration::from_millis(1500));
+        // None, a negative, an infinite or a NaN time: none
+        for ms in [0.0, -0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(asleep(ms), Duration::ZERO, "{ms}");
+        }
+        // Too long for a Duration: the longest
+        assert_eq!(asleep(f64::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn a_list_keeps_its_empty_items() {
+        let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(list(""), v(&[]));
+        assert_eq!(list("\0"), v(&[""]));
+        assert_eq!(
+            list("app\0--label\0\0next\0"),
+            v(&["app", "--label", "", "next"])
+        );
+        assert_eq!(list("app\0\0"), v(&["app", ""]));
+        assert_eq!(list("\0app\0"), v(&["", "app"]));
+        // The last NUL is the terminator of the last item, not an item of its own
+        assert_eq!(list("A=1\0B=\0"), v(&["A=1", "B="]));
+        assert_eq!(list("a\0b"), v(&["a", "b"]));
     }
 }

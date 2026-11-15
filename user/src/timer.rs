@@ -186,8 +186,38 @@ fn expiries(left: i128, interval: u64) -> u64 {
         .map_or(1, |q| q.saturating_add(1))
 }
 
-fn clamp(ns: u128) -> u64 {
+pub(crate) fn clamp(ns: u128) -> u64 {
     ns.min(FAR as u128) as u64
+}
+
+/// A deadline `left` ns off when the process was saved, once it has been asleep `asleep` ns: what
+/// is left of it, and how many times it came due in the sleep (one that repeats every `every` ns,
+/// 0 for once, comes due each period).
+pub(crate) fn after_sleep(left: u64, every: u64, asleep: u64) -> (u64, u64) {
+    if left > asleep {
+        return (left - asleep, 0);
+    }
+    let late = asleep - left;
+    if every == 0 {
+        return (0, 1);
+    }
+    (every - late % every, (late / every).saturating_add(1))
+}
+
+/// When a timer saved `left` ns off is due after the sleep. One that came due in it is due when
+/// it did, in the past: `fire_timers` signals it once, counts the periods it missed as overruns
+/// and sets the next expiry on the timer's own phase. (A one-shot is due at once. A host whose
+/// clock can't go back that far, as macOS's before it booted, has no such instant: the timer is
+/// due less than a period ago then, on its phase, and the overruns are lost.)
+fn due_after_sleep(now: Instant, left: u64, every: u64, asleep: u64) -> Instant {
+    let Some(late) = asleep.checked_sub(left) else {
+        return now + Duration::from_nanos(clamp((left - asleep) as u128));
+    };
+    let back = |ns| now.checked_sub(Duration::from_nanos(ns));
+    match late.checked_rem(every) {
+        None => now,
+        Some(phase) => back(late).or_else(|| back(phase)).unwrap_or(now),
+    }
 }
 
 impl Timers {
@@ -381,12 +411,13 @@ impl Timers {
     }
 
     /// Process `pid`'s ITIMER_REAL from its record (`save_real`)
-    pub(crate) fn load_real(&mut self, r: &mut R, pid: i64, now: Instant) -> Result<(), String> {
+    pub(crate) fn load_real(&mut self, r: &mut R, pid: i64, now: Instant, asleep: u64) -> Result<(), String> {
         let left = r.u()?;
         if left != u64::MAX {
+            let interval = r.u()?;
             let arm = Arm {
-                due: Due::At(now + Duration::from_nanos(clamp(left as u128))),
-                interval: r.u()?,
+                due: Due::At(due_after_sleep(now, left, interval, asleep)),
+                interval,
             };
             self.itimers.push(ITimer {
                 pid,
@@ -398,7 +429,7 @@ impl Timers {
     }
 
     /// The timers' section of a snapshot (`save`), into what `load_real` has read
-    pub(crate) fn load(&mut self, r: &mut R, now: Instant) -> Result<(), String> {
+    pub(crate) fn load(&mut self, r: &mut R, now: Instant, asleep: u64) -> Result<(), String> {
         let s = self;
         for _ in 0..r.u()? {
             let (pid, ns) = (r.u()? as i64, r.u()?);
@@ -413,16 +444,20 @@ impl Timers {
             s.next_id.insert(pid, id);
         }
         let arm = |r: &mut R| -> Result<Option<Arm>, String> {
-            let due = match r.u()? {
-                0 => return Ok(None),
-                1 => Due::At(now + Duration::from_nanos(clamp(r.u()? as u128))),
-                2 => Due::Cpu(r.u()?),
-                k => return Err(format!("unknown timer due {k}")),
+            let kind = r.u()?;
+            if kind == 0 {
+                return Ok(None);
+            }
+            if kind > 2 {
+                return Err(format!("unknown timer due {kind}"));
+            }
+            let (value, interval) = (r.u()?, r.u()?);
+            // (CPU time does not pass in the sleep: only the clocks' due times move)
+            let due = match kind {
+                1 => Due::At(due_after_sleep(now, value, interval, asleep)),
+                _ => Due::Cpu(value),
             };
-            Ok(Some(Arm {
-                due,
-                interval: r.u()?,
-            }))
+            Ok(Some(Arm { due, interval }))
         };
         for _ in 0..r.u()? {
             let (pid, which) = (r.u()? as i64, r.u()? as u32);
@@ -576,7 +611,7 @@ impl Process {
             };
             if t.queued {
                 // Its signal is not delivered yet: this expiry is counted, not queued
-                t.overrun = (t.overrun + n).min(MAX_OVERRUN);
+                t.overrun = t.overrun.saturating_add(n).min(MAX_OVERRUN);
                 continue;
             }
             t.overrun = n - 1;
@@ -858,5 +893,74 @@ impl Process {
             }
         }
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_timer_restored_after_a_sleep_keeps_its_phase_whatever_the_sleep() {
+        const S: u64 = NS;
+        assert_eq!(after_sleep(20 * S, 0, 5 * S), (15 * S, 0));
+        assert_eq!(after_sleep(10 * S, 0, 35 * S), (0, 1));
+        assert_eq!(after_sleep(10 * S, 10 * S, 35 * S), (5 * S, 3));
+        // (The longest sleep and the shortest period count without overflowing)
+        assert_eq!(after_sleep(0, 1, u64::MAX), (1, u64::MAX));
+        let now = Instant::now();
+        assert_eq!(
+            due_after_sleep(now, 20 * S, 0, 5 * S),
+            now + Duration::from_secs(15)
+        );
+        assert_eq!(due_after_sleep(now, 10 * S, 0, 35 * S), now);
+        // Due in the past, on its phase: as long ago as it was, or (a host clock that can't go
+        // back that far) less than a period ago
+        for asleep in [35 * S, FAR, u64::MAX] {
+            let due = due_after_sleep(now, 10 * S, 10 * S, asleep);
+            let ago = now.saturating_duration_since(due).as_nanos() as u64;
+            assert_eq!(ago % (10 * S), (asleep - 10 * S) % (10 * S), "{asleep}");
+        }
+    }
+
+    #[test]
+    fn a_disarmed_timer_is_restored_disarmed_and_an_unknown_due_is_an_error() {
+        // A POSIX timer created and not armed, and one on CPU time, which the sleep does not move
+        let mut s = Timers::default();
+        let cpu = Arm {
+            due: Due::Cpu(5 * NS),
+            interval: NS,
+        };
+        for (id, arm) in [(0, None), (1, Some(cpu))] {
+            s.posix.push(Posix {
+                pid: 1,
+                id,
+                clock: 2,
+                scope: Scope::Proc(1),
+                sig: 14,
+                thread: None,
+                value: 0,
+                arm,
+                queued: false,
+                overrun: 0,
+                last: 0,
+            });
+        }
+        let now = Instant::now();
+        let mut w = W(Vec::new());
+        s.save(&mut w, now);
+        let mut t = Timers::default();
+        t.load(&mut R(&w.0), now, 3600 * NS).unwrap();
+        assert!(t.posix[0].arm.is_none());
+        assert!(
+            matches!(t.posix[1].arm, Some(Arm { due: Due::Cpu(c), interval: NS }) if c == 5 * NS)
+        );
+        // An interval timer whose due is of no kind there is
+        let mut w = W(Vec::new());
+        for v in [0, 0, 0, 1, 1, 1, 3, 0, 0] {
+            w.u(v);
+        }
+        let got = Timers::default().load(&mut R(&w.0), now, 0);
+        assert_eq!(got.err().as_deref(), Some("unknown timer due 3"));
     }
 }

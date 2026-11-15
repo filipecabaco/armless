@@ -4,6 +4,8 @@
 
 mod prog;
 
+use std::time::Duration;
+
 use armless::vm::{Config, Vm};
 use armless_user::Process;
 use prog::*;
@@ -792,7 +794,7 @@ fn aio_contexts_and_groups_survive_a_snapshot() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    let mut p = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process, Duration::ZERO).unwrap();
     p.input(b"\n");
     let (_, status) = run(&mut p, &mut vm);
     ok(&status);
@@ -1280,7 +1282,7 @@ fn armed_timers_go_on_in_a_restored_process() {
 
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut proc = Process::restore(&mut vm.cpus[0], None, &process).unwrap();
+    let mut proc = Process::restore(&mut vm.cpus[0], None, &process, Duration::ZERO).unwrap();
     let (_, status) = run(&mut proc, &mut vm);
     ok(&status);
 }
@@ -1560,7 +1562,7 @@ fn a_restored_process_keeps_its_command_line() {
 
     let mut vm = machine_with_prog(&elf);
     vm.load_state(&state).unwrap();
-    let mut proc = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process).unwrap();
+    let mut proc = Process::restore(&mut vm.cpus[0], Some(vm.board.clone()), &process, Duration::ZERO).unwrap();
     proc.input(b"\n");
     let (out, status) = run(&mut proc, &mut vm);
     ok(&status);
@@ -1698,9 +1700,228 @@ fn a_process_state_whose_frames_are_not_counted_is_refused() {
         bad.extend_from_slice(&(n as u64 - 1).to_le_bytes());
         bad.extend_from_slice(&process[32..32 + 16 * i]);
         bad.extend_from_slice(&process[32 + 16 * (i + 1)..]);
-        let got = Process::restore(&mut vm.cpus[0], None, &bad);
+        let got = Process::restore(&mut vm.cpus[0], None, &bad, Duration::ZERO);
         assert!(got.is_err(), "frame {} taken out", word(32 + 16 * i));
     }
     // As saved, it is restored
-    assert!(Process::restore(&mut vm.cpus[0], None, &process).is_ok());
+    assert!(Process::restore(&mut vm.cpus[0], None, &process, Duration::ZERO).is_ok());
+}
+
+// ------------------------------------------------------------ a process restored after a sleep
+
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+
+type TestVm = Vm<armless::platform::NativePlatform>;
+
+/// Runs `p` until every thread waits and saves it there: the machine's state and the process's
+fn saved_while_waiting(p: Prog) -> (Vec<u8>, Vec<u8>, armless_user::Status) {
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    let status = loop {
+        match proc.run_on(&mut vm.cpus, Duration::from_millis(20)) {
+            armless_user::Status::Running => {},
+            s => break s,
+        }
+    };
+    let process = proc.save(&vm.cpus[0]);
+    (vm.save_state(), process, status)
+}
+
+/// The process from `saved_while_waiting`, on a machine of its own, `asleep` later
+fn restored_after(state: &[u8], process: &[u8], asleep: Duration) -> (TestVm, Process) {
+    let mut vm = machine();
+    vm.load_state(state).unwrap();
+    let p = Process::restore(&mut vm.cpus[0], None, process, asleep).unwrap();
+    (vm, p)
+}
+
+/// An hour, and then some
+const HOUR: Duration = Duration::from_secs(3601);
+
+/// A program that waits an hour or two as `wait` says, and prints "w" if it is let go
+fn waiting(wait: impl FnOnce(&mut Prog)) -> Prog {
+    let mut p = Prog::default();
+    p.put(0x300, &[3600u64, 0].map(u64::to_le_bytes).concat());
+    wait(&mut p);
+    p.out(0x380, 1);
+    p.put(0x380, b"w");
+    p
+}
+
+#[test]
+fn a_sleep_that_ran_out_while_the_process_was_saved_ends_at_once() {
+    // nanosleep and ppoll, each for an hour
+    let sleeps: [fn(&mut Prog); 2] = [
+        |p| {
+            p.sys(101, &[D(0x300), I(0)]).expect(0);
+        },
+        |p| {
+            p.sys(73, &[I(0), I(0), D(0x300), I(0), I(8)]).expect(0);
+        },
+    ];
+    for sleep in sleeps {
+        let (state, process, status) = saved_while_waiting(waiting(sleep));
+        assert!(matches!(status, armless_user::Status::Idle(Some(_))), "{status:?}");
+        // Not asleep long enough: still waiting
+        let (mut vm, mut p) = restored_after(&state, &process, Duration::from_secs(1800));
+        let status = p.run_on(&mut vm.cpus, Duration::from_millis(100));
+        assert!(matches!(status, armless_user::Status::Idle(Some(_))), "{status:?}");
+        // Longer than the wait: it ends at once, though no time passed
+        let (mut vm, mut p) = restored_after(&state, &process, HOUR);
+        let (out, status) = run(&mut p, &mut vm);
+        ok(&status);
+        assert_eq!(out, b"w");
+    }
+}
+
+#[test]
+fn an_interval_timer_that_came_due_while_the_process_was_saved_signals_at_once() {
+    // The program sleeps two hours, but for the timer's SIGALRM, which ends it (exit status
+    // 128 + 14) when due: set with setitimer, and with timer_create on the monotonic clock
+    let timers: [fn(&mut Prog); 2] = [
+        |p| {
+            // struct itimerval { interval, value }: once, in an hour
+            p.put(0x200, &[0u64, 0, 3600, 0].map(u64::to_le_bytes).concat());
+            p.sys(103, &[I(0), D(0x200), I(0)]).expect(0);
+        },
+        |p| {
+            // A timer on the monotonic clock (SIGALRM, as sigevent's none gives), in an hour
+            p.put(0x200, &[0u64, 0, 3600, 0].map(u64::to_le_bytes).concat());
+            p.sys(107, &[I(CLOCK_MONOTONIC), I(0), D(0x100)]).expect(0);
+            p.sys(110, &[W(0x100), I(0), D(0x200), I(0)]).expect(0);
+        },
+    ];
+    for timer in timers {
+        let mut p = Prog::default();
+        p.put(0x300, &[7200u64, 0].map(u64::to_le_bytes).concat());
+        timer(&mut p);
+        p.sys(101, &[D(0x300), I(0)]);
+        let (state, process, status) = saved_while_waiting(p);
+        assert!(matches!(status, armless_user::Status::Idle(Some(_))), "{status:?}");
+        let (mut vm, mut p) = restored_after(&state, &process, Duration::from_secs(1800));
+        let status = p.run_on(&mut vm.cpus, Duration::from_millis(100));
+        assert!(matches!(status, armless_user::Status::Idle(Some(_))), "{status:?}");
+        let (mut vm, mut p) = restored_after(&state, &process, HOUR);
+        let (_, status) = run(&mut p, &mut vm);
+        assert!(matches!(status, armless_user::Status::Exited(142)), "{status:?}");
+    }
+}
+
+#[test]
+fn a_recurring_timer_saved_across_several_periods_signals_once_and_keeps_its_phase() {
+    let mut p = Prog::default();
+    p.put(0x100, &mask(&[SIGALRM, SIGUSR1]));
+    p.put(0x108, &mask(&[SIGUSR1]));
+    p.put(0x200, &sigevent(0x123, SIGUSR1, SIGEV_SIGNAL));
+    // Every 10 s, the first in 10 s (an itimerval and an itimerspec look alike); and a wait of 30 s
+    p.put(0x240, &pair((10, 0), (10, 0)));
+    p.put(0x300, &[30u64, 0].map(u64::to_le_bytes).concat());
+    p.sys(135, &[I(SIG_BLOCK), D(0x100), I(0), I(8)]).expect(0);
+    p.sys(103, &[I(0), D(0x240), I(0)]).expect(0); // setitimer(ITIMER_REAL)
+    p.sys(107, &[I(CLOCK_MONOTONIC), D(0x200), D(0x280)]).expect(0);
+    p.sys(110, &[W(0x280), I(0), D(0x240), I(0)]).expect(0);
+    p.sys(101, &[D(0x300), I(0)]).expect(0);
+    // Restored after 35 s: the timers came due at 10, 20 and 30 s. One SIGUSR1 is there, and the
+    // two expirations it stands for besides it are its overrun
+    p.sys(137, &[D(0x108), D(0x400), I(0), I(8)]).expect(SIGUSR1 as i64);
+    p.arg(0, W(0x414));
+    p.expect(2);
+    p.sys(109, &[W(0x280)]).expect(2);
+    // The next expiry is at 40 s: 5 s on, less what the test took
+    p.sys(108, &[W(0x280), D(0x440)]).expect(0);
+    p.arg(0, X(0x440));
+    p.expect(10);
+    p.arg(0, X(0x450));
+    check(&mut p, HS, 4);
+    p.arg(0, X(0x450));
+    check(&mut p, LO, 6);
+    p.sys(102, &[I(0), D(0x480)]).expect(0); // getitimer
+    p.arg(0, X(0x480));
+    p.expect(10);
+    p.arg(0, X(0x490));
+    check(&mut p, HS, 4);
+    p.arg(0, X(0x490));
+    check(&mut p, LO, 6);
+    let (state, process, status) = saved_while_waiting(p);
+    assert!(matches!(status, armless_user::Status::Idle(Some(_))), "{status:?}");
+    let (mut vm, mut p) = restored_after(&state, &process, Duration::from_secs(35));
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn timerfds_count_the_expirations_of_the_time_the_process_was_saved() {
+    let mut p = Prog::default();
+    // struct itimerspec { interval, value }: every 10 s, the first in 10 s; and once in 20 s
+    p.put(0x200, &[10u64, 0, 10, 0].map(u64::to_le_bytes).concat());
+    p.put(0x240, &[0u64, 0, 20, 0].map(u64::to_le_bytes).concat());
+    p.sys(85, &[I(CLOCK_MONOTONIC), I(0)]).expect(3);
+    p.sys(85, &[I(CLOCK_MONOTONIC), I(0o4000)]).expect(4); // TFD_NONBLOCK
+    p.sys(86, &[I(3), I(0), D(0x200), I(0)]).expect(0);
+    p.sys(86, &[I(4), I(0), D(0x240), I(0)]).expect(0);
+    // The read waits for the first
+    p.sys(63, &[I(3), D(0x400), I(8)]).expect(8);
+    p.arg(0, X(0x400));
+    p.expect(3); // 10 s, 20 s and 30 s of the 35
+    p.sys(63, &[I(4), D(0x410), I(8)]).expect(8);
+    p.arg(0, X(0x410));
+    p.expect(1);
+    p.sys(63, &[I(4), D(0x410), I(8)]).expect(-11); // spent: it did not repeat
+    let (state, process, status) = saved_while_waiting(p);
+    assert!(matches!(status, armless_user::Status::Idle(Some(_))), "{status:?}");
+    let (mut vm, mut p) = restored_after(&state, &process, Duration::from_secs(35));
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn the_clocks_go_on_by_the_time_the_process_was_saved_but_not_the_cpu_time() {
+    let mut p = Prog::default();
+    // The clocks before and after a read that waits for input: seconds of each
+    for (clock, at) in [(CLOCK_MONOTONIC, 0x100), (CLOCK_REALTIME, 0x110), (CLOCK_PROCESS_CPUTIME_ID, 0x120)] {
+        p.sys(113, &[I(clock), D(at)]).expect(0);
+    }
+    p.sys(63, &[I(0), D(0x400), I(1)]).expect(1);
+    for (clock, at) in [(CLOCK_MONOTONIC, 0x140), (CLOCK_REALTIME, 0x150), (CLOCK_PROCESS_CPUTIME_ID, 0x160)] {
+        p.sys(113, &[I(clock), D(at)]).expect(0);
+    }
+    // Monotonic: an hour on, give or take the seconds the test took
+    p.arg(0, X(0x140));
+    p.code.push(0xd100_0000 | 3600 << 10); // sub x0, x0, #3600
+    p.expect_below(10);
+    p.arg(0, X(0x100));
+    p.expect_below(10); // (and what it read before was no later than that)
+    // The wall clock is the host's: no hour passed
+    p.arg(1, X(0x150));
+    p.arg(0, X(0x110));
+    p.code.push(0xcb00_0020); // sub x0, x1, x0
+    p.expect_below(10);
+    // The CPU time it used is not the time it slept
+    p.arg(0, X(0x160));
+    p.expect(0);
+    let (state, process, status) = saved_while_waiting(p);
+    assert!(matches!(status, armless_user::Status::Idle(None)), "{status:?}");
+    let (mut vm, mut p) = restored_after(&state, &process, HOUR);
+    p.input(b"\n");
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn a_process_restored_after_the_longest_sleep_goes_on() {
+    // An hour's sleep, and the monotonic clock after it: about 68 years on (2^31 s), the longest
+    // a host can say, whatever it says
+    let p = waiting(|p| {
+        p.sys(101, &[D(0x300), I(0)]).expect(0);
+        p.sys(113, &[I(CLOCK_MONOTONIC), D(0x140)]).expect(0);
+        p.arg(0, X(0x140));
+        p.code.push(0xd35f_fc00); // lsr x0, x0, #31
+        p.expect(1);
+    });
+    let (state, process, _) = saved_while_waiting(p);
+    let (mut vm, mut p) = restored_after(&state, &process, Duration::MAX);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"w");
 }

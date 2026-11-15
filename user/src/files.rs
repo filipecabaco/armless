@@ -407,7 +407,7 @@ impl Files {
         self.net.save(w);
     }
 
-    pub fn load(r: &mut R) -> Result<Files, String> {
+    pub fn load(r: &mut R, asleep: u64) -> Result<Files, String> {
         let mut f = Files {
             next_desc: r.u()? as u32,
             next_pipe: r.u()? as u32,
@@ -451,7 +451,7 @@ impl Files {
                 11 => Kind::Sock(r.u()? as u32),
                 12 => Kind::Signal { mask: r.u()? },
                 13 => Kind::Pidfd { pid: r.u()? as i64 },
-                14 => Kind::TimerFd(crate::timerfd::Timer::load(r)?),
+                14 => Kind::TimerFd(crate::timerfd::Timer::load(r, asleep)?),
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {

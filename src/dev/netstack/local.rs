@@ -148,13 +148,12 @@ impl Stack {
         self.locals.listening.insert(port);
     }
 
-    /// Stop; the connections nobody accepted are reset.
-    pub fn local_unlisten(&mut self, port: u16) {
+    /// Stop; the connections nobody accepted are closed. Nobody has their ids to drop them later,
+    /// so they go now, and the host hears it (`TcpClosed`) and lets its sockets for them go.
+    pub fn local_unlisten(&mut self, port: u16, out: &Outbox) {
         self.locals.listening.remove(&port);
         for id in self.locals.pending.remove(&port).unwrap_or_default() {
-            if let Some(c) = self.locals.conns.get_mut(&id) {
-                c.reset = true;
-            }
+            self.local_drop(id, out);
         }
     }
 

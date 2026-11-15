@@ -16,10 +16,11 @@
 
 pub mod egress;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -162,6 +163,8 @@ pub struct NativeHost {
     /// still be behind the guest's event in the loop).
     links: Arc<Mutex<Vec<Tunnel>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    conns: Shared,
 }
 
 /// Bytes the guest has not taken yet before a sender waits.
@@ -196,8 +199,17 @@ struct Conns {
     websockets: HashMap<u32, Sender<WsOut>>,
     /// Tunnelled TCP: the guest's bytes (`None`: it has finished sending)
     tunnels: HashMap<u32, Bytes>,
-    /// Connections the guest has closed (requests in flight stop)
-    closed: HashSet<u32>,
+    /// A flag per connection with host work (requests, sockets, tunnels), set when the guest
+    /// closes it so that work stops. Made by the event loop when the work starts, removed
+    /// at the connection's `TcpClosed` (or the host's own abort): bounded by the open connections.
+    open: HashMap<u32, Arc<AtomicBool>>,
+}
+
+impl Conns {
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.open.len() + self.sockets.len() + self.websockets.len() + self.tunnels.len()
+    }
 }
 
 enum WsOut {
@@ -206,6 +218,20 @@ enum WsOut {
 }
 
 type Shared = Arc<Mutex<Conns>>;
+
+/// The close flag of connection `id`. Called by the event loop, before it hands the connection
+/// to a thread: the guest's `TcpClosed` is handled after, in the same loop, and finds the flag.
+fn watch(conns: &Shared, id: u32) -> Arc<AtomicBool> {
+    conns.lock().unwrap().open.entry(id).or_default().clone()
+}
+
+/// Reset a connection from the host. No `TcpClosed` follows, so what is kept for it goes now.
+fn abort(board: &Board, conns: &Shared, id: u32) {
+    board.tcp_abort(id);
+    let mut c = conns.lock().unwrap();
+    c.open.remove(&id);
+    c.tunnels.remove(&id);
+}
 
 impl NativeHost {
     pub fn spawn(board: Arc<Board>, options: HostOptions, observer: Observer) -> NativeHost {
@@ -218,19 +244,23 @@ impl NativeHost {
             }));
         }
         let links = Arc::new(Mutex::new(Vec::new()));
+        let conns: Shared = Arc::default();
         let thread = {
             let board = board.clone();
             let tx = tx.clone();
             let links = links.clone();
+            let conns = conns.clone();
             std::thread::Builder::new()
                 .name("armless-host".into())
-                .spawn(move || event_loop(board, options, observer, rx, tx, links))
+                .spawn(move || event_loop(board, options, observer, rx, tx, links, conns))
                 .expect("spawn host thread")
         };
         NativeHost {
             tx,
             links,
             thread: Some(thread),
+            #[cfg(test)]
+            conns,
         }
     }
 
@@ -270,8 +300,8 @@ fn event_loop(
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     links: Arc<Mutex<Vec<Tunnel>>>,
+    conns: Shared,
 ) {
-    let conns: Shared = Arc::default();
     let egress = Arc::new(options.egress.clone());
     // Host sockets waiting for their guest connection to come up.
     let mut forwarding: HashMap<u32, TcpStream> = HashMap::new();
@@ -328,10 +358,10 @@ fn event_loop(
                         board.http_fail(id, "this machine has no network");
                         continue;
                     }
-                    let (board, conns, egress, tx) =
-                        (board.clone(), conns.clone(), egress.clone(), tx.clone());
+                    let closed = watch(&conns, id);
+                    let (board, egress, tx) = (board.clone(), egress.clone(), tx.clone());
                     std::thread::spawn(move || {
-                        http(&board, &conns, &egress, id, &method, &url, &headers, &body);
+                        http(&board, &closed, &egress, id, &method, &url, &headers, &body);
                         let _ = tx.send(Msg::Wake);
                     });
                 },
@@ -342,10 +372,11 @@ fn event_loop(
                     }
                     let (wtx, wrx) = channel();
                     conns.lock().unwrap().websockets.insert(id, wtx);
+                    let closed = watch(&conns, id);
                     let (board, conns, egress, tx) =
                         (board.clone(), conns.clone(), egress.clone(), tx.clone());
                     std::thread::spawn(move || {
-                        websocket(&board, &conns, &egress, id, &url, &protocols, wrx);
+                        websocket(&board, &conns, &closed, &egress, id, &url, &protocols, wrx);
                         let _ = tx.send(Msg::Wake);
                     });
                 },
@@ -364,6 +395,7 @@ fn event_loop(
                         board.tcp_refuse(id);
                         continue;
                     }
+                    let closed = watch(&conns, id);
                     // A link: a direct connection to its address (a Unix socket or a TCP
                     // one), the host's own choice
                     let found = links
@@ -379,7 +411,7 @@ fn event_loop(
                             match link(&l) {
                                 Ok(s) => {
                                     board.tcp_accept(id);
-                                    attach(&board, &conns, id, s);
+                                    attach(&board, &conns, &closed, id, s);
                                 },
                                 Err(_) => board.tcp_refuse(id),
                             }
@@ -401,7 +433,7 @@ fn event_loop(
                         let (board, conns, egress, tx) =
                             (board.clone(), conns.clone(), egress.clone(), tx.clone());
                         std::thread::spawn(move || {
-                            tunnel(&board, &conns, &egress, id, &url, trx);
+                            tunnel(&board, &conns, &closed, &egress, id, &url, trx);
                             let _ = tx.send(Msg::Wake);
                         });
                         continue;
@@ -412,7 +444,7 @@ fn event_loop(
                         match egress.connect(&host, port) {
                             Ok(s) => {
                                 board.tcp_accept(id);
-                                attach(&board, &conns, id, s);
+                                attach(&board, &conns, &closed, id, s);
                             },
                             Err(_) => board.tcp_refuse(id),
                         }
@@ -421,7 +453,8 @@ fn event_loop(
                 },
                 Event::TcpConnected { id } => {
                     if let Some(s) = forwarding.remove(&id) {
-                        attach(&board, &conns, id, s);
+                        let closed = watch(&conns, id);
+                        attach(&board, &conns, &closed, id, s);
                     }
                 },
                 Event::TcpData { id, data } => {
@@ -449,24 +482,28 @@ fn event_loop(
                     }
                     c.websockets.remove(&id);
                     c.tunnels.remove(&id);
-                    c.closed.insert(id);
+                    if let Some(f) = c.open.remove(&id) {
+                        f.store(true, Ordering::Release);
+                    }
                 },
                 Event::Serial(_) | Event::Console(_) => {},
             }
         }
     }
-    for (_, (_, s)) in conns.lock().unwrap().sockets.drain() {
+    // The host is going: its sockets close, and the threads working for a connection stop as if
+    // the guest had closed it (dropping the senders ends the WebSockets' and tunnels' queues)
+    let c = std::mem::take(&mut *conns.lock().unwrap());
+    for (_, s) in c.sockets.into_values() {
         let _ = s.shutdown(Shutdown::Both);
+    }
+    for f in c.open.into_values() {
+        f.store(true, Ordering::Release);
     }
 }
 
-fn is_closed(conns: &Shared, id: u32) -> bool {
-    conns.lock().unwrap().closed.contains(&id)
-}
-
 /// Wait while the guest is behind on what we sent it.
-fn backpressure(board: &Board, conns: &Shared, id: u32) {
-    while board.tcp_buffered(id) > BACKLOG && !is_closed(conns, id) {
+fn backpressure(board: &Board, closed: &AtomicBool, id: u32) {
+    while board.tcp_buffered(id) > BACKLOG && !closed.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -474,7 +511,7 @@ fn backpressure(board: &Board, conns: &Shared, id: u32) {
 #[allow(clippy::too_many_arguments)]
 fn http(
     board: &Board,
-    conns: &Shared,
+    closed: &AtomicBool,
     egress: &Egress,
     id: u32,
     method: &str,
@@ -487,14 +524,14 @@ fn http(
             board.http_respond(id, r.status, &r.reason, &r.headers);
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                if is_closed(conns, id) {
+                if closed.load(Ordering::Acquire) {
                     return;
                 }
                 match r.body.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         board.http_body(id, &buf[..n]);
-                        backpressure(board, conns, id);
+                        backpressure(board, closed, id);
                     },
                     Err(_) => {
                         // A broken transfer: the guest sees the connection end early
@@ -509,9 +546,11 @@ fn http(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn websocket(
     board: &Board,
     conns: &Shared,
+    closed: &AtomicBool,
     egress: &Egress,
     id: u32,
     url: &str,
@@ -535,7 +574,7 @@ fn websocket(
     let mut messages = ws::Messages::default();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
-        if is_closed(conns, id) {
+        if closed.load(Ordering::Acquire) {
             let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(1001)));
             return;
         }
@@ -589,7 +628,7 @@ fn websocket(
                 _ => {
                     if let Some((text, data)) = messages.push(frame) {
                         board.ws_send(id, text, &data);
-                        backpressure(board, conns, id);
+                        backpressure(board, closed, id);
                     }
                 },
             }
@@ -602,6 +641,7 @@ fn websocket(
 fn tunnel(
     board: &Board,
     conns: &Shared,
+    closed: &AtomicBool,
     egress: &Egress,
     id: u32,
     url: &str,
@@ -629,7 +669,7 @@ fn tunnel(
             match out.try_recv() {
                 Ok(Some(data)) => {
                     if conn.write_all(&client_frame(ws::BINARY, &data)).is_err() {
-                        board.tcp_abort(id);
+                        abort(board, conns, id);
                         return;
                     }
                 },
@@ -646,7 +686,7 @@ fn tunnel(
                 },
             }
         }
-        if gone || is_closed(conns, id) {
+        if gone || closed.load(Ordering::Acquire) {
             let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(1000)));
             return;
         }
@@ -663,7 +703,7 @@ fn tunnel(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {},
             Err(_) => {
-                board.tcp_abort(id);
+                abort(board, conns, id);
                 return;
             },
         }
@@ -681,7 +721,7 @@ fn tunnel(
                 // A byte stream: fragments and text frames are just more bytes
                 _ => {
                     board.tcp_send(id, &frame.payload);
-                    backpressure(board, conns, id);
+                    backpressure(board, closed, id);
                 },
             }
         }
@@ -694,18 +734,33 @@ fn client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Pump a socket and a guest connection into each other.
-fn attach(board: &Arc<Board>, conns: &Shared, id: u32, stream: TcpStream) {
+fn attach(
+    board: &Arc<Board>,
+    conns: &Shared,
+    closed: &Arc<AtomicBool>,
+    id: u32,
+    stream: TcpStream,
+) {
     let _ = stream.set_nodelay(true);
     let (wtx, wrx) = channel::<Option<Vec<u8>>>();
     let Ok(mut writer) = stream.try_clone() else {
-        board.tcp_abort(id);
+        abort(board, conns, id);
         return;
     };
     let Ok(mut reader) = stream.try_clone() else {
-        board.tcp_abort(id);
+        abort(board, conns, id);
         return;
     };
-    conns.lock().unwrap().sockets.insert(id, (wtx, stream));
+    {
+        let mut c = conns.lock().unwrap();
+        // The guest closed before the socket was here (TcpClosed is handled under this lock, and
+        // sets the flag): nothing would ever remove it
+        if closed.load(Ordering::Acquire) {
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+        c.sockets.insert(id, (wtx, stream));
+    }
     // guest -> socket
     std::thread::spawn(move || {
         while let Ok(msg) = wrx.recv() {
@@ -725,7 +780,7 @@ fn attach(board: &Arc<Board>, conns: &Shared, id: u32, stream: TcpStream) {
     });
     // socket -> guest
     let board = board.clone();
-    let conns = conns.clone();
+    let closed = closed.clone();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -736,7 +791,7 @@ fn attach(board: &Arc<Board>, conns: &Shared, id: u32, stream: TcpStream) {
                 },
                 Ok(n) => {
                     board.tcp_send(id, &buf[..n]);
-                    backpressure(&board, &conns, id);
+                    backpressure(&board, &closed, id);
                 },
             }
         }
