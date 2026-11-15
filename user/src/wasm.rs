@@ -189,7 +189,8 @@ pub extern "C" fn armless_user_save() -> u32 {
 
 /// How long the state the next `armless_user_restore` restores was saved for, in ms: the process's
 /// monotonic clocks go on by that much and what was due in it is due now (`Process::restore`). 0
-/// (the default) resumes where the process stopped; it applies to one restore only.
+/// (the default) resumes where the process stopped, as does a negative, infinite or NaN value; it
+/// applies to one restore only.
 #[no_mangle]
 pub extern "C" fn armless_user_asleep_ms(ms: f64) {
     ASLEEP_MS.set(ms);
@@ -206,7 +207,7 @@ pub extern "C" fn armless_user_asleep_ms(ms: f64) {
 pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
     seed();
     let v = vm();
-    let asleep = Duration::from_secs_f64(ASLEEP_MS.replace(0.0).max(0.0) / 1e3);
+    let asleep = Duration::try_from_secs_f64(ASLEEP_MS.replace(0.0) / 1e3).unwrap_or_default();
     match Process::restore(&mut v.cpus[0], Some(v.board.clone()), slice(ptr, len), asleep) {
         Ok(p) => {
             PROCESS.set(Some(p));
