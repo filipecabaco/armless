@@ -1547,7 +1547,8 @@ impl Process {
         data: &[u8],
         asleep: Duration,
     ) -> Result<Process, String> {
-        let asleep = asleep.as_nanos().min(u64::MAX as u128) as u64;
+        // (At most the longest a timer is set for, so the clocks it moves don't overflow)
+        let asleep = timer::clamp(asleep.as_nanos());
         // Which format it is (MAGIC says what each adds): 5 to 9
         let Some((ver, rest)) = MAGICS
             .iter()

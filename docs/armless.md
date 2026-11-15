@@ -485,7 +485,9 @@ x0–x5, answers it in x0, and resumes at ELR.
   at once, and a timerfd that repeats counts every period it missed, as if it had been read all
   along. A recurring signal timer (`setitimer`, `timer_create`) signals once, keeps its phase (its
   next expiry is on the period it had) and counts the other periods it missed as the overrun of
-  a POSIX timer. The wall clock is the host's and the CPU-time clocks stand still.
+  a POSIX timer (but where the host's clock can't go back that far, as macOS's before it booted:
+  then no overrun is counted, and the phase is kept only if it can go back a period). The sleep
+  is at most about 68 years. The wall clock is the host's and the CPU-time clocks stand still.
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,

@@ -186,7 +186,7 @@ fn expiries(left: i128, interval: u64) -> u64 {
         .map_or(1, |q| q.saturating_add(1))
 }
 
-fn clamp(ns: u128) -> u64 {
+pub(crate) fn clamp(ns: u128) -> u64 {
     ns.min(FAR as u128) as u64
 }
 
@@ -201,21 +201,22 @@ pub(crate) fn after_sleep(left: u64, every: u64, asleep: u64) -> (u64, u64) {
     if every == 0 {
         return (0, 1);
     }
-    (every - late % every, late / every + 1)
+    (every - late % every, (late / every).saturating_add(1))
 }
 
 /// When a timer saved `left` ns off is due after the sleep. One that came due in it is due when
 /// it did, in the past: `fire_timers` signals it once, counts the periods it missed as overruns
 /// and sets the next expiry on the timer's own phase. (A one-shot is due at once. A host whose
-/// clock has not run as long as the sleep has no such instant: the timer is due now then, and
-/// its phase and overruns are lost.)
+/// clock can't go back that far, as macOS's before it booted, has no such instant: the timer is
+/// due less than a period ago then, on its phase, and the overruns are lost.)
 fn due_after_sleep(now: Instant, left: u64, every: u64, asleep: u64) -> Instant {
-    match after_sleep(left, every, asleep) {
-        (left, 0) => now + Duration::from_nanos(clamp(left as u128)),
-        _ if every == 0 => now,
-        _ => now
-            .checked_sub(Duration::from_nanos(asleep - left))
-            .unwrap_or(now),
+    let Some(late) = asleep.checked_sub(left) else {
+        return now + Duration::from_nanos(clamp((left - asleep) as u128));
+    };
+    let back = |ns| now.checked_sub(Duration::from_nanos(ns));
+    match late.checked_rem(every) {
+        None => now,
+        Some(phase) => back(late).or_else(|| back(phase)).unwrap_or(now),
     }
 }
 
@@ -610,7 +611,7 @@ impl Process {
             };
             if t.queued {
                 // Its signal is not delivered yet: this expiry is counted, not queued
-                t.overrun = (t.overrun + n).min(MAX_OVERRUN);
+                t.overrun = t.overrun.saturating_add(n).min(MAX_OVERRUN);
                 continue;
             }
             t.overrun = n - 1;
@@ -892,5 +893,33 @@ impl Process {
             }
         }
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_timer_restored_after_a_sleep_keeps_its_phase_whatever_the_sleep() {
+        const S: u64 = NS;
+        assert_eq!(after_sleep(20 * S, 0, 5 * S), (15 * S, 0));
+        assert_eq!(after_sleep(10 * S, 0, 35 * S), (0, 1));
+        assert_eq!(after_sleep(10 * S, 10 * S, 35 * S), (5 * S, 3));
+        // (The longest sleep and the shortest period count without overflowing)
+        assert_eq!(after_sleep(0, 1, u64::MAX), (1, u64::MAX));
+        let now = Instant::now();
+        assert_eq!(
+            due_after_sleep(now, 20 * S, 0, 5 * S),
+            now + Duration::from_secs(15)
+        );
+        assert_eq!(due_after_sleep(now, 10 * S, 0, 35 * S), now);
+        // Due in the past, on its phase: as long ago as it was, or (a host clock that can't go
+        // back that far) less than a period ago
+        for asleep in [35 * S, FAR, u64::MAX] {
+            let due = due_after_sleep(now, 10 * S, 10 * S, asleep);
+            let ago = now.saturating_duration_since(due).as_nanos() as u64;
+            assert_eq!(ago % (10 * S), (asleep - 10 * S) % (10 * S), "{asleep}");
+        }
     }
 }

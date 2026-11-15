@@ -42,7 +42,9 @@ mod wasm {
 
     impl Instant {
         pub fn now() -> Instant {
-            Instant((armless::wasm::now_ms() * 1e6) as u64)
+            // From 2^62 ns (146 years) on, so that a time a long sleep before a page loaded is an
+            // instant too (`Process::restore`: a timer due in the sleep keeps its phase)
+            Instant(((armless::wasm::now_ms() * 1e6) as u64).saturating_add(1 << 62))
         }
 
         pub fn elapsed(&self) -> Duration {

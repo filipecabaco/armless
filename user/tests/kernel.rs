@@ -1907,3 +1907,21 @@ fn the_clocks_go_on_by_the_time_the_process_was_saved_but_not_the_cpu_time() {
     let (_, status) = run(&mut p, &mut vm);
     ok(&status);
 }
+
+#[test]
+fn a_process_restored_after_the_longest_sleep_goes_on() {
+    // An hour's sleep, and the monotonic clock after it: about 68 years on (2^31 s), the longest
+    // a host can say, whatever it says
+    let p = waiting(|p| {
+        p.sys(101, &[D(0x300), I(0)]).expect(0);
+        p.sys(113, &[I(CLOCK_MONOTONIC), D(0x140)]).expect(0);
+        p.arg(0, X(0x140));
+        p.code.push(0xd35f_fc00); // lsr x0, x0, #31
+        p.expect(1);
+    });
+    let (state, process, _) = saved_while_waiting(p);
+    let (mut vm, mut p) = restored_after(&state, &process, Duration::MAX);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, b"w");
+}

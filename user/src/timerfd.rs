@@ -14,7 +14,7 @@ use crate::errno::{EAGAIN, EBADF, EFAULT, EINVAL};
 use crate::files::{Desc, Kind};
 use crate::host::Instant;
 use crate::ser::{R, W};
-use crate::timer::after_sleep;
+use crate::timer::{after_sleep, clamp};
 use crate::{Process, Ret};
 
 const CLOCK_REALTIME: u64 = 0;
@@ -78,7 +78,8 @@ impl Timer {
             let (left, n) = after_sleep(left, every, asleep);
             t.ticks = t.ticks.saturating_add(n);
             // (One that does not repeat and came due is spent)
-            t.next = (every != 0 || n == 0).then(|| now + Duration::from_nanos(left));
+            t.next =
+                (every != 0 || n == 0).then(|| now + Duration::from_nanos(clamp(left as u128)));
         }
         Ok(t)
     }

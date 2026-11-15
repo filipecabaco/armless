@@ -26,8 +26,8 @@ std::thread_local! {
     static PROCESS: RefCell<Option<Process>> = const { RefCell::new(None) };
     /// When `armless_user_run` returned 1: when to run again, in `microtick()` ms, or -1.
     static WAKE_MS: Cell<f64> = const { Cell::new(-1.0) };
-    /// What `armless_user_asleep_ms` set for the next `armless_user_restore`, in ms.
-    static ASLEEP_MS: Cell<f64> = const { Cell::new(0.0) };
+    /// What `armless_user_asleep_ms` set for the next `armless_user_restore`.
+    static ASLEEP: Cell<Duration> = const { Cell::new(Duration::ZERO) };
 }
 
 /// The process's randomness (getrandom, /dev/urandom, AT_RANDOM) from the host's: the machine's
@@ -189,11 +189,17 @@ pub extern "C" fn armless_user_save() -> u32 {
 
 /// How long the state the next `armless_user_restore` restores was saved for, in ms: the process's
 /// monotonic clocks go on by that much and what was due in it is due now (`Process::restore`). 0
-/// (the default) resumes where the process stopped, as does a negative, infinite or NaN value; it
-/// applies to one restore only.
+/// (the default) resumes where the process stopped, as does a negative, infinite or NaN value; one
+/// too long for a `Duration` is the longest (`Process::restore` caps it). It applies to one
+/// restore only.
 #[no_mangle]
 pub extern "C" fn armless_user_asleep_ms(ms: f64) {
-    ASLEEP_MS.set(ms);
+    let asleep = if ms.is_finite() && ms > 0.0 {
+        Duration::try_from_secs_f64(ms / 1e3).unwrap_or(Duration::MAX)
+    } else {
+        Duration::ZERO
+    };
+    ASLEEP.set(asleep);
 }
 
 /// The process from its saved state (`armless_user_save`, or `Process::save` natively), on the
@@ -207,8 +213,9 @@ pub extern "C" fn armless_user_asleep_ms(ms: f64) {
 pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
     seed();
     let v = vm();
-    let asleep = Duration::try_from_secs_f64(ASLEEP_MS.replace(0.0) / 1e3).unwrap_or_default();
-    match Process::restore(&mut v.cpus[0], Some(v.board.clone()), slice(ptr, len), asleep) {
+    // SAFETY: the caller's promise
+    let state = unsafe { slice(ptr, len) };
+    match Process::restore(&mut v.cpus[0], Some(v.board.clone()), state, ASLEEP.take()) {
         Ok(p) => {
             PROCESS.set(Some(p));
             0
