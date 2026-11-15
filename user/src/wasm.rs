@@ -61,11 +61,15 @@ pub unsafe extern "C" fn armless_user_exec(
     cwd: u32,
     cwd_len: u32,
 ) -> i32 {
-    let (argv, env, cwd) = (
-        list(&string(argv, argv_len)),
-        list(&string(env, env_len)),
-        string(cwd, cwd_len),
-    );
+    // SAFETY: the caller's promise
+    let (argv, env, cwd) = unsafe {
+        (
+            string(argv, argv_len),
+            string(env, env_len),
+            string(cwd, cwd_len),
+        )
+    };
+    let (argv, env) = (list(&argv), list(&env));
     let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
     seed();
     let v = vm();
@@ -218,7 +222,10 @@ mod tests {
         let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(list(""), v(&[]));
         assert_eq!(list("\0"), v(&[""]));
-        assert_eq!(list("app\0--label\0\0next\0"), v(&["app", "--label", "", "next"]));
+        assert_eq!(
+            list("app\0--label\0\0next\0"),
+            v(&["app", "--label", "", "next"])
+        );
         assert_eq!(list("app\0\0"), v(&["app", ""]));
         assert_eq!(list("\0app\0"), v(&["", "app"]));
         // The last NUL is the terminator of the last item, not an item of its own
