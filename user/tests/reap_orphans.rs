@@ -111,7 +111,11 @@ fn orphan(reap: bool, pause: bool, probe: Probe) -> Prog {
 /// The program forks A, which forks B and waits for B's end (the pipe's end of file) without
 /// waiting for it, and ends: B is a zombie when its parent ends. The program waits for A only.
 fn zombie_grandchild(reap: bool) -> Prog {
-    let mut p = Prog::default();
+    zombie_grandchild_after(Prog::default(), reap)
+}
+
+/// `zombie_grandchild`, after what `p` does first
+fn zombie_grandchild_after(mut p: Prog, reap: bool) -> Prog {
     p.put(0x260, b"/proc/1002\0");
     let a = p.fork();
     p.sys(59, &[D(0x100), I(0)]).expect(0); // pipe2: 3 (read) and 4 (write)
@@ -292,4 +296,146 @@ fn a_reaping_first_process_neither_sees_nor_keeps_its_orphans_on_every_cpu() {
     let mut vm = machine();
     let mut p = start_orphan(&mut vm, zombie_grandchild(true), true);
     ok(&run(&mut p, &mut vm).1);
+}
+
+/// Sleeps (a timer) before anything else, so the machine can be saved with one process
+fn paused() -> Prog {
+    let mut p = Prog::default();
+    p.put(0x240, &[0u8; 8]);
+    p.put(0x248, &200_000_000u64.to_le_bytes());
+    p.sys(101, &[D(0x240), I(0)]).expect(0);
+    p
+}
+
+/// Runs until the program sleeps, and saves the process and the machine
+fn save_when_idle(mut p: Process, mut vm: Machine) -> (Vec<u8>, Vec<u8>) {
+    let status = loop {
+        let status = p.run_on(&mut vm.cpus, Duration::from_millis(20));
+        if !matches!(status, Status::Running) {
+            break status;
+        }
+    };
+    assert!(matches!(status, Status::Idle(Some(_))), "{status:?}");
+    (p.save(&vm.cpus[0]), vm.save_state())
+}
+
+fn restore(state: &[u8], process: &[u8]) -> (Process, Machine) {
+    let mut vm = machine_with_cpus(1);
+    vm.load_state(state).unwrap();
+    let p = Process::restore(&mut vm.cpus[0], None, process).unwrap();
+    (p, vm)
+}
+
+#[test]
+fn reaping_turned_on_for_a_restored_process_reaps_the_orphans_after() {
+    let mut vm = machine_with_cpus(1);
+    let p = start_orphan(&mut vm, zombie_grandchild_after(paused(), true), false);
+    let (process, state) = save_when_idle(p, vm);
+    let (mut p, mut vm) = restore(&state, &process);
+    // It keeps what it was saved with, and the host may change it before it runs on
+    assert!(!p.reap_orphans);
+    p.reap_orphans = true;
+    ok(&run(&mut p, &mut vm).1);
+}
+
+#[test]
+fn a_state_saved_before_orphans_were_reaped_loads_with_none_reaped() {
+    let mut vm = machine_with_cpus(1);
+    let p = start_orphan(&mut vm, zombie_grandchild_after(paused(), false), true);
+    let (mut process, state) = save_when_idle(p, vm);
+    // ARMLUSR9: no reaping option at the end, nor an orphan flag after the one process's command
+    // line ("p\0")
+    process.truncate(process.len() - 8);
+    let cmdline = [&2u64.to_le_bytes()[..], b"p\0"].concat();
+    let at: Vec<usize> = (0..process.len() - cmdline.len())
+        .filter(|&i| process[i..].starts_with(&cmdline))
+        .collect();
+    assert_eq!(at.len(), 1);
+    let flag = at[0] + cmdline.len();
+    assert_eq!(process[flag..flag + 8], [0; 8]);
+    process.drain(flag..flag + 8);
+    process[..8].copy_from_slice(b"ARMLUSR9");
+    let (mut p, mut vm) = restore(&state, &process);
+    assert!(!p.reap_orphans);
+    ok(&run(&mut p, &mut vm).1);
+}
+
+/// As `zombie_grandchild_told`, B ending with status 0 or killed by SIGKILL: what the SIGCHLD the
+/// first process gets says (si_code CLD_EXITED or CLD_KILLED)
+fn zombie_grandchild_told_how(killed: bool) -> Prog {
+    const WALL: u64 = 0x4000_0000;
+    let mut p = Prog::default();
+    p.put(0x2a0, &SIGCHLD_BIT.to_le_bytes());
+    p.put(0x240, &[0u8; 16]);
+    p.sys(135, &[I(0), D(0x2a0), I(0), I(8)]).expect(0);
+    p.sys(220, &[I(0), I(0), I(0), I(0), I(0)]);
+    p.code.push(0);
+    let a = p.code.len() - 1;
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    let b = p.fork();
+    if killed {
+        p.sys(172, &[]).save(0x180);
+        p.sys(129, &[W(0x180), I(9)]);
+    }
+    p.parent(b);
+    p.sys(57, &[I(4)]).expect(0);
+    p.sys(63, &[I(3), D(0x300), I(1)]).expect(0);
+    p.parent(a);
+    p.sys(260, &[I(1001), D(0x280), I(WALL), I(0)]).expect(1001);
+    // rt_sigtimedwait: SIGCHLD is pending, its siginfo's si_code 8 bytes in
+    p.sys(137, &[D(0x2a0), D(0x500), D(0x240), I(8)]).expect(17);
+    p.arg(0, W(0x508));
+    p.expect(if killed { 2 } else { 1 });
+    p
+}
+
+#[test]
+fn the_sigchld_of_a_zombie_moved_to_the_first_process_says_how_it_ended() {
+    for killed in [false, true] {
+        let mut vm = machine();
+        let mut p = start_orphan(&mut vm, zombie_grandchild_told_how(killed), false);
+        ok(&run(&mut p, &mut vm).1);
+    }
+}
+
+#[test]
+fn a_zombie_that_goes_to_a_first_process_with_sa_nocldwait_is_dropped() {
+    // As the SIG_IGN case: SIGCHLD's default action, with SA_NOCLDWAIT
+    let mut p = Prog::default();
+    p.put(0x3fe0, &[0u64, 2, 0, 0].map(u64::to_le_bytes).concat());
+    p.sys(134, &[I(17), D(0x3fe0), I(0), I(8)]).expect(0);
+    p.put(0x260, b"/proc/1002\0");
+    let a = p.fork();
+    p.put(0x3fc0, &[0u8; 32]);
+    p.sys(134, &[I(17), D(0x3fc0), I(0), I(8)]).expect(0);
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    let b = p.fork();
+    p.parent(b);
+    p.sys(57, &[I(4)]).expect(0);
+    p.sys(63, &[I(3), D(0x300), I(1)]).expect(0);
+    p.parent(a);
+    p.sys(260, &[I(1001), D(0x280), I(0), I(0)]).expect(ECHILD);
+    p.sys(79, &[I(AT_FDCWD), D(0x260), D(0x400), I(0)])
+        .expect(ENOENT);
+    p.sys(260, &[I(0xffff_ffff), D(0x280), I(WNOHANG), I(0)])
+        .expect(ECHILD);
+    let mut vm = machine();
+    let mut p = start_orphan(&mut vm, p, false);
+    ok(&run(&mut p, &mut vm).1);
+}
+
+#[test]
+fn armless_exec_reaps_orphans_with_reap_orphans() {
+    let path = std::env::temp_dir().join(format!("armless-reap-orphans-{}", std::process::id()));
+    std::fs::write(&path, orphan(true, false, Probe::Wait4).elf()).unwrap();
+    let exec = |flag: Option<&str>| {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_armless-exec"));
+        c.args(["-m", "128"]).args(flag).arg(&path);
+        c.output().unwrap().status.code()
+    };
+    let (with, without) = (exec(Some("--reap-orphans")), exec(None));
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(with, Some(0));
+    // Without it the orphan is the program's to wait for, which this one does not expect
+    assert_ne!(without, Some(0));
 }
