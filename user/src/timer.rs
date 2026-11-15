@@ -922,4 +922,45 @@ mod tests {
             assert_eq!(ago % (10 * S), (asleep - 10 * S) % (10 * S), "{asleep}");
         }
     }
+
+    #[test]
+    fn a_disarmed_timer_is_restored_disarmed_and_an_unknown_due_is_an_error() {
+        // A POSIX timer created and not armed, and one on CPU time, which the sleep does not move
+        let mut s = Timers::default();
+        let cpu = Arm {
+            due: Due::Cpu(5 * NS),
+            interval: NS,
+        };
+        for (id, arm) in [(0, None), (1, Some(cpu))] {
+            s.posix.push(Posix {
+                pid: 1,
+                id,
+                clock: 2,
+                scope: Scope::Proc(1),
+                sig: 14,
+                thread: None,
+                value: 0,
+                arm,
+                queued: false,
+                overrun: 0,
+                last: 0,
+            });
+        }
+        let now = Instant::now();
+        let mut w = W(Vec::new());
+        s.save(&mut w, now);
+        let mut t = Timers::default();
+        t.load(&mut R(&w.0), now, 3600 * NS).unwrap();
+        assert!(t.posix[0].arm.is_none());
+        assert!(
+            matches!(t.posix[1].arm, Some(Arm { due: Due::Cpu(c), interval: NS }) if c == 5 * NS)
+        );
+        // An interval timer whose due is of no kind there is
+        let mut w = W(Vec::new());
+        for v in [0, 0, 0, 1, 1, 1, 3, 0, 0] {
+            w.u(v);
+        }
+        let got = Timers::default().load(&mut R(&w.0), now, 0);
+        assert_eq!(got.err().as_deref(), Some("unknown timer due 3"));
+    }
 }

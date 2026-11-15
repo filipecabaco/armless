@@ -223,3 +223,37 @@ impl Process {
         self.put_itimerspec(at, t.every.as_nanos() as u64, left)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_timerfd_restored_after_a_sleep_counts_what_came_due_and_one_disarmed_stays_so() {
+        let hour = Duration::from_secs(3600).as_nanos() as u64;
+        let now = Instant::now();
+        let restored = |next: Option<Duration>| {
+            let t = Timer {
+                clock: 1,
+                next: next.map(|d| now + d),
+                every: Duration::ZERO,
+                ticks: 2,
+            };
+            let mut w = W(Vec::new());
+            t.save(&mut w, now);
+            Timer::load(&mut R(&w.0), hour).unwrap()
+        };
+        // Disarmed: still, and its count kept
+        let t = restored(None);
+        assert!(t.next.is_none());
+        assert_eq!(t.ticks, 2);
+        // A one-shot due in the sleep: counted and spent
+        let t = restored(Some(Duration::from_secs(60)));
+        assert!(t.next.is_none());
+        assert_eq!(t.ticks, 3);
+        // Due after it: still to come
+        let t = restored(Some(Duration::from_secs(7200)));
+        assert!(t.next.is_some());
+        assert_eq!(t.ticks, 2);
+    }
+}

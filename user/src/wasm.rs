@@ -226,3 +226,23 @@ pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_time_asleep_is_a_duration_or_none() {
+        let asleep = |ms: f64| {
+            armless_user_asleep_ms(ms);
+            ASLEEP.take()
+        };
+        assert_eq!(asleep(1500.0), Duration::from_millis(1500));
+        // None, a negative, an infinite or a NaN time: none
+        for ms in [0.0, -0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(asleep(ms), Duration::ZERO, "{ms}");
+        }
+        // Too long for a Duration: the longest
+        assert_eq!(asleep(f64::MAX), Duration::MAX);
+    }
+}
