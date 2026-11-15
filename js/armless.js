@@ -689,8 +689,13 @@
       const e = this.exports;
       const argv = typeof user.argv === "string" ? [user.argv] : user.argv || [];
       if (!argv.length) throw new Error("armless: user mode needs a program (user.argv)");
-      // argv and env as NUL-separated lists
-      const list = (items) => utf8.encode(items.map((s) => s + "\0").join(""));
+      // argv and env as lists of NUL-terminated items (one with a NUL in it would be two: execve
+      // can't pass one either)
+      const list = (items) => {
+        const s = items.map(String);
+        if (s.some((x) => x.includes("\0"))) throw new Error("armless: user mode: a NUL in an argument or variable");
+        return utf8.encode(s.map((x) => x + "\0").join(""));
+      };
       const parts = [list(argv), list(user.env || []), utf8.encode(user.cwd || "/")];
       const ptrs = parts.map((b) => this._copy_in(b));
       try {
