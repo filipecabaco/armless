@@ -480,7 +480,7 @@ x0–x5, answers it in x0, and resumes at ELR.
   starts as a new process has it); a state from before 0.14 does not (addresses are virtual,
   there are processes, and the sockets are in the machine's state).
   A host that restores after a while says how long (`Process::restore`'s `asleep`,
-  `armless_user_restore`'s `asleep_ms`, armless-exec's `--restore` the age of `process.bin`): the
+  `armless_user_asleep_ms` before `armless_user_restore`, armless-exec's `--restore` the age of `process.bin`): the
   monotonic and boot-time clocks go on by that much, a wait or timer that came due in it is due
   at once, and a timerfd that repeats counts every period it missed, as if it had been read all
   along. A recurring signal timer (`setitimer`, `timer_create`) signals once, keeps its phase (its
@@ -541,7 +541,8 @@ and then, instead of a boot:
 | export | |
 |---|---|
 | `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
-| `armless_user_restore(ptr, len, asleep_ms)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine; `asleep_ms` is how long it was saved for (0: none), which its clocks and deadlines go on by |
+| `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine; for one restore, how long it was saved for is what `armless_user_asleep_ms` set |
+| `armless_user_asleep_ms(ms)` | how long the next restored state was saved for, in ms (0, the default: none), which its clocks and deadlines go on by |
 | `armless_user_run(budget_ms)` | 0 its time ran out, 1 idle, 2 exited, 3 faulted (the reason in `armless_error`), -1 no process |
 | `armless_user_wake_ms()` | after 1: the `microtick()` time of its next deadline, or -1 (only input or a blob wakes it) |
 | `armless_user_waiting_on_blobs()` | 1 when a thread waits on a blob rather than on input |

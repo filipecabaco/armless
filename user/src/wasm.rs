@@ -26,6 +26,8 @@ std::thread_local! {
     static PROCESS: RefCell<Option<Process>> = const { RefCell::new(None) };
     /// When `armless_user_run` returned 1: when to run again, in `microtick()` ms, or -1.
     static WAKE_MS: Cell<f64> = const { Cell::new(-1.0) };
+    /// What `armless_user_asleep_ms` set for the next `armless_user_restore`, in ms.
+    static ASLEEP_MS: Cell<f64> = const { Cell::new(0.0) };
 }
 
 /// The process's randomness (getrandom, /dev/urandom, AT_RANDOM) from the host's: the machine's
@@ -185,19 +187,27 @@ pub extern "C" fn armless_user_save() -> u32 {
     })
 }
 
+/// How long the state the next `armless_user_restore` restores was saved for, in ms: the process's
+/// monotonic clocks go on by that much and what was due in it is due now (`Process::restore`). 0
+/// (the default) resumes where the process stopped; it applies to one restore only.
+#[no_mangle]
+pub extern "C" fn armless_user_asleep_ms(ms: f64) {
+    ASLEEP_MS.set(ms);
+}
+
 /// The process from its saved state (`armless_user_save`, or `Process::save` natively), on the
 /// machine restored from the snapshot it was saved with (`armless_state_*` first). It asks again
-/// for blobs it was waiting on. `asleep_ms` is how long the state sat saved: the process's monotonic
-/// clocks go on by that much and what was due in it is due now (`Process::restore`); pass 0 to
-/// resume where it stopped. Returns 0 or -1 (see `armless_error`).
+/// for blobs it was waiting on. How long the state sat saved is what `armless_user_asleep_ms` set
+/// before (once: 0 after). Returns 0 or -1 (see `armless_error`).
 ///
 /// # Safety
 /// `ptr` must reference `len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32, asleep_ms: f64) -> i32 {
+pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
     seed();
     let v = vm();
-    match Process::restore(&mut v.cpus[0], Some(v.board.clone()), slice(ptr, len), Duration::from_secs_f64(asleep_ms.max(0.0) / 1e3)) {
+    let asleep = Duration::from_secs_f64(ASLEEP_MS.replace(0.0).max(0.0) / 1e3);
+    match Process::restore(&mut v.cpus[0], Some(v.board.clone()), slice(ptr, len), asleep) {
         Ok(p) => {
             PROCESS.set(Some(p));
             0

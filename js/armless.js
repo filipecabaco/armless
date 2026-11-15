@@ -716,7 +716,8 @@
     async _user_restore(src, asleep_ms = 0) {
       const file = typeof src === "string" ? src : "user_state";
       const bytes = await load(src, (loaded, total) => this.emit("progress", { file, loaded, total }));
-      if (this._with_bytes(bytes, (p, n) => this.exports.armless_user_restore(p, n, asleep_ms)) !== 0) {
+      this.exports.armless_user_asleep_ms(asleep_ms ?? 0);
+      if (this._with_bytes(bytes, (p, n) => this.exports.armless_user_restore(p, n)) !== 0) {
         throw new Error("armless: user state: " + this._error());
       }
       this.user = true;
