@@ -26,6 +26,10 @@ std::thread_local! {
     static PROCESS: RefCell<Option<Process>> = const { RefCell::new(None) };
     /// When `armless_user_run` returned 1: when to run again, in `microtick()` ms, or -1.
     static WAKE_MS: Cell<f64> = const { Cell::new(-1.0) };
+    /// `armless_user_plain_std`: the next exec has no terminal.
+    static PLAIN_STD: Cell<bool> = const { Cell::new(false) };
+    /// `armless_user_hostname`: the bytes of the next exec's hostname.
+    static HOSTNAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The process's randomness (getrandom, /dev/urandom, AT_RANDOM) from the host's: the machine's
@@ -46,7 +50,9 @@ fn list(s: &str) -> Vec<String> {
 /// `argv[0]` has no slash; a dynamically linked one with its loader): `argv` and `env` are
 /// NUL-separated lists, `cwd` the working directory. Returns 0 when it is ready to run, 1 when
 /// its files are still being fetched (blob events were raised: provide them, then call again),
-/// -1 on failure (see `armless_error`). It replaces any process there was.
+/// -1 on failure (see `armless_error`). It replaces any process there was. It starts with the
+/// options set by `armless_user_plain_std` and `armless_user_hostname` and, once it returns 0 or
+/// -1, goes back to the defaults (a 1 keeps them for the call that follows the blobs).
 ///
 /// # Safety
 /// Each pointer must reference its length of readable bytes.
@@ -63,46 +69,58 @@ pub unsafe extern "C" fn armless_user_exec(
         list(&string(argv, argv_len)),
         list(&string(env, env_len)),
         string(cwd, cwd_len),
-        ExecOptions::default(),
+        pending_options(),
     )
 }
 
-/// `armless_user_exec` with options: `flags` bit 0 gives it the standard streams of a container
-/// without a terminal (`StdStreams::Plain`: stdin reads end of file, stdout and stderr are no
-/// terminal), and `hostname` (empty: "armless") is what uname says.
-///
-/// # Safety
-/// Each pointer must reference its length of readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn armless_user_exec_opts(
-    argv: u32,
-    argv_len: u32,
-    env: u32,
-    env_len: u32,
-    cwd: u32,
-    cwd_len: u32,
-    flags: u32,
-    hostname: u32,
-    hostname_len: u32,
-) -> i32 {
-    let hostname = string(hostname, hostname_len);
-    let opts = ExecOptions {
-        std: if flags & 1 != 0 { StdStreams::Plain } else { StdStreams::Terminal },
+/// The options the host set for this exec (`armless_user_plain_std`, `armless_user_hostname`).
+fn pending_options() -> ExecOptions {
+    let hostname = HOSTNAME.with_borrow(|h| String::from_utf8_lossy(h).into_owned());
+    ExecOptions {
+        std: if PLAIN_STD.get() { StdStreams::Plain } else { StdStreams::Terminal },
         hostname: (!hostname.is_empty()).then_some(hostname),
-    };
-    exec(
-        list(&string(argv, argv_len)),
-        list(&string(env, env_len)),
-        string(cwd, cwd_len),
-        opts,
-    )
+    }
+}
+
+/// The next exec's standard streams: nonzero gives the program those of a container without a
+/// terminal (`StdStreams::Plain`: stdin reads end of file, stdout and stderr are no terminal),
+/// zero the terminal (the default). Call it before `armless_user_exec`; that exec (once it is not
+/// asking for blobs any more) puts it back to the default.
+#[no_mangle]
+pub extern "C" fn armless_user_plain_std(on: u32) {
+    PLAIN_STD.set(on != 0);
+}
+
+/// The next exec's hostname, which is what uname says (empty: "armless"): makes room for `len`
+/// bytes (at most 64, the longest name; a longer one fails with 0 and the reason in
+/// `armless_error`) and returns where they are in the module's memory. Write the UTF-8 bytes
+/// there, then call `armless_user_exec`, which reads them and puts the hostname back to the
+/// default. The pointer is only good until the next call of this function or the exec, and the
+/// memory may have grown since the module was last asked, so re-read it before writing.
+#[no_mangle]
+pub extern "C" fn armless_user_hostname(len: u32) -> u32 {
+    if len > 64 {
+        HOSTNAME.with_borrow_mut(Vec::clear);
+        set_error(format!("hostname: {len} bytes is longer than 64"));
+        return 0;
+    }
+    HOSTNAME.with_borrow_mut(|h| {
+        h.clear();
+        h.resize(len as usize, 0);
+        h.as_mut_ptr() as u32
+    })
 }
 
 fn exec(argv: Vec<String>, env: Vec<String>, cwd: String, opts: ExecOptions) -> i32 {
     let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
     seed();
     let v = vm();
-    match Process::exec_with(&mut v.cpus[0], v.board.clone(), &argv, &env, &cwd, &opts) {
+    let r = Process::exec_with(&mut v.cpus[0], v.board.clone(), &argv, &env, &cwd, &opts);
+    if !matches!(r, Err(ExecError::Need(_))) {
+        PLAIN_STD.set(false);
+        HOSTNAME.with_borrow_mut(Vec::clear);
+    }
+    match r {
         Ok(p) => {
             PROCESS.set(Some(p));
             0

@@ -281,7 +281,7 @@ x0–x5, answers it in x0, and resumes at ELR.
   output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
   newlines start a line (ONLCR).
 - **Without a terminal:** `ExecOptions { std: StdStreams::Plain, .. }` (`Process::exec_with`;
-  `armless-exec --plain-std`; `armless_user_exec_opts`; `plain_std` in the JS options) starts the
+  `armless-exec --plain-std`; `armless_user_plain_std`; `plain_std` in the JS options) starts the
   program as a container with no tty has it: stdin is `/dev/null` (end of file, `isatty` false),
   stdout and stderr are character devices that are no terminal (no TCGETS, no ONLCR) and write to
   the same output (`take_output`, console events), and `/dev/stdin`, `/dev/stdout` and
@@ -541,7 +541,8 @@ and then, instead of a boot:
 | export | |
 |---|---|
 | `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
-| `armless_user_exec_opts(argv, len, env, len, cwd, len, flags, hostname, len)` | `armless_user_exec` with options: `flags` bit 0 is no terminal (`StdStreams::Plain`), `hostname` (empty: armless) is what uname says |
+| `armless_user_plain_std(on)` | the next `armless_user_exec` has no terminal (`StdStreams::Plain`) when `on` is nonzero |
+| `armless_user_hostname(len)` | room for the next exec's hostname (at most 64 bytes; 0 and `armless_error` otherwise): returns where to write its UTF-8 bytes, which `armless_user_exec` reads (empty: armless); the exec puts both options back to the defaults |
 | `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine |
 | `armless_user_run(budget_ms)` | 0 its time ran out, 1 idle, 2 exited, 3 faulted (the reason in `armless_error`), -1 no process |
 | `armless_user_wake_ms()` | after 1: the `microtick()` time of its next deadline, or -1 (only input or a blob wakes it) |

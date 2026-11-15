@@ -694,17 +694,23 @@
       if (!argv.length) throw new Error("armless: user mode needs a program (user.argv)");
       // argv and env as NUL-separated lists
       const list = (items) => utf8.encode(items.map((s) => s + "\0").join(""));
-      const parts = [list(argv), list(user.env || []), utf8.encode(user.cwd || "/"), utf8.encode(user.hostname || "")];
-      const opts = user.plain_std || user.hostname;
-      if (opts && !e.armless_user_exec_opts) throw new Error("armless: this build has no exec options");
+      const parts = [list(argv), list(user.env || []), utf8.encode(user.cwd || "/")];
+      const name = utf8.encode(user.hostname || "");
+      if ((user.plain_std && !e.armless_user_plain_std) || (name.length && !e.armless_user_hostname)) {
+        throw new Error("armless: this build has no exec options");
+      }
       const ptrs = parts.map((b) => this._copy_in(b));
       try {
-        // Its executable and loader may be fetched first
+        // The exec options stay set while its executable and loader are fetched
+        if (user.plain_std) e.armless_user_plain_std(1);
+        if (name.length) {
+          const at = e.armless_user_hostname(name.length);
+          if (!at) throw new Error("armless: user mode: " + this._error());
+          // read the memory after the call: it may have grown
+          new Uint8Array(this.memory.buffer, at, name.length).set(name);
+        }
         for (;;) {
-          const r = opts ?
-            e.armless_user_exec_opts(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length,
-              user.plain_std ? 1 : 0, ptrs[3], parts[3].length) :
-            e.armless_user_exec(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length);
+          const r = e.armless_user_exec(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length);
           if (r === 0) break;
           if (r < 0) throw new Error("armless: user mode: " + this._error());
           this._drain();
