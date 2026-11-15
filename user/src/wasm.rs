@@ -175,6 +175,14 @@ pub extern "C" fn armless_user_resize(cols: u32, rows: u32) {
     PROCESS.with_borrow_mut(|p| p.as_mut().map(|p| p.resize(cols as u16, rows as u16)));
 }
 
+/// Whether the first process reaps its orphans (`Process::reap_orphans`: a program that is pid 1 of
+/// a container). Call it after `armless_user_exec` and before the first `armless_user_run`; a
+/// restored process keeps what it was saved with.
+#[no_mangle]
+pub extern "C" fn armless_user_reap_orphans(on: u32) {
+    PROCESS.with_borrow_mut(|p| p.as_mut().map(|p| p.reap_orphans = on != 0));
+}
+
 /// A signal for the process (`Process::kill`), as `kill(2)` sends it: SIGINT (2) when a page's
 /// stop button interrupts the program without going through the terminal.
 #[no_mangle]
@@ -236,6 +244,48 @@ pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A static ELF whose one instruction is a branch to itself: enough to make a process
+    fn elf() -> Vec<u8> {
+        const BASE: u64 = 0x40_0000;
+        let mut e = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
+        e.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        e.extend_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        e.extend_from_slice(&1u32.to_le_bytes());
+        e.extend_from_slice(&(BASE + 120).to_le_bytes()); // entry, after the headers
+        e.extend_from_slice(&64u64.to_le_bytes());
+        e.extend_from_slice(&0u64.to_le_bytes());
+        e.extend_from_slice(&0u32.to_le_bytes());
+        for v in [64u16, 56, 1, 64, 0, 0] {
+            e.extend_from_slice(&v.to_le_bytes());
+        }
+        e.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD, R X
+        e.extend_from_slice(&5u32.to_le_bytes());
+        for v in [0, BASE, BASE, 124, 124, 0x1000] {
+            e.extend_from_slice(&v.to_le_bytes());
+        }
+        e.extend_from_slice(&0x1400_0000u32.to_le_bytes()); // b .
+        e
+    }
+
+    #[test]
+    fn reap_orphans_sets_the_option_of_the_process_there_is() {
+        // None yet: nothing to set
+        armless_user_reap_orphans(1);
+        let config = armless::vm::Config {
+            memory_size: 64 << 20,
+            cpus: 1,
+            devices: Default::default(),
+        };
+        let mut vm = armless::runner::new_vm(config).unwrap().0;
+        let p = Process::exec_bytes(&mut vm.cpus[0], None, &elf(), &["p".into()], &[]).unwrap();
+        assert!(!p.reap_orphans);
+        PROCESS.set(Some(p));
+        armless_user_reap_orphans(1);
+        assert!(PROCESS.with_borrow(|p| p.as_ref().unwrap().reap_orphans));
+        armless_user_reap_orphans(0);
+        assert!(PROCESS.with_borrow(|p| !p.as_ref().unwrap().reap_orphans));
+    }
 
     #[test]
     fn the_time_asleep_is_a_duration_or_none() {

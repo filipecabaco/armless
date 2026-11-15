@@ -280,6 +280,14 @@ x0–x5, answers it in x0, and resumes at ELR.
   ISIG, Ctrl-C, Ctrl-\ and Ctrl-Z are SIGINT, SIGQUIT and SIGTSTP, flushing the input and the
   output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
   newlines start a line (ONLCR).
+- **Orphans:** a process whose parent ended is a child of the first process, which can wait for
+  it. A container's program is pid 1 and does not: `Process::reap_orphans` (`armless-exec
+  --reap-orphans`, `armless_user_reap_orphans`, `reap_orphans` in the JS options; saved) makes the
+  first process reap them as init does. They get no SIGCHLD for it, `wait4(-1)` and `waitid` never
+  report them (ECHILD once it has no children of its own), and they leave as they end, so nothing
+  piles up as zombies. Its own children are as before. Without it, as Linux reparents, an
+  orphan ends with SIGCHLD, and one that had ended already raises it in the first process then
+  (or goes, if that one ignores SIGCHLD).
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
 - **File locks** (user/src/locks.rs), as Linux keeps them: record locks (`fcntl` F_GETLK,
   F_SETLK, F_SETLKW) are a process's, on byte ranges, and go when it closes any descriptor of the
@@ -551,6 +559,7 @@ and then, instead of a boot:
 | `armless_user_waiting_for_input()` | 1 when a thread waits in a call input could complete (read, poll, epoll) and none on a blob: a REPL at its prompt, not a program asleep |
 | `armless_user_exit_code()` | the exit status, -1 while it runs |
 | `armless_user_input(ptr, len)`, `armless_user_close_input()`, `armless_user_resize(cols, rows)` | the terminal |
+| `armless_user_reap_orphans(on)` | the first process reaps its orphans (after `armless_user_exec`, before it runs) |
 | `armless_user_kill(sig)` | a signal for the program, as kill(2) sends it (SIGINT for a stop button) |
 | `armless_user_save()` | the process's state, at `armless_buf` |
 

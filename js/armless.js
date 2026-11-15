@@ -13,7 +13,7 @@
 //
 // User mode (no guest kernel): a Linux program from the filesystem runs on the machine's CPU
 // and its system calls are answered in armless, with the console as its terminal. Instead of
-// `boot`, `user: { argv: ["python3"], env: ["PATH=/usr/bin", ...], cwd: "/", cols, rows }`
+// `boot`, `user: { argv: ["python3"], env: ["PATH=/usr/bin", ...], cwd: "/", cols, rows, reap_orphans }`
 // starts one; `user_state` (URL or bytes, a process saved with save_process() or natively,
 // system/user.bin of a snowglobe site) restores one next to `initial_state`, with `user_asleep_ms`
 // (default 0) the time it was saved for, which its clocks and deadlines go on by. The events and
@@ -684,11 +684,12 @@
 
     // ------------------------------------------------------------ user mode
 
-    /** Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows }. */
+    /** Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows, reap_orphans }. */
     async _user_exec(user) {
       const e = this.exports;
       const argv = typeof user.argv === "string" ? [user.argv] : user.argv || [];
       if (!argv.length) throw new Error("armless: user mode needs a program (user.argv)");
+      if (user.reap_orphans && !e.armless_user_reap_orphans) throw new Error("armless: this build cannot reap orphans");
       // argv and env as lists of NUL-terminated items (one with a NUL in it would be two: execve
       // can't pass one either)
       const list = (items) => {
@@ -711,6 +712,7 @@
         ptrs.forEach((p, i) => e.armless_free(p, parts[i].length));
       }
       this.user = true;
+      if (user.reap_orphans) e.armless_user_reap_orphans(1);
       e.armless_user_resize(user.cols || 80, user.rows || 24);
     }
 

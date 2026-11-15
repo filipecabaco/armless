@@ -231,6 +231,10 @@ pub(crate) struct Proc {
     pub zombie: Option<i32>,
     /// Nobody will wait for it (its parent ignores its end): it goes once it is not the current one
     pub reap: bool,
+    /// Its parent ended and it went to the first process, which reaps such children
+    /// (`Process::reap_orphans`): the first process's wait does not see it, it gets no exit signal
+    /// and it goes as it ends
+    pub orphan: bool,
     pub cwd: Ino,
     pub umask: u32,
     /// The executable's path, for /proc/self/exe
@@ -349,6 +353,11 @@ pub struct Process {
     pub(crate) timers: Timers,
     /// The processes the host started (spawn.rs), and its ends of their pipes. Not saved.
     pub(crate) spawned: BTreeMap<i64, spawn::Spawned>,
+    /// The first process reaps its orphans, as init does and a container's program must when it
+    /// is pid 1: the children of a process that ended (not its own) go as they end, with no
+    /// SIGCHLD, and its `wait` and `waitid` never report them. Set it before the program runs; it
+    /// holds for those that end after. Saved.
+    pub reap_orphans: bool,
     pub trace: bool,
     /// With `trace`, only these system calls (empty: all of them)
     pub trace_only: Vec<u64>,
@@ -712,6 +721,7 @@ impl Process {
                 exit_signal: 0,
                 zombie: None,
                 reap: false,
+                orphan: false,
                 cwd: ROOT,
                 umask: 0o022,
                 exe: exe.to_vec(),
@@ -740,6 +750,7 @@ impl Process {
             cpu_cur: vec![0; cpu.machine.ncpus],
             machine: cpu.machine.clone(),
             resume_deadline: None,
+            reap_orphans: false,
             trace: false,
             trace_only: Vec::new(),
             stats: Stats::default(),
@@ -1466,6 +1477,7 @@ impl Process {
             creds::save_groups(&p.groups, &mut w);
             aio::save(&p.aio, &mut w);
             w.b(&p.cmdline);
+            w.u(p.orphan as u64);
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1534,6 +1546,7 @@ impl Process {
         self.files.net.save_cm(&mut w);
         self.timers.save(&mut w, now);
         self.files.locks.save(&mut w);
+        w.u(self.reap_orphans as u64);
         w.0
     }
 
@@ -1549,7 +1562,7 @@ impl Process {
     ) -> Result<Process, String> {
         // (At most the longest a timer is set for, so the clocks it moves don't overflow)
         let asleep = timer::clamp(asleep.as_nanos());
-        // Which format it is (MAGIC says what each adds): 5 to 9
+        // Which format it is (MAGIC says what each adds): 5 to 10
         let Some((ver, rest)) = MAGICS
             .iter()
             .enumerate()
@@ -1615,6 +1628,8 @@ impl Process {
             let aio = if ver >= 7 { aio::load(&mut r)? } else { BTreeMap::new() };
             // Before ARMLUSR9 no command line was kept: /proc gives the executable's path
             let cmdline = if ver >= 9 { r.b()?.to_vec() } else { Vec::new() };
+            // Before ARMLUSRA nothing reaped orphans
+            let orphan = ver >= 10 && r.u()? != 0;
             all.insert(
                 pid,
                 Proc {
@@ -1627,6 +1642,7 @@ impl Process {
                     exit_signal,
                     zombie: ended.then_some(status),
                     reap: false,
+                    orphan,
                     cwd,
                     umask,
                     exe,
@@ -1734,6 +1750,7 @@ impl Process {
         if ver >= 8 {
             files.locks = locks::Locks::load(&mut r)?;
         }
+        let reap_orphans = ver >= 10 && r.u()? != 0;
         files.check_refs(all.values().map(|p| &p.fds))?;
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
@@ -1770,6 +1787,7 @@ impl Process {
             cpu_cur: vec![0; cpu.machine.ncpus],
             machine: cpu.machine.clone(),
             resume_deadline: None,
+            reap_orphans,
             trace: false,
             trace_only: Vec::new(),
             stats: Stats::default(),
@@ -1823,14 +1841,17 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
     }
 }
 
-/// The process state's format: ARMLUSR9 (0.19) has each process's command line (after its AIO
-/// contexts); ARMLUSR8 (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
+/// The process state's format: ARMLUSRA has whether the first process reaps orphans (at the
+/// end, after the file locks) and each process's orphan flag (after its command line); ARMLUSR9
+/// (0.19) has each process's command line (after its AIO contexts); ARMLUSR8 (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
 /// each thread's scheduling (sched.rs) and the timers but ITIMER_REAL, with the CPU time they
 /// count (timer.rs, at the end); ARMLUSR6 (0.15) has none of that; ARMLUSR5 (0.14) has neither
 /// the ids, timers, shared memory, shared file pages nor descriptors in flight of 0.15. Each
 /// still loads.
-const MAGIC: &[u8; 8] = b"ARMLUSR9";
-const MAGICS: [&[u8; 8]; 5] = [b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", MAGIC];
+const MAGIC: &[u8; 8] = b"ARMLUSRA";
+const MAGICS: [&[u8; 8]; 6] = [
+    b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", b"ARMLUSR9", MAGIC,
+];
 
 const _: () = {
     const fn send<T: Send>() {}

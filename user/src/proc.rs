@@ -246,9 +246,28 @@ impl Process {
             .collect();
         self.timers.end(pid, &tids);
         self.release_vfork(pid);
-        for q in self.procs.values_mut() {
-            if q.ppid == pid {
-                q.ppid = INIT;
+        // Its children go to the first process. When that one reaps orphans they are no one's to
+        // wait for: those that ended already go, the others as they end. Otherwise, as Linux
+        // reparents, they end with SIGCHLD (whatever they were cloned with), and one that ended
+        // already is told of then, or goes if the first process ignores its children's ends.
+        let reap = self.reap_orphans;
+        let mut ended = Vec::new();
+        for q in self.procs.values_mut().filter(|q| q.ppid == pid) {
+            q.ppid = INIT;
+            q.orphan = reap;
+            q.exit_signal = if reap { 0 } else { signal::SIGCHLD };
+            if let Some(status) = q.zombie {
+                ended.push((q.pid, status));
+            }
+        }
+        let vanish = reap || self.proc_ref(INIT).is_some_and(|q| q.sig.children_vanish());
+        for (q, status) in ended {
+            if vanish {
+                self.procs.remove(&q);
+            } else {
+                // CLD_EXITED or CLD_KILLED
+                let code = if status & 0x7f == 0 { 1 } else { 2 };
+                self.raise_in(INIT, signal::SIGCHLD, None, code);
             }
         }
         let status = match how {
@@ -257,7 +276,7 @@ impl Process {
         };
         self.p.zombie = Some(status);
         let (ppid, exit_signal) = (self.p.ppid, self.p.exit_signal);
-        if self.proc_ref(ppid).is_some_and(|q| q.sig.children_vanish()) {
+        if self.p.orphan || self.proc_ref(ppid).is_some_and(|q| q.sig.children_vanish()) {
             self.p.reap = true;
         }
         if exit_signal != 0 {
@@ -301,7 +320,7 @@ impl Process {
     fn children(&self, pick: Pick) -> Option<Option<(i64, i32)>> {
         let me = self.p.pid;
         let mut any = false;
-        for c in self.proc_list().filter(|c| c.ppid == me && c.pid != me) {
+        for c in self.proc_list().filter(|c| c.ppid == me && c.pid != me && !c.orphan) {
             let wanted = match pick {
                 Pick::Any => true,
                 Pick::Pid(p) => c.pid == p,
@@ -636,6 +655,7 @@ impl Process {
             exit_signal: c.exit_signal,
             zombie: None,
             reap: false,
+            orphan: false,
             cwd: self.p.cwd,
             umask: self.p.umask,
             exe: self.p.exe.clone(),
