@@ -151,6 +151,9 @@ fn the_options_survive_a_save_and_restore() {
     p.sys(160, &[D(0x400)]).expect(0);
     p.out(0x400 + 65, 6);
     p.sys(29, &[I(1), I(TCGETS), D(0x500)]).expect(ENOTTY);
+    // Still no terminal to open
+    p.put(0x310, b"/dev/tty\0");
+    p.sys(56, &[I(AT_FDCWD), D(0x310), I(2), I(0)]).expect(-6);
     p.out(0x300, 2);
     let mut vm = machine();
     let opts = ExecOptions {
@@ -291,4 +294,96 @@ fn dev_std_of_a_closed_descriptor_is_no_file() {
     let mut p = start(&mut vm, p);
     let (_, status) = run(&mut p, &mut vm);
     ok(&status);
+}
+
+#[test]
+fn dev_stdin_on_a_file_renamed_to_dev_stdin_does_not_loop() {
+    const ENOENT: i64 = -2;
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/f\0");
+    p.put(0x210, b"/dev/stdin\0");
+    // O_CREAT | O_RDWR, as stdin, then named /dev/stdin in the filesystem
+    p.sys(56, &[I(AT_FDCWD), D(0x200), I(0o102), I(0o644)])
+        .save(0x100)
+        .expect_ok();
+    p.sys(24, &[W(0x100), I(0), I(0)]).expect(0);
+    p.sys(38, &[I(AT_FDCWD), D(0x200), I(AT_FDCWD), D(0x210)])
+        .expect(0);
+    // Its only name is the device's, which opens the descriptor again: no file to reopen
+    p.sys(56, &[I(AT_FDCWD), D(0x210), I(0), I(0)])
+        .expect(ENOENT);
+    let config = armless::vm::Config {
+        memory_size: 128 << 20,
+        cpus: test_cpus(),
+        devices: armless::dev::DeviceConfig {
+            console: false,
+            fs_tag: Some("host9p".into()),
+            ..Default::default()
+        },
+    };
+    let mut vm: Machine = armless::runner::new_vm(config).unwrap().0;
+    let json = br#"{"version":3,"fsroot":[["dev",0,0,16877,0,0,[]],["tmp",0,0,17407,0,0,[]]]}"#;
+    vm.board.load_filesystem(json).unwrap();
+    let mut p = start(&mut vm, p);
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+}
+
+#[test]
+fn plain_stdout_is_not_dev_null_and_dev_stdout_stats_as_it() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/dev/null\0");
+    p.put(0x210, b"/dev/stdout\0");
+    p.sys(80, &[I(1), D(0x400)]).expect(0);
+    p.sys(79, &[I(AT_FDCWD), D(0x200), D(0x500), I(0)])
+        .expect(0);
+    p.sys(79, &[I(AT_FDCWD), D(0x210), D(0x600), I(0)])
+        .expect(0);
+    for at in [0x400, 0x500, 0x600] {
+        p.out(at, 48);
+    }
+    let mut vm = machine();
+    let mut p = start_with(&mut vm, p, &plain());
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    // st_dev, st_ino, st_mode and st_rdev of each
+    let stat = |n: usize| {
+        let s = &out[48 * n..48 * (n + 1)];
+        let u64_at = |at: usize| u64::from_le_bytes(s[at..at + 8].try_into().unwrap());
+        (
+            u64_at(0),
+            u64_at(8),
+            u32::from_le_bytes(s[16..20].try_into().unwrap()),
+            u64_at(32),
+        )
+    };
+    let (stdout, null, dev_stdout) = (stat(0), stat(1), stat(2));
+    assert_eq!(stdout.2 & S_IFMT, S_IFCHR);
+    // GNU grep writes nothing to a stdout with /dev/null's st_dev and st_ino
+    assert_ne!((stdout.0, stdout.1), (null.0, null.1));
+    assert_ne!(stdout.3, null.3);
+    assert_eq!(dev_stdout, stdout);
+}
+
+#[test]
+fn without_a_terminal_dev_tty_is_no_device() {
+    const ENXIO: i64 = -6;
+    let program = |expect: i64| {
+        let mut p = Prog::default();
+        p.put(0x200, b"/dev/tty\0");
+        p.sys(56, &[I(AT_FDCWD), D(0x200), I(2), I(0)]);
+        if expect < 0 {
+            p.expect(expect);
+        } else {
+            p.expect_ok();
+        }
+        p
+    };
+    let mut vm = machine();
+    let mut p = start_with(&mut vm, program(ENXIO), &plain());
+    ok(&run(&mut p, &mut vm).1);
+    // With the terminal, it is the terminal
+    let mut vm = machine();
+    let mut p = start(&mut vm, program(0));
+    ok(&run(&mut p, &mut vm).1);
 }

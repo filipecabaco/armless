@@ -285,8 +285,9 @@ x0–x5, answers it in x0, and resumes at ELR.
   program as a container with no tty has it: stdin is `/dev/null` (end of file, `isatty` false),
   stdout and stderr are character devices that are no terminal (no TCGETS, no ONLCR) and write to
   the same output (`take_output`, console events), and `/dev/stdin`, `/dev/stdout` and
-  `/dev/stderr` open the same. `ExecOptions::hostname` (`--hostname`, `hostname`) is what uname
-  and `/proc/sys/kernel/hostname` say ("armless" by default). Both are in the saved state.
+  `/dev/stderr` open the same; with no controlling terminal, `/dev/tty` is ENXIO.
+  `ExecOptions::hostname` (`--hostname`, `hostname`) is what uname and
+  `/proc/sys/kernel/hostname` say ("armless" by default). Both are in the saved state.
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
 - **File locks** (user/src/locks.rs), as Linux keeps them: record locks (`fcntl` F_GETLK,
   F_SETLK, F_SETLKW) are a process's, on byte ranges, and go when it closes any descriptor of the

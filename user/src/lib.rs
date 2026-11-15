@@ -373,6 +373,8 @@ pub struct Process {
     pub(crate) spawned: BTreeMap<i64, spawn::Spawned>,
     /// The hostname, one for every process (`ExecOptions::hostname`)
     pub(crate) hostname: String,
+    /// Whether there is a terminal (`ExecOptions::std`): with `Plain`, /dev/tty is no device
+    pub(crate) std: StdStreams,
     pub trace: bool,
     /// With `trace`, only these system calls (empty: all of them)
     pub trace_only: Vec<u64>,
@@ -802,6 +804,7 @@ impl Process {
             timers: Timers::default(),
             spawned: BTreeMap::new(),
             hostname,
+            std: opts.std,
         };
         p.net_attach();
         let (entry, sp) = match p.load_image(&image, &layout, args, env, exe) {
@@ -1590,6 +1593,7 @@ impl Process {
         self.files.net.save_cm(&mut w);
         self.timers.save(&mut w, now);
         self.files.locks.save(&mut w);
+        w.u((self.std == StdStreams::Plain) as u64);
         w.b(self.hostname.as_bytes());
         w.0
     }
@@ -1784,7 +1788,13 @@ impl Process {
         if ver >= 8 {
             files.locks = locks::Locks::load(&mut r)?;
         }
-        // The hostname from ARMLUSRA (before, it was always "armless")
+        // Whether it has a terminal, and the hostname, from ARMLUSRA (before, the terminal and
+        // "armless")
+        let std = match if ver >= 10 { r.u()? } else { 0 } {
+            0 => StdStreams::Terminal,
+            1 => StdStreams::Plain,
+            _ => return Err("bad standard streams".into()),
+        };
         let hostname = if ver >= 10 {
             let name = String::from_utf8(r.b()?.to_vec()).map_err(|_| "bad hostname")?;
             if !valid_hostname(&name) {
@@ -1837,6 +1847,7 @@ impl Process {
             timers,
             spawned: BTreeMap::new(),
             hostname,
+            std,
         };
         p.net_attach();
         let wanted: Vec<String> = p

@@ -184,24 +184,15 @@ impl Files {
     /// one has them: /dev/null to read, one output to write
     pub fn standard(std: crate::StdStreams) -> Files {
         let mut f = Files::default();
-        match std {
+        let (input, output) = match std {
             crate::StdStreams::Terminal => {
                 let tty = f.add(Kind::Tty, 2);
-                for fd in 0..3 {
-                    f.fds.insert(fd, (tty, false));
-                    f.descs.get_mut(&tty).unwrap().refs = 3;
-                }
+                (tty, tty)
             },
-            crate::StdStreams::Plain => {
-                let null = f.add(Kind::Null, 0);
-                let out = f.add(Kind::Out, 1);
-                f.fds.insert(0, (null, false));
-                f.descs.get_mut(&null).unwrap().refs = 1;
-                for fd in 1..3 {
-                    f.fds.insert(fd, (out, false));
-                    f.descs.get_mut(&out).unwrap().refs = 2;
-                }
-            },
+            crate::StdStreams::Plain => (f.add(Kind::Null, 0), f.add(Kind::Out, 1)),
+        };
+        for (fd, d) in [(0, input), (1, output), (2, output)] {
+            f.put(fd, d, false);
         }
         f
     }
@@ -789,9 +780,11 @@ impl Stat {
         })
     }
 
+    /// What stat says of what is not in the filesystem: a device is an inode of its own (outside
+    /// the filesystem's numbers), as programs tell /dev/null from the others by st_dev and st_ino
     pub fn device(mode: u32, rdev: u64) -> Stat {
         Stat {
-            ino: 0,
+            ino: if rdev == 0 { 0 } else { 1 << 32 | rdev },
             mode,
             nlink: 1,
             uid: 0,
@@ -907,6 +900,10 @@ pub(crate) fn encode_dirents(
     }
     Ok((out, next))
 }
+
+/// The device number of `Kind::Out`: a character device of its own (major 240, for local use),
+/// not /dev/null's 1:3 nor a terminal's
+pub(crate) const OUT_RDEV: u64 = 0xf000;
 
 /// The devices a path may name, which the filesystem doesn't hold (the guest has no devtmpfs):
 /// the kind of description they open, and their mode and device number for stat.

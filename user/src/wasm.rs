@@ -69,17 +69,19 @@ pub unsafe extern "C" fn armless_user_exec(
         list(&string(argv, argv_len)),
         list(&string(env, env_len)),
         string(cwd, cwd_len),
-        pending_options(),
     )
 }
 
 /// The options the host set for this exec (`armless_user_plain_std`, `armless_user_hostname`).
-fn pending_options() -> ExecOptions {
-    let hostname = HOSTNAME.with_borrow(|h| String::from_utf8_lossy(h).into_owned());
-    ExecOptions {
+fn pending_options() -> Result<ExecOptions, String> {
+    // (Refused, not made UTF-8 by replacing bytes: that would be a name the host did not give)
+    let hostname = HOSTNAME
+        .with_borrow(|h| String::from_utf8(h.clone()))
+        .map_err(|_| "hostname: not UTF-8")?;
+    Ok(ExecOptions {
         std: if PLAIN_STD.get() { StdStreams::Plain } else { StdStreams::Terminal },
         hostname: (!hostname.is_empty()).then_some(hostname),
-    }
+    })
 }
 
 /// The next exec's standard streams: nonzero gives the program those of a container without a
@@ -111,11 +113,13 @@ pub extern "C" fn armless_user_hostname(len: u32) -> u32 {
     })
 }
 
-fn exec(argv: Vec<String>, env: Vec<String>, cwd: String, opts: ExecOptions) -> i32 {
+fn exec(argv: Vec<String>, env: Vec<String>, cwd: String) -> i32 {
     let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
     seed();
     let v = vm();
-    let r = Process::exec_with(&mut v.cpus[0], v.board.clone(), &argv, &env, &cwd, &opts);
+    let r = pending_options().map_err(ExecError::Fail).and_then(|opts| {
+        Process::exec_with(&mut v.cpus[0], v.board.clone(), &argv, &env, &cwd, &opts)
+    });
     if !matches!(r, Err(ExecError::Need(_))) {
         PLAIN_STD.set(false);
         HOSTNAME.with_borrow_mut(Vec::clear);

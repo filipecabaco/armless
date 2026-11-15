@@ -718,6 +718,9 @@
         }
       } finally {
         ptrs.forEach((p, i) => e.armless_free(p, parts[i].length));
+        // Back to the defaults however it ended (a fetch that failed leaves them set otherwise)
+        if (e.armless_user_plain_std) e.armless_user_plain_std(0);
+        if (e.armless_user_hostname) e.armless_user_hostname(0);
       }
       this.user = true;
       e.armless_user_resize(user.cols || 80, user.rows || 24);
