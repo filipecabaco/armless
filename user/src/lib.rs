@@ -1835,8 +1835,8 @@ pub(crate) fn read_all(board: &Board, ino: Ino) -> Result<Vec<u8>, ExecError> {
 }
 
 /// The process state's format: ARMLUSRA has whether the first process reaps orphans (at the
-/// end, after the file locks) and each process's orphan flag (after its command line); ARMLUSR9 (0.19) has each process's command line (after its AIO
-/// contexts); ARMLUSR8 (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
+/// end, after the file locks) and each process's orphan flag (after its command line); ARMLUSR9
+/// (0.19) has each process's command line (after its AIO contexts); ARMLUSR8 (0.17) has the file locks (locks.rs, at the end); ARMLUSR7 (0.16) has
 /// each thread's scheduling (sched.rs) and the timers but ITIMER_REAL, with the CPU time they
 /// count (timer.rs, at the end); ARMLUSR6 (0.15) has none of that; ARMLUSR5 (0.14) has neither
 /// the ids, timers, shared memory, shared file pages nor descriptors in flight of 0.15. Each

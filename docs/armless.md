@@ -285,7 +285,9 @@ x0–x5, answers it in x0, and resumes at ELR.
   --reap-orphans`, `armless_user_reap_orphans`, `reap_orphans` in the JS options; saved) makes the
   first process reap them as init does. They get no SIGCHLD for it, `wait4(-1)` and `waitid` never
   report them (ECHILD once it has no children of its own), and they leave as they end, so nothing
-  piles up as zombies. Its own children are as before.
+  piles up as zombies. Its own children are as before. Without it, as Linux reparents, an
+  orphan ends with SIGCHLD, and one that had ended already raises it in the first process then
+  (or goes, if that one ignores SIGCHLD).
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
 - **File locks** (user/src/locks.rs), as Linux keeps them: record locks (`fcntl` F_GETLK,
   F_SETLK, F_SETLKW) are a process's, on byte ranges, and go when it closes any descriptor of the

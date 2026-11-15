@@ -218,3 +218,78 @@ fn reaping_orphans_survives_a_save_and_restore_with_the_orphan_alive() {
     let (_, status) = run(&mut p, &mut vm);
     ok(&status);
 }
+
+/// The program, SIGCHLD blocked, clones A with no exit signal (so A's end raises none); A forks B,
+/// which ends, and A ends without waiting for it: B is a zombie when it goes to the first process.
+/// Then what is pending, and what the program can wait for.
+fn zombie_grandchild_told(reap: bool) -> Prog {
+    const WALL: u64 = 0x4000_0000;
+    let mut p = Prog::default();
+    p.put(0x2a0, &SIGCHLD_BIT.to_le_bytes());
+    p.sys(135, &[I(0), D(0x2a0), I(0), I(8)]).expect(0);
+    // clone(0): A, whose end nobody is signalled of
+    p.sys(220, &[I(0), I(0), I(0), I(0), I(0)]);
+    p.code.push(0);
+    let a = p.code.len() - 1;
+    p.sys(59, &[D(0x100), I(0)]).expect(0); // pipe2: 3 (read) and 4 (write)
+    let b = p.fork();
+    p.parent(b); // B ends at once
+    p.sys(57, &[I(4)]).expect(0);
+    p.sys(63, &[I(3), D(0x300), I(1)]).expect(0); // B has ended
+    p.parent(a);
+    p.sys(260, &[I(1001), D(0x280), I(WALL), I(0)]).expect(1001);
+    // Linux tells the new parent of a child that had ended already: SIGCHLD
+    p.sys(136, &[D(0x2a8), I(8)]).expect(0);
+    p.arg(0, X(0x2a8));
+    p.expect_wide(if reap { 0 } else { SIGCHLD_BIT });
+    p
+}
+
+#[test]
+fn a_zombie_that_goes_to_the_first_process_raises_sigchld_there() {
+    let mut vm = machine();
+    let mut p = start_orphan(&mut vm, zombie_grandchild_told(false), false);
+    ok(&run(&mut p, &mut vm).1);
+    let mut vm = machine();
+    let mut p = start_orphan(&mut vm, zombie_grandchild_told(true), true);
+    ok(&run(&mut p, &mut vm).1);
+}
+
+#[test]
+fn a_zombie_that_goes_to_a_first_process_ignoring_sigchld_is_dropped() {
+    // As zombie_grandchild, the program ignoring SIGCHLD: A goes as it ends, and so does B, the
+    // zombie it leaves (Linux's reparenting drops it then)
+    let mut p = Prog::default();
+    p.ignore_signal(17);
+    p.put(0x260, b"/proc/1002\0");
+    let a = p.fork();
+    // A takes SIGCHLD as it comes (SIG_DFL), so that B is its zombie
+    p.put(0x3fc0, &[0u8; 32]);
+    p.sys(134, &[I(17), D(0x3fc0), I(0), I(8)]).expect(0);
+    p.sys(59, &[D(0x100), I(0)]).expect(0);
+    let b = p.fork();
+    p.parent(b);
+    p.sys(57, &[I(4)]).expect(0);
+    p.sys(63, &[I(3), D(0x300), I(1)]).expect(0);
+    p.parent(a);
+    // (Waits until A has gone: no child to report)
+    p.sys(260, &[I(1001), D(0x280), I(0), I(0)]).expect(ECHILD);
+    p.sys(79, &[I(AT_FDCWD), D(0x260), D(0x400), I(0)])
+        .expect(ENOENT);
+    p.sys(260, &[I(0xffff_ffff), D(0x280), I(WNOHANG), I(0)])
+        .expect(ECHILD);
+    let mut vm = machine();
+    let mut p = start_orphan(&mut vm, p, false);
+    ok(&run(&mut p, &mut vm).1);
+}
+
+#[test]
+fn a_reaping_first_process_neither_sees_nor_keeps_its_orphans_on_every_cpu() {
+    // (machine(): ARMLESS_TEST_CPUS of them)
+    let mut vm = machine();
+    let mut p = start_orphan(&mut vm, orphan(true, false, Probe::Wait4), true);
+    ok(&run(&mut p, &mut vm).1);
+    let mut vm = machine();
+    let mut p = start_orphan(&mut vm, zombie_grandchild(true), true);
+    ok(&run(&mut p, &mut vm).1);
+}

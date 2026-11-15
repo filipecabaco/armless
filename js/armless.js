@@ -688,6 +688,7 @@
       const e = this.exports;
       const argv = typeof user.argv === "string" ? [user.argv] : user.argv || [];
       if (!argv.length) throw new Error("armless: user mode needs a program (user.argv)");
+      if (user.reap_orphans && !e.armless_user_reap_orphans) throw new Error("armless: this build cannot reap orphans");
       // argv and env as NUL-separated lists
       const list = (items) => utf8.encode(items.map((s) => s + "\0").join(""));
       const parts = [list(argv), list(user.env || []), utf8.encode(user.cwd || "/")];

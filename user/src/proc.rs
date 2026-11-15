@@ -247,18 +247,28 @@ impl Process {
         self.timers.end(pid, &tids);
         self.release_vfork(pid);
         // Its children go to the first process. When that one reaps orphans they are no one's to
-        // wait for: those that ended already go, the others as they end.
-        for q in self.procs.values_mut() {
-            if q.ppid == pid {
-                q.ppid = INIT;
-                if self.reap_orphans {
-                    q.orphan = true;
-                    q.exit_signal = 0;
-                }
+        // wait for: those that ended already go, the others as they end. Otherwise, as Linux
+        // reparents, they end with SIGCHLD (whatever they were cloned with), and one that ended
+        // already is told of then, or goes if the first process ignores its children's ends.
+        let reap = self.reap_orphans;
+        let mut ended = Vec::new();
+        for q in self.procs.values_mut().filter(|q| q.ppid == pid) {
+            q.ppid = INIT;
+            q.orphan = reap;
+            q.exit_signal = if reap { 0 } else { signal::SIGCHLD };
+            if let Some(status) = q.zombie {
+                ended.push((q.pid, status));
             }
         }
-        if self.reap_orphans {
-            self.procs.retain(|_, q| !(q.orphan && q.zombie.is_some()));
+        let vanish = reap || self.proc_ref(INIT).is_some_and(|q| q.sig.children_vanish());
+        for (q, status) in ended {
+            if vanish {
+                self.procs.remove(&q);
+            } else {
+                // CLD_EXITED or CLD_KILLED
+                let code = if status & 0x7f == 0 { 1 } else { 2 };
+                self.raise_in(INIT, signal::SIGCHLD, None, code);
+            }
         }
         let status = match how {
             End::Exit(c) => (c & 0xff) << 8,
