@@ -74,6 +74,8 @@ jobs:
         run: |
           rustup component add clippy
           cargo clippy --release --all-targets --features wasm-api --workspace
+          # User mode with default features off: armless and armless-user with no native JIT
+          cargo clippy --release --all-targets -p armless-user --no-default-features
           cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wasm-api
           cargo clippy -p armless-user --lib --target wasm32-unknown-unknown --features wasm-api
       - name: Build armless.wasm and armless-smp.wasm

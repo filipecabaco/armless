@@ -319,11 +319,12 @@ fn tunnelled_destinations_are_carried_over_a_websocket() {
         tunnels: vec![Tunnel::parse(&format!("5432=ws://127.0.0.1:{dead}/")).unwrap()],
         ..options(true)
     };
-    let _host = NativeHost::spawn(b.clone(), opts, obs);
+    let host = NativeHost::spawn(b.clone(), opts, obs);
     let mut g = Guest::on_board(b.clone());
     let ip = g.resolve("anything", 1).unwrap();
     g.syn(ip, 40002, 5432);
     seg(&mut g, "a reset", |s| s.has(RST));
+    untracked(&host);
 }
 
 #[test]
@@ -513,6 +514,7 @@ fn what_the_guest_wrote_before_closing_reaches_a_forwarded_socket() {
             g.accept(&syn, 0x1000);
             let to = (syn.src, syn.dport, syn.sport, syn.seq.wrapping_add(1));
             guest_sends_then_closes(g, &seen, outside, to, &payload, ending);
+            untracked(&host);
         }
     }
 }
@@ -523,7 +525,7 @@ fn what_the_guest_wrote_before_closing_reaches_the_host_server_it_connected_to()
         for ending in [Ending::Fin, Ending::Reset] {
             let b = board(true);
             let (obs, seen) = observer();
-            let _host = NativeHost::spawn(b.clone(), options(true), obs);
+            let host = NativeHost::spawn(b.clone(), options(true), obs);
             let mut g = Guest::on_board(b.clone());
             let ip = g.resolve("localhost", 1).unwrap();
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -544,6 +546,7 @@ fn what_the_guest_wrote_before_closing_reaches_the_host_server_it_connected_to()
                 &payload,
                 ending,
             );
+            untracked(&host);
         }
     }
 }
@@ -557,7 +560,7 @@ fn what_the_guest_wrote_before_closing_reaches_a_tunnels_far_side() {
         tunnels: vec![Tunnel::parse(&format!("db.internal:5432=ws://127.0.0.1:{port}/t")).unwrap()],
         ..options(true)
     };
-    let _host = NativeHost::spawn(b.clone(), opts, obs);
+    let host = NativeHost::spawn(b.clone(), opts, obs);
     let mut g = Guest::on_board(b.clone());
     let ip = g.resolve("db.internal", 1).unwrap();
     g.syn(ip, 40000, 5432);
@@ -576,4 +579,219 @@ fn what_the_guest_wrote_before_closing_reaches_a_tunnels_far_side() {
     let next = || frames.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(next(), (ws::BINARY, b"the last words".to_vec()));
     assert_eq!(next().0, ws::CLOSE);
+    untracked(&host);
+}
+
+/// What the host keeps for connections (the flags, sockets, tunnels), once there are none left.
+fn untracked(host: &NativeHost) {
+    until("the host to forget its connections", || {
+        (host.conns.lock().unwrap().tracked() == 0).then_some(())
+    });
+}
+
+#[test]
+fn what_the_host_keeps_for_closed_connections_goes_with_them() {
+    const N: u16 = 64;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    // Every connection the host makes must end: its socket closed, not left in a table
+    let (eof_tx, eof_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for _ in 0..N {
+            let (mut s, _) = l.accept().unwrap();
+            let eof_tx = eof_tx.clone();
+            thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = s.read_to_end(&mut sink);
+                let _ = eof_tx.send(());
+            });
+        }
+    });
+    let b = board(true);
+    let (obs, seen) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("localhost", 1).unwrap();
+    for i in 0..N {
+        let sport = 41000 + i;
+        g.syn(ip, sport, port);
+        if i % 2 == 0 {
+            // Reset once the connection is up
+            let sa = seg(&mut g, "the SYN-ACK", |s| {
+                s.has(SYN | ACK) && s.dport == sport
+            });
+            let theirs = sa.seq.wrapping_add(1);
+            g.ack(ip, sport, port, theirs);
+            g.rst(ip, sport, port, theirs);
+        } else {
+            // Reset before the host has connected, perhaps before its thread has started: the
+            // close comes first, and the socket the thread makes after it must not be kept
+            g.rst(ip, sport, port, 0);
+        }
+    }
+    for _ in 0..N {
+        eof_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a host socket was kept open after the guest closed its connection");
+    }
+    until("every close", || {
+        let closed = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Event::TcpClosed { .. }))
+            .count();
+        (closed == N as usize).then_some(())
+    });
+    untracked(&host);
+}
+
+/// A request through the web relay, its response under way and the guest taking none of it.
+struct Endless {
+    host: NativeHost,
+    g: Guest,
+    ip: [u8; 4],
+    theirs: u32,
+    /// Why the server stopped writing
+    done: mpsc::Receiver<std::io::Error>,
+}
+
+/// A request for a response nobody can finish reading (a terabyte): the server writes until it
+/// can't.
+fn endless_request() -> Endless {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            s.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1099511627776\r\n\r\n")
+            .unwrap();
+        let chunk = [7u8; 64 * 1024];
+        let _ = done_tx.send(loop {
+            if let Err(e) = s.write_all(&chunk) {
+                break e;
+            }
+        });
+    });
+    let b = board(true);
+    let (obs, _) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("localhost", 1).unwrap();
+    g.syn(ip, 42000, 80);
+    let sa = seg(&mut g, "the SYN-ACK", |s| s.has(SYN | ACK));
+    let theirs = sa.seq.wrapping_add(1);
+    g.ack(ip, 42000, 80, theirs);
+    g.data(
+        ip,
+        42000,
+        80,
+        theirs,
+        format!("GET /big HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes(),
+    );
+    // The guest takes nothing: the host's thread waits for it, holding the response open
+    seg(&mut g, "the response", |s| !s.payload.is_empty());
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the server stopped writing before anything closed"
+    );
+    Endless {
+        host,
+        g,
+        ip,
+        theirs,
+        done: done_rx,
+    }
+}
+
+#[test]
+fn a_request_stops_when_the_guest_closes_its_connection_and_leaves_nothing_kept() {
+    let mut r = endless_request();
+    r.g.rst(r.ip, 42000, 80, r.theirs);
+    r.done
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the host kept reading the response after the guest closed");
+    untracked(&r.host);
+}
+
+#[test]
+fn a_request_stops_when_the_host_goes() {
+    let r = endless_request();
+    drop(r.host);
+    r.done
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the request kept reading the response after its host was dropped");
+}
+
+#[test]
+fn a_tunnel_the_far_side_resets_is_reset_for_the_guest_and_forgotten() {
+    // A WebSocket server that takes the handshake, then resets the connection once the client
+    // sends something (closing with bytes unread sends a reset)
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            s.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        s.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").unwrap();
+        let _ = s.peek(&mut b);
+    });
+    let b = board(true);
+    let (obs, seen) = observer();
+    let opts = HostOptions {
+        tunnels: vec![Tunnel::parse(&format!("5432=ws://127.0.0.1:{port}/")).unwrap()],
+        ..options(true)
+    };
+    let host = NativeHost::spawn(b.clone(), opts, obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("db.internal", 1).unwrap();
+    g.syn(ip, 40000, 5432);
+    let sa = seg(&mut g, "the SYN-ACK once the WebSocket is open", |s| {
+        s.has(SYN | ACK)
+    });
+    let theirs = sa.seq.wrapping_add(1);
+    g.ack(ip, 40000, 5432, theirs);
+    g.data(ip, 40000, 5432, theirs, b"SELECT 1");
+    // The host resets the guest's connection: no TcpClosed comes, the host forgets it itself
+    seg(&mut g, "the reset", |s| s.has(RST));
+    untracked(&host);
+    assert!(!seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, Event::TcpClosed { .. })));
+}
+
+#[test]
+fn connections_a_process_never_accepted_end_when_it_stops_listening() {
+    let b = board(true);
+    let (obs, _) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    b.local_listen(8080);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut outside = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (inside, _) = l.accept().unwrap();
+    host.forward(inside, 8080);
+    until("the host's socket for the connection", || {
+        (host.conns.lock().unwrap().tracked() > 0).then_some(())
+    });
+    // The process closes its listening socket without accepting: the outside hears the end
+    b.local_unlisten(8080);
+    outside
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(outside.read(&mut buf).unwrap(), 0);
+    untracked(&host);
 }

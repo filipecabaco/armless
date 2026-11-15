@@ -241,7 +241,9 @@ next to the machine's; armless-smp.wasm is armless's alone (user mode runs on on
 
 Cargo features: `native-jit` (default; Cranelift), `hypervisor` (see
 [docs/hypervisor.md](docs/hypervisor.md)) and `wasm-api` (compiles the wasm export layer
-natively, to type-check it; `armless-user` has one of the same name for its own exports).
+natively, to type-check it; `armless-user` has `wasm-api` and `native-jit` of the same names,
+the latter default-on: `default-features = false` on `armless-user` (and on `armless`, if you
+depend on it too) links no Cranelift).
 
 ## How it works
 

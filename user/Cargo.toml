@@ -11,9 +11,13 @@ name = "armless-exec"
 path = "src/main.rs"
 
 [dependencies]
-armless = { path = ".." }
+armless = { path = "..", default-features = false }
 
 [features]
+default = ["native-jit"]
+# Compile hot guest code to host code on native hosts (armless's native-jit, which pulls in cranelift).
+# Off, a build links no code generator.
+native-jit = ["armless/native-jit"]
 # Compile the wasm export layer (src/wasm.rs) natively, to type-check it without a wasm target.
 wasm-api = ["armless/wasm-api"]
 
