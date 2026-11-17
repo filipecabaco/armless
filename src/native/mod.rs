@@ -236,6 +236,8 @@ fn abort(board: &Board, conns: &Shared, id: u32) {
 impl NativeHost {
     pub fn spawn(board: Arc<Board>, options: HostOptions, observer: Observer) -> NativeHost {
         board.seed(&random_bytes(32));
+        // Every connection's writer says what it sent (`tcp_consumed`)
+        board.set_tcp_flow_control(true);
         let (tx, rx) = channel();
         {
             let tx = tx.clone();
@@ -459,8 +461,17 @@ fn event_loop(
                 },
                 Event::TcpData { id, data } => {
                     let c = conns.lock().unwrap();
-                    if let Some(w) = c.sockets.get(&id).map(|(w, _)| w).or(c.tunnels.get(&id)) {
-                        let _ = w.send(Some(data));
+                    let n = data.len();
+                    let sent = c
+                        .sockets
+                        .get(&id)
+                        .map(|(w, _)| w)
+                        .or(c.tunnels.get(&id))
+                        .is_some_and(|w| w.send(Some(data)).is_ok());
+                    drop(c);
+                    if !sent {
+                        // Nowhere to go (not connected yet, or gone): dropped, so consumed
+                        board.tcp_consumed(id, n);
                     }
                 },
                 Event::TcpEof { id } => {
@@ -681,7 +692,9 @@ fn tunnel(
         loop {
             match out.try_recv() {
                 Ok(Some(data)) => {
-                    if conn.write_all(&client_frame(ws::BINARY, &data)).is_err() {
+                    let ok = conn.write_all(&client_frame(ws::BINARY, &data)).is_ok();
+                    board.tcp_consumed(id, data.len());
+                    if !ok {
                         abort(board, conns, id);
                         return;
                     }
@@ -781,12 +794,15 @@ fn attach(
         }
         c.sockets.insert(id, (wtx, stream));
     }
-    // guest -> socket
+    // guest -> socket: what is written is consumed, and opens the guest's window again
+    let wboard = board.clone();
     std::thread::spawn(move || {
         while let Ok(msg) = wrx.recv() {
             match msg {
                 Some(data) => {
-                    if writer.write_all(&data).is_err() {
+                    let ok = writer.write_all(&data).is_ok();
+                    wboard.tcp_consumed(id, data.len());
+                    if !ok {
                         break;
                     }
                 },

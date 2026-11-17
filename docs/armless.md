@@ -53,7 +53,7 @@ is queued as `Event`s, and the host answers through `Board`:
 | `WsOpen { id, url, protocols }` | `ws_accept(id, protocol)` or `http_fail`; then `ws_send`/`ws_close` |
 | `WsMessage`, `WsClose` | (deliver to the other end) |
 | `TcpOpen { id, host, port }` | `tcp_accept(id)` or `tcp_refuse(id)`, then `tcp_send`/`tcp_close` |
-| `TcpData`, `TcpEof`, `TcpClosed` | (deliver to the other end) |
+| `TcpData`, `TcpEof`, `TcpClosed` | (deliver to the other end); with flow control, `tcp_consumed(id, n)` once `TcpData` is sent on |
 | `TcpConnected { id }` | after `tcp_connect(port)`, the host's connection into the guest is up |
 
 Input goes through `console_input`, `console_resize` and `serial_input`. Console
@@ -165,6 +165,18 @@ The guest has at most 1024 TCP connections through the stack at once (`MAX_CONNS
 web connections included); past that a SYN is reset, as by a full listen queue, so a guest
 can't make the host open connections (natively, threads) without end.
 
+**Flow control.** A host that turns it on (`Board::set_tcp_flow_control`; NativeHost and armless.js
+do) says what it has done with each connection's data (`tcp_consumed(id, n)`: sent on, or
+dropped), and the guest is offered a window of what is left of 64 KiB unconsumed: a guest writing
+to a far end that reads slowly, or not at all, waits in its own socket buffer rather than piling
+its data up in the host. Data past the window is dropped unacknowledged, as from a guest whose
+stack ignored it, and the guest gets a window update once there is room for a segment. NativeHost
+says a write's bytes are consumed once the socket took them (a tunnel's, once its WebSocket
+frame is written); armless.js once a `data` listener had them, or for a tunnel once the
+WebSocket's `bufferedAmount` drained. A host that never says would stall its connections, so the
+stack's window stays open unless it is turned on. The web relay's connections are consumed in the
+machine (and bounded there).
+
 Either host can carry chosen destinations over a WebSocket instead: a **tunnel** maps a
 name and port (or any name, on a port) to a ws:// or wss:// URL, and each connection to
 it becomes one WebSocket whose binary messages are the stream's bytes (what websockify,
@@ -248,12 +260,13 @@ Pages a Linux guest has freed still hold what they held, so a snapshot after a p
 and gave back a lot of memory carries all of it. With free page reporting
 (`DeviceConfig::free_page_reporting`, armless.js's `free_page_reporting`, armless-run's
 `--free-page-reporting`) a virtio-balloon sits in PCI slot 4 offering only
-VIRTIO_BALLOON_F_REPORTING: the guest's kernel (CONFIG_VIRTIO_BALLOON, CONFIG_PAGE_REPORTING;
-Ubuntu's generic kernels have both) reports free blocks of pageblock order (2 MiB) a couple of
-seconds after they free up, and the device zeroes them (`Io::discard`: the host's pages go back
-where they can, and code compiled or decoded from them is dropped on every CPU). On 2026-11-17,
-Ubuntu's 6.8 arm64 kernel with an init that wrote and freed 200 MiB in a 512 MiB machine: a
-snapshot of 278.5 MB without it, 72.6 MB with it. It is off by default because the devices are
+VIRTIO_BALLOON_F_REPORTING: the guest's kernel (CONFIG_VIRTIO_BALLOON, CONFIG_PAGE_REPORTING; the
+test kernel's `armless_defconfig` has both, as do Ubuntu's generic kernels) reports free blocks of
+pageblock order (2 MiB) a couple of seconds after they free up, and the device zeroes them
+(`Io::discard`: the host's pages go back where they can, and code compiled or decoded from them is
+dropped on every CPU). `tests/linux/free-pages.sh` (in CI) boots the test kernel with an init that
+writes and frees 200 MiB in a 512 MiB machine: on 2026-11-17 its snapshot was 227.4 MB without
+free page reporting and 59.5 MB with it. It is off by default because the devices are
 part of what a snapshot must be restored onto. A range is zeroed only where it is all RAM, and a
 guest that reports a page it still uses only loses its own data.
 

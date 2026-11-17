@@ -120,6 +120,17 @@ and it costs compile time and code (blocks overlap). A block that branches to it
 in place instead (`loop $self` in `gen.rs`), which made the compiled loop of `cargo bench --bench
 machine` 17% faster.
 
+Carrying guest registers round a compiled loop in host registers (Cranelift variables: loaded once
+before the loop, their stores kept back round it and made where control leaves it) was tried on
+2026-11-17 too, the idea behind unkernel's registers in wasm locals. It gained nothing on the
+compiled loop above and made the benchmark guest's total 4–15% slower, depending on how much was
+carried (everything the loop reads, or only what it both reads and writes, at most six; stores kept
+back through `if`s or not). The native JIT already reuses a field's value within straight-line code
+(`known`) and defers its stores; what a carried value saves is a load that hits the cache, while it
+costs merges, register pressure and reloads after every helper call, and most of a loop's time is
+the fast TLB's checks, the budget and interrupt check, and helpers. Measured interleaved, median
+of five runs each: the TLB and TTBR phases 11–17% slower, nothing faster beyond noise.
+
 ## `cargo bench --bench machine`
 
 Host-side costs with [criterion](https://github.com/bheisler/criterion.rs): one guest
@@ -135,6 +146,16 @@ and read` and `fork, exit, wait` are the four unkernel's README reports for Linu
 the two compare in the same engine. On 2026-11-17, on one cloud container: natively 164 ns, 257 ns,
 475 ns and 18 µs; under Node 175 ns, 262 ns, 586 ns and 8.6 µs (unkernel's README: 172 ns, 172 ns,
 482 ns and 57 µs, on its own machine).
+
+`sh bench/machine-syscalls.sh KERNEL [--wasm]` times the same four under a Linux guest kernel
+(machine mode): `bench/syscalls-init.c` is a static `/init` that times them with the guest's own
+clock, booted natively with the native JIT and, with `--wasm`, through armless.js. On 2026-11-17,
+on one cloud container, with the test kernel (`tests/linux/build.sh`, Linux 6.8 with
+`armless_defconfig`): natively 0.89 µs, 1.6 µs, 5.7 µs and 0.59 ms; under Node 0.88 µs, 1.6 µs,
+5.4 µs and 0.84 ms. That is 10–70 times user mode's, the price of emulating the kernel's own entry
+and exit, page tables and scheduler; unkernel's README gives 1.7 µs, 2.2 µs, 7.3 µs and 1.2 ms for
+qemu-system on its machine. The kernel matters: Ubuntu's generic arm64 kernel (zeroing every page it
+allocates, `init_on_alloc`, and its mitigations) took 2.5–3 times as long for each.
 
 Every pull request runs all of them on its base and then on itself, on one runner
 ([`.github/workflows/bench.yml`](../.github/workflows/bench.yml)), and puts a table of the two in

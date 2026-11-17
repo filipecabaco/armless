@@ -1328,7 +1328,15 @@
           if (c) { c.state = "open"; c.emit("connect"); }
           break;
         }
-        case 6: this._conns.get(id)?.emit("data", data); break;
+        case 6: {
+          // The guest's data for a connection: once it has gone where it goes, the guest may
+          // send more (flow control). A listener takes it at once; a tunnel once its WebSocket
+          // sent it (`consume_later`); a connection no longer here drops it.
+          const c = this._conns.get(id);
+          if (c) c.emit("data", data);
+          if (!c?.consume_later) this._call("armless_tcp_consumed", id, data.length);
+          break;
+        }
         case 7: this._conns.get(id)?.emit("end"); break;
         case 8: {
           const c = this._conns.get(id);
@@ -1501,7 +1509,29 @@
         this._poke();
       };
       // A WebSocket can't half-close: the guest finishing its side closes it
-      conn.on("data", (bytes) => socket.readyState === 1 && socket.send(bytes));
+      conn.consume_later = true;
+      let unsent = 0; // bytes sent to the WebSocket, not yet said consumed
+      let waiting = false; // a settle() is scheduled
+      const settle = () => {
+        waiting = false;
+        // What has left the WebSocket's buffer is consumed; the guest's window opens again
+        const left = socket.readyState === 1 ? socket.bufferedAmount : 0;
+        const done = unsent - Math.min(unsent, left);
+        if (done > 0) {
+          unsent -= done;
+          if (conn.state !== "closed") this._call("armless_tcp_consumed", conn.id, done);
+          this._poke();
+        }
+        if (unsent > 0 && socket.readyState === 1 && !waiting) {
+          waiting = true;
+          setTimeout(settle, 5);
+        }
+      };
+      conn.on("data", (bytes) => {
+        if (socket.readyState === 1) socket.send(bytes);
+        unsent += bytes.length;
+        settle();
+      });
       conn.on("end", () => socket.readyState <= 1 && socket.close(1000));
       conn.on("close", () => socket.readyState <= 1 && socket.close(1000));
     }

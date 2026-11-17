@@ -22,6 +22,7 @@ pub(crate) struct Seg {
     pub(crate) seq: u32,
     pub(crate) ack: u32,
     pub(crate) flags: u8,
+    pub(crate) window: u16,
     pub(crate) options: Vec<u8>,
     pub(crate) payload: Vec<u8>,
 }
@@ -38,7 +39,7 @@ pub(crate) struct Guest {
     out: Outbox,
     board: Option<std::sync::Arc<crate::vm::Board>>,
     /// The guest's next sequence number, per local port.
-    seq: HashMap<u16, u32>,
+    pub(crate) seq: HashMap<u16, u32>,
 }
 
 fn sum(parts: &[&[u8]]) -> u16 {
@@ -183,6 +184,7 @@ impl Guest {
                     seq: be32(t, 4),
                     ack: be32(t, 8),
                     flags: t[13],
+                    window: be16(t, 14),
                     options: t[20..off].to_vec(),
                     payload: t[off..].to_vec(),
                 }
@@ -600,6 +602,71 @@ fn connections_past_the_limit_are_refused_and_room_comes_back() {
     g.segs();
     let (_, host) = g.open(dst, 20000, 5432, 1460);
     assert_eq!(host, "many.test");
+}
+
+#[test]
+fn with_flow_control_the_guest_sends_only_what_the_host_has_room_for() {
+    let mut g = Guest::new();
+    g.stack.flow_control = true;
+    let dst = g.resolve("slow.test", 1).unwrap();
+    let (id, _) = g.open(dst, 41000, 5432, 1460);
+    let theirs = g.establish(id, dst, 41000, 5432);
+    let taken = |g: &mut Guest| -> usize {
+        g.events()
+            .iter()
+            .map(|e| match e {
+                Event::TcpData { data, .. } => data.len(),
+                _ => 0,
+            })
+            .sum()
+    };
+    // The window shrinks by what the host hasn't consumed
+    g.data(dst, 41000, 5432, theirs, &[7; 1000]);
+    assert_eq!(taken(&mut g), 1000);
+    let s = g.segs();
+    assert_eq!(s.last().unwrap().window as u32, OUR_WINDOW as u32 - 1000, "{s:?}");
+    // Filled: the window is closed
+    let fill = OUR_WINDOW as usize - 1000;
+    let mut sent = 0;
+    while sent < fill {
+        let n = (fill - sent).min(1460);
+        g.data(dst, 41000, 5432, theirs, &vec![7; n]);
+        sent += n;
+    }
+    assert_eq!(taken(&mut g), fill);
+    let s = g.segs();
+    assert_eq!(s.last().unwrap().window, 0);
+    let acked = s.last().unwrap().ack;
+    // A guest that sends past the window has it dropped, unacknowledged
+    let seq = g.seq[&41000];
+    g.send_tcp(dst, 41000, 5432, seq, theirs, ACK | PSH, 64000, &[], &[9; 500]);
+    assert_eq!(taken(&mut g), 0, "data past a closed window reached the host");
+    let s = g.segs();
+    assert_eq!((s.last().unwrap().ack, s.last().unwrap().window), (acked, 0));
+    // The host consumes a little: not yet a segment's worth, no update
+    g.stack.consumed(id, 100);
+    assert!(g.segs().is_empty());
+    // Enough for a segment: the guest is told at once
+    g.stack.consumed(id, 3000);
+    let s = g.segs();
+    assert!(s.len() == 1 && s[0].window == 3100 && s[0].ack == acked, "{s:?}");
+    // and what it sends again now is taken
+    g.send_tcp(dst, 41000, 5432, seq, theirs, ACK | PSH, 64000, &[], &[9; 500]);
+    assert_eq!(taken(&mut g), 500);
+    assert_eq!(g.segs().last().unwrap().window, 2600);
+}
+
+#[test]
+fn without_flow_control_the_window_stays_open() {
+    let mut g = Guest::new();
+    let dst = g.resolve("fast.test", 1).unwrap();
+    let (id, _) = g.open(dst, 41100, 5432, 1460);
+    let theirs = g.establish(id, dst, 41100, 5432);
+    for _ in 0..100 {
+        g.data(dst, 41100, 5432, theirs, &[1; 1460]);
+    }
+    assert!(g.segs().iter().all(|s| s.window == OUR_WINDOW));
+    let _ = id;
 }
 
 #[test]

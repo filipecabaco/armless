@@ -3,6 +3,8 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use armless::dev::{DeviceConfig, Event};
@@ -37,6 +39,8 @@ fn usage() -> ! {
   --trap-undef         stop on the first undefined instruction
   --skip-idle          fast-forward time while the guest idles (1 CPU)
   --save FILE          when --timeout ends the run, save a snapshot of the machine to FILE
+  --save-after TEXT    with --save: save as soon as the serial port or console printed TEXT
+                       (then stop), rather than at the timeout
   --restore FILE       start from a snapshot (made with the same -m, --smp and devices)
                        instead of booting
   --stats              print instruction count, speed and what the JIT did at exit
@@ -81,6 +85,7 @@ fn main() {
     let mut timeout = None;
     let mut free_page_reporting = false;
     let mut save: Option<PathBuf> = None;
+    let mut save_after: Option<String> = None;
     let mut restore: Option<String> = None;
     let mut input = String::new();
     let mut console_input = String::new();
@@ -111,6 +116,7 @@ fn main() {
             "--net" => net = true,
             "--free-page-reporting" => free_page_reporting = true,
             "--save" => save = Some(PathBuf::from(val())),
+            "--save-after" => save_after = Some(val()),
             "--restore" => restore = Some(val()),
             "--tunnel" => {
                 tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
@@ -202,6 +208,10 @@ fn main() {
     let mut pending_input = console_after.as_ref().map(|_| console_input.clone());
     let b2 = board.clone();
     let wait_for = console_after.clone();
+    // --save-after: set once the guest printed its text
+    let printed = Arc::new(AtomicBool::new(false));
+    let (printed2, save_text) = (printed.clone(), save_after.clone());
+    let mut out_seen = Vec::new();
     let _host = NativeHost::spawn(
         board.clone(),
         HostOptions {
@@ -220,6 +230,15 @@ fn main() {
                 Event::Serial(b) | Event::Console(b) => {
                     let _ = out.write_all(b);
                     let _ = out.flush();
+                    if let Some(text) = &save_text {
+                        out_seen.extend_from_slice(b);
+                        if String::from_utf8_lossy(&out_seen).contains(text.as_str()) {
+                            printed2.store(true, Ordering::Release);
+                        }
+                        // Only the end can still complete the text
+                        let keep = out_seen.len().saturating_sub(text.len());
+                        out_seen.drain(..keep);
+                    }
                     if let (Event::Console(b), Some(after)) = (e, &wait_for) {
                         seen.extend_from_slice(b);
                         if pending_input.is_some()
@@ -240,7 +259,24 @@ fn main() {
 
     let start = Instant::now();
     runner.start();
-    let result = runner.wait(timeout);
+    let result = match &save_after {
+        None => runner.wait(timeout),
+        Some(_) => {
+            // Short waits, until the guest stops, the text was printed, or the timeout
+            let deadline = timeout.map(|t| start + t);
+            loop {
+                if let Some(s) = runner.wait(Some(Duration::from_millis(50))) {
+                    break Some(s);
+                }
+                if printed.load(Ordering::Acquire) || deadline.is_some_and(|d| Instant::now() >= d) {
+                    break None;
+                }
+            }
+        },
+    };
+    if save_after.is_some() && !printed.load(Ordering::Acquire) && result.is_none() {
+        die("the guest never printed the --save-after text");
+    }
     if let (None, Some(path)) = (&result, &save) {
         let state = runner.save_state();
         if let Err(e) = std::fs::write(path, &state) {
@@ -249,6 +285,8 @@ fn main() {
         eprintln!("\narmless-run: saved {} ({} bytes)", path.display(), state.len());
     }
     let code = match &result {
+        // Stopped where --save-after asked: done
+        None if printed.load(Ordering::Acquire) => 0,
         None => {
             eprintln!("\narmless-run: timeout");
             3

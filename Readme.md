@@ -57,7 +57,8 @@ cargo run --release --bin armless-run -- --help
 binaries (`--raw FILE[@ADDR]`). Besides `--kernel`, `--initrd`, `--append`, `-m MB` and
 `--smp N`, it takes `--fs DIR` (a 9p root; `--boot-fs` boots the kernel under `/boot` in
 it), `--net` with `--tunnel [H:]P=URL` and `--allow-private`, `--free-page-reporting`,
-`--timeout`, `--save FILE` (a snapshot when the timeout ends the run) and `--restore FILE`,
+`--timeout`, `--save FILE` (a snapshot when the timeout ends the run, or with `--save-after TEXT`
+once the guest printed TEXT) and `--restore FILE`,
 input flags for scripted runs, and `--stats` / `--fallbacks` for JIT numbers.
 
 Rust 1.97 or newer is needed (Cranelift, behind the default `native-jit` feature).
@@ -178,6 +179,10 @@ Subscribe with `vm.on(name, fn)` (`off` removes).
   fetched), once until it prints or gets input again.
 - `memory`: a sample of the memory (with the `debug` option).
 - `tcp-connection`: a `Connection` from the guest to a port nothing else handles.
+
+The guest's data for a connection counts as taken once its `data` listeners had it, and a tunnel's
+once its WebSocket sent it: the guest waits for room rather than the page buffering what a slow far
+end can't take.
 
 A `Connection` has `host` (the name the guest resolved) and `port`, and supports
 `accept()`, `refuse()`, `hold()` (decide later), `write()`, `close()` and `drain()`, plus
@@ -327,12 +332,14 @@ for armless 0.2.10 and older.
 | `cargo test --release --workspace` | unit tests (user mode's too); the bare-metal CPU suite (`guest/`); four CPUs racing on shared counters with LSE atomics and exclusives; TLS and HTTP of the web relay against rustls |
 | `tests/difftest/run.sh CLASS N SEED` | random instructions against qemu-aarch64; CLASS is `int`, `fp`, `simd`, `simds`, `ldst`, `crypto` or `lse` (`DUT=jit`: the wasm JIT) |
 | `tests/linux/{boot,userspace,smp}.sh` | Linux on `armless-run`; userspace and SMP stress output against qemu-aarch64 |
+| `tests/linux/free-pages.sh` | free page reporting on the test kernel: a snapshot after the guest freed 200 MiB is that much smaller |
 | `ARMLESS_9PFS=DIR cargo test --release --test vm` | the snowglobe flow natively: 9p root, console, snapshot, restore |
 | `node tests/js/flow.mjs DIR [CPUS]` | the same through `armless.js`, plus HTTP over fetch and port forwarding |
 | `node tests/js/boot.mjs`, `run-bare.mjs`, `alpine.mjs` | kernels, bare-metal binaries and a real Alpine through `armless.js` |
 | `node --test 'tests/js/*.test.mjs'` | user mode's API in `armless.js` on `build/armless.wasm` (build it first with `sh build-wasm.sh`): argv and env, `plain_std`, `hostname`, `reap_orphans`, `user_asleep_ms`, and their errors. Self-contained: the programs are machine code made by the test (`tests/js/prog.mjs`) and the filesystem is in memory |
 | `node tests/js/user.mjs SITE` | user mode through `armless.js` against a real program (not in CI, by hand): a `--kernel none` snowglobe site restored from its native snapshot, asked a question, saved and restored again; `--exec FSDIR PROGRAM ARGS` starts a program from a filesystem |
 | `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node) |
+| `node bench/syscalls.mjs`, `sh bench/machine-syscalls.sh KERNEL [--wasm]` | what system calls cost in user mode under Node, and under a guest kernel (machine mode), natively and under Node |
 | `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands |
 | `cargo bench --bench machine` | host-side costs with criterion: an instruction interpreted and compiled, a page's compile, a snapshot |
 | `cargo bench --bench zstd` | the zstd decoder's throughput, whole and in pieces |

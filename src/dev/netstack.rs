@@ -80,10 +80,24 @@ struct Conn {
     guest_fin: bool,
     /// Ports 80 and 443: relayed as HTTP inside the machine
     web: Option<Box<Web>>,
+    /// Bytes of the guest's handed to the host (`TcpData`) that it hasn't said it consumed
+    /// (`consumed`): with flow control, what the window leaves room for
+    unconsumed: u32,
     dup_acks: u32,
     last_progress: u64,
     rto: u64,
     retries: u32,
+}
+
+/// The window `c` offers the guest: all of OUR_WINDOW, or with flow control (`Stack::flow_control`)
+/// what the host's unconsumed bytes leave of it. The relay's connections are consumed in the
+/// machine, and bounded there.
+fn room(flow_control: bool, c: &Conn) -> u32 {
+    if flow_control && c.web.is_none() {
+        (OUR_WINDOW as u32).saturating_sub(c.unconsumed)
+    } else {
+        OUR_WINDOW as u32
+    }
 }
 
 impl Conn {
@@ -116,6 +130,11 @@ pub struct Stack {
     /// The site's CA: with it, port 443 is HTTPS terminated here
     pub tls: Option<TlsKeys>,
     pub rng: Rng,
+    /// The host says what it consumed of each connection's data (`consumed`), and the window the
+    /// guest is offered is what is left of OUR_WINDOW: data it sends faster than the host takes
+    /// it waits in the guest, instead of piling up in the host. Off, the window stays open, for
+    /// hosts that never say.
+    pub flow_control: bool,
 }
 
 fn checksum(parts: &[&[u8]]) -> u16 {
@@ -161,6 +180,7 @@ impl Stack {
             frames: VecDeque::new(),
             tls: None,
             rng: Rng::default(),
+            flow_control: false,
         }
     }
 
@@ -219,6 +239,7 @@ impl Stack {
         seq: u32,
         ack: u32,
         flags: u8,
+        window: u16,
         options: &[u8],
         payload: &[u8],
     ) {
@@ -230,7 +251,7 @@ impl Stack {
         t.extend_from_slice(&ack.to_be_bytes());
         t.push(((hl / 4) as u8) << 4);
         t.push(flags);
-        t.extend_from_slice(&OUR_WINDOW.to_be_bytes());
+        t.extend_from_slice(&window.to_be_bytes());
         t.extend_from_slice(&[0, 0, 0, 0]);
         t.extend_from_slice(options);
         t.extend_from_slice(payload);
@@ -244,6 +265,7 @@ impl Stack {
         let Some(c) = self.conns.get(&id) else { return };
         let (ip, sport, dport, ack) = (c.remote_ip, c.remote_port, c.guest_port, c.rcv_nxt);
         let ack_flag = if c.state == State::SynSent { 0 } else { ACK };
+        let window = room(self.flow_control, c) as u16;
         self.tcp_raw(
             ip,
             sport,
@@ -251,10 +273,13 @@ impl Stack {
             seq,
             ack,
             flags | ack_flag,
+            window,
             options,
             payload,
         );
     }
+
+
 
     fn send_ack(&mut self, id: u32) {
         if let Some(c) = self.conns.get(&id) {
@@ -368,7 +393,7 @@ impl Stack {
         if let Some(c) = self.conns.get(&id) {
             let ack = c.rcv_nxt;
             let (ip, sport, dport) = (c.remote_ip, c.remote_port, c.guest_port);
-            self.tcp_raw(ip, sport, dport, 0, ack, RST | ACK, &[], &[]);
+            self.tcp_raw(ip, sport, dport, 0, ack, RST | ACK, OUR_WINDOW, &[], &[]);
             self.conns.remove(&id);
             out.push(Event::TcpClosed { id });
         }
@@ -426,6 +451,19 @@ impl Stack {
     }
 
     /// Bytes the host gave a connection that the guest has not acknowledged.
+    /// The host consumed `n` bytes of `id`'s data (wrote them out, or dropped them): with flow
+    /// control, that much more room in the window, and a window update for the guest once there
+    /// is room for a segment again (it waits for one, or probes).
+    pub fn consumed(&mut self, id: u32, n: usize) {
+        let flow = self.flow_control;
+        let Some(c) = self.conns.get_mut(&id) else { return };
+        let before = room(flow, c);
+        c.unconsumed = c.unconsumed.saturating_sub(n.min(u32::MAX as usize) as u32);
+        if flow && before < c.mss as u32 && room(flow, c) >= c.mss as u32 {
+            self.send_ack(id);
+        }
+    }
+
     pub fn buffered(&self, id: u32) -> usize {
         if self.is_local(id) {
             return self.local_buffered(id);
@@ -474,6 +512,7 @@ impl Stack {
             rto: RTO_MS,
             retries: 0,
             web: None,
+            unconsumed: 0,
         }
     }
 
@@ -764,7 +803,7 @@ impl Stack {
             }
             if flags & SYN != 0 && flags & ACK == 0 && self.conns.len() >= MAX_CONNS {
                 let len = payload.len() as u32 + 1;
-                self.tcp_raw(dst, dport, sport, 0, seq.wrapping_add(len), RST | ACK, &[], &[]);
+                self.tcp_raw(dst, dport, sport, 0, seq.wrapping_add(len), RST | ACK, OUR_WINDOW, &[], &[]);
                 return;
             }
             if flags & SYN != 0 && flags & ACK == 0 {
@@ -797,7 +836,7 @@ impl Stack {
                 let len = payload.len() as u32 + (flags & (SYN | FIN) != 0) as u32;
                 (0, seq.wrapping_add(len), RST | ACK)
             };
-            self.tcp_raw(dst, dport, sport, rseq, rack, rflags, &[], &[]);
+            self.tcp_raw(dst, dport, sport, rseq, rack, rflags, OUR_WINDOW, &[], &[]);
             return;
         };
 
@@ -878,8 +917,14 @@ impl Stack {
             let c = self.conns.get_mut(&id).unwrap();
             let skip = c.rcv_nxt.wrapping_sub(seq) as usize;
             if skip <= payload.len() && !c.guest_fin {
-                let fresh = &payload[skip..];
+                // Only what the window offered is taken (a guest that sends past it, as its stack
+                // never would, has the rest dropped unacknowledged, to send again)
+                let room = room(self.flow_control, c) as usize;
+                let fresh = &payload[skip..(skip + room).min(payload.len())];
                 let is_web = c.web.is_some();
+                if self.flow_control && !is_web {
+                    c.unconsumed += fresh.len() as u32;
+                }
                 if !fresh.is_empty() {
                     c.rcv_nxt = c.rcv_nxt.wrapping_add(fresh.len() as u32);
                     if is_web {
