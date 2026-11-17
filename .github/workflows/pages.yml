@@ -73,14 +73,14 @@ jobs:
           node-version: 24
       - name: Test the CPU count for a device
         run: node --test site/test/cpus.test.mjs
-      - name: Test the machine (boot, nproc, mandel, ctrl+c) on 1, 2, 4 and 8 CPUs
+      - name: Test the machine (boot, nproc, trench, ctrl+c) on 1, 2, 4 and 8 CPUs
         run: |
           if [ ! -f site/static/demo/config.json ]; then
             echo "::warning::the machine was not put together; nothing to test"
             exit 0
           fi
           for n in 1 2 4 8; do node site/test/guest.mjs site/static/demo $n; done
-      - name: Test the site (docs cutting, links, anchors, mandel.awk)
+      - name: Test the site (docs cutting, links, anchors, trench.awk)
         run: elixir site/test/site_test.exs
       - name: Build the site
         run: elixir site/build.exs

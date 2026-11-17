@@ -111,7 +111,7 @@
     let tail = "";
     let started = false;   // the machine is running
     let typed = false;     // the page gave the shell its command
-    let drawing = false;   // the guest printed its first pass
+    let drawing = false;   // the guest printed its first frame
     let yours = false;     // the visitor took over
     let promptSeen = false;
 
@@ -129,9 +129,9 @@
         setTimeout(start, 300);
       }
       if (typed && !drawing && !yours) {
-        if (/pass 1:/.test(tail)) {
+        if (/frame 1:/.test(tail)) {
           drawing = true;
-          set("ready", `drawing on ${cpus} CPU${cpus > 1 ? "s" : ""}. ctrl+c stops it`);
+          set("ready", `flying the trench on ${cpus} CPU${cpus > 1 ? "s" : ""}. ctrl+c stops it`);
         } else if (/not found|rror/.test(tail)) {
           takeOver();
         }
@@ -155,12 +155,12 @@
     };
     new ResizeObserver(resize).observe($("terminal"));
 
-    // The page types the command, unless the visitor got there first: mandel, a shell script in
-    // the initramfs that runs one awk per CPU (site/guest/mandel)
+    // The page types the command, unless the visitor got there first: trench, a shell script in
+    // the initramfs that runs one awk per CPU (site/guest/trench)
     async function start() {
       if (yours) return;
       set("loading", "starting");
-      const line = `mandel ${Math.min(term.cols - 1, 110)} ${Math.min(term.rows - 2, 40)}\n`;
+      const line = `trench ${Math.min(term.cols - 1, 110)} ${Math.min(term.rows - 2, 40)}\n`;
       for (const ch of reduced ? [line] : line) {
         if (yours) return;
         vm.console_input(ch);
