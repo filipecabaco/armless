@@ -32,9 +32,23 @@
     document.head.append(s);
   });
 
-  const LOOP =
-    'n=0; while :; do n=$((n+1)); dd if=/dev/zero of=/tmp/ballast bs=1M count=$((n%4*16+16)) 2>/dev/null; ' +
-    'echo "pass $n: $(wc -c </tmp/ballast) bytes"; rm /tmp/ballast; done\n';
+  // The Mandelbrot set, computed by busybox awk inside the machine and redrawn in place with more
+  // iterations each frame (4 to 64, then again), so it sharpens out of a blob. The shading follows
+  // the log of the escape time, so the higher counts still show the bands outside the set. Points
+  // known to be in the set (the main cardioid and the period-2 bulb) are not iterated, the bottom
+  // half is the top half mirrored, and the frame goes out in one write. Each frame also adds 4 MiB
+  // to a file, deleted when the set starts over, so the memory chart climbs as the picture sharpens.
+  const AWK =
+    'BEGIN{s=" .:-=+*#%@";L=log(m+1);h=int((H+1)/2);' +
+    'for(y=0;y<h;y++){ci=1.1*(2*y/(H-1)-1);c2=ci*ci;l="";for(x=0;x<W;x++){cr=-0.6+1.7*(2*x/W-1);p=cr-0.25;q=p*p+c2;' +
+    'if(q*(q+p)<0.25*c2||(cr+1)*(cr+1)+c2<0.0625)i=m;else{a=0;b=0;for(i=0;i<m;i++){u=a*a;v=b*b;if(u+v>4)break;b=2*a*b+ci;a=u-v+cr}}' +
+    'l=l substr(s,int(9*log(i+1)/L)+1,1)}r[y]=l}' +
+    'o="\\033[H";for(y=0;y<h;y++)o=o r[y] "\\n";for(y=h;y<H;y++)o=o r[H-1-y] "\\n";printf "%s",o}';
+  const LOOP = (w, h) =>
+    `printf '\\033[2J'; n=0; while :; do k=$((n%16)); n=$((n+1)); m=$((4+4*k)); ` +
+    `awk -v W=${w} -v H=${h} -v m=$m '${AWK}'; ` +
+    '[ $k = 0 ] && rm -f /tmp/ballast; dd if=/dev/zero bs=1M count=4 2>/dev/null >>/tmp/ballast; ' +
+    `printf '\\033[Kpass %d: %d iterations, %d MiB in /tmp/ballast\\n' $n $m $((4*k+4)); done\n`;
 
   (async () => {
     set("loading", "loading");
@@ -94,6 +108,7 @@
     let loopRan = false;    // the guest printed its first pass
     let yours = false;      // the visitor took over
     let promptSeen = false;
+    let drawing = false;
 
     const takeOver = () => {
       if (yours) return;
@@ -109,10 +124,14 @@
         promptSeen = true;
         setTimeout(startLoop, 150);
       }
+      if (loopTyped && !loopRan && !yours && !drawing && /\x1b\[2J/.test(tail)) {
+        drawing = true;
+        set("ready", "drawing. ctrl+c stops it");
+      }
       if (loopTyped && !loopRan && !yours) {
         if (/pass 1:/.test(tail)) {
           loopRan = true;
-          set("ready", "running a loop. ctrl+c stops it");
+          set("ready", "drawing. ctrl+c stops it");
         } else if (/syntax error|not found/.test(tail)) {
           takeOver();
         }
@@ -136,18 +155,12 @@
     };
     new ResizeObserver(resize).observe($("terminal"));
 
-    // The page types the loop into the shell, as keystrokes, unless the visitor got there first
-    async function startLoop() {
+    // The page gives the shell its first command, unless the visitor got there first
+    function startLoop() {
       if (yours) return;
-      set("loading", "typing a loop");
-      if (reduced) vm.console_input(LOOP);
-      else {
-        for (const ch of LOOP) {
-          if (yours) return;
-          vm.console_input(ch);
-          await new Promise((r) => setTimeout(r, ch === "\n" ? 200 : 18));
-        }
-      }
+      set("loading", "starting");
+      // Pasted as one line: typed out a key at a time, it would take longer than a frame.
+      vm.console_input(LOOP(Math.min(term.cols - 1, 64), Math.min(term.rows - 2, 22)));
       loopTyped = true;
     }
 
@@ -170,7 +183,7 @@
     resize();
     set("loading", "starting the shell");
     // If the prompt went by unrecognised, start anyway once the shell has had time to settle
-    setTimeout(() => { if (!promptSeen) { promptSeen = true; startLoop(); } }, 6000);
+    setTimeout(() => { if (!promptSeen) { promptSeen = true; startLoop(); } }, 15000);
     $("keys").hidden = false;
     for (const b of document.querySelectorAll("[data-send]")) {
       b.addEventListener("click", () => {
@@ -239,4 +252,5 @@
       `<text class="axis" x="${L - 8}" y="${T - 12}" text-anchor="end">MiB</text>` +
       `<path class="peak" d="${line("peak")}"/><path class="live" d="${line("live")}"/>`;
   }
+
 })();
