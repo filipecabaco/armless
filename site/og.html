@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<!-- The share image (site/static/og.png, 1200x630, referenced by og:image and twitter:image).
+     Regenerate after edits: serve site/, open this file at a 1200x630 viewport with
+     deviceScaleFactor 2, capture it, and downscale to 1200x630 (sips -z 630 1200 og.png).
+     The frame on the right is the output of the landing page's own awk program at 64 iterations. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>armless share image</title>
+<style>
+  @font-face { font-family: "Space Mono"; font-weight: 400; src: url("static/fonts/SpaceMono-400.woff2") format("woff2"); }
+  @font-face { font-family: "Space Mono"; font-weight: 700; src: url("static/fonts/SpaceMono-700.woff2") format("woff2"); }
+  :root { --ground: oklch(0.13 0.008 70); --line: oklch(0.28 0.010 70); --text: oklch(0.96 0.012 70);
+    --muted: oklch(0.74 0.010 70); --faint: oklch(0.66 0.009 70); --console: oklch(0.1 0.008 70); }
+  html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; }
+  body { background: var(--ground); color: var(--text); font-family: "Space Mono", monospace; -webkit-font-smoothing: antialiased;
+    padding: 52px 64px 56px; box-sizing: border-box; display: grid; grid-template-rows: auto 1fr; }
+  .top { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 22px; border-bottom: 1px solid var(--line); }
+  .mark { font-weight: 700; font-size: 26px; letter-spacing: 0.02em; }
+  .url { font-size: 17px; color: var(--faint); }
+  .main { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 40px; align-items: center; }
+  h1 { font-size: 58px; line-height: 1.04; letter-spacing: -0.03em; font-weight: 700; margin: 0 0 26px; }
+  p { font-size: 21px; line-height: 1.5; color: var(--muted); margin: 0; }
+  .panel { border: 1px solid var(--line); background: var(--console); }
+  .bar { padding: 10px 16px; border-bottom: 1px solid var(--line); font-size: 14px; color: var(--faint); }
+  .bar b { color: var(--text); font-weight: 400; margin-right: 14px; }
+  pre { margin: 0; padding: 16px 18px 18px; font: 400 13.2px/1.36 "Space Mono", monospace; color: var(--text); font-variant-ligatures: none; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <span class="mark">armless</span>
+    <span class="url">filipecabaco.github.io/armless</span>
+  </div>
+  <div class="main">
+    <div>
+      <h1>arm64 Linux,<br>in a browser tab.</h1>
+      <p>An AArch64 machine emulator written in Rust. The whole machine, devices included, is Rust.</p>
+    </div>
+    <div class="panel"><div class="bar"><b>/bin/sh</b>pass 16: 64 iterations</div><pre>..........:::::::::::::::::----+----::::::::::::::
+.........:::::::::::::::------==*+=----:::::::::::
+........::::::::::::::-------=+#@++=----::::::::::
+.......::::::::::::------=====+@@@+====--:::::::::
+......:::::::::::------==*@**@@@@@@@%+#*=-::::::::
+......::::::::-------===++@@@@@@@@@@@@@+=--:::::::
+.....::::-----=+===+===+*@@@@@@@@@@@@@@@+=--::::::
+.....:--------==*@@@@#+@@@@@@@@@@@@@@@@@+=--::::::
+.....-----===+++@@@@@@@@@@@@@@@@@@@@@@@@=---::::::
+.....@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+==---::::::
+.....-----===+++@@@@@@@@@@@@@@@@@@@@@@@@=---::::::
+.....:--------==*@@@@#+@@@@@@@@@@@@@@@@@+=--::::::
+.....::::-----=+===+===+*@@@@@@@@@@@@@@@+=--::::::
+......::::::::-------===++@@@@@@@@@@@@@+=--:::::::
+......:::::::::::------==*@**@@@@@@@%+#*=-::::::::
+.......::::::::::::------=====+@@@+====--:::::::::
+........::::::::::::::-------=+#@++=----::::::::::
+.........:::::::::::::::------==*+=----:::::::::::
+..........:::::::::::::::::----+----::::::::::::::</pre></div>
+  </div>
+</body>
+</html>

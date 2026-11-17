@@ -15,6 +15,8 @@ Mix.install([{:mdex, "~> 0.13"}])
 
 defmodule Site do
   @repo "https://github.com/filipecabaco/armless"
+  # Where the site is published; share cards need absolute URLs
+  @site "https://filipecabaco.github.io/armless/"
 
   # {slug, nav title, group, sources, description}
   # A source is :intro (Readme.md before its first `##`), {:section, "Heading"}
@@ -83,7 +85,8 @@ defmodule Site do
             prev: prev,
             next: next,
             version: version,
-            repo: @repo
+            repo: @repo,
+            site: @site
           ]
         )
 
@@ -96,6 +99,7 @@ defmodule Site do
         assigns: [
           version: version,
           repo: @repo,
+          site: @site,
           demo?: demo?,
           embed: embed(readme)
         ]
@@ -113,7 +117,8 @@ defmodule Site do
   end
 
   # The browser snippet of the Quick start, as the README has it
-  defp embed(readme) do
+  @doc false
+  def embed(readme) do
     [_, code] = Regex.run(~r/```html\n(.*?)```/s, Map.fetch!(readme, "Quick start"))
     code |> String.trim_trailing() |> h()
   end
@@ -129,7 +134,8 @@ defmodule Site do
 
   # ---- sources -------------------------------------------------------------
 
-  defp parse_readme(text) do
+  @doc false
+  def parse_readme(text) do
     {done, {name, buf}, _} =
       text
       |> String.split("\n")
@@ -179,7 +185,8 @@ defmodule Site do
   end
 
   # One section on its own page: its `###` headings become the page's `##`.
-  defp promote(body) do
+  @doc false
+  def promote(body) do
     {lines, _} =
       body
       |> String.split("\n")
@@ -202,7 +209,8 @@ defmodule Site do
 
   # ---- markdown ------------------------------------------------------------
 
-  defp render(md) do
+  @doc false
+  def render(md) do
     md
     |> MDEx.to_html!(
       extension: [table: true, strikethrough: true],
@@ -219,7 +227,8 @@ defmodule Site do
     end))
   end
 
-  defp add_ids(html) do
+  @doc false
+  def add_ids(html) do
     # Walk the headings in order so repeated titles get distinct ids.
     {out, {toc, _}} =
       Regex.split(~r/(<h[23]>.*?<\/h[23]>)/s, html, include_captures: true)
@@ -253,7 +262,8 @@ defmodule Site do
     |> String.replace("&#39;", "'")
   end
 
-  defp slug(text) do
+  @doc false
+  def slug(text) do
     text
     |> String.downcase()
     |> String.replace(~r/[^a-z0-9 \-]/, "")
@@ -262,7 +272,8 @@ defmodule Site do
 
   # ---- links ---------------------------------------------------------------
 
-  defp rewrite_links(page, owners, files, root) do
+  @doc false
+  def rewrite_links(page, owners, files, root) do
     Regex.replace(~r/href="([^"]*)"/, page.html, fn whole, href ->
       cond do
         String.starts_with?(href, ["http://", "https://", "mailto:"]) -> whole
@@ -335,4 +346,5 @@ defmodule Site do
   end
 end
 
-Site.run()
+# site/test/site_test.exs loads this file for its functions, without building
+unless System.get_env("SITE_BUILD") == "test", do: Site.run()

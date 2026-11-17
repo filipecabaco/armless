@@ -1,7 +1,7 @@
-// The landing page's machine: a program in armless's user mode (busybox's sh from an Alpine
-// filesystem, no kernel), its console in xterm.js, and armless's own memory report beside it.
-// Nothing here is simulated: the numbers are vm.memory_report() and the text is what the
-// guest writes. The status line only says what the page has seen happen.
+// The landing page's machine: Linux booted from an initramfs on several CPUs, its console in
+// xterm.js, and armless's own report of what each CPU is doing beside it. Nothing here is
+// simulated: the numbers come from vm.memory_report() and vm.smp_report(), the text is what the
+// guest writes, and the status line only says what the page has seen happen.
 (() => {
   const $ = (id) => document.getElementById(id);
   const status = $("status");
@@ -32,28 +32,41 @@
     document.head.append(s);
   });
 
-  // The Mandelbrot set, computed by busybox awk inside the machine and redrawn in place with more
-  // iterations each frame (4 to 64, then again), so it sharpens out of a blob. The shading follows
-  // the log of the escape time, so the higher counts still show the bands outside the set. Points
-  // known to be in the set (the main cardioid and the period-2 bulb) are not iterated, the bottom
-  // half is the top half mirrored, and the frame goes out in one write. Each frame also adds 4 MiB
-  // to a file, deleted when the set starts over, so the memory chart climbs as the picture sharpens.
-  const AWK =
-    'BEGIN{s=" .:-=+*#%@";L=log(m+1);h=int((H+1)/2);' +
-    'for(y=0;y<h;y++){ci=1.1*(2*y/(H-1)-1);c2=ci*ci;l="";for(x=0;x<W;x++){cr=-0.6+1.7*(2*x/W-1);p=cr-0.25;q=p*p+c2;' +
-    'if(q*(q+p)<0.25*c2||(cr+1)*(cr+1)+c2<0.0625)i=m;else{a=0;b=0;for(i=0;i<m;i++){u=a*a;v=b*b;if(u+v>4)break;b=2*a*b+ci;a=u-v+cr}}' +
-    'l=l substr(s,int(9*log(i+1)/L)+1,1)}r[y]=l}' +
-    'o="\\033[H";for(y=0;y<h;y++)o=o r[y] "\\n";for(y=h;y<H;y++)o=o r[H-1-y] "\\n";printf "%s",o}';
-  const LOOP = (w, h) =>
-    `printf '\\033[2J'; n=0; while :; do k=$((n%16)); n=$((n+1)); m=$((4+4*k)); ` +
-    `awk -v W=${w} -v H=${h} -v m=$m '${AWK}'; ` +
-    '[ $k = 0 ] && rm -f /tmp/ballast; dd if=/dev/zero bs=1M count=4 2>/dev/null >>/tmp/ballast; ' +
-    `printf '\\033[Kpass %d: %d iterations, %d MiB in /tmp/ballast\\n' $n $m $((4*k+4)); done\n`;
+  // More than one CPU needs a cross-origin isolated page. GitHub Pages can't send the headers, so
+  // sw.js adds them: the first visit installs it and reloads once. Where that can't happen the
+  // machine runs on one CPU, and says so.
+  async function isolate() {
+    const key = "armless-isolate";
+    if (crossOriginIsolated) { sessionStorage.removeItem(key); return true; }
+    if (!("serviceWorker" in navigator) || !isSecureContext || sessionStorage.getItem(key)) return false;
+    try {
+      await navigator.serviceWorker.register("sw.js");
+      await navigator.serviceWorker.ready;
+      sessionStorage.setItem(key, "1");
+      location.reload();
+      return new Promise(() => {});
+    } catch {
+      return false;
+    }
+  }
 
   (async () => {
     set("loading", "loading");
+    const isolated = await isolate();
     const config = await fetch("demo/config.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error("the machine is not part of this build"))));
-    await Promise.all([load("demo/xterm.js"), load("demo/addon-fit.js"), load("demo/armless.js")]);
+    await Promise.all([load("cpus.js"), load("demo/xterm.js"), load("demo/addon-fit.js"), load("demo/armless.js")]);
+    // As many CPUs as this device can spare (cpus.js), up to armless's limit
+    const cores = navigator.hardwareConcurrency || 0;
+    const cpus = cpuCount({
+      isolated,
+      cores,
+      memoryGb: navigator.deviceMemory,
+      coarse: matchMedia("(pointer: coarse)").matches,
+      max: config.max_cpus,
+    });
+    if (!isolated) $("one-cpu").hidden = false;
+    $("m-cpus").textContent = String(cpus);
+    if (cores) $("m-cores").textContent = `of ${cores} core${cores > 1 ? "s" : ""} on this device`;
 
     const css = getComputedStyle(document.documentElement);
     const term = new Terminal({
@@ -72,7 +85,7 @@
     term.loadAddon(fit);
     term.open($("terminal"));
     fit.fit();
-    term.write("\x1b[2mfetching armless.wasm and filesystem.json\x1b[0m\r\n");
+    term.write(`\x1b[2mfetching armless, Linux and its initramfs\x1b[0m\r\n`);
 
     // A terminal must not keep the keyboard: Escape then Tab leaves it, as the caption says
     let escAt = 0;
@@ -85,30 +98,22 @@
 
     const vm = new Armless({
       wasm: "demo/armless.wasm",
+      wasm_smp: "demo/armless-smp.wasm",
       memory_mb: config.memory_mb,
-      cpus: 1,
-      debug: false,
+      cpus,
       autostart: false,
-      filesystem: { json: "demo/filesystem.json", baseurl: config.baseurl },
-      user: {
-        argv: ["/bin/sh"],
-        env: ["PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "TERM=xterm-256color", "HOME=/root"],
-        cwd: "/",
-        cols: term.cols,
-        rows: term.rows,
-      },
+      boot: { kernel: "demo/Image.gz", initrd: "demo/initrd.cpio", cmdline: config.cmdline },
     });
     window.armless = vm;
 
-    // What the guest printed, as text: for the prompt and loop checks and the screen reader log
+    // What the guest printed, as text: for the prompt and status checks and the screen reader log
     const decoder = new TextDecoder();
     let tail = "";
-    let started = false;    // the machine is running
-    let loopTyped = false;  // the page finished typing the loop
-    let loopRan = false;    // the guest printed its first pass
-    let yours = false;      // the visitor took over
+    let started = false;   // the machine is running
+    let typed = false;     // the page gave the shell its command
+    let drawing = false;   // the guest printed its first pass
+    let yours = false;     // the visitor took over
     let promptSeen = false;
-    let drawing = false;
 
     const takeOver = () => {
       if (yours) return;
@@ -119,20 +124,15 @@
     vm.on("console", (bytes) => {
       term.write(bytes);
       tail = (tail + decoder.decode(bytes, { stream: true })).slice(-4000);
-      // The shell's prompt, with any control sequences it wrote after it taken off
       if (!promptSeen && /#\s*$/.test(tail.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""))) {
         promptSeen = true;
-        setTimeout(startLoop, 150);
+        setTimeout(start, 300);
       }
-      if (loopTyped && !loopRan && !yours && !drawing && /\x1b\[2J/.test(tail)) {
-        drawing = true;
-        set("ready", "drawing. ctrl+c stops it");
-      }
-      if (loopTyped && !loopRan && !yours) {
+      if (typed && !drawing && !yours) {
         if (/pass 1:/.test(tail)) {
-          loopRan = true;
-          set("ready", "drawing. ctrl+c stops it");
-        } else if (/syntax error|not found/.test(tail)) {
+          drawing = true;
+          set("ready", `drawing on ${cpus} CPU${cpus > 1 ? "s" : ""}. ctrl+c stops it`);
+        } else if (/not found|rror/.test(tail)) {
           takeOver();
         }
       }
@@ -144,7 +144,7 @@
     // The terminal also answers the guest's queries through onData, so only keys and pastes count
     term.onKey(({ domEvent }) => {
       if (domEvent.ctrlKey && domEvent.key.toLowerCase() === "c") takeOver();
-      else if (!loopTyped) takeOver();
+      else if (!typed) takeOver();
     });
     term.textarea?.addEventListener("paste", takeOver);
     term.onData((data) => { if (started) vm.console_input(data); });
@@ -155,13 +155,18 @@
     };
     new ResizeObserver(resize).observe($("terminal"));
 
-    // The page gives the shell its first command, unless the visitor got there first
-    function startLoop() {
+    // The page types the command, unless the visitor got there first: mandel, a shell script in
+    // the initramfs that runs one awk per CPU (site/guest/mandel)
+    async function start() {
       if (yours) return;
       set("loading", "starting");
-      // Pasted as one line: typed out a key at a time, it would take longer than a frame.
-      vm.console_input(LOOP(Math.min(term.cols - 1, 64), Math.min(term.rows - 2, 22)));
-      loopTyped = true;
+      const line = `mandel ${Math.min(term.cols - 1, 110)} ${Math.min(term.rows - 2, 40)}\n`;
+      for (const ch of reduced ? [line] : line) {
+        if (yours) return;
+        vm.console_input(ch);
+        await new Promise((r) => setTimeout(r, 45));
+      }
+      typed = true;
     }
 
     // A polite log of the guest's last line, for screen readers, at most every two seconds
@@ -181,9 +186,9 @@
     vm.run();
     started = true;
     resize();
-    set("loading", "starting the shell");
+    set("loading", "booting Linux");
     // If the prompt went by unrecognised, start anyway once the shell has had time to settle
-    setTimeout(() => { if (!promptSeen) { promptSeen = true; startLoop(); } }, 15000);
+    setTimeout(() => { if (!promptSeen) { promptSeen = true; start(); } }, 30000);
     $("keys").hidden = false;
     for (const b of document.querySelectorAll("[data-send]")) {
       b.addEventListener("click", () => {
@@ -193,53 +198,62 @@
       });
     }
 
-    memory(vm);
+    report(vm, cpus);
   })().catch((e) => fail(e.message || String(e)));
 
-  function memory(vm) {
-    const started = performance.now();
+  // What each CPU did in the last second, from armless's own counters
+  function report(vm, cpus) {
+    const t0 = performance.now();
     const history = [];
-    let linear0 = null;
-    const fig = (id, v) => ($(id).textContent = v);
-    const mib = (n) => (n / MIB).toFixed(1);
+    let last = null;
+    const bars = $("cpus");
+    bars.innerHTML = Array.from({ length: cpus }, (_, i) =>
+      `<li><span class="cpu-name">cpu${i}</span><span class="cpu-bar"><span id="cpu-bar-${i}"></span></span><span class="cpu-rate" id="cpu-rate-${i}">-</span></li>`).join("");
 
     const sample = () => {
-      if (document.hidden) return;
+      if (document.hidden) { last = null; return; }
       let r;
       try { r = vm.memory_report({ scan: false }); } catch { return; }
-      const t = (performance.now() - started) / 1000;
-      linear0 ??= r.memory;
-      history.push({ t, live: r.heap.live, peak: r.heap.peak });
-      while (history.length && history[0].t < t - WINDOW_S) history.shift();
-
-      fig("m-linear", mib(r.memory));
-      fig("m-grown", r.memory > linear0 ? "+" + mib(r.memory - linear0) : "0.0");
-      fig("m-live", mib(r.heap.live));
-      fig("m-peak", mib(r.heap.peak));
-      fig("m-written", mib(r.fs.written_bytes));
-      fig("m-jit", String(r.jit.compiled));
-      draw(history, t);
+      const now = performance.now();
+      const insns = r.smp?.insns ?? [vm.instruction_count];
+      if (last) {
+        const dt = (now - last.at) / 1000;
+        const rates = insns.map((n, i) => Math.max(0, (n - (last.insns[i] ?? 0)) / dt / 1e6));
+        const total = rates.reduce((a, b) => a + b, 0);
+        const top = Math.max(...rates, 1);
+        rates.forEach((m, i) => {
+          $(`cpu-bar-${i}`).style.width = (100 * m / top).toFixed(1) + "%";
+          $(`cpu-rate-${i}`).textContent = m.toFixed(0) + " MIPS";
+        });
+        $("m-mips").textContent = total.toFixed(0);
+        history.push({ t: (now - t0) / 1000, mips: total });
+        while (history.length && history[0].t < (now - t0) / 1000 - WINDOW_S) history.shift();
+        draw(history, (now - t0) / 1000);
+      }
+      last = { at: now, insns };
+      $("m-linear").textContent = (r.memory / MIB).toFixed(1);
+      $("m-jit").textContent = String(r.jit.compiled);
     };
     setInterval(sample, 1000);
     sample();
   }
 
   function draw(history, now) {
-    const W = 520, H = 230, L = 50, R = 12, T = 26, B = 32;
-    const peak = Math.max(...history.map((p) => p.peak), 8 * MIB);
-    const top = Math.ceil(peak / (16 * MIB)) * 16 * MIB;
+    const W = 520, H = 200, L = 50, R = 12, T = 26, B = 32;
+    const peak = Math.max(...history.map((p) => p.mips), 50);
+    const step = peak > 400 ? 200 : peak > 200 ? 100 : 50;
+    const top = Math.ceil(peak / step) * step;
     const span = Math.max(30, Math.min(now, WINDOW_S));
     const x = (t) => L + ((t - (now - span)) / span) * (W - L - R);
     const y = (v) => T + (1 - v / top) * (H - T - B);
     // A gap in the samples (the tab was hidden) is a gap in the line, not a straight stretch
-    const line = (key) => history.map((p, i) => (i && p.t - history[i - 1].t < 3 ? "L" : "M") + x(p.t).toFixed(1) + " " + y(p[key]).toFixed(1)).join("");
+    const line = history.map((p, i) => (i && p.t - history[i - 1].t < 3 ? "L" : "M") + x(p.t).toFixed(1) + " " + y(p.mips).toFixed(1)).join("");
 
     let ticks = "";
-    const step = top / 4;
     for (let i = 0; i <= 4; i++) {
-      const v = step * i;
+      const v = (top / 4) * i;
       ticks += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>` +
-        `<text class="axis" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${Math.round(v / MIB)}</text>`;
+        `<text class="axis" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${Math.round(v)}</text>`;
     }
     let xticks = "";
     for (let k = 0; k <= 4; k++) {
@@ -247,10 +261,8 @@
       const t = now - span + s;
       xticks += `<text class="axis" x="${x(t)}" y="${H - 8}" text-anchor="${k === 0 ? "start" : k === 4 ? "end" : "middle"}">${k === 4 ? "now" : "-" + Math.round(span - s) + " s"}</text>`;
     }
-    $("chart").innerHTML =
-      ticks + xticks +
-      `<text class="axis" x="${L - 8}" y="${T - 12}" text-anchor="end">MiB</text>` +
-      `<path class="peak" d="${line("peak")}"/><path class="live" d="${line("live")}"/>`;
+    $("chart").innerHTML = ticks + xticks +
+      `<text class="axis" x="${L - 8}" y="${T - 12}" text-anchor="end">MIPS</text>` +
+      `<path class="live" d="${line}"/>`;
   }
-
 })();

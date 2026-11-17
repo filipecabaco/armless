@@ -30,7 +30,7 @@ Source and releases live at github.com/filipecabaco/armless (remote `origin`). A
 
 ## Capabilities and Constraints
 
-Facts live in `Readme.md` and `docs/`. Do not state a number, speed or compatibility claim that is not in them. The landing page runs a live machine (a program in armless's user mode, not a kernel boot) from a published snowglobe site; `site/demo.exs` fetches it at build time. No benchmark figures should be quoted without checking `docs/profiling.md`.
+Facts live in `Readme.md` and `docs/`. Do not state a number, speed or compatibility claim that is not in them. The landing page boots a live machine: Linux 6.8 (the CI test kernel) from an initramfs with busybox, on 4 CPUs where the page can be cross-origin isolated (a service worker adds the headers GitHub Pages can't send) and on 1 CPU otherwise. The Pages workflow builds the kernel and busybox; `site/demo.exs` takes armless from its latest release and packs the initramfs. No benchmark figures should be quoted without checking `docs/profiling.md`.
 
 ## Brand Commitments
 
