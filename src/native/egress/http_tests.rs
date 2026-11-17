@@ -106,6 +106,7 @@ fn no_proxy_names_go_direct() {
         no_proxy: vec!["internal.corp".into(), ".svc".into(), "*.local".into()],
         allow_private: false,
         deny_all: false,
+        ports: Vec::new(),
     };
     for host in ["internal.corp", "a.internal.corp", "db.svc", "X.Local"] {
         assert!(e.proxy_for(host, true).is_none(), "{host}");
@@ -447,4 +448,44 @@ fn response_heads_are_bounded() {
         };
         assert!(err.to_string().contains(why), "{why}: {err}");
     }
+}
+
+#[test]
+fn only_the_ports_allowed_are_reached() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let open = l.local_addr().unwrap().port();
+    let e = Egress {
+        ports: vec![open],
+        ..local()
+    };
+    assert!(e.connect("127.0.0.1", open).is_ok());
+    let refused = |r: io::Result<()>| r.err().map(|e| e.kind());
+    for port in [80, 443, 22] {
+        let err = e.connect("127.0.0.1", port).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{port}");
+        assert!(err.to_string().contains("only port"), "{err}");
+    }
+    // A request or a WebSocket to another port is refused before anything connects
+    assert_eq!(
+        refused(e.request("GET", "http://127.0.0.1:80/", &[], b"").map(|_| ())),
+        Some(io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(
+        refused(e.websocket("ws://127.0.0.1:80/", &[], "k").map(|_| ())),
+        Some(io::ErrorKind::PermissionDenied)
+    );
+    // HTTPS only: the default port of http:// is refused, https:// is not (it only fails to find
+    // a server here)
+    let https = Egress {
+        ports: vec![443],
+        ..local()
+    };
+    assert_eq!(
+        refused(https.request("GET", "http://127.0.0.1/", &[], b"").map(|_| ())),
+        Some(io::ErrorKind::PermissionDenied)
+    );
+    assert_ne!(
+        refused(https.request("GET", "https://127.0.0.1/", &[], b"").map(|_| ())),
+        Some(io::ErrorKind::PermissionDenied)
+    );
 }

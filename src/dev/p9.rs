@@ -521,15 +521,15 @@ impl P9 {
             },
             TSTATFS => {
                 self.fid(r.u32()?)?;
-                let (used, files) = self.fs.statfs();
-                let blocks: u64 = (used / 4096).max(1 << 20) * 2;
+                // What is left of a write budget, if the host set one (`Fs::space`)
+                let (blocks, free, files, ffree) = self.fs.space();
                 w.u32(0x0102_1997); // V9FS_MAGIC
                 w.u32(4096);
                 w.u64(blocks);
-                w.u64(blocks - used / 4096);
-                w.u64(blocks - used / 4096);
-                w.u64(files + (1 << 20));
-                w.u64(1 << 20);
+                w.u64(free);
+                w.u64(free);
+                w.u64(files);
+                w.u64(ffree);
                 w.u64(0);
                 w.u32(255);
             },

@@ -242,7 +242,14 @@ runner.start();
   TLS-intercepting proxy. Private and loopback addresses are off limits unless
   `allow_private` is set (through a proxy, which resolves names itself, private IP literals
   and `localhost` names are refused before it sees them). [`examples/fetch.rs`](examples/fetch.rs) makes a request this way.
+  `ports` limits the TCP ports the guest reaches (`vec![443]`: HTTPS and wss:// only; its DNS
+  is answered inside the machine and isn't affected); `deny_all` lets nothing out.
 - `Board::set_fs_cache` is the native counterpart of `fs_cache_mb`.
+- `Board::set_fs_write_limit` caps the host memory the guest's file writes hold (its
+  filesystem lives there): past the budget its writes fail with ENOSPC and `statfs` (`df`)
+  shows what is left. Counted from when it is set (a fork of a restored machine gets its own
+  count); `Board::fs_write_budget` says what is used and whether a write was refused. Off by
+  default.
 - `runner::new_vm` and every `Runner` restore seed the machine from the host
   (`Board::seed`), so a restored guest gets a new VM generation id and Linux reseeds its
   random generator at once.

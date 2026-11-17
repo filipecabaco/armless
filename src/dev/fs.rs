@@ -33,6 +33,7 @@ pub const ENOTDIR: u32 = 20;
 pub const EISDIR: u32 = 21;
 pub const EINVAL: u32 = 22;
 pub const EFBIG: u32 = 27;
+pub const ENOSPC: u32 = 28;
 pub const ENOTEMPTY: u32 = 39;
 pub const ENODATA: u32 = 61;
 pub const EOPNOTSUPP: u32 = 95;
@@ -48,6 +49,35 @@ const WRITE_CHUNK: usize = 1 << 20;
 /// when needed (the guest's page cache keeps what it uses often anyway). Hosts
 /// set their own budget (`DeviceConfig::fs_cache`, `Board::set_fs_cache`).
 pub const DEFAULT_CACHE: usize = 256 << 20;
+/// What an inode costs the write budget besides its contents (`set_write_limit`): its record here
+const INODE_COST: u64 = 256;
+/// What a name in a directory costs it besides the name's bytes
+const ENTRY_COST: u64 = 64;
+
+/// A budget on the host memory the guest's writes hold (`Fs::set_write_limit`). `held` is what
+/// every inode's own bytes (written contents, symlink targets, directory entries, the inodes
+/// themselves) add up to now; `base` what they added up to when the budget was set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WriteBudget {
+    pub limit: u64,
+    base: u64,
+    held: u64,
+    /// A write was refused with ENOSPC
+    pub hit: bool,
+}
+
+impl WriteBudget {
+    /// Bytes the guest's writes hold beyond what they held when the budget was set (negative
+    /// when it has removed more than it wrote).
+    pub fn used(&self) -> i64 {
+        self.held as i64 - self.base as i64
+    }
+
+    /// Bytes still to be written before ENOSPC.
+    pub fn left(&self) -> u64 {
+        (self.limit as i64 - self.used()).max(0) as u64
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Content {
@@ -233,6 +263,10 @@ pub struct Fs {
     pinned: HashSet<String>,
     /// The last `Inode::data_gen` handed out
     clock: u64,
+    /// The guest's write budget, if one is set (host-side: not saved)
+    budget: Option<WriteBudget>,
+    /// Files with a size limit of their own, outside the write budget (`set_allowance`)
+    allowances: HashMap<Ino, u64>,
 }
 
 impl Fs {
@@ -250,6 +284,8 @@ impl Fs {
             failed: HashSet::new(),
             pinned: HashSet::new(),
             clock: 0,
+            budget: None,
+            allowances: HashMap::new(),
         };
         let root = fs.alloc(Inode {
             mode: S_IFDIR | 0o755,
@@ -413,6 +449,93 @@ impl Fs {
         }
     }
 
+    // ------------------------------------------------------------ write budget
+
+    /// Hold the guest's writes to `limit` bytes of host memory beyond what they hold now (None:
+    /// no limit, as by default). Past it, what would hold more fails with ENOSPC, and `statfs`
+    /// says what is left. What counts: the bytes of files written (a file the guest changes is
+    /// copied into memory, the chunks it touches of a large one), symlink targets, directory
+    /// entries and the inodes themselves; not the cache of fetched contents, which has its own
+    /// budget (`set_cache_limit`). Setting it again starts the count again from here.
+    pub fn set_write_limit(&mut self, limit: Option<u64>) {
+        self.budget = limit.map(|limit| {
+            let held = (0..self.inodes.len() as Ino).map(|i| self.held_by_ino(i)).sum();
+            WriteBudget { limit, base: held, held, hit: false }
+        });
+    }
+
+    /// Give file `ino` a size limit of its own (`max` bytes: a write that starts within it is
+    /// taken whole, one that starts past it dropped, answered as written), outside the write budget: what it holds is neither counted in the
+    /// budget nor refused by it. How a host lets a guest's output (a log it reads back) go on
+    /// while the guest's other writes are at their limit, and still bounds it. None takes it
+    /// back into the budget. Forgotten when the file is.
+    pub fn set_allowance(&mut self, ino: Ino, max: Option<u64>) {
+        let was = self.held_by_ino(ino);
+        match max {
+            Some(m) => {
+                self.allowances.insert(ino, m);
+            },
+            None => {
+                self.allowances.remove(&ino);
+            },
+        }
+        // In or out of the budget without changing what is used of it
+        let now = self.held_by_ino(ino);
+        if let Some(b) = &mut self.budget {
+            b.held = (b.held + now).saturating_sub(was);
+            b.base = (b.base + now).saturating_sub(was);
+        }
+    }
+
+    /// The write budget and what is used of it, if one is set.
+    pub fn write_budget(&self) -> Option<WriteBudget> {
+        self.budget
+    }
+
+    /// What an inode holds in memory for the budget.
+    fn held_by(i: &Inode) -> u64 {
+        INODE_COST
+            + match &i.content {
+                Content::Mem(d) => d.len() as u64,
+                Content::Chunks(chunks) => chunks
+                    .iter()
+                    .filter(|c| matches!(c.data, Piece::Mem(_)))
+                    .map(|c| c.len)
+                    .sum(),
+                Content::Symlink(t) => t.len() as u64,
+                Content::Dir { entries, .. } => {
+                    entries.keys().map(|k| ENTRY_COST + k.len() as u64).sum()
+                },
+                _ => 0,
+            }
+    }
+
+    /// What an inode holds for the budget: nothing for a file with an allowance of its own
+    fn held_by_ino(&self, ino: Ino) -> u64 {
+        if self.allowances.contains_key(&ino) {
+            return 0;
+        }
+        self.get(ino).map_or(0, Self::held_by)
+    }
+
+    /// Room for `more` bytes, or ENOSPC (and the budget remembers it was hit).
+    fn reserve(&mut self, more: u64) -> Res<()> {
+        if let Some(b) = &mut self.budget {
+            if more > 0 && b.used().saturating_add(more as i64) > b.limit as i64 {
+                b.hit = true;
+                return Err(ENOSPC.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The budget's count moves by what an inode's holding went from `before` to `after`.
+    fn held_changed(&mut self, before: u64, after: u64) {
+        if let Some(b) = &mut self.budget {
+            b.held = (b.held + after).saturating_sub(before);
+        }
+    }
+
     pub fn get(&self, ino: Ino) -> Option<&Inode> {
         self.inodes.get(ino as usize)?.as_ref()
     }
@@ -445,8 +568,18 @@ impl Fs {
 
     fn link_into(&mut self, dir: Ino, name: &[u8], ino: Ino) {
         if let Ok(e) = self.entries_mut(dir) {
-            e.insert(name.to_vec(), ino);
+            if e.insert(name.to_vec(), ino).is_none() {
+                self.held_changed(0, ENTRY_COST + name.len() as u64);
+            }
         }
+    }
+
+    /// Take `name` out of `dir` (the inode it named is left as it is).
+    fn unlink_from(&mut self, dir: Ino, name: &[u8]) -> Res<()> {
+        if self.entries_mut(dir)?.remove(name).is_some() {
+            self.held_changed(ENTRY_COST + name.len() as u64, 0);
+        }
+        Ok(())
     }
 
     pub fn parent(&self, dir: Ino) -> Ino {
@@ -516,6 +649,7 @@ impl Fs {
         if self.entries(dir)?.contains_key(name) {
             return Err(EEXIST.into());
         }
+        self.reserve(INODE_COST + ENTRY_COST + name.len() as u64)?;
         let t = (now, 0);
         let content = match mode & S_IFMT {
             S_IFDIR => Content::Dir {
@@ -541,6 +675,7 @@ impl Fs {
             refs: 0,
             data_gen: 0,
         });
+        self.held_changed(0, INODE_COST);
         self.link_into(dir, name, ino);
         let d = self.inode_mut(dir)?;
         if is_dir {
@@ -560,10 +695,12 @@ impl Fs {
         gid: u32,
         now: u64,
     ) -> Res<Ino> {
+        self.reserve(INODE_COST + ENTRY_COST + name.len() as u64 + target.len() as u64)?;
         let ino = self.create(dir, name, S_IFLNK | 0o777, uid, gid, now)?;
         let i = self.inode_mut(ino)?;
         i.size = target.len() as u64;
         i.content = Content::Symlink(target.to_vec());
+        self.held_changed(0, target.len() as u64);
         Ok(ino)
     }
 
@@ -575,6 +712,7 @@ impl Fs {
         if self.entries(dir)?.contains_key(name) {
             return Err(EEXIST.into());
         }
+        self.reserve(ENTRY_COST + name.len() as u64)?;
         self.link_into(dir, name, target);
         let i = self.inode_mut(target)?;
         i.nlink += 1;
@@ -589,8 +727,11 @@ impl Fs {
         }
         if let Some(i) = self.get(ino) {
             if i.nlink == 0 && i.refs == 0 {
+                let held = if self.budget.is_some() && !self.allowances.contains_key(&ino) { Self::held_by(i) } else { 0 };
                 self.inodes[ino as usize] = None;
                 self.free.push(ino);
+                self.allowances.remove(&ino);
+                self.held_changed(held, 0);
             }
         }
     }
@@ -624,7 +765,7 @@ impl Fs {
         if is_dir && !self.entries(ino)?.is_empty() {
             return Err(ENOTEMPTY.into());
         }
-        self.entries_mut(dir)?.remove(name);
+        self.unlink_from(dir, name)?;
         let d = self.inode_mut(dir)?;
         if is_dir {
             d.nlink -= 1;
@@ -680,7 +821,7 @@ impl Fs {
             }
             self.unlink(ndir, nname, e_dir, now)?;
         }
-        self.entries_mut(odir)?.remove(oname);
+        self.unlink_from(odir, oname)?;
         self.link_into(ndir, nname, ino);
         if is_dir {
             if let Content::Dir { parent, .. } = &mut self.inode_mut(ino)?.content {
@@ -969,6 +1110,45 @@ impl Fs {
         }
     }
 
+    /// What a file would hold in memory more than now (for the write budget) once `start..end` of
+    /// it is made writable and it is `new_size` bytes long: what it grows by, and the fetched
+    /// contents a write copies (the whole file, or the chunks it touches of a chunked one).
+    fn costs(&self, ino: Ino, start: u64, end: u64, new_size: u64) -> Res<u64> {
+        let i = self.inode(ino)?;
+        Ok(match &i.content {
+            Content::Blob(_) => new_size,
+            Content::Chunks(chunks) => {
+                let copied: u64 = Self::chunks_in(chunks, start, end.min(i.size))
+                    .into_iter()
+                    .filter(|&(k, _)| matches!(chunks[k].data, Piece::Blob(_)))
+                    .map(|(k, _)| chunks[k].len)
+                    .sum();
+                new_size.saturating_sub(i.size) + copied
+            },
+            _ => new_size.saturating_sub(i.size),
+        })
+    }
+
+    /// `f`, a change of `ino`'s contents, within the write budget: refused (ENOSPC) before it
+    /// starts if it would go over, and what it changed counted once it is done.
+    fn budgeted<T>(
+        &mut self,
+        ino: Ino,
+        cost: impl FnOnce(&Self) -> Res<u64>,
+        f: impl FnOnce(&mut Self) -> Res<T>,
+    ) -> Res<T> {
+        if self.budget.is_none() {
+            return f(self);
+        }
+        let more = cost(self)?;
+        self.reserve(more)?;
+        let before = self.held_by_ino(ino);
+        let r = f(self);
+        let after = self.held_by_ino(ino);
+        self.held_changed(before, after);
+        r
+    }
+
     pub fn write(&mut self, ino: Ino, offset: u64, bytes: &[u8], now: u64) -> Res<usize> {
         let end = offset
             .checked_add(bytes.len() as u64)
@@ -976,6 +1156,27 @@ impl Fs {
         if end > MAX_FILE {
             return Err(EFBIG.into());
         }
+        let size = self.inode(ino)?.size;
+        // A file with an allowance of its own: a write that starts within it is taken whole (it
+        // may go past by that one write, which 9p's message size bounds), one that starts at or
+        // past it is dropped, answered as written. Never a short count nor an error: Linux's 9p
+        // client (cache=loose) oopses on a write to such a file that fails, and a log past its
+        // limit is one whose writer the host is about to stop anyway
+        if let Some(&max) = self.allowances.get(&ino) {
+            if offset >= max {
+                return Ok(bytes.len());
+            }
+            return self.write_within(ino, offset, end, bytes, now);
+        }
+        let end = offset + bytes.len() as u64;
+        self.budgeted(
+            ino,
+            |fs| fs.costs(ino, offset, end, size.max(end)),
+            |fs| fs.write_within(ino, offset, end, bytes, now),
+        )
+    }
+
+    fn write_within(&mut self, ino: Ino, offset: u64, end: u64, bytes: &[u8], now: u64) -> Res<usize> {
         let size = self.inode(ino)?.size;
         self.bump(ino)?;
         self.chunk_if_large(ino, size.max(end))?;
@@ -1003,6 +1204,22 @@ impl Fs {
         if size > MAX_FILE {
             return Err(EFBIG.into());
         }
+        if let Some(&max) = self.allowances.get(&ino) {
+            if size > max {
+                return Err(ENOSPC.into());
+            }
+            return self.truncate_within(ino, size);
+        }
+        self.budgeted(
+            ino,
+            // Nothing of a file's old contents is copied to make it shorter, but for a whole file
+            // not yet written (copied, then cut)
+            |fs| if size == 0 { Ok(0) } else { fs.costs(ino, 0, 0, size) },
+            |fs| fs.truncate_within(ino, size),
+        )
+    }
+
+    fn truncate_within(&mut self, ino: Ino, size: u64) -> Res<()> {
         self.bump(ino)?;
         if size == 0 {
             if let Content::Blob(_) | Content::Chunks(_) = self.inode(ino)?.content {
@@ -1258,6 +1475,24 @@ impl Fs {
         (used, files)
     }
 
+    /// What statfs answers, in 4 KiB blocks and inodes: (blocks, free blocks, inodes, free
+    /// inodes). Without a write budget, room to spare (at least 8 GiB, twice what is used); with
+    /// one, what is left of it.
+    pub fn space(&self) -> (u64, u64, u64, u64) {
+        let (used, files) = self.statfs();
+        match self.budget {
+            Some(b) => {
+                let free = b.left() / 4096;
+                let ffree = b.left() / (INODE_COST + ENTRY_COST);
+                (used / 4096 + free, free, files + ffree, ffree)
+            },
+            None => {
+                let blocks: u64 = (used / 4096).max(1 << 20) * 2;
+                (blocks, blocks - used / 4096, files + (1 << 20), 1 << 20)
+            },
+        }
+    }
+
     /// Free inodes that are neither named nor referenced (after a restore).
     pub fn collect(&mut self) {
         let ids: Vec<Ino> = (0..self.inodes.len() as Ino).collect();
@@ -1468,3 +1703,6 @@ mod cache_tests;
 
 #[cfg(test)]
 mod chunk_tests;
+
+#[cfg(test)]
+mod budget_tests;

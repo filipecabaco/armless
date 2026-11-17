@@ -67,6 +67,11 @@ pub struct Egress {
     /// outside (links, which the host's program sets, still do). A machine whose network is only
     /// for what it is linked to and what forwards in.
     pub deny_all: bool,
+    /// Only these TCP ports are reached (empty: any). `[443]` lets the guest out to HTTPS (and
+    /// wss://) and nothing else: plain HTTP and any other protocol are refused. Its DNS is answered
+    /// inside the machine (names get addresses of its own; the host looks them up on connect), so
+    /// it is not affected.
+    pub ports: Vec<u16>,
 }
 
 fn env(names: &[&str]) -> Option<String> {
@@ -95,6 +100,7 @@ impl Egress {
                 .unwrap_or_default(),
             allow_private: false,
             deny_all: false,
+            ports: Vec::new(),
         }
     }
 
@@ -117,6 +123,18 @@ impl Egress {
             io::ErrorKind::PermissionDenied,
             format!("{host} is a private address: not reachable from the guest"),
         ))
+    }
+
+    /// A port the guest may not reach (`ports`)
+    fn port_refused(&self, host: &str, port: u16) -> io::Result<()> {
+        if !self.ports.is_empty() && !self.ports.contains(&port) {
+            let allowed = self.ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ");
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{host}:{port}: only port {allowed} is reachable from the guest"),
+            ));
+        }
+        Ok(())
     }
 
     fn bypass(&self, host: &str) -> bool {
@@ -166,6 +184,7 @@ impl Egress {
     /// A TCP stream to host:port: direct, or tunnelled through the proxy with CONNECT.
     pub fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         self.refused(host)?;
+        self.port_refused(host, port)?;
         let Some(p) = self.proxy_for(host, true) else {
             return self.direct(host, port);
         };
@@ -429,6 +448,7 @@ impl Egress {
     /// for plain HTTP through a proxy).
     pub fn open(&self, t: &Target) -> io::Result<(Conn, String)> {
         self.refused(&t.host)?;
+        self.port_refused(&t.host, t.port)?;
         if !t.secure {
             if let Some(p) = self.proxy_for(&t.host, false) {
                 self.named_private(&t.host)?;
