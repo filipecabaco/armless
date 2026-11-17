@@ -451,6 +451,7 @@ pub enum Device {
     Console(Console),
     P9(P9),
     Net(Net),
+    Balloon(super::balloon::Balloon),
 }
 
 impl Device {
@@ -458,6 +459,7 @@ impl Device {
         match self {
             Device::Net(_) => 1,
             Device::Console(_) => 3,
+            Device::Balloon(_) => 5,
             Device::P9(_) => 9,
         }
     }
@@ -467,6 +469,7 @@ impl Device {
             Device::Net(_) => 0x02_00_00,
             Device::Console(_) => 0x07_80_00,
             Device::P9(_) => 0x01_80_00,
+            Device::Balloon(_) => 0x05_00_00,
         }
     }
 
@@ -475,6 +478,7 @@ impl Device {
             Device::Console(_) => Console::FEATURES,
             Device::P9(_) => P9::FEATURES,
             Device::Net(_) => Net::FEATURES,
+            Device::Balloon(_) => super::balloon::Balloon::FEATURES,
         }
     }
 
@@ -483,6 +487,8 @@ impl Device {
             Device::Console(_) => &[128, 128],
             Device::P9(_) => &[128],
             Device::Net(_) => &[256, 256],
+            // inflate, deflate, free page reporting
+            Device::Balloon(_) => &[64, 64, 64],
         }
     }
 
@@ -491,6 +497,7 @@ impl Device {
             Device::Console(c) => c.config_read(off),
             Device::P9(p) => p.config_read(off),
             Device::Net(n) => n.config_read(off),
+            Device::Balloon(b) => b.config_read(off),
         }
     }
 
@@ -502,6 +509,7 @@ impl Device {
             Device::Console(c) => c.notify(io, t, q),
             Device::P9(p) => p.notify(io, t, q),
             Device::Net(n) => n.notify(io, t, q),
+            Device::Balloon(b) => b.notify(io, t, q),
         }
     }
 
@@ -509,7 +517,7 @@ impl Device {
     pub fn activate(&mut self, io: &Io, t: &mut Transport) {
         match self {
             Device::Console(c) => c.activate(io, t),
-            Device::P9(_) => {},
+            Device::P9(_) | Device::Balloon(_) => {},
             Device::Net(n) => n.activate(io, t),
         }
     }
@@ -519,6 +527,7 @@ impl Device {
             Device::Console(c) => c.reset(),
             Device::P9(p) => p.reset(),
             Device::Net(n) => n.reset(),
+            Device::Balloon(b) => b.reset(),
         }
     }
 
@@ -527,6 +536,7 @@ impl Device {
             Device::Console(c) => c.save(w),
             Device::P9(p) => p.save(w),
             Device::Net(n) => n.save(w),
+            Device::Balloon(b) => b.save(w),
         }
     }
 
@@ -535,6 +545,7 @@ impl Device {
             Device::Console(c) => c.load(r),
             Device::P9(p) => p.load(r),
             Device::Net(n) => n.load(r),
+            Device::Balloon(b) => b.load(r),
         }
     }
 }

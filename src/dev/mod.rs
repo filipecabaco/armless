@@ -7,6 +7,7 @@
 //! output, files to fetch, network connections — is queued in the
 //! [`Outbox`]; the host drains it and answers through [`crate::vm::Vm`].
 
+pub mod balloon;
 pub mod console;
 pub mod fs;
 pub mod json;
@@ -204,18 +205,38 @@ impl Io {
         if !usize::try_from(addr).is_ok_and(|a| self.mem.write(a, data)) {
             return false;
         }
-        if !data.is_empty() {
-            let first = addr >> 12;
-            let last = (addr + data.len() as u64 - 1) >> 12;
-            for p in first..=last {
-                let flag = &self.machine.code_pages[p as usize];
-                if flag.load(Ordering::Relaxed) != 0 {
-                    flag.store(0, Ordering::Relaxed);
-                    self.machine.invalidate_code(p as u32, usize::MAX);
-                }
+        self.drop_code(addr, data.len() as u64);
+        true
+    }
+
+    /// Zero `len` bytes of guest memory at `addr`, giving the host back the memory under them
+    /// where it can (`Ram::discard`), and drop JIT code of those pages on every CPU. False, and
+    /// nothing done, if the range is not all RAM.
+    pub fn discard(&self, addr: u64, len: u64) -> bool {
+        let (Ok(a), Ok(n)) = (usize::try_from(addr), usize::try_from(len)) else {
+            return false;
+        };
+        if !self.mem.discard(a, n) {
+            return false;
+        }
+        self.drop_code(addr, len);
+        true
+    }
+
+    /// Drop what CPUs compiled or decoded from the pages of [addr, addr + len), which is RAM.
+    fn drop_code(&self, addr: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let first = addr >> 12;
+        let last = (addr + len - 1) >> 12;
+        for p in first..=last {
+            let flag = &self.machine.code_pages[p as usize];
+            if flag.load(Ordering::Relaxed) != 0 {
+                flag.store(0, Ordering::Relaxed);
+                self.machine.invalidate_code(p as u32, usize::MAX);
             }
         }
-        true
     }
 
     pub fn read_u16(&self, addr: u64) -> u16 {
@@ -259,6 +280,11 @@ pub struct DeviceConfig {
     /// virtio-net with the user-mode network
     pub net: bool,
     pub mac: [u8; 6],
+    /// virtio-balloon with free page reporting: the guest's kernel reports memory it freed, and
+    /// it is zeroed, so snapshots leave it out (off by default: the machine's devices are part of
+    /// what a snapshot must match, and the guest's kernel needs CONFIG_VIRTIO_BALLOON and
+    /// CONFIG_PAGE_REPORTING)
+    pub free_page_reporting: bool,
 }
 
 impl Default for DeviceConfig {
@@ -269,6 +295,7 @@ impl Default for DeviceConfig {
             fs_cache: fs::DEFAULT_CACHE,
             net: false,
             mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            free_page_reporting: false,
         }
     }
 }
@@ -288,6 +315,7 @@ const EXT_P9_OWNERS: u32 = u32::from_le_bytes(*b"P9OW");
 /// Snapshot extension: the VM generation ID
 const EXT_VMGENID: u32 = u32::from_le_bytes(*b"VGID");
 pub const SLOT_NET: u8 = 3;
+pub const SLOT_BALLOON: u8 = 4;
 
 impl Devices {
     pub fn new(cfg: &DeviceConfig) -> Devices {
@@ -310,6 +338,9 @@ impl Devices {
         }
         if cfg.net {
             pci.add(SLOT_NET, virtio::Device::Net(net::Net::new(cfg.mac)));
+        }
+        if cfg.free_page_reporting {
+            pci.add(SLOT_BALLOON, virtio::Device::Balloon(balloon::Balloon::default()));
         }
         Devices {
             uart: uart::Uart::default(),
@@ -470,5 +501,33 @@ mod outbox_tests {
         // Drained, there is room again
         out.push(Event::Serial(b"after".to_vec()));
         assert!(matches!(&out.drain()[..], [Event::Serial(b)] if b == b"after"));
+    }
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    /// What the guest reports free is zeroed and loses its compiled code everywhere; a range
+    /// that isn't all RAM is refused, untouched.
+    #[test]
+    fn discard_zeroes_ram_and_drops_its_code() {
+        let io = Io::new(Arc::new(crate::smp::Machine::new(1 << 20, 1)), || 0);
+        io.write(0x3000, &[0xab; 0x2000]);
+        io.machine.code_pages[4].store(1, Ordering::Relaxed);
+        let gen = io.machine.code_inval.lock().gen;
+        assert!(io.discard(0x3000, 0x2000));
+        let mut back = vec![1u8; 0x2000];
+        io.read(0x3000, &mut back);
+        assert!(back.iter().all(|&b| b == 0));
+        assert_eq!(io.machine.code_pages[4].load(Ordering::Relaxed), 0);
+        assert!(io.machine.code_inval.lock().gen > gen, "the other CPUs were not told");
+        // Past RAM, or wrapping: nothing done
+        io.write(0xf_f000, &[0xcd; 0x1000]);
+        assert!(!io.discard(0xf_f000, 0x2000));
+        assert!(!io.discard(u64::MAX - 0xfff, 0x2000));
+        let mut b = [0u8; 1];
+        io.read(0xf_f000, &mut b);
+        assert_eq!(b[0], 0xcd);
     }
 }

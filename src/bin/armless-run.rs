@@ -21,6 +21,8 @@ fn usage() -> ! {
                        its blobs in DIR/blobs (or DIR/filesystem), tag host9p
   --boot-fs            boot the kernel and initrd found under /boot in --fs
   --net                virtio-net, with the guest's TCP connections made from here
+  --free-page-reporting  virtio-balloon with free page reporting: memory the guest's
+                       kernel frees is zeroed, so snapshots leave it out
   --tunnel [H:]P=URL   carry the guest's TCP to H:P (any host if H is left out) over a
                        WebSocket to URL (ws://, wss://) or a TCP connection to it
                        (tcp://HOST:PORT) instead (repeatable; needs --net)
@@ -34,6 +36,7 @@ fn usage() -> ! {
   --console-after TEXT type them once the console printed TEXT
   --trap-undef         stop on the first undefined instruction
   --skip-idle          fast-forward time while the guest idles (1 CPU)
+  --save FILE          when --timeout ends the run, save a snapshot of the machine to FILE
   --stats              print instruction count, speed and what the JIT did at exit
   --stats-json FILE    write the same as JSON to FILE (for scripts: bench/run.exs)
   --fallbacks          count, by opcode, the instructions compiled code hands back to the
@@ -74,6 +77,8 @@ fn main() {
     let mut allow_private = false;
     let mut mem_mb = 512u64;
     let mut timeout = None;
+    let mut free_page_reporting = false;
+    let mut save: Option<PathBuf> = None;
     let mut input = String::new();
     let mut console_input = String::new();
     let mut console_after: Option<String> = None;
@@ -101,6 +106,8 @@ fn main() {
             "--fs" => fs_dir = Some(PathBuf::from(val())),
             "--boot-fs" => boot_fs = true,
             "--net" => net = true,
+            "--free-page-reporting" => free_page_reporting = true,
+            "--save" => save = Some(PathBuf::from(val())),
             "--tunnel" => {
                 tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
             },
@@ -127,6 +134,7 @@ fn main() {
             console: true,
             fs_tag: fs_dir.as_ref().map(|_| "host9p".to_string()),
             net,
+            free_page_reporting,
             ..Default::default()
         },
     };
@@ -224,6 +232,13 @@ fn main() {
     let start = Instant::now();
     runner.start();
     let result = runner.wait(timeout);
+    if let (None, Some(path)) = (&result, &save) {
+        let state = runner.save_state();
+        if let Err(e) = std::fs::write(path, &state) {
+            die(format!("{}: {e}", path.display()));
+        }
+        eprintln!("\narmless-run: saved {} ({} bytes)", path.display(), state.len());
+    }
     let code = match &result {
         None => {
             eprintln!("\narmless-run: timeout");
