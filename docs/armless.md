@@ -244,6 +244,19 @@ their state is left out and shared interrupts aimed only at them go to CPU 0. A 
 CPUs restores it; the guest sees the rest as offline CPUs, and CPU_ON for them fails. snowglobe
 boots and warms a site on more CPUs than it ships with this way.
 
+Pages a Linux guest has freed still hold what they held, so a snapshot after a program allocated
+and gave back a lot of memory carries all of it. With free page reporting
+(`DeviceConfig::free_page_reporting`, armless.js's `free_page_reporting`, armless-run's
+`--free-page-reporting`) a virtio-balloon sits in PCI slot 4 offering only
+VIRTIO_BALLOON_F_REPORTING: the guest's kernel (CONFIG_VIRTIO_BALLOON, CONFIG_PAGE_REPORTING;
+Ubuntu's generic kernels have both) reports free blocks of pageblock order (2 MiB) a couple of
+seconds after they free up, and the device zeroes them (`Io::discard`: the host's pages go back
+where they can, and code compiled or decoded from them is dropped on every CPU). On 2026-11-17,
+Ubuntu's 6.8 arm64 kernel with an init that wrote and freed 200 MiB in a 512 MiB machine: a
+snapshot of 278.5 MB without it, 72.6 MB with it. It is off by default because the devices are
+part of what a snapshot must be restored onto. A range is zeroed only where it is all RAM, and a
+guest that reports a page it still uses only loses its own data.
+
 ## SMP in the browser
 
 `armless-smp.wasm` is built with atomics and imports a shared memory. The page's

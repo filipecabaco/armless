@@ -30,7 +30,8 @@ armless started as a fork of [v86](https://github.com/copy/v86).
   Other TCP connections become streams the host accepts, refuses, or carries over a
   WebSocket tunnel.
 - **Snapshots:** the whole machine can be saved and restored. A restore streams straight
-  into guest memory, zstd-compressed or not, and a save is handed out in pieces.
+  into guest memory, zstd-compressed or not, and a save is handed out in pieces. With free
+  page reporting on, memory the guest freed is zeroed and left out.
 - **User mode (experimental):** a Linux program runs with no guest kernel at all
   ([`user/`](user)): the CPU runs it at EL0 and its system calls are answered by the host.
   Static and dynamically linked programs, the machine's filesystem, a terminal, threads,
@@ -55,8 +56,9 @@ cargo run --release --bin armless-run -- --help
 `armless-run` runs Linux kernels (`Image`, `Image.gz`, zstd or EFI zboot) and bare-metal
 binaries (`--raw FILE[@ADDR]`). Besides `--kernel`, `--initrd`, `--append`, `-m MB` and
 `--smp N`, it takes `--fs DIR` (a 9p root; `--boot-fs` boots the kernel under `/boot` in
-it), `--net` with `--tunnel [H:]P=URL` and `--allow-private`, `--timeout`, input flags for
-scripted runs, and `--stats` / `--fallbacks` for JIT numbers.
+it), `--net` with `--tunnel [H:]P=URL` and `--allow-private`, `--free-page-reporting`,
+`--timeout`, `--save FILE` (a snapshot when the timeout ends the run) and `--restore FILE`,
+input flags for scripted runs, and `--stats` / `--fallbacks` for JIT numbers.
 
 Rust 1.97 or newer is needed (Cranelift, behind the default `native-jit` feature).
 
@@ -129,6 +131,7 @@ vm.on("stop", ({ reason, code }) => console.log(reason, code)); // "exit", 0
 | `user_state` | user mode from a snapshot: the process (URL or bytes) saved with the machine `initial_state` restores, by `save_process()` or natively by `Process::save` (snowglobe's `system/user.bin`). The machine must be made as the one saved was: `memory_mb`, `filesystem`, and `console`, `network` on or off |
 | `network` | turns on virtio-net; see below |
 | `console` | virtio-console on or off (default on) |
+| `free_page_reporting` | a virtio-balloon that zeroes the memory the guest's kernel reports free, so snapshots leave it out (default off; a snapshot restores only onto the devices it was saved with; the kernel needs CONFIG_VIRTIO_BALLOON and CONFIG_PAGE_REPORTING) |
 | `mac` | the NIC's MAC address, `"aa:bb:cc:dd:ee:ff"` |
 | `jit`, `jit_threshold` | the wasm JIT on or off (default on) and how often a block runs before it is compiled |
 | `autostart` | run as soon as it is set up (default true); otherwise call `run()` |
@@ -294,7 +297,8 @@ depend on it too) links no Cranelift).
   them, under one lock. Atomics are host compare-and-swap on guest RAM. In the browser,
   `armless-smp.wasm` imports a shared memory that every worker instantiates on.
 - **Devices.** UART, GIC and RTC are memory-mapped; the virtio devices sit on a PCI bus in
-  fixed slots (1 console, 2 9p with tag `host9p`, 3 network). The machine never calls the
+  fixed slots (1 console, 2 9p with tag `host9p`, 3 network, 4 free page reporting). The
+  machine never calls the
   host synchronously: what the host must do is queued as events and answered through
   `Board`.
 - **Snapshots.** CPUs, GIC, timers, device state and the filesystem tree (with the files the

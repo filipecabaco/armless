@@ -37,6 +37,8 @@ fn usage() -> ! {
   --trap-undef         stop on the first undefined instruction
   --skip-idle          fast-forward time while the guest idles (1 CPU)
   --save FILE          when --timeout ends the run, save a snapshot of the machine to FILE
+  --restore FILE       start from a snapshot (made with the same -m, --smp and devices)
+                       instead of booting
   --stats              print instruction count, speed and what the JIT did at exit
   --stats-json FILE    write the same as JSON to FILE (for scripts: bench/run.exs)
   --fallbacks          count, by opcode, the instructions compiled code hands back to the
@@ -79,6 +81,7 @@ fn main() {
     let mut timeout = None;
     let mut free_page_reporting = false;
     let mut save: Option<PathBuf> = None;
+    let mut restore: Option<String> = None;
     let mut input = String::new();
     let mut console_input = String::new();
     let mut console_after: Option<String> = None;
@@ -108,6 +111,7 @@ fn main() {
             "--net" => net = true,
             "--free-page-reporting" => free_page_reporting = true,
             "--save" => save = Some(PathBuf::from(val())),
+            "--restore" => restore = Some(val()),
             "--tunnel" => {
                 tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
             },
@@ -162,7 +166,9 @@ fn main() {
             .find(|p| p.is_dir());
     }
 
-    if let Some((file, addr)) = raw {
+    if restore.is_some() {
+        // The snapshot's state replaces everything below, once the runner holds the machine
+    } else if let Some((file, addr)) = raw {
         armless::boot_raw(&mut vm.cpus[0], &read_file(&file), addr).unwrap_or_else(|e| die(e));
     } else if let Some(k) = kernel {
         let rd = initrd.map(|f| read_file(&f));
@@ -189,6 +195,9 @@ fn main() {
 
     let board = vm.board.clone();
     let mut runner = Runner::new(vm, clock, skip_idle);
+    if let Some(file) = &restore {
+        runner.load_state(&read_file(file)).unwrap_or_else(|e| die(format!("{file}: {e}")));
+    }
     let mut seen = Vec::new();
     let mut pending_input = console_after.as_ref().map(|_| console_input.clone());
     let b2 = board.clone();

@@ -181,6 +181,8 @@ pub unsafe fn string(ptr: u32, len: u32) -> String {
 pub const DEV_CONSOLE: u32 = 1;
 pub const DEV_FS: u32 = 2;
 pub const DEV_NET: u32 = 4;
+/// virtio-balloon with free page reporting (`DeviceConfig::free_page_reporting`)
+pub const DEV_BALLOON: u32 = 8;
 
 /// Create the machine: `memory_mb` MiB of RAM, `ncpus` CPUs (more than one
 /// needs armless-smp.wasm), devices per DEV_* flags; `mac_ptr` points to 6
@@ -203,6 +205,7 @@ pub unsafe extern "C" fn armless_create(
         console: flags & DEV_CONSOLE != 0,
         fs_tag: (flags & DEV_FS != 0).then(|| "host9p".to_string()),
         net: flags & DEV_NET != 0,
+        free_page_reporting: flags & DEV_BALLOON != 0,
         ..Default::default()
     };
     if mac_ptr != 0 {
