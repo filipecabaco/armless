@@ -50,7 +50,7 @@ defmodule Demo do
     image = File.read!(Path.join(kernel_dir, "Image"))
     save(out, "Image.gz", :zlib.gzip(image))
 
-    # ... and an initramfs: busybox, the init script and the Mandelbrot set
+    # ... and an initramfs: busybox, the init script and the trench run
     guest = Path.join(__DIR__, "guest")
 
     {_, 0} =
@@ -59,8 +59,8 @@ defmodule Demo do
         Path.join(out, "initrd.cpio"),
         "init=" <> Path.join(guest, "init"),
         "bin/busybox=" <> Path.join(kernel_dir, "busybox"),
-        "bin/mandel=" <> Path.join(guest, "mandel"),
-        "usr/share/mandel.awk=" <> Path.join(guest, "mandel.awk"),
+        "bin/trench=" <> Path.join(guest, "trench"),
+        "usr/share/trench.awk=" <> Path.join(guest, "trench.awk"),
         "proc/",
         "sys/",
         "tmp/",

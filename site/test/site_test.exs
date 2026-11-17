@@ -1,7 +1,7 @@
 #!/usr/bin/env elixir
 
 # Tests for the site: how site/build.exs cuts and links the docs, that a full build leaves no
-# broken link or anchor, and that site/guest/mandel.awk's CPUs together draw exactly the
+# broken link or anchor, and that site/guest/trench.awk's CPUs together draw exactly the
 # picture one CPU draws.
 #
 #   elixir site/test/site_test.exs
@@ -118,32 +118,37 @@ defmodule SiteTest do
     end
   end
 
-  describe "mandel.awk" do
-    @awk Path.join([Path.expand("..", __DIR__), "guest", "mandel.awk"])
+  describe "trench.awk" do
+    @awk Path.join([Path.expand("..", __DIR__), "guest", "trench.awk"])
+    @run 120
 
-    defp frame(cpus, w, h, m) do
+    defp frame(cpus, w, h, f, seed) do
       for j <- 0..(cpus - 1), reduce: %{} do
         acc ->
-          {out, 0} = System.cmd("awk", ~w(-v W=#{w} -v H=#{h} -v m=#{m} -v J=#{j} -v P=#{cpus} -f #{@awk}))
+          {out, 0} = System.cmd("awk", ~w(-v W=#{w} -v H=#{h} -v J=#{j} -v P=#{cpus} -v f=#{f} -v F=#{@run} -v SEED=#{seed} -f #{@awk}))
 
-          for [_, row, text] <- Regex.scan(~r/\e\[(\d+);1H([^\e]*)/, out), into: acc do
+          for [_, row, text] <- Regex.scan(~r/\e\[(\d+);1H((?:[^\e]|\e\[[0-9;]*m)*)/, out), into: acc do
             {String.to_integer(row), text}
           end
       end
     end
 
+    defp plain(text), do: String.replace(text, ~r/\e\[[0-9;]*m/, "")
+
     test "every CPU count draws every row, the same picture as one CPU" do
-      for {w, h} <- [{64, 22}, {84, 26}, {40, 11}], m <- [8, 64] do
-        one = frame(1, w, h, m)
+      # frames at the start, among the fighters, with the torpedo going in and in the explosion
+      for {w, h} <- [{64, 22}, {84, 26}, {40, 11}], f <- [0, 37, 100, 110, 116], seed <- [1, 424_242] do
+        one = frame(1, w, h, f, seed)
         assert Map.keys(one) |> Enum.sort() == Enum.to_list(1..h)
-        assert Enum.all?(one, fn {_, text} -> String.length(text) == w end)
-        for cpus <- [2, 3, 4, 8], do: assert(frame(cpus, w, h, m) == one, "#{cpus} CPUs, #{w}x#{h}, #{m}")
+        assert Enum.all?(one, fn {_, text} -> String.length(plain(text)) == w end)
+        for cpus <- [2, 3, 8], do: assert(frame(cpus, w, h, f, seed) == one, "#{cpus} CPUs, #{w}x#{h}, frame #{f}, seed #{seed}")
       end
     end
 
-    test "the bottom half mirrors the top" do
-      rows = frame(1, 64, 22, 32)
-      for y <- 1..11, do: assert(rows[y] == rows[23 - y])
+    test "every run is a different trench, and a frame is the same each time it is drawn" do
+      assert frame(1, 64, 22, 30, 1) != frame(1, 64, 22, 30, 2)
+      assert frame(1, 64, 22, 30, 7) == frame(1, 64, 22, 30, 7)
+      assert frame(1, 64, 22, 30, 7) != frame(1, 64, 22, 31, 7)
     end
   end
 end

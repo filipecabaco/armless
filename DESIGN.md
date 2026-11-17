@@ -28,7 +28,7 @@ Space Mono 400 and 700 for everything, including the console. Self-hosted subset
 - **Docs:** plain list of pages on the left (current page underlined), the page, "on this page" on the right from 76rem. Tables scroll inside a ruled region.
 - **Buttons:** quiet until pointed at; primary is solid text colour. 44px tall on touch screens.
 - **Code blocks:** Space Mono like everything else, with a quiet copy button (added by `site.js`; without JavaScript the text is still selectable). Short inline code never breaks mid-token.
-- **Console:** the guest boots and the page types `mandel`, a script in the initramfs: one busybox awk per CPU draws every Nth row of the Mandelbrot set in place, from 8 to 128 iterations and over again, shaded by the log of the escape time. The status line says only what the page has seen happen (booting, starting, drawing on N CPUs, the shell is yours). Escape, then Tab, leaves the terminal; a polite live region reads the guest's last line to screen readers.
+- **Console:** the guest boots and the page types `trench`, a script in the initramfs: one busybox awk per CPU draws every Nth row of a ray-cast trench run in place, a new run (seeded weave, panels, TIE fighters and bolts, ending in the exhaust port) every 120 frames. The status line says only what the page has seen happen (booting, starting, flying the trench on N CPUs, the shell is yours). Escape, then Tab, leaves the terminal; a polite live region reads the guest's last line to screen readers.
 - **Small screens:** the page list and "on this page" fold into two collapsed rows above the content.
 
 ## Rules

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Boots the landing page's machine as the page does (site/static/demo: armless from its release,
 // the kernel and the initramfs) and checks what a visitor would see: the banner with the CPU
-// count, a shell prompt, nproc, mandel drawing passes on every CPU, ctrl+c handing the shell
+// count, a shell prompt, nproc, trench drawing frames on every CPU, ctrl+c handing the shell
 // back, and the shell still working after.
 //
 //   node site/test/guest.mjs [DEMO_DIR] [CPUS]
@@ -63,13 +63,17 @@ type("nproc\n");
 const n = await expect(/^(\d+)\s*$/m, "nproc's answer");
 if (Number(n[1]) !== cpus) fail(`nproc says ${n[1]}`);
 
-type("mandel 40 12\n");
+type("trench 40 12\n");
 const unit = cpus === 1 ? "CPU" : "CPUs";
-await expect(new RegExp(`pass 1: 8 iterations on ${cpus} ${unit}`), "mandel's first pass");
-await expect(new RegExp(`pass 3: 24 iterations on ${cpus} ${unit}`), "mandel's third pass");
+await expect(new RegExp(`frame 1: stay on target \\(${cpus} ${unit}\\)`), "trench's first frame");
+await expect(new RegExp(`frame 3: stay on target \\(${cpus} ${unit}\\)`), "trench's third frame");
 
-// The picture: each row is written to its place on the screen, 40 shading characters wide
-const rows = new Set([...out.matchAll(/\x1b\[(\d+);1H([ .:\-=+*#%@]{40})/g)].map((m) => Number(m[1])));
+// The picture: each row is written to its place on the screen, 40 characters wide once the colours
+// are taken out of it
+const rows = new Set();
+for (const m of out.matchAll(/\x1b\[(\d+);1H((?:[^\x1b\r\n]|\x1b\[[0-9;]*m)+)/g)) {
+  if (m[2].replace(/\x1b\[[0-9;]*m/g, "").length === 40) rows.add(Number(m[1]));
+}
 if (rows.size !== 12) fail(`rows ${[...rows].sort((a, b) => a - b).join(",")} of the picture, not 1 to 12`);
 
 type("\x03");
