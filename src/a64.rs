@@ -698,11 +698,14 @@ impl<H: Host> Cpu<H> {
                         self.jit
                             .invalidate_page_by(page as usize, crate::jit::Inval::IcLocal);
                         self.machine.invalidate_code(page, self.index);
+                        // The block running may be this page's: an ISB after must leave it
+                        self.set_irq_dirty();
                     }
                 },
                 sr::IC_IALLU | sr::IC_IALLUIS if self.machine.ncpus > 1 => {
                     self.jit.flush_all();
                     self.machine.invalidate_code(smp_code_all(), self.index);
+                    self.set_irq_dirty();
                 },
                 _ => {}, // other IC/DC maintenance: caches are coherent
             },
@@ -1275,7 +1278,7 @@ impl<H: Host> Cpu<H> {
                 Some(ok) => {
                     if ok {
                         // Only the words written: code next to the lock word stays compiled
-                        self.jit.code_written(pa, bytes);
+                        self.code_written(pa, bytes);
                     }
                     Ok(ok)
                 },

@@ -105,6 +105,20 @@ impl Egress {
         Ok(())
     }
 
+    /// Before a destination is handed to a proxy, which resolves names itself: refuse what is
+    /// private as written (an IP literal, in any of the forms resolvers accept, or a `localhost`
+    /// name), so that a proxy on loopback or in the host's network doesn't make
+    /// `allow_private: false` mean nothing. Names the proxy resolves are its own policy's.
+    fn named_private(&self, host: &str) -> io::Result<()> {
+        if self.allow_private || !private_name(host) {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{host} is a private address: not reachable from the guest"),
+        ))
+    }
+
     fn bypass(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
         self.no_proxy.iter().any(|p| {
@@ -155,6 +169,7 @@ impl Egress {
         let Some(p) = self.proxy_for(host, true) else {
             return self.direct(host, port);
         };
+        self.named_private(host)?;
         let mut s = self.proxy(p)?;
         s.set_read_timeout(Some(TIMEOUT))?;
         let target =
@@ -209,7 +224,7 @@ fn reach(host: &str, addrs: &[SocketAddr]) -> io::Result<TcpStream> {
 fn private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
-            let [a, b, ..] = v.octets();
+            let [a, b, c, _] = v.octets();
             v.is_loopback()
                 || v.is_private()
                 || v.is_link_local()
@@ -219,18 +234,87 @@ fn private(ip: IpAddr) -> bool {
                 // carrier-grade NAT, and the reserved 240.0.0.0/4
                 || a == 100 && (b & 0xc0) == 64
                 || a >= 240
+                // IETF protocol assignments, 192.0.0.0/24
+                || a == 192 && b == 0 && c == 0
+                // benchmarking, 198.18.0.0/15: local proxies' fake addresses often come from it
+                || a == 198 && (b & 0xfe) == 18
+                // multicast
+                || (a & 0xf0) == 224
         },
         // An IPv4 address written as IPv6 is that IPv4 address
         IpAddr::V6(v) if v.to_ipv4_mapped().is_some() => {
             private(IpAddr::V4(v.to_ipv4_mapped().unwrap()))
         },
         IpAddr::V6(v) => {
+            let s = v.segments();
+            let low_v4 = || IpAddr::V4(std::net::Ipv4Addr::new(
+                (s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8,
+            ));
             v.is_loopback()
                 || v.is_unspecified()
-                || (v.segments()[0] & 0xfe00) == 0xfc00
-                || (v.segments()[0] & 0xffc0) == 0xfe80
+                // unique local fc00::/7, link-local fe80::/10, site-local fec0::/10
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
+                // multicast
+                || (s[0] & 0xff00) == 0xff00
+                // IPv4-compatible ::a.b.c.d (deprecated): that IPv4 address
+                || s[..6] == [0; 6] && private(low_v4())
+                // NAT64 64:ff9b::/96 carries an IPv4 address; 64:ff9b:1::/48 is for local use
+                || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] && private(low_v4())
+                || s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1
+                // 6to4 2002::/16 carries an IPv4 address in its next 32 bits
+                || s[0] == 0x2002 && private(IpAddr::V4(std::net::Ipv4Addr::new(
+                    (s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8,
+                )))
+                // Teredo 2001::/32 tunnels to an IPv4 address it hides
+                || s[0] == 0x2001 && s[1] == 0
         },
     }
+}
+
+/// Whether `host`, as a guest wrote it, names a private address without any lookup: an IP
+/// literal (bracketed IPv6 included, and the shorthand IPv4 forms `inet_aton` accepts, such as
+/// `2130706433`, `0x7f.1` or `127.1`, which proxies may parse the same way) or `localhost`.
+fn private_name(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    let h = h.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(&h);
+    if h.is_empty() || h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return private(ip);
+    }
+    inet_aton(h).is_some_and(|v| private(IpAddr::V4(v)))
+}
+
+/// IPv4 as `inet_aton` reads it: one to four parts, each decimal, `0x` hex or `0` octal, the
+/// last filling the bytes the others leave.
+fn inet_aton(s: &str) -> Option<std::net::Ipv4Addr> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() > 4 {
+        return None;
+    }
+    let mut nums = Vec::with_capacity(4);
+    for p in &parts {
+        let n = if let Some(x) = p.strip_prefix("0x") {
+            u64::from_str_radix(x, 16).ok()?
+        } else if p.len() > 1 && p.starts_with('0') {
+            u64::from_str_radix(&p[1..], 8).ok()?
+        } else {
+            p.parse::<u64>().ok()?
+        };
+        nums.push(n);
+    }
+    let (last, head) = nums.split_last()?;
+    if head.iter().any(|&n| n > 0xff) || *last >= 1u64 << (8 * (4 - head.len())) {
+        return None;
+    }
+    let mut v = *last as u32;
+    for (i, &n) in head.iter().enumerate() {
+        v |= (n as u32) << (24 - 8 * i);
+    }
+    Some(v.into())
 }
 
 /// A stream that may be TLS.
@@ -347,6 +431,7 @@ impl Egress {
         self.refused(&t.host)?;
         if !t.secure {
             if let Some(p) = self.proxy_for(&t.host, false) {
+                self.named_private(&t.host)?;
                 let s = self.proxy(p)?;
                 return Ok((
                     Conn::Plain(s),
@@ -576,7 +661,7 @@ mod http_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::private;
+    use super::{private, private_name};
 
     #[test]
     fn private_addresses() {
@@ -597,6 +682,19 @@ mod tests {
             "::ffff:10.0.0.1",
             "::ffff:127.0.0.1",
             "::ffff:0.250.250.254",
+            "192.0.0.170",
+            "198.18.0.1",
+            "198.19.255.254",
+            "224.0.0.1",
+            "fec0::1",
+            "ff02::1",
+            "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::1",
+            "2002:7f00:1::1",
+            "2002:c0a8:101::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
         ] {
             assert!(private(a.parse().unwrap()), "{a} should be private");
         }
@@ -606,8 +704,38 @@ mod tests {
             "100.128.0.1",
             "2606:4700::1111",
             "::ffff:1.1.1.1",
+            "198.20.0.1",
+            "64:ff9b::101:101",
+            "2002:101:101::1",
+            "2001:db8::1",
         ] {
             assert!(!private(a.parse().unwrap()), "{a} should be reachable");
+        }
+    }
+
+    #[test]
+    fn names_that_are_private_as_written() {
+        for h in [
+            "localhost",
+            "LOCALHOST.",
+            "db.localhost",
+            "127.0.0.1",
+            "127.1",
+            "2130706433",
+            "0x7f.1",
+            "0177.0.0.1",
+            "0x7f000001",
+            "169.254.169.254",
+            "0xa9.0xfe.0xa9.0xfe",
+            "[::1]",
+            "::ffff:10.0.0.1",
+            "[fd00:ec2::254]",
+            "0",
+        ] {
+            assert!(private_name(h), "{h} should be private");
+        }
+        for h in ["example.com", "1.1.1.1", "16843009", "[2606:4700::1111]", "0x1.0x1.0x1.0x1", "localhost.example.com", "127.0.0.1.nip.io"] {
+            assert!(!private_name(h), "{h} should not be refused by name");
         }
     }
 }
