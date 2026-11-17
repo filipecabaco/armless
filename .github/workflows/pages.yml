@@ -5,6 +5,9 @@ name: Pages
 # redeploys the site. site/demo.exs fetches the landing page's machine (armless.js and
 # armless.wasm, the filesystem of a published snowglobe site, xterm.js); if that fails the
 # site still deploys, and the landing page says the machine is not in this build.
+#
+# A pull request that touches the site or the docs only builds it, so a broken build shows
+# up before it reaches main. A push to main builds and deploys.
 # In the repository settings, Pages > Source must be "GitHub Actions".
 
 on:
@@ -16,16 +19,21 @@ on:
       - "Readme.md"
       - "Cargo.toml"
       - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - "docs/**"
+      - "Readme.md"
+      - "Cargo.toml"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -37,20 +45,31 @@ jobs:
           elixir-version: "1.19"
           otp-version: "28"
       - uses: actions/configure-pages@v6
+        if: github.event_name != 'pull_request'
         id: pages
       - name: Fetch the landing page's machine
         run: elixir site/demo.exs
       - name: Build the site
         run: elixir site/build.exs
         env:
-          SITE_BASE: ${{ steps.pages.outputs.base_path }}/
+          SITE_BASE: ${{ steps.pages.outputs.base_path || '/armless' }}/
+      - name: Check the build
+        run: |
+          test -f site/_out/index.html
+          test -f site/_out/docs/index.html
+          test -f site/_out/demo/config.json || echo "::warning::the landing page's machine was not fetched; the site says so"
       - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
         with:
           path: site/_out
 
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
