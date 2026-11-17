@@ -28,6 +28,11 @@ use crate::smp::{Machine, SpinLock, MAX_CPUS};
 pub use crate::dev::Event as VmEvent;
 
 const MAGIC: &[u8; 8] = b"ARMLESS\x03";
+
+/// The most a restore reserves for a snapshot's state on its header's word alone: the header is
+/// untrusted, and in a wasm page what is reserved is never given back. A state larger than this
+/// (the files a guest wrote can make one) grows as its bytes arrive, so its size has to be real.
+const META_RESERVE: usize = 256 << 20;
 const PAGE: usize = 4096;
 const END: u32 = u32::MAX;
 /// In a snapshot's CPU count: the snapshot has no pages, its RAM is an image (`split_state`).
@@ -1001,12 +1006,14 @@ pub fn split_state(data: &mut dyn std::io::Read, image: &std::fs::File) -> Resul
     out[16..20].copy_from_slice(&cpus.to_le_bytes());
     // A corrupt length is refused, not a capacity overflow or an abort for want of memory
     let meta = usize::try_from(meta).map_err(|_| "corrupt snapshot")?;
-    out.try_reserve_exact(meta)
+    out.try_reserve_exact(meta.min(META_RESERVE))
         .map_err(|_| format!("no memory for the snapshot's {} MiB of state", meta >> 20))?;
+    // Read as it comes, not into `meta` zeroed bytes first: the length is the header's word
     let at = out.len();
-    out.resize(at + meta, 0);
-    data.read_exact(&mut out[at..])
-        .map_err(|_| "truncated snapshot")?;
+    let read = std::io::Read::read_to_end(&mut std::io::Read::take(&mut *data, meta as u64), &mut out).map_err(e)?;
+    if read != meta || out.len() != at + meta {
+        return Err("truncated snapshot".into());
+    }
     image.set_len(0).map_err(e)?;
     let mut page = vec![0u8; PAGE];
     loop {
@@ -1083,6 +1090,14 @@ impl StateLoader {
                         _ => unreachable!(),
                     };
                     let n = (want - self.buf.len()).min(data.len());
+                    if self.buf.capacity() - self.buf.len() < n {
+                        // Past what the header earned (META_RESERVE): double, but never beyond
+                        // what the state still lacks
+                        let more = (want - self.buf.len()).min(self.buf.len().max(n));
+                        self.buf.try_reserve_exact(more).map_err(|_| {
+                            format!("no memory for the snapshot's {} MiB of state", want >> 20)
+                        })?;
+                    }
                     self.buf.extend_from_slice(&data[..n]);
                     data = &data[n..];
                     if self.buf.len() < want {
@@ -1132,7 +1147,7 @@ impl StateLoader {
                             // Once, at its size: the state holds the files the guest wrote, and a
                             // buffer grown by doubling would need half as much again on top while
                             // it moves (and leave the old one in a wasm heap, which never shrinks)
-                            self.buf.try_reserve_exact(meta).map_err(|_| {
+                            self.buf.try_reserve_exact(meta.min(META_RESERVE)).map_err(|_| {
                                 format!("no memory for the snapshot's {} MiB of state", meta >> 20)
                             })?;
                             Stage::Meta(meta)
@@ -1602,5 +1617,64 @@ mod host_fs_tests {
             assert!(files.contains(&("small".to_string(), b"small".to_vec())));
             assert_eq!(vm.board.io.mem.load(3 * super::PAGE, 1), 0x5a);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot header for a machine of `ram` bytes and one CPU, declaring `meta` bytes of state.
+    fn header(ram: usize, meta: u64) -> Vec<u8> {
+        let mut h = MAGIC.to_vec();
+        h.extend_from_slice(&(ram as u64).to_le_bytes());
+        h.extend_from_slice(&1u32.to_le_bytes());
+        h.extend_from_slice(&meta.to_le_bytes());
+        h
+    }
+
+    /// A header that declares an enormous state reserves no more than META_RESERVE, and what
+    /// it reserves beyond grows with the bytes that actually come.
+    #[test]
+    fn a_snapshot_header_alone_reserves_a_bounded_amount() {
+        const RAM: usize = 16 << 20;
+        let (vm, _) = crate::runner::new_vm(Config { memory_size: RAM, ..Default::default() }).unwrap();
+        let mut l = StateLoader::new(&vm.board);
+        l.feed(&vm.board, &header(RAM, 1 << 40)).unwrap();
+        assert!(matches!(l.stage, Stage::Meta(n) if n == 1 << 40));
+        assert!(l.buf.capacity() <= META_RESERVE, "{} reserved", l.buf.capacity());
+
+        // A state just past the reserve: it grows to hold it, exactly
+        let meta = META_RESERVE + 5;
+        let mut l = StateLoader::new(&vm.board);
+        l.feed(&vm.board, &header(RAM, meta as u64)).unwrap();
+        let chunk = vec![7u8; 1 << 20];
+        let mut left = meta;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            l.feed(&vm.board, &chunk[..n]).unwrap();
+            left -= n;
+            if left > 0 {
+                assert!(l.buf.capacity() <= meta, "{} reserved for {meta}", l.buf.capacity());
+            }
+        }
+        assert_eq!(l.meta.len(), meta);
+        assert!(matches!(l.stage, Stage::PageNumber));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn split_state_refuses_a_state_shorter_than_its_header_says() {
+        let image = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(std::env::temp_dir().join(format!("armless-split-{}", std::process::id())))
+            .unwrap();
+        let mut data = header(1 << 20, 1 << 40);
+        data.extend_from_slice(b"short");
+        let err = split_state(&mut &data[..], &image).unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
     }
 }
