@@ -252,6 +252,11 @@ pub struct Cpu<H: Host> {
     /// it, whatever VBAR and the MMU say: for a host that answers them itself (user mode, whose
     /// page tables may be on with no vector table).
     pub stop_on_exceptions: bool,
+    /// The generic timers drive interrupts: off where nothing can arm them (user mode, whose
+    /// CNTKCTL lets EL0 read the counters but not program the timers, and which has no interrupt
+    /// controller to raise), so that entering `run` (after each system call there) reads no host
+    /// clock and takes no lock for them.
+    pub timers: bool,
     /// Whether the CPU runs in hardware (`hv`).
     #[cfg(armless_hw)]
     pub(crate) hv: hw::Backend,
@@ -516,6 +521,7 @@ impl<H: Host> Cpu<H> {
             insn_count: 0,
             trap_undefined: false,
             stop_on_exceptions: false,
+            timers: true,
             #[cfg(armless_hw)]
             hv: hw::Backend::Off,
             last_undefined: None,
@@ -790,6 +796,9 @@ impl<H: Host> Cpu<H> {
 
     /// Recompute timer ISTATUS bits and the PPI lines into the GIC.
     pub fn update_timers(&mut self) {
+        if !self.timers {
+            return;
+        }
         let cnt = self.counter();
         let fire = |ctl: &mut u64, cval: u64| -> bool {
             let status = *ctl & 1 != 0 && cnt >= cval;

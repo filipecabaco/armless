@@ -84,6 +84,11 @@ pub(crate) const PAGE: u64 = 4096;
 pub(crate) const INIT: i64 = 1000;
 /// Instructions a guest thread runs before the next one gets the CPU.
 pub(crate) const SLICE: u64 = 1 << 20;
+/// What an answered system call costs of a slice, in instructions (as unkernel charges each
+/// syscall and fault 1000 of its slice): a thread that polls (a zero-timeout poll, an EAGAIN read,
+/// the clock) spends its slice in the host, not in instructions, and must still give way, and the
+/// slice still ends often enough for `schedule` to see the run's wall-time budget.
+pub(crate) const SYSCALL_COST: u64 = 1000;
 const STACK_SIZE: u64 = 8 << 20;
 const BRK_SIZE: u64 = 64 << 20;
 /// The most one read or write moves, as Linux's: a page short of 2 GiB
@@ -490,6 +495,7 @@ pub(crate) fn setup_cpu<H: Host>(cpu: &mut Cpu<H>) {
     cpu.sys.cpacr = 3 << 20;
     cpu.sys.cntkctl = 3;
     cpu.stop_on_exceptions = true;
+    cpu.timers = false;
     // On, with no guest kernel to start it; and in no guest code yet, nor are the others when a
     // program starts or is restored (CPU 0's call), for TLB shootdowns not to wait for them
     if cpu.index == 0 {
@@ -1095,17 +1101,20 @@ impl Process {
                 Err(status) => return status,
             };
             // Run it until it blocks, faults, or its slice ends: syscalls answered on the way
-            // count against the slice, so a thread that polls the clock cannot keep the CPU.
+            // count against the slice (SYSCALL_COST each), so a thread that polls the clock
+            // cannot keep the CPU.
+            let mut calls = 0;
             loop {
-                let used = cpu.insn_count - start;
+                let used = cpu.insn_count - start + calls * SYSCALL_COST;
                 if used >= SLICE {
                     self.end_slice();
                     break;
                 }
                 let exit = cpu.run(SLICE - used);
-                if !self.answer(cpu, exit, until) {
+                if !self.answer(cpu, exit) {
                     break;
                 }
+                calls += 1;
             }
         }
     }
@@ -1219,7 +1228,7 @@ impl Process {
 
     /// The CPU's thread stopped (`exit`): its system call is answered, its fault handled. Whether
     /// it runs on (true), or the CPU looks for the next thread (false).
-    pub(crate) fn answer<H: Host>(&mut self, cpu: &mut Cpu<H>, exit: Exit, until: Instant) -> bool {
+    pub(crate) fn answer<H: Host>(&mut self, cpu: &mut Cpu<H>, exit: Exit) -> bool {
         // (None: another CPU took it off this one, its process having ended)
         let Some(cur) = self.on_cpu[self.cpu] else {
             return false;
@@ -1282,8 +1291,9 @@ impl Process {
                     Ret::Val(r) => {
                         cpu.x[0] = r as u64;
                         // (Its thread may be gone: its process ended)
-                        let on = Instant::now() < until
-                            && self.on_cpu[self.cpu] == Some(cur)
+                        // (No clock read here: the slice, which each call is charged against, ends
+                        // within ~1000 calls, and `schedule` checks the run's budget)
+                        let on = self.on_cpu[self.cpu] == Some(cur)
                             && self.exit_code.is_none()
                             && self.fault.is_none()
                             && !self.signal_ready();
