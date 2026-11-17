@@ -52,6 +52,28 @@ fn syscalls(c: &mut Criterion) {
             p.sys(172, &[]);
         })
     });
+    // The four unkernel's README reports (Linux in wasm; getppid ~170 ns, a 64-byte read ~170 ns,
+    // a pipe write and read ~480 ns, fork + exit + wait ~57 µs, measured under Node), with the
+    // pipe one in `pipes` below
+    case(c, "getppid", |p, n| {
+        repeat(p, n, |p| {
+            p.sys(173, &[]);
+        })
+    });
+    case(c, "read 64 bytes of /dev/zero", |p, n| {
+        p.put(0x200, b"/dev/zero\0");
+        p.sys(56, &[I(-100i64 as u64), D(0x200), I(0)]).save(0x10);
+        repeat(p, n, |p| {
+            p.sys(63, &[X(0x10), D(0x400), I(64)]);
+        });
+    });
+    case(c, "fork, exit, wait", |p, n| {
+        repeat(p, n, |p| {
+            let at = p.fork();
+            p.parent(at);
+            p.sys(260, &[I(u64::MAX), I(0), I(0), I(0)]); // wait4(-1)
+        });
+    });
     case(c, "open, read 64 bytes, close /proc/self/maps", |p, n| {
         p.put(0x200, b"/proc/self/maps\0");
         repeat(p, n, |p| {

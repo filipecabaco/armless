@@ -122,7 +122,12 @@ page, and saving and restoring a 64 MiB machine. `-- --save-baseline NAME` and
 
 `cargo bench --bench zstd` times the zstd decoder (`decompress` and `decompress_each`) on frames
 of 64 KiB, 4 MiB and 32 MiB with an 8 MiB window, and `cargo bench -p armless-user --bench
-syscalls` what user mode's system calls cost.
+syscalls` what user mode's system calls cost. Its `getppid`, `read 64 bytes of /dev/zero`, `pipe: 1-byte write
+and read` and `fork, exit, wait` are the four unkernel's README reports for Linux compiled to wasm;
+`node bench/syscalls.mjs [ROUNDS]` runs the same four through armless.js on `build/armless.wasm`, so
+the two compare in the same engine. On 2026-11-17, on one cloud container: natively 164 ns, 257 ns,
+475 ns and 18 µs; under Node 175 ns, 262 ns, 586 ns and 8.6 µs (unkernel's README: 172 ns, 172 ns,
+482 ns and 57 µs, on its own machine).
 
 Every pull request runs all of them on its base and then on itself, on one runner
 ([`.github/workflows/bench.yml`](../.github/workflows/bench.yml)), and puts a table of the two in
