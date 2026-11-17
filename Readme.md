@@ -179,6 +179,10 @@ Subscribe with `vm.on(name, fn)` (`off` removes).
 - `memory`: a sample of the memory (with the `debug` option).
 - `tcp-connection`: a `Connection` from the guest to a port nothing else handles.
 
+The guest's data for a connection counts as taken once its `data` listeners had it, and a tunnel's
+once its WebSocket sent it: the guest waits for room rather than the page buffering what a slow far
+end can't take.
+
 A `Connection` has `host` (the name the guest resolved) and `port`, and supports
 `accept()`, `refuse()`, `hold()` (decide later), `write()`, `close()` and `drain()`, plus
 the `data`, `end`, `connect` and `close` events. A page can't make raw TCP connections, so

@@ -329,6 +329,18 @@ impl Board {
     pub fn tcp_send(&self, id: u32, data: &[u8]) {
         self.with_net(|s, _| s.send(id, data));
     }
+    /// Turn guest-to-host flow control on: from now on the host says, with `tcp_consumed`, what
+    /// it has done with each connection's `TcpData`, and the guest is offered a window of what is
+    /// left (64 KiB at most unconsumed per connection), so a guest writing to a slow far end waits
+    /// instead of piling its data up in the host. A host that never says would stall its
+    /// connections, so it is off unless the host turns it on (NativeHost and armless.js do).
+    pub fn set_tcp_flow_control(&self, on: bool) {
+        self.with_net(|s, _| s.flow_control = on);
+    }
+    /// The host is done with `n` bytes of `id`'s `TcpData` (sent them on, or dropped them).
+    pub fn tcp_consumed(&self, id: u32, n: usize) {
+        self.with_net(|s, _| s.consumed(id, n));
+    }
     /// Bytes given to `tcp_send` the guest has not acknowledged yet.
     pub fn tcp_buffered(&self, id: u32) -> usize {
         self.with_net(|s, _| s.buffered(id)).unwrap_or(0)

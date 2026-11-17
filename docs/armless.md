@@ -53,7 +53,7 @@ is queued as `Event`s, and the host answers through `Board`:
 | `WsOpen { id, url, protocols }` | `ws_accept(id, protocol)` or `http_fail`; then `ws_send`/`ws_close` |
 | `WsMessage`, `WsClose` | (deliver to the other end) |
 | `TcpOpen { id, host, port }` | `tcp_accept(id)` or `tcp_refuse(id)`, then `tcp_send`/`tcp_close` |
-| `TcpData`, `TcpEof`, `TcpClosed` | (deliver to the other end) |
+| `TcpData`, `TcpEof`, `TcpClosed` | (deliver to the other end); with flow control, `tcp_consumed(id, n)` once `TcpData` is sent on |
 | `TcpConnected { id }` | after `tcp_connect(port)`, the host's connection into the guest is up |
 
 Input goes through `console_input`, `console_resize` and `serial_input`. Console
@@ -164,6 +164,18 @@ Other ports reach the host as `TcpOpen` streams:
 The guest has at most 1024 TCP connections through the stack at once (`MAX_CONNS`, relayed
 web connections included); past that a SYN is reset, as by a full listen queue, so a guest
 can't make the host open connections (natively, threads) without end.
+
+**Flow control.** A host that turns it on (`Board::set_tcp_flow_control`; NativeHost and armless.js
+do) says what it has done with each connection's data (`tcp_consumed(id, n)`: sent on, or
+dropped), and the guest is offered a window of what is left of 64 KiB unconsumed: a guest writing
+to a far end that reads slowly, or not at all, waits in its own socket buffer rather than piling
+its data up in the host. Data past the window is dropped unacknowledged, as from a guest whose
+stack ignored it, and the guest gets a window update once there is room for a segment. NativeHost
+says a write's bytes are consumed once the socket took them (a tunnel's, once its WebSocket
+frame is written); armless.js once a `data` listener had them, or for a tunnel once the
+WebSocket's `bufferedAmount` drained. A host that never says would stall its connections, so the
+stack's window stays open unless it is turned on. The web relay's connections are consumed in the
+machine (and bounded there).
 
 Either host can carry chosen destinations over a WebSocket instead: a **tunnel** maps a
 name and port (or any name, on a port) to a ws:// or wss:// URL, and each connection to

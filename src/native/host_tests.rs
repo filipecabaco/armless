@@ -460,8 +460,33 @@ fn guest_sends_then_closes(
         theirs = fin.seq.wrapping_add(1);
         g.ack(dst, sport, dport, theirs);
     }
-    for chunk in payload.chunks(1400) {
-        g.data(dst, sport, dport, theirs, chunk);
+    // The outside reads as it comes, as a peer does: with flow control, a host that can't write
+    // what the guest sent stops taking more, so a reader that waited for the end never got it
+    let reader = thread::spawn(move || {
+        let mut got = Vec::new();
+        let read = outside.read_to_end(&mut got);
+        (got, read)
+    });
+    // As a TCP stack does: no more in flight than the window the host's side offers (with flow
+    // control, what the host hasn't consumed yet closes it)
+    let base = g.seq[&sport];
+    let (mut sent, mut acked, mut window) = (0usize, 0usize, 65535usize);
+    while sent < payload.len() {
+        for s in g.segs() {
+            let a = s.ack.wrapping_sub(base) as usize;
+            if a <= sent && a >= acked {
+                acked = a;
+                window = s.window as usize;
+            }
+        }
+        let room = (acked + window).saturating_sub(sent);
+        if room == 0 {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        let n = room.min(1400).min(payload.len() - sent);
+        g.data(dst, sport, dport, theirs, &payload[sent..sent + n]);
+        sent += n;
     }
     match ending {
         Ending::Fin => g.fin(dst, sport, dport, theirs),
@@ -473,10 +498,7 @@ fn guest_sends_then_closes(
             .any(|e| matches!(e, Event::TcpClosed { .. }))
             .then_some(())
     });
-    // The host handles the close right after the observer saw it
-    thread::sleep(Duration::from_millis(300));
-    let mut got = Vec::new();
-    let read = outside.read_to_end(&mut got);
+    let (got, read) = reader.join().unwrap();
     assert!(
         got == payload,
         "{ending:?}: the outside got {} of the guest's {} bytes ({read:?})",
@@ -549,6 +571,63 @@ fn what_the_guest_wrote_before_closing_reaches_the_host_server_it_connected_to()
             untracked(&host);
         }
     }
+}
+
+/// A server that stops reading closes the guest's window: what the guest can make the host hold
+/// is the socket's buffers and a window more, not all it cares to send. Reading again opens it.
+#[test]
+fn a_server_that_does_not_read_makes_the_guest_wait() {
+    let b = board(true);
+    let (obs, _) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("localhost", 1).unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let accepted = thread::spawn(move || l.accept().unwrap().0);
+    g.syn(ip, 40500, port);
+    let sa = seg(&mut g, "the SYN-ACK", |s| s.has(SYN | ACK));
+    let theirs = sa.seq.wrapping_add(1);
+    g.ack(ip, 40500, port, theirs);
+    let mut outside = accepted.join().unwrap();
+    let base = g.seq[&40500];
+    let chunk = [0x5a; 1400];
+    let (mut sent, mut acked, mut window) = (0usize, 0usize, 65535usize);
+    let mut stuck = Instant::now();
+    // Send within the window until it stays shut for half a second
+    while stuck.elapsed() < Duration::from_millis(500) {
+        for s in g.segs() {
+            let a = s.ack.wrapping_sub(base) as usize;
+            if a <= sent && a >= acked {
+                acked = a;
+                window = s.window as usize;
+            }
+        }
+        let room = (acked + window).saturating_sub(sent);
+        if room == 0 {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        let n = room.min(chunk.len());
+        g.data(ip, 40500, port, theirs, &chunk[..n]);
+        sent += n;
+        stuck = Instant::now();
+        assert!(sent < 256 << 20, "the guest was never held back");
+    }
+    assert_eq!(window, 0);
+    // Reading opens it again
+    outside.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut read = 0;
+    let opened = until("the window to open", || {
+        if let Ok(n) = outside.read(&mut buf) {
+            read += n;
+        }
+        g.segs().into_iter().find(|s| s.window > 0)
+    });
+    assert!(opened.window > 0 && read > 0);
+    g.rst(ip, 40500, port, theirs);
+    untracked(&host);
 }
 
 #[test]

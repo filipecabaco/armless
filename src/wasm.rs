@@ -238,6 +238,8 @@ pub unsafe extern "C" fn armless_create(
                 }));
             }
             v.board.set_notify(Box::new(|| host_notify()));
+            // armless.js says what it did with each connection's data (armless_tcp_consumed)
+            v.board.set_tcp_flow_control(true);
             VM.store(Box::into_raw(Box::new(v)), Ordering::Release);
             0
         },
@@ -774,6 +776,12 @@ pub extern "C" fn armless_tcp_refuse(id: u32) {
 #[no_mangle]
 pub unsafe extern "C" fn armless_tcp_send(id: u32, ptr: u32, len: u32) {
     vm().board.tcp_send(id, slice(ptr, len));
+}
+
+/// The page is done with `n` bytes of connection `id`'s data (flow control: `Board::tcp_consumed`).
+#[no_mangle]
+pub extern "C" fn armless_tcp_consumed(id: u32, n: u32) {
+    vm().board.tcp_consumed(id, n as usize);
 }
 
 #[no_mangle]
