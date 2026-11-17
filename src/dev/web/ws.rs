@@ -14,6 +14,17 @@ pub const PONG: u8 = 10;
 
 /// "No status code": what a close frame without one means, and never sent (RFC 6455 7.4.1).
 pub const NO_STATUS: u16 = 1005;
+/// Sec-WebSocket-Accept for a handshake's Sec-WebSocket-Key (RFC 6455 4.2.2).
+pub fn accept_key(key: &str) -> String {
+    use sha1::Digest;
+    super::base64_encode(
+        &sha1::Sha1::new()
+            .chain_update(key.as_bytes())
+            .chain_update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+            .finalize(),
+    )
+}
+
 /// The close code for a message too big to process (RFC 6455 7.4.1).
 pub const TOO_BIG: u16 = 1009;
 

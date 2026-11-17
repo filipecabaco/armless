@@ -247,7 +247,7 @@ fn ws_server(greeting: &'static [u8]) -> (u16, mpsc::Receiver<(u8, Vec<u8>)>) {
             s.read_exact(&mut b).unwrap();
             head.push(b[0]);
         }
-        s.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").unwrap();
+        s.write_all(switching(&head).as_bytes()).unwrap();
         s.write_all(&ws::encode(ws::BINARY, greeting, None))
             .unwrap();
         let mut buf = Vec::new();
@@ -744,7 +744,7 @@ fn a_tunnel_the_far_side_resets_is_reset_for_the_guest_and_forgotten() {
             s.read_exact(&mut b).unwrap();
             head.push(b[0]);
         }
-        s.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").unwrap();
+        s.write_all(switching(&head).as_bytes()).unwrap();
         let _ = s.peek(&mut b);
     });
     let b = board(true);
@@ -794,4 +794,17 @@ fn connections_a_process_never_accepted_end_when_it_stops_listening() {
     let mut buf = [0u8; 1];
     assert_eq!(outside.read(&mut buf).unwrap(), 0);
     untracked(&host);
+}
+
+/// A server's 101 for the WebSocket handshake request `head` (its key answered).
+fn switching(head: &[u8]) -> String {
+    let head = String::from_utf8_lossy(head);
+    let key = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .expect("a WebSocket key");
+    format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+        crate::dev::web::ws::accept_key(key.trim())
+    )
 }

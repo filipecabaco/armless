@@ -949,30 +949,22 @@ pub fn load_state<H: Host>(
 ) -> Result<(), String> {
     let mut loader = StateLoader::new(board);
     if crate::zstd::is_zstd(data) {
-        // Natively, piece by piece into the loader: the decompressed snapshot is never all in
-        // memory beside the RAM it fills
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut failed = None;
-            let ended =
-                crate::zstd::decompress_each(data, &mut |piece| match loader.feed(board, piece) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        failed = Some(e);
-                        false
-                    },
-                });
-            if let Some(e) = failed {
-                return Err(e);
-            }
-            if ended != crate::zstd::Ended::Done {
-                return Err("corrupt zstd snapshot".into());
-            }
+        // Piece by piece into the loader: the decompressed snapshot is never all in memory beside
+        // the RAM it fills (in a wasm page, never given back), and a zstd bomb fills no more than
+        // the loader takes: its pages go into RAM, its state is bounded (META_RESERVE)
+        let mut failed = None;
+        let ended = crate::zstd::decompress_each(data, &mut |piece| match loader.feed(board, piece) {
+            Ok(()) => true,
+            Err(e) => {
+                failed = Some(e);
+                false
+            },
+        });
+        if let Some(e) = failed {
+            return Err(e);
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let raw = crate::zstd::decompress(data).ok_or("corrupt zstd snapshot")?;
-            loader.feed(board, &raw)?;
+        if ended != crate::zstd::Ended::Done {
+            return Err("corrupt zstd snapshot".into());
         }
     } else {
         loader.feed(board, data)?;

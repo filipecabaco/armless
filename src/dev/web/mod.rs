@@ -748,13 +748,9 @@ impl Web {
         if self.phase != Phase::WsOpening {
             return out;
         }
-        let accept = sha1::Sha1::new()
-            .chain_update(self.ws_key.as_bytes())
-            .chain_update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
-            .finalize();
         let mut head = format!(
             "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {}\r\n",
-            base64_encode(&accept)
+            ws::accept_key(&self.ws_key)
         );
         if !protocol.is_empty() {
             head.push_str(&format!("sec-websocket-protocol: {protocol}\r\n"));

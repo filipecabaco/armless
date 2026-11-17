@@ -1564,6 +1564,16 @@
     }
 
     async _fetch_blob(name) {
+      // A blob's name is a file name (a hash, an extension): anything else, which a snapshot
+      // from elsewhere could hold, would resolve to another path or another site
+      if (!/^[A-Za-z0-9_~-][A-Za-z0-9._~-]*$/.test(name) || name.includes("..")) {
+        console.warn(`armless: refused a blob named ${JSON.stringify(name)}`);
+        const n = utf8.encode(name);
+        this._with_bytes(n, (p, len) => this._call("armless_blob_failed", p, len));
+        this._drain();
+        this._poke();
+        return;
+      }
       if (this._blobs_in_flight.has(name)) return;
       this._blobs_in_flight.add(name);
       this.emit("blob", name);
