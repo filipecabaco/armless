@@ -397,6 +397,62 @@ fn a_block_that_rewrites_itself_runs_the_new_instruction_after_an_isb() {
     assert!(jit.jit.page_invalidations > invalidated);
 }
 
+/// The same past a conditional branch: a superblock goes on after one (on the path not taken), so
+/// the instruction it rewrites there is one it was compiled from, and the write must drop it.
+#[test]
+fn a_superblock_that_rewrites_an_instruction_past_its_branch_runs_the_new_one() {
+    const SMC: u64 = 0x6000;
+    const NEW: u32 = 0x9100_0800; // add x0, x0, #2
+    let to_exit = |at: u64| (((EXIT as i64 - at as i64) / 4) as u32) & 0x3ff_ffff;
+    // SMC: str w3, [x4]; cbnz x6, EXIT; ic ivau, x4; dsb ish; isb; add x0, x0, #1; b EXIT
+    let words = [
+        0xb900_0083u32,
+        0xb500_0006 | (to_exit(SMC + 4) & 0x7ffff) << 5,
+        0xd50b_7524,
+        0xd503_3b9f,
+        0xd503_3fdf,
+        0x9100_0400,
+        0x1400_0000 | to_exit(SMC + 24),
+    ];
+    let Some(mut jit) = at_block(1) else { return };
+    let mut interp = at_block(1).unwrap();
+    interp.jit.enabled = false;
+    for c in [&mut jit, &mut interp] {
+        for (i, w) in words.iter().enumerate() {
+            c.mem.write(SMC as usize + 4 * i, &w.to_le_bytes());
+        }
+        (c.x[0], c.x[3], c.x[4], c.x[6]) = (0, 0, 0x8000, 0);
+        for _ in 0..4 {
+            c.pc = SMC;
+            c.jit_entry = true;
+            c.run(7);
+            c.wait_native_jit();
+        }
+        assert_eq!(c.x[0], 4);
+    }
+    // The add, past the branch, is among the words the compiled code covers
+    let covered = jit.jit.covered.get(&((SMC >> 12) as u32)).expect("SMC's page compiled");
+    assert!(covered[0] & (1 << 5) != 0, "the word past the branch is not covered");
+    let runs = jit.jit.block_runs;
+    for c in [&mut jit, &mut interp] {
+        (c.x[0], c.x[3], c.x[4]) = (0, NEW as u64, SMC + 20);
+        c.pc = SMC;
+        c.jit_entry = true;
+        c.run(7);
+        assert_eq!(c.pc, EXIT);
+        assert_eq!(c.x[0], 2, "the instruction written ran, not the one compiled");
+    }
+    assert!(jit.jit.block_runs > runs, "the rewriting run was not compiled code");
+    // The branch taken leaves the superblock where it says
+    for c in [&mut jit, &mut interp] {
+        (c.x[0], c.x[3], c.x[4], c.x[6]) = (0, NEW as u64, 0x8000, 1);
+        c.pc = SMC;
+        c.jit_entry = true;
+        c.run(2);
+        assert_eq!((c.pc, c.x[0]), (EXIT, 0));
+    }
+}
+
 /// A CPU at the start of a two-instruction block (`add x0, x0, #1; b EXIT`) at CODE.
 fn at_block(threshold: u32) -> Option<Cpu<NoDevices>> {
     let mut c = Cpu::new(RAM, NoDevices);

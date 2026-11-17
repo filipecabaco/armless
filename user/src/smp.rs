@@ -167,8 +167,9 @@ impl<'a> Smp<'a> {
             }
             // (Each time read once: the end of one span is the start of the next)
             let mut t = std::time::Instant::now();
+            let mut calls = 0;
             loop {
-                let used = cpu.insn_count - start;
+                let used = cpu.insn_count - start + calls * crate::SYSCALL_COST;
                 if used >= SLICE {
                     self.answering(i, |p| p.end_slice());
                     break;
@@ -176,10 +177,11 @@ impl<'a> Smp<'a> {
                 let exit = cpu.run(SLICE - used);
                 cpu.left_guest();
                 let ran = self.count(i, 0, t);
-                let (go, done) = self.answering_since(i, ran, |p| p.answer(cpu, exit, until));
+                let (go, done) = self.answering_since(i, ran, |p| p.answer(cpu, exit));
                 if !go {
                     break;
                 }
+                calls += 1;
                 t = done;
             }
         }

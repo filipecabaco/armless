@@ -469,11 +469,27 @@ pub struct Response {
 /// A response's status, reason and headers.
 type Head = (u16, String, Vec<(String, String)>);
 
+/// The longest line of a response head (or a chunk-size line) taken from a server or a proxy,
+/// the most header lines, and the most interim responses before the real one.
+const MAX_LINE: u64 = 16 << 10;
+const MAX_HEADERS: usize = 256;
+const MAX_INTERIM: usize = 16;
+
+/// One line, of at most MAX_LINE bytes: a server sending more without an end of line is refused,
+/// not buffered without end. Returns the bytes read (0 at the end of the stream).
+fn read_line(r: &mut impl BufRead, line: &mut String) -> io::Result<usize> {
+    let n = r.take(MAX_LINE).read_line(line)?;
+    if n as u64 == MAX_LINE && !line.ends_with('\n') {
+        return Err(io::Error::other("a response line too long"));
+    }
+    Ok(n)
+}
+
 fn read_head(r: &mut BufReader<Conn>) -> io::Result<Head> {
     let mut line = String::new();
-    loop {
+    for _ in 0..=MAX_INTERIM {
         line.clear();
-        if r.read_line(&mut line)? == 0 {
+        if read_line(r, &mut line)? == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no response"));
         }
         let mut parts = line.trim_end().splitn(3, ' ');
@@ -486,8 +502,11 @@ fn read_head(r: &mut BufReader<Conn>) -> io::Result<Head> {
         let mut headers = Vec::new();
         loop {
             let mut h = String::new();
-            if r.read_line(&mut h)? == 0 || h.trim_end().is_empty() {
+            if read_line(r, &mut h)? == 0 || h.trim_end().is_empty() {
                 break;
+            }
+            if headers.len() == MAX_HEADERS {
+                return Err(io::Error::other("too many response headers"));
             }
             if let Some((k, v)) = h.trim_end().split_once(':') {
                 headers.push((k.trim().to_string(), v.trim().to_string()));
@@ -499,6 +518,7 @@ fn read_head(r: &mut BufReader<Conn>) -> io::Result<Head> {
         }
         return Ok((status, reason, headers));
     }
+    Err(io::Error::other("too many interim responses"))
 }
 
 /// `Transfer-Encoding: chunked`, decoded.
@@ -515,10 +535,10 @@ impl Read for Chunked {
         }
         if self.left == 0 {
             let mut line = String::new();
-            self.r.read_line(&mut line)?;
+            read_line(&mut self.r, &mut line)?;
             if line.trim().is_empty() {
                 line.clear();
-                self.r.read_line(&mut line)?;
+                read_line(&mut self.r, &mut line)?;
             }
             let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or("0"), 16)
                 .map_err(|_| io::Error::other("bad chunk size"))?;
@@ -646,6 +666,17 @@ impl Egress {
             return Err(io::Error::other(format!(
                 "the server answered {status} {reason}"
             )));
+        }
+        // A server that switched to WebSocket says so, and proves it read our key (RFC 6455
+        // 4.1): anything else, such as a cache or a proxy answering 101, isn't one
+        let get = |name: &str| {
+            headers.iter().find(|(h, _)| h.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        };
+        let expected = crate::dev::web::ws::accept_key(key);
+        if !get("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
+            || get("sec-websocket-accept") != Some(expected.as_str())
+        {
+            return Err(io::Error::other("the server's answer is not a WebSocket handshake"));
         }
         let protocol = headers
             .iter()

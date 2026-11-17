@@ -113,6 +113,13 @@ Lowering the threshold made every site slower, so that time is the interpreter's
 less time and java, elixir and python were 1–4% faster, but the benchmark guest's tight loops ran
 7–23% slower; even then a lower threshold did not pay. `single_pass` made every site 21–31% slower.
 
+Superblocks (compiled blocks that go on past a conditional branch, on the path not taken, instead
+of ending at it) were tried on 2026-11-17: the benchmark guest's total grew about 11%, natively
+and through the wasm JIT. Registers go through memory either way, so a longer block saves little,
+and it costs compile time and code (blocks overlap). A block that branches to its own start loops
+in place instead (`loop $self` in `gen.rs`), which made the compiled loop of `cargo bench --bench
+machine` 17% faster.
+
 ## `cargo bench --bench machine`
 
 Host-side costs with [criterion](https://github.com/bheisler/criterion.rs): one guest
@@ -122,7 +129,12 @@ page, and saving and restoring a 64 MiB machine. `-- --save-baseline NAME` and
 
 `cargo bench --bench zstd` times the zstd decoder (`decompress` and `decompress_each`) on frames
 of 64 KiB, 4 MiB and 32 MiB with an 8 MiB window, and `cargo bench -p armless-user --bench
-syscalls` what user mode's system calls cost.
+syscalls` what user mode's system calls cost. Its `getppid`, `read 64 bytes of /dev/zero`, `pipe: 1-byte write
+and read` and `fork, exit, wait` are the four unkernel's README reports for Linux compiled to wasm;
+`node bench/syscalls.mjs [ROUNDS]` runs the same four through armless.js on `build/armless.wasm`, so
+the two compare in the same engine. On 2026-11-17, on one cloud container: natively 164 ns, 257 ns,
+475 ns and 18 µs; under Node 175 ns, 262 ns, 586 ns and 8.6 µs (unkernel's README: 172 ns, 172 ns,
+482 ns and 57 µs, on its own machine).
 
 Every pull request runs all of them on its base and then on itself, on one runner
 ([`.github/workflows/bench.yml`](../.github/workflows/bench.yml)), and puts a table of the two in

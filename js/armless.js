@@ -39,7 +39,7 @@
   const TABLE_SIZE = JIT_SLOT_BASE + JIT_SLOTS;
   const STACK_SIZE = 1 << 20;
   const BUDGET = 200000;
-  const DEV_CONSOLE = 1, DEV_FS = 2, DEV_NET = 4;
+  const DEV_CONSOLE = 1, DEV_FS = 2, DEV_NET = 4, DEV_BALLOON = 8;
   const STOP_REASONS = { 2: "poweroff", 3: "reset", 4: "halt", 5: "fault" };
   // User mode: how long a program runs in one go (ms), and the longest it sleeps idle before it
   // is looked at again (input, a resize and blobs wake it at once)
@@ -581,7 +581,8 @@
         armless_jit_fp3: e.armless_jit_fp3,
       };
 
-      const flags = (o.console !== false ? DEV_CONSOLE : 0) | (o.filesystem ? DEV_FS : 0) | (o.network ? DEV_NET : 0);
+      const flags = (o.console !== false ? DEV_CONSOLE : 0) | (o.filesystem ? DEV_FS : 0) | (o.network ? DEV_NET : 0)
+        | (o.free_page_reporting ? DEV_BALLOON : 0);
       let mac = 0;
       if (o.mac) mac = this._copy_in(Uint8Array.from(o.mac.split(":").map((x) => parseInt(x, 16))));
       if (e.armless_create(o.memory_mb, this.cpus, flags, mac) !== 0) throw new Error("armless: " + this._error());
@@ -1564,6 +1565,16 @@
     }
 
     async _fetch_blob(name) {
+      // A blob's name is a file name (a hash, an extension): anything else, which a snapshot
+      // from elsewhere could hold, would resolve to another path or another site
+      if (!/^[A-Za-z0-9_~-][A-Za-z0-9._~-]*$/.test(name) || name.includes("..")) {
+        console.warn(`armless: refused a blob named ${JSON.stringify(name)}`);
+        const n = utf8.encode(name);
+        this._with_bytes(n, (p, len) => this._call("armless_blob_failed", p, len));
+        this._drain();
+        this._poke();
+        return;
+      }
       if (this._blobs_in_flight.has(name)) return;
       this._blobs_in_flight.add(name);
       this.emit("blob", name);

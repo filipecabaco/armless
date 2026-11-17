@@ -340,3 +340,18 @@ fn a_waiting_read_keeps_its_chunks_cached() {
     fs.provide_blob("o", b"xyz".to_vec()).unwrap();
     assert_eq!(fs.blobs.len(), 1);
 }
+
+#[test]
+fn a_saved_state_naming_a_blob_outside_the_blob_store_is_refused() {
+    let save = |blob: &str| {
+        let json = format!(r#"{{"version":3,"fsroot":[["f",3,0,33188,0,0,"{blob}"],["c",4,0,33188,0,0,[["{blob}",4]]]]}}"#);
+        let fs = Fs::from_json(json.as_bytes()).unwrap();
+        let mut w = W::new();
+        fs.save(&mut w);
+        w.0
+    };
+    assert!(Fs::load(&mut R(&save("ab12cd.bin.zst"))).is_some());
+    for bad in ["../outside", "https:evil.example", "a/b", "..", ".hidden", "a%2fb", "a?b", "a\\b"] {
+        assert!(Fs::load(&mut R(&save(&bad.replace('\\', "\\\\")))).is_none(), "{bad}");
+    }
+}

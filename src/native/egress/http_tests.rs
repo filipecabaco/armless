@@ -391,7 +391,8 @@ fn a_proxy_that_refuses_or_hangs_up_is_an_error_naming_it() {
 #[test]
 fn websockets_open_with_the_servers_subprotocol_or_fail_with_its_answer() {
     let (port, got) = server(
-        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Protocol: chat\r\n\r\n\x81\x02hi",
+        // The accept value for the key "a2V5" sent below
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: acoMowsaMs4gzl5sy2uaF1804GA=\r\nSec-WebSocket-Protocol: chat\r\n\r\n\x81\x02hi",
     );
     let (protocol, mut r) = local()
         .websocket(
@@ -419,4 +420,31 @@ fn websockets_open_with_the_servers_subprotocol_or_fail_with_its_answer() {
         panic!("opened")
     };
     assert!(err.to_string().contains("403 Forbidden"), "{err}");
+    // A 101 that doesn't prove it read the key (no accept, or a wrong one), or doesn't upgrade
+    for reply in [
+        &b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"[..],
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: dGhlIHNhbXBsZQ==\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nSec-WebSocket-Accept: acoMowsaMs4gzl5sy2uaF1804GA=\r\n\r\n",
+    ] {
+        let (port, _) = server(reply);
+        let Err(err) = local().websocket(&format!("ws://127.0.0.1:{port}/"), &[], "a2V5") else {
+            panic!("opened on {}", String::from_utf8_lossy(reply))
+        };
+        assert!(err.to_string().contains("not a WebSocket handshake"), "{err}");
+    }
+}
+
+#[test]
+fn response_heads_are_bounded() {
+    // A line with no end, too many headers, interim answers without end
+    let long = Box::leak(format!("HTTP/1.1 200 OK\r\nX-A: {}\r\n\r\n", "a".repeat(32 << 10)).into_boxed_str());
+    let many = Box::leak(format!("HTTP/1.1 200 OK\r\n{}\r\n", "X-A: 1\r\n".repeat(300)).into_boxed_str());
+    let interim = Box::leak("HTTP/1.1 100 Continue\r\n\r\n".repeat(20).into_boxed_str());
+    for (reply, why) in [(long.as_bytes(), "too long"), (many.as_bytes(), "too many"), (interim.as_bytes(), "interim")] {
+        let (port, _) = server(reply);
+        let Err(err) = local().request("GET", &format!("http://127.0.0.1:{port}/"), &[], &[]) else {
+            panic!("{why}: answered")
+        };
+        assert!(err.to_string().contains(why), "{why}: {err}");
+    }
 }

@@ -142,7 +142,9 @@ impl P9 {
             return;
         }
         while let Some(chain) = t.queues[0].pop(io) {
-            let request = chain.read_all(io);
+            // No request is longer than the largest msize (the guest's size field says the
+            // rest, and a request cut short is answered with an error)
+            let request = chain.read_up_to(io, MAX_MSIZE as usize);
             self.serve(io, t, chain, request);
         }
     }

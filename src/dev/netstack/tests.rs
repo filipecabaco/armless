@@ -578,6 +578,31 @@ fn refused_and_reset_connections_end_with_tcp_closed() {
 }
 
 #[test]
+fn connections_past_the_limit_are_refused_and_room_comes_back() {
+    let mut g = Guest::new();
+    let dst = g.resolve("many.test", 1).unwrap();
+    let mut first = None;
+    for i in 0..MAX_CONNS {
+        let (id, _) = g.open(dst, 10000 + i as u16, 5432, 1460);
+        first.get_or_insert(id);
+    }
+    assert_eq!(g.stack.conns.len(), MAX_CONNS);
+    g.segs();
+    // One more: reset at once, and the host never hears of it
+    g.syn(dst, 10000 + MAX_CONNS as u16, 5432);
+    let s = g.segs();
+    assert!(s.len() == 1 && s[0].has(RST | ACK), "{s:?}");
+    assert!(g.events().is_empty());
+    assert_eq!(g.stack.conns.len(), MAX_CONNS);
+    // One closes: there is room for another
+    g.stack.refuse(first.unwrap(), &g.out);
+    g.events();
+    g.segs();
+    let (_, host) = g.open(dst, 20000, 5432, 1460);
+    assert_eq!(host, "many.test");
+}
+
+#[test]
 fn segments_for_no_connection_are_reset() {
     let mut g = Guest::new();
     let dst = [10, 0, 0, 2];

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use armless::dev::web::cert::TlsKeys;
-use armless::dev::web::{Out, Rng, Web};
+use armless::dev::web::{Out, Rng, Web, MAX_BODY};
 use armless::dev::Event;
 
 fn keys() -> TlsKeys {
@@ -280,8 +280,9 @@ fn a_chunk_size_past_usize_is_a_bad_request() {
         );
         let out = web.from_guest(request.as_bytes(), None, &mut rng);
         let text = String::from_utf8_lossy(&out.to_guest);
+        // Past MAX_BODY, refused as soon as the size line is in
         assert!(
-            text.starts_with("HTTP/1.1 400 Bad Request"),
+            text.starts_with("HTTP/1.1 413 Content Too Large"),
             "{size}: {text}"
         );
         assert!(out.events.is_empty(), "{size}: {:?}", out.events);
@@ -833,4 +834,159 @@ fn an_unknown_ticket_means_a_full_handshake() {
     let out = q.web.from_guest(&wire, Some(&mut q.keys), &mut q.rng);
     assert!(!out.close);
     assert_eq!(out.to_guest[0], 22, "a ServerHello");
+}
+
+// ------------------------------------------------------------ what the guest may send
+
+/// The relay's answer to `request` sent whole: its status line, whether it closed, and the
+/// requests it passed on.
+fn send_one(request: &[u8]) -> (String, bool, usize) {
+    let mut web = Web::new(9, false, "a.test".into());
+    let mut rng = Rng::default();
+    let out = web.from_guest(request, None, &mut rng);
+    let text = String::from_utf8_lossy(&out.to_guest);
+    (text.lines().next().unwrap_or("").to_string(), out.close, requests(&out).len())
+}
+
+#[test]
+fn a_bare_cr_or_lf_or_other_control_in_a_request_head_is_refused() {
+    // Each of these would end a line, or start a header, for a proxy or server further on
+    for request in [
+        &b"GET / HTTP/1.1\r\nHost: a.test\r\nX-A: 1\nX-Injected: 2\r\n\r\n"[..],
+        b"GET / HTTP/1.1\r\nHost: a.test\r\nX-A: 1\rX-Injected: 2\r\n\r\n",
+        b"GET / HTTP/1.1\nHost: a.test\r\n\r\n",
+        b"GET /\rx HTTP/1.1\r\nHost: a.test\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: a.test\r\nX-A: a\x00b\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: a.test\r\nX-A: a\x7fb\r\n\r\n",
+        // A folded line, a space before the colon, a name that is no token, a method that is no token
+        b"GET / HTTP/1.1\r\nHost: a.test\r\nX-A: 1\r\n folded\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost : a.test\r\n\r\n",
+        b"GET / HTTP/1.1\r\nX(A): 1\r\n\r\n",
+        b"G\"T / HTTP/1.1\r\nHost: a.test\r\n\r\n",
+        // More than three parts in the request line, or something else than HTTP/ at its end
+        b"GET / HTTP/1.1 extra\r\nHost: a.test\r\n\r\n",
+        b"GET / XTTP/1.1\r\nHost: a.test\r\n\r\n",
+    ] {
+        let (status, close, n) = send_one(request);
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{:?}", String::from_utf8_lossy(request));
+        assert!(close && n == 0, "{:?}", String::from_utf8_lossy(request));
+    }
+    // Tabs in a value, and a value with spaces around it, are fine
+    let (status, _, n) = send_one(b"GET / HTTP/1.1\r\nHost: a.test\r\nX-A: \ta\tb \r\n\r\n");
+    assert_eq!((status.as_str(), n), ("", 1));
+}
+
+#[test]
+fn request_bodies_are_framed_strictly_and_bounded() {
+    // Lengths that can't frame a request
+    for cl in ["+5", "-1", "5, 6", " ", "0x5"] {
+        let req = format!("POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: {cl}\r\n\r\nhello");
+        assert_eq!(send_one(req.as_bytes()).0, "HTTP/1.1 400 Bad Request", "{cl:?}");
+    }
+    let req = b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+    assert_eq!(send_one(req).0, "HTTP/1.1 400 Bad Request");
+    // The same length twice is one length
+    let req = b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+    assert_eq!(send_one(req).2, 1);
+    // A coding other than chunked last can't be framed
+    let req = b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked, gzip\r\n\r\n";
+    assert_eq!(send_one(req).0, "HTTP/1.1 400 Bad Request");
+    // A chunk that doesn't end with CRLF where its size says
+    let req = b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcd\r\n0\r\n\r\n";
+    assert_eq!(send_one(req).0, "HTTP/1.1 400 Bad Request");
+    // Past MAX_BODY: refused as soon as the head says so, before any of the body is buffered
+    for req in [
+        format!("POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1),
+        format!("POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: {}\r\n\r\n", u128::MAX),
+        format!("POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", MAX_BODY + 1),
+    ] {
+        let (status, close, n) = send_one(req.as_bytes());
+        assert_eq!(status, "HTTP/1.1 413 Content Too Large", "{req:?}");
+        assert!(close && n == 0);
+    }
+}
+
+#[test]
+fn a_chunked_body_arriving_a_byte_at_a_time_is_read_once() {
+    let mut web = Web::new(3, false, "a.test".into());
+    let mut rng = Rng::default();
+    let mut body = Vec::new();
+    let mut want = Vec::new();
+    for i in 0..2000u32 {
+        let chunk = format!("chunk {i};");
+        body.extend_from_slice(format!("{:x};ext=1\r\n{chunk}\r\n", chunk.len()).as_bytes());
+        want.extend_from_slice(chunk.as_bytes());
+    }
+    body.extend_from_slice(b"0\r\nTrailer: x\r\n\r\n");
+    let out = web.from_guest(b"POST /up HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n", None, &mut rng);
+    assert!(requests(&out).is_empty());
+    let mut got = Vec::new();
+    for b in &body {
+        got.extend(requests(&web.from_guest(&[*b], None, &mut rng)));
+    }
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].2, want);
+    // and the next request starts clean
+    answer(&mut web, 200, &[], &[b"ok"]);
+    let out = web.from_guest(b"POST /two HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n", None, &mut rng);
+    assert_eq!(requests(&out), [("POST".into(), "http://a.test/two".into(), b"hi".to_vec())]);
+}
+
+#[test]
+fn what_the_guest_sends_while_it_waits_is_bounded() {
+    let mut web = Web::new(3, false, "a.test".into());
+    let mut rng = Rng::default();
+    let out = web.from_guest(&get("/slow"), None, &mut rng);
+    assert_eq!(requests(&out).len(), 1);
+    // While the host answers, the guest keeps sending
+    let flood = vec![b'x'; 1 << 20];
+    let mut closed = false;
+    for _ in 0..(MAX_BODY >> 20) + 2 {
+        let out = web.from_guest(&flood, None, &mut rng);
+        if out.close {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "the relay kept buffering");
+}
+
+#[test]
+fn a_websocket_frame_or_message_past_the_limit_closes_it() {
+    let open = || {
+        let mut web = Web::new(4, false, "ws.test".into());
+        let mut rng = Rng::default();
+        web.from_guest(
+            b"GET /s HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            None,
+            &mut rng,
+        );
+        web.ws_accept("");
+        (web, rng)
+    };
+    let closed_too_big = |out: &Out| {
+        out.close
+            && out.events.iter().any(|e| matches!(e, Event::WsClose { code: 1009, .. }))
+            && out.to_guest.ends_with(&[0x88, 2, 0x03, 0xf1])
+    };
+    // One frame declaring more than the limit: closed as soon as its length is in
+    let (mut web, mut rng) = open();
+    let mut f = vec![0x82, 0x80 | 127];
+    f.extend_from_slice(&(1u64 << 40).to_be_bytes());
+    let out = web.from_guest(&f, None, &mut rng);
+    assert!(closed_too_big(&out), "{:?}", out.events);
+    // Fragments adding up to more
+    let (mut web, mut rng) = open();
+    let frag = |fin: bool, op: u8, n: usize| {
+        let mut f = vec![(fin as u8) << 7 | op, 127];
+        f.extend_from_slice(&(n as u64).to_be_bytes());
+        f.extend(std::iter::repeat_n(0u8, n));
+        f
+    };
+    let half = armless::dev::web::MAX_WS_MESSAGE / 2 + 1;
+    let out = web.from_guest(&frag(false, 2, half), None, &mut rng);
+    assert!(!out.close);
+    let out = web.from_guest(&frag(true, 0, half), None, &mut rng);
+    assert!(closed_too_big(&out), "{:?}", out.events);
 }

@@ -41,11 +41,23 @@ impl Chain {
 
     /// Everything the driver gave the device to read.
     pub fn read_all(&self, io: &Io) -> Vec<u8> {
-        let mut out = vec![0; self.read_len()];
+        self.read_up_to(io, usize::MAX)
+    }
+
+    /// What the driver gave the device to read, up to `max` bytes. The lengths are the driver's:
+    /// a device that knows the most a request of its may hold reads no more than that, rather
+    /// than allocating what the descriptors claim (up to all of RAM, in a host heap that, in a
+    /// browser, never shrinks).
+    pub fn read_up_to(&self, io: &Io, max: usize) -> Vec<u8> {
+        let mut out = vec![0; self.read_len().min(max)];
         let mut at = 0;
         for &(addr, len) in &self.readable {
-            io.read(addr, &mut out[at..at + len as usize]);
-            at += len as usize;
+            let n = (len as usize).min(out.len() - at);
+            if n == 0 {
+                break;
+            }
+            io.read(addr, &mut out[at..at + n]);
+            at += n;
         }
         out
     }
@@ -439,6 +451,7 @@ pub enum Device {
     Console(Console),
     P9(P9),
     Net(Net),
+    Balloon(super::balloon::Balloon),
 }
 
 impl Device {
@@ -446,6 +459,7 @@ impl Device {
         match self {
             Device::Net(_) => 1,
             Device::Console(_) => 3,
+            Device::Balloon(_) => 5,
             Device::P9(_) => 9,
         }
     }
@@ -455,6 +469,7 @@ impl Device {
             Device::Net(_) => 0x02_00_00,
             Device::Console(_) => 0x07_80_00,
             Device::P9(_) => 0x01_80_00,
+            Device::Balloon(_) => 0x05_00_00,
         }
     }
 
@@ -463,6 +478,7 @@ impl Device {
             Device::Console(_) => Console::FEATURES,
             Device::P9(_) => P9::FEATURES,
             Device::Net(_) => Net::FEATURES,
+            Device::Balloon(_) => super::balloon::Balloon::FEATURES,
         }
     }
 
@@ -471,6 +487,8 @@ impl Device {
             Device::Console(_) => &[128, 128],
             Device::P9(_) => &[128],
             Device::Net(_) => &[256, 256],
+            // inflate, deflate, free page reporting
+            Device::Balloon(_) => &[64, 64, 64],
         }
     }
 
@@ -479,6 +497,7 @@ impl Device {
             Device::Console(c) => c.config_read(off),
             Device::P9(p) => p.config_read(off),
             Device::Net(n) => n.config_read(off),
+            Device::Balloon(b) => b.config_read(off),
         }
     }
 
@@ -490,6 +509,7 @@ impl Device {
             Device::Console(c) => c.notify(io, t, q),
             Device::P9(p) => p.notify(io, t, q),
             Device::Net(n) => n.notify(io, t, q),
+            Device::Balloon(b) => b.notify(io, t, q),
         }
     }
 
@@ -497,7 +517,7 @@ impl Device {
     pub fn activate(&mut self, io: &Io, t: &mut Transport) {
         match self {
             Device::Console(c) => c.activate(io, t),
-            Device::P9(_) => {},
+            Device::P9(_) | Device::Balloon(_) => {},
             Device::Net(n) => n.activate(io, t),
         }
     }
@@ -507,6 +527,7 @@ impl Device {
             Device::Console(c) => c.reset(),
             Device::P9(p) => p.reset(),
             Device::Net(n) => n.reset(),
+            Device::Balloon(b) => b.reset(),
         }
     }
 
@@ -515,6 +536,7 @@ impl Device {
             Device::Console(c) => c.save(w),
             Device::P9(p) => p.save(w),
             Device::Net(n) => n.save(w),
+            Device::Balloon(b) => b.save(w),
         }
     }
 
@@ -523,6 +545,7 @@ impl Device {
             Device::Console(c) => c.load(r),
             Device::P9(p) => p.load(r),
             Device::Net(n) => n.load(r),
+            Device::Balloon(b) => b.load(r),
         }
     }
 }
@@ -587,6 +610,24 @@ mod tests {
         let chain = q.pop(&io).unwrap();
         assert_eq!(chain.read_all(&io), b"abcde");
         assert_eq!(chain.write_len(), 64);
+    }
+
+    #[test]
+    fn a_device_reads_no_more_than_its_requests_can_hold() {
+        let io = io();
+        let mut q = queue();
+        io.write(0x8000, b"abc");
+        io.write(0x8100, b"defgh");
+        // Lengths the driver claims are far past what is read: RAM-sized
+        desc(&io, 0, 0x8000, 3, DESC_F_NEXT, 1);
+        desc(&io, 1, 0x8100, (1 << 20) - 0x8100, 0, 0);
+        offer(&io, 0);
+        let chain = q.pop(&io).unwrap();
+        assert_eq!(chain.read_len(), 3 + (1 << 20) - 0x8100);
+        assert_eq!(chain.read_up_to(&io, 6), b"abcdef");
+        assert_eq!(chain.read_up_to(&io, 2), b"ab");
+        assert_eq!(chain.read_up_to(&io, 0), b"");
+        assert_eq!(chain.read_up_to(&io, usize::MAX).len(), chain.read_len());
     }
 
     #[test]

@@ -1408,14 +1408,14 @@ impl Fs {
                     Content::Dir { entries, parent }
                 },
                 1 => Content::Symlink(r.bytes()?.to_vec()),
-                2 => Content::Blob(r.str()?),
+                2 => Content::Blob(blob_name(r.str()?)?),
                 3 => Content::Mem(r.bytes()?.to_vec()),
                 5 => {
                     let mut chunks = Vec::new();
                     for _ in 0..r.u64()? {
                         let len = r.u64()?;
                         let data = match r.u8()? {
-                            0 => Piece::Blob(r.str()?),
+                            0 => Piece::Blob(blob_name(r.str()?)?),
                             1 => Piece::Mem(r.bytes()?.to_vec()),
                             _ => return None,
                         };
@@ -1451,6 +1451,17 @@ impl Fs {
 
 #[cfg(all(test, unix))]
 mod spill_tests;
+
+/// A blob name from a saved state, if it is one: a file name (a hash and an extension), as the
+/// filesystem's tree makes them. Hosts fetch blobs by name, from a directory or relative to a
+/// URL, so a saved state from elsewhere naming `../x` or `https:host` is refused.
+fn blob_name(name: String) -> Option<String> {
+    let ok = !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._~-".contains(&b));
+    ok.then_some(name)
+}
 
 #[cfg(test)]
 mod cache_tests;

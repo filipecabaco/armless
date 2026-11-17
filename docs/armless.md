@@ -116,8 +116,17 @@ the site's CA, end inside the machine:
   (fetch() never does); a host that sends less, or more, than it said closes the
   connection. HTTP/1.0 and `connection: close` requests get a response that ends with
   the connection, as does a guest that has finished sending, after its last request.
+  Requests are parsed strictly, since the host passes them on (perhaps to a shared proxy):
+  a bare CR or LF or another control character in the head, a folded line, a header name
+  or method that is no token, or a Content-Length that isn't one plain number is a 400.
+  A body may be at most 64 MiB (`MAX_BODY`, refused with 413 as soon as the head or a
+  chunk size says more); a chunked one is read incrementally. What the guest sends while
+  its request is answered, or its WebSocket opened, is held up to a body and a head more
+  (pipelining); past that the connection closes.
 - **WebSocket upgrades** become `WsOpen` and the frames become messages. Pings are
-  answered in the machine.
+  answered in the machine. A frame or a message over 64 MiB (`MAX_WS_MESSAGE`), from the
+  guest or from a server the native host talks to, closes the WebSocket with 1009, as soon
+  as the frame's length is in.
 
 The host only sees `HttpRequest`/`WsOpen`, with full https://, wss://… URLs:
 
@@ -151,6 +160,10 @@ Other ports reach the host as `TcpOpen` streams:
 
 - **Native:** a real connection, direct or tunnelled with CONNECT through the proxy.
 - **Browser:** refused unless the page takes it.
+
+The guest has at most 1024 TCP connections through the stack at once (`MAX_CONNS`, relayed
+web connections included); past that a SYN is reset, as by a full listen queue, so a guest
+can't make the host open connections (natively, threads) without end.
 
 Either host can carry chosen destinations over a WebSocket instead: a **tunnel** maps a
 name and port (or any name, on a port) to a ws:// or wss:// URL, and each connection to
@@ -230,6 +243,19 @@ the others offline (`echo 0 > /sys/devices/system/cpu/cpuN/online`, which ends i
 their state is left out and shared interrupts aimed only at them go to CPU 0. A machine with n
 CPUs restores it; the guest sees the rest as offline CPUs, and CPU_ON for them fails. snowglobe
 boots and warms a site on more CPUs than it ships with this way.
+
+Pages a Linux guest has freed still hold what they held, so a snapshot after a program allocated
+and gave back a lot of memory carries all of it. With free page reporting
+(`DeviceConfig::free_page_reporting`, armless.js's `free_page_reporting`, armless-run's
+`--free-page-reporting`) a virtio-balloon sits in PCI slot 4 offering only
+VIRTIO_BALLOON_F_REPORTING: the guest's kernel (CONFIG_VIRTIO_BALLOON, CONFIG_PAGE_REPORTING;
+Ubuntu's generic kernels have both) reports free blocks of pageblock order (2 MiB) a couple of
+seconds after they free up, and the device zeroes them (`Io::discard`: the host's pages go back
+where they can, and code compiled or decoded from them is dropped on every CPU). On 2026-11-17,
+Ubuntu's 6.8 arm64 kernel with an init that wrote and freed 200 MiB in a 512 MiB machine: a
+snapshot of 278.5 MB without it, 72.6 MB with it. It is off by default because the devices are
+part of what a snapshot must be restored onto. A range is zeroed only where it is all RAM, and a
+guest that reports a page it still uses only loses its own data.
 
 ## SMP in the browser
 

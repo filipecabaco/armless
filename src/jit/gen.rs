@@ -234,7 +234,10 @@ impl Gen<'_> {
         self.c.i32_load8_u(l.irq_dirty);
         self.c.i32_eqz();
         self.c.i32_and();
-        self.c.br_if(self.depth_top + self.nest);
+        // The budget and interrupts are checked on every back edge, a tight loop's included: a
+        // guest's loop can't keep the thread past its slice, nor run on code a write dropped.
+        // Back to this block's own start: its `loop $self`, no dispatch; elsewhere: $top's.
+        self.c.br_if(if delta == 0 { self.nest } else { self.depth_top + self.nest });
         self.store_pc(|g| g.c.get(L_PC));
         self.c.i32c(STATUS_DONE);
         self.c.ret();
@@ -2949,11 +2952,15 @@ pub fn translate_page_code(
     g.c.br_table(&targets, n_entries);
     for (i, &e) in entries.iter().enumerate() {
         g.c.end(); // block $e_i: entry i's code follows
+        // loop $self: a branch back to the block's own start (a tight loop) goes here directly,
+        // not through $top's dispatch (`goto`)
+        g.c.loop_(EMPTY);
         g.entry_off = e as i64;
-        g.depth_top = n_entries - i as u32;
+        g.depth_top = n_entries - i as u32 + 1;
         g.nest = 0;
         let insns = block_insns(words, e as usize / 4, max_block);
         translate_block(&mut g, insns);
+        g.c.end(); // $self (never reached: every block ends in a branch or a return)
     }
     g.c.end(); // $miss: the PC is not an entry of this module
     g.store_pc(|g| g.c.get(L_PC));
