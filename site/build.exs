@@ -1,0 +1,338 @@
+#!/usr/bin/env elixir
+
+# Builds the armless site into site/_out.
+#
+#   elixir site/build.exs
+#
+# The docs are not written twice: every page is cut from Readme.md (by its
+# `##` headings) or is one of the files under docs/. The landing page is
+# site/templates/index.html.eex, written by hand.
+#
+# SITE_BASE is the path the site is served from ("/armless/" on GitHub Pages).
+# Only the 404 page needs it, because it is served from any depth.
+
+Mix.install([{:mdex, "~> 0.13"}])
+
+defmodule Site do
+  @repo "https://github.com/filipecabaco/armless"
+
+  # {slug, nav title, group, sources, description}
+  # A source is :intro (Readme.md before its first `##`), {:section, "Heading"}
+  # or {:file, "docs/x.md"}.
+  @pages [
+    {"index", "Overview", "Start", [:intro, {:section, "What it has"}],
+     "What armless is, and what the machine has: CPU, backends, devices, filesystem, network, snapshots."},
+    {"getting-started", "Getting started", "Start",
+     [{:section, "Quick start"}, {:section, "Building"}],
+     "Run armless natively with armless-run or in a browser page with armless.js, and build the wasm files."},
+    {"browser-api", "Browser API", "Use", [{:section, "Browser API", promote: true}],
+     "Options, events and calls of the armless.js Armless class."},
+    {"native-api", "Native API", "Use", [{:section, "Native API", promote: true}],
+     "Using the armless crate from Rust: NativeHost, Runner and the egress proxy settings."},
+    {"how-it-works", "How it works", "Internals", [{:section, "How it works", promote: true}],
+     "The interpreter, the JIT, hardware backends, the MMU, SMP, devices, snapshots and the browser memory model."},
+    {"design", "Design notes", "Internals", [{:file, "docs/armless.md"}],
+     "The address map, the host interface, the 9p filesystem, the web relay, threads and the snapshot format."},
+    {"map", "Where things are", "Internals", [{:file, "docs/map.md"}],
+     "Which module to look in to change something, and which tests say it still works."},
+    {"hypervisor", "Hardware virtualization", "Internals", [{:file, "docs/hypervisor.md"}],
+     "Running guests on the host's own cores with Hypervisor.framework or KVM."},
+    {"profiling", "Measuring", "Internals", [{:file, "docs/profiling.md"}],
+     "Where the time goes: armless-run --stats, the benchmark guest, real workloads and criterion."},
+    {"testing", "Testing and releases", "Project",
+     [{:section, "Filesystem images"}, {:section, "Testing"}, {:section, "Releases"}],
+     "Building test filesystems, the test suites, and how a release is published."}
+  ]
+
+  def run do
+    # ARMLESS_SRC points at another checkout of the repository to cut the docs from
+    root = System.get_env("ARMLESS_SRC") || Path.expand("..", __DIR__)
+    out = Path.join(__DIR__, "_out")
+    File.rm_rf!(out)
+    File.mkdir_p!(Path.join(out, "docs"))
+    File.cp_r!(Path.join(__DIR__, "static"), out)
+    File.write!(Path.join(out, ".nojekyll"), "")
+
+    readme = parse_readme(File.read!(Path.join(root, "Readme.md")))
+    version = version(Path.join(root, "Cargo.toml"))
+    demo? = File.exists?(Path.join([__DIR__, "static", "demo", "config.json"]))
+
+    pages =
+      for {slug, title, group, sources, desc} <- @pages do
+        {md, src_dir, edit} = assemble(root, readme, sources)
+        {html, toc} = md |> render() |> add_ids()
+        %{slug: slug, title: title, group: group, desc: desc, html: html, toc: toc, dir: src_dir, edit: edit}
+      end
+
+    owners = for p <- pages, {_, id, _} <- p.toc, into: %{}, do: {id, p.slug}
+    files = for p <- pages, f <- source_files(p), into: %{}, do: {f, p.slug}
+
+    pages = Enum.map(pages, &%{&1 | html: rewrite_links(&1, owners, files, root)})
+
+    layout = template("layout.html.eex")
+
+    for {p, i} <- Enum.with_index(pages) do
+      prev = if i > 0, do: Enum.at(pages, i - 1)
+      next = Enum.at(pages, i + 1)
+
+      html =
+        EEx.eval_file(layout,
+          assigns: [
+            page: p,
+            nav: nav(pages, p.slug),
+            prev: prev,
+            next: next,
+            version: version,
+            repo: @repo
+          ]
+        )
+
+      File.write!(Path.join([out, "docs", p.slug <> ".html"]), html)
+    end
+
+    File.write!(
+      Path.join(out, "index.html"),
+      EEx.eval_file(template("index.html.eex"),
+        assigns: [
+          version: version,
+          repo: @repo,
+          demo?: demo?,
+          embed: embed(readme)
+        ]
+      )
+    )
+
+    base = System.get_env("SITE_BASE", "/armless/")
+
+    File.write!(
+      Path.join(out, "404.html"),
+      EEx.eval_file(template("404.html.eex"), assigns: [base: base, repo: @repo])
+    )
+
+    IO.puts("site: #{length(pages)} doc pages + landing into #{Path.relative_to_cwd(out)}")
+  end
+
+  # The browser snippet of the Quick start, as the README has it
+  defp embed(readme) do
+    [_, code] = Regex.run(~r/```html\n(.*?)```/s, Map.fetch!(readme, "Quick start"))
+    code |> String.trim_trailing() |> h()
+  end
+
+  defp template(name), do: Path.join([__DIR__, "templates", name])
+
+  defp version(cargo) do
+    case Regex.run(~r/^version\s*=\s*"([^"]+)"/m, File.read!(cargo)) do
+      [_, v] -> v
+      _ -> raise "no version in Cargo.toml"
+    end
+  end
+
+  # ---- sources -------------------------------------------------------------
+
+  defp parse_readme(text) do
+    {done, {name, buf}, _} =
+      text
+      |> String.split("\n")
+      |> Enum.reduce({[], {:intro, []}, false}, fn line, {acc, {name, buf}, fence} ->
+        toggled = if String.starts_with?(line, "```"), do: not fence, else: fence
+
+        if not fence and String.starts_with?(line, "## ") do
+          heading = line |> String.trim_leading("## ") |> String.trim()
+          {[{name, buf} | acc], {heading, []}, toggled}
+        else
+          {acc, {name, [line | buf]}, toggled}
+        end
+      end)
+
+    [{name, buf} | done]
+    |> Map.new(fn {n, b} -> {n, b |> Enum.reverse() |> Enum.join("\n") |> String.trim()} end)
+    |> Map.update!(:intro, fn intro -> intro |> String.replace(~r/\A# armless\s*/, "") end)
+  end
+
+  defp assemble(root, _readme, [{:file, path}]) do
+    md = File.read!(Path.join(root, path))
+    {md |> String.replace(~r/\A# .*\n/, "") |> String.trim(), Path.dirname(path) |> dot(), path}
+  end
+
+  defp assemble(_root, readme, sources) do
+    md =
+      sources
+      |> Enum.map(fn
+        :intro ->
+          Map.fetch!(readme, :intro)
+
+        {:section, name} ->
+          section(readme, name, "## " <> name <> "\n\n")
+
+        {:section, name, promote: true} ->
+          section(readme, name, "")
+      end)
+      |> Enum.join("\n\n")
+
+    {md, "", "Readme.md"}
+  end
+
+  defp section(readme, name, prefix) do
+    body = Map.fetch!(readme, name)
+    body = if prefix == "", do: promote(body), else: body
+    prefix <> body
+  end
+
+  # One section on its own page: its `###` headings become the page's `##`.
+  defp promote(body) do
+    {lines, _} =
+      body
+      |> String.split("\n")
+      |> Enum.map_reduce(false, fn line, fence ->
+        toggled = if String.starts_with?(line, "```"), do: not fence, else: fence
+
+        line =
+          if not fence and Regex.match?(~r/^[#]{3,4} /, line), do: String.replace_prefix(line, "#", ""), else: line
+
+        {line, toggled}
+      end)
+
+    Enum.join(lines, "\n")
+  end
+
+  defp dot("."), do: ""
+  defp dot(d), do: d
+
+  defp source_files(%{edit: edit}), do: [edit]
+
+  # ---- markdown ------------------------------------------------------------
+
+  defp render(md) do
+    md
+    |> MDEx.to_html!(
+      extension: [table: true, strikethrough: true],
+      syntax_highlight: nil
+    )
+    |> String.replace("<table>", ~s(<div class="table-wrap" tabindex="0" role="region" aria-label="Table, scrolls sideways"><table>))
+    |> String.replace("</table>", "</table></div>")
+    |> String.replace("<pre", ~s(<pre tabindex="0"))
+    # Short inline code (a flag, an option) never breaks in the middle
+    |> then(&Regex.replace(~r/<code>([^<]{1,32})<\/code>/, &1, "<code class=\"nw\">\\1</code>"))
+    # Each option row of an API table can be linked to: #predecode_mb
+    |> then(&Regex.replace(~r/<tr>\s*<td><code(?: class="nw")?>([a-z][a-z0-9_]*)<\/code>/, &1, fn whole, name ->
+      String.replace(whole, "<tr>", ~s(<tr id="#{name}">), global: false)
+    end))
+  end
+
+  defp add_ids(html) do
+    # Walk the headings in order so repeated titles get distinct ids.
+    {out, {toc, _}} =
+      Regex.split(~r/(<h[23]>.*?<\/h[23]>)/s, html, include_captures: true)
+      |> Enum.map_reduce({[], %{}}, fn chunk, {toc, seen} ->
+        case Regex.run(~r/\A<h([23])>(.*?)<\/h\1>\z/s, chunk) do
+          [_, level, inner] ->
+            text = inner |> String.replace(~r/<[^>]+>/, "") |> unescape()
+            base = slug(text)
+            n = Map.get(seen, base, 0)
+            id = if n == 0, do: base, else: "#{base}-#{n}"
+
+            chunk =
+              ~s(<h#{level} id="#{id}">#{inner}<a class="anchor" href="##{id}" aria-label="Link to #{h(text)}">#</a></h#{level}>)
+
+            {chunk, {[{String.to_integer(level), id, text} | toc], Map.put(seen, base, n + 1)}}
+
+          nil ->
+            {chunk, {toc, seen}}
+        end
+      end)
+
+    {Enum.join(out), Enum.reverse(toc)}
+  end
+
+  defp unescape(s) do
+    s
+    |> String.replace("&amp;", "&")
+    |> String.replace("&lt;", "<")
+    |> String.replace("&gt;", ">")
+    |> String.replace("&quot;", "\"")
+    |> String.replace("&#39;", "'")
+  end
+
+  defp slug(text) do
+    text
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9 \-]/, "")
+    |> String.replace(" ", "-")
+  end
+
+  # ---- links ---------------------------------------------------------------
+
+  defp rewrite_links(page, owners, files, root) do
+    Regex.replace(~r/href="([^"]*)"/, page.html, fn whole, href ->
+      cond do
+        String.starts_with?(href, ["http://", "https://", "mailto:"]) -> whole
+        # permalinks added by add_ids
+        String.starts_with?(href, "#") -> anchor(page, owners, whole, String.trim_leading(href, "#"))
+        true -> ~s(href="#{file_link(page, files, root, href)}")
+      end
+    end)
+  end
+
+  defp anchor(page, owners, whole, id) do
+    case Map.get(owners, id) do
+      nil ->
+        IO.warn("#{page.slug}: no heading for ##{id}")
+        whole
+
+      owner when owner == page.slug ->
+        whole
+
+      owner ->
+        ~s(href="#{owner}.html##{id}")
+    end
+  end
+
+  defp file_link(page, files, root, href) do
+    [path, frag] =
+      case String.split(href, "#", parts: 2) do
+        [p] -> [p, nil]
+        [p, f] -> [p, f]
+      end
+
+    full = Path.join(page.dir, path) |> Path.expand("/") |> String.trim_leading("/")
+    suffix = if frag, do: "#" <> frag, else: ""
+
+    case Map.get(files, full) do
+      nil ->
+        abs = Path.join(root, full)
+        kind = if File.dir?(abs), do: "tree", else: "blob"
+        unless File.exists?(abs), do: IO.warn("#{page.slug}: #{full} does not exist")
+        "#{@repo}/#{kind}/main/#{full}#{suffix}"
+
+      slug ->
+        "#{slug}.html#{suffix}"
+    end
+  end
+
+  # ---- navigation ----------------------------------------------------------
+
+  defp nav(pages, current) do
+    pages
+    |> Enum.chunk_by(& &1.group)
+    |> Enum.map_join("\n", fn [%{group: group} | _] = ps ->
+      items =
+        Enum.map_join(ps, "\n", fn p ->
+          cur = if p.slug == current, do: ~s( aria-current="page"), else: ""
+          ~s(<li><a href="#{p.slug}.html"#{cur}>#{h(p.title)}</a></li>)
+        end)
+
+      ~s(<p class="nav-group">#{h(group)}</p><ul>#{items}</ul>)
+    end)
+  end
+
+  def h(text) do
+    text
+    |> to_string()
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+    |> String.replace("\"", "&quot;")
+  end
+end
+
+Site.run()

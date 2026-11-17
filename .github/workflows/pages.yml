@@ -1,0 +1,59 @@
+name: Pages
+
+# Builds the site (landing page + docs) with site/build.exs and publishes it to
+# GitHub Pages. The docs are cut from Readme.md and docs/, so a change to either
+# redeploys the site. site/demo.exs fetches the landing page's machine (armless.js and
+# armless.wasm, the filesystem of a published snowglobe site, xterm.js); if that fails the
+# site still deploys, and the landing page says the machine is not in this build.
+# In the repository settings, Pages > Source must be "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "docs/**"
+      - "Readme.md"
+      - "Cargo.toml"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+      - uses: actions/configure-pages@v6
+        id: pages
+      - name: Fetch the landing page's machine
+        run: elixir site/demo.exs
+      - name: Build the site
+        run: elixir site/build.exs
+        env:
+          SITE_BASE: ${{ steps.pages.outputs.base_path }}/
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/_out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

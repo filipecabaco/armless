@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><%= Site.h(@page.title) %> · armless</title>
+<meta name="description" content="<%= Site.h(@page.desc) %>">
+<meta property="og:title" content="<%= Site.h(@page.title) %> · armless">
+<meta property="og:description" content="<%= Site.h(@page.desc) %>">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="preload" href="../fonts/SpaceMono-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../style.css">
+<script src="../site.js" defer></script>
+</head>
+<body class="docs">
+<a class="skip" href="#content">Skip to the page</a>
+
+<header class="bar">
+  <a class="name" href="../index.html">armless</a>
+  <nav aria-label="Site"><a href="index.html" aria-current="true">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+</header>
+
+<div class="shell">
+  <aside class="side" aria-label="Pages"><%= @nav %></aside>
+
+  <main id="content" class="doc">
+    <details class="pages-m">
+      <summary>pages <span>/ <%= Site.h(@page.title) %></span></summary>
+      <nav aria-label="Pages, small screens"><%= @nav %></nav>
+    </details>
+    <h1><%= Site.h(@page.title) %></h1>
+    <%= if length(@page.toc) > 1 do %>
+    <details class="toc-m">
+      <summary>on this page</summary>
+      <ul>
+        <%= for {level, id, text} <- @page.toc do %>
+        <li class="l<%= level %>"><a href="#<%= id %>"><%= Site.h(text) %></a></li>
+        <% end %>
+      </ul>
+    </details>
+    <% end %>
+    <div class="prose">
+<%= @page.html %>
+    </div>
+
+    <nav class="pager" aria-label="Previous and next page">
+      <%= if @prev do %><a class="prev" href="<%= @prev.slug %>.html"><span class="dir">previous</span><span class="pager-title"><%= Site.h(@prev.title) %></span></a><% else %><span></span><% end %>
+      <%= if @next do %><a class="next" href="<%= @next.slug %>.html"><span class="dir">next</span><span class="pager-title"><%= Site.h(@next.title) %></span></a><% end %>
+    </nav>
+    <p class="edit"><a href="<%= @repo %>/blob/main/<%= @page.edit %>">this page's source</a></p>
+  </main>
+
+  <%= if length(@page.toc) > 1 do %>
+  <aside class="toc" aria-label="On this page">
+    <p class="nav-group">on this page</p>
+    <ul>
+      <%= for {level, id, text} <- @page.toc do %>
+      <li class="l<%= level %>"><a href="#<%= id %>"><%= Site.h(text) %></a></li>
+      <% end %>
+    </ul>
+  </aside>
+  <% end %>
+</div>
+
+<footer class="foot">
+  <span>armless <%= @version %>. BSD 2-Clause.</span>
+  <nav aria-label="Footer"><a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+</footer>
+</body>
+</html>
