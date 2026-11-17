@@ -1,24 +1,18 @@
 name: Pages
 
-# Builds the site (landing page + docs) with site/build.exs and publishes it to
-# GitHub Pages. The docs are cut from Readme.md and docs/, so a change to either
-# redeploys the site. site/demo.exs fetches the landing page's machine (armless.js and
-# armless.wasm, the filesystem of a published snowglobe site, xterm.js); if that fails the
-# site still deploys, and the landing page says the machine is not in this build.
+# Builds the site (landing page + docs) with site/build.exs and publishes it to GitHub
+# Pages. Every merge to main redeploys it: the docs are cut from Readme.md and docs/, the
+# footer carries the version from Cargo.toml, and the machine is fetched afresh.
+# site/demo.exs fetches the landing page's machine (armless.js and armless.wasm, the
+# filesystem of a published snowglobe site, xterm.js); if that fails the site still
+# deploys, and the landing page says the machine is not in this build.
 #
 # A pull request that touches the site or the docs only builds it, so a broken build shows
-# up before it reaches main. A push to main builds and deploys.
-# In the repository settings, Pages > Source must be "GitHub Actions".
+# up before it reaches main. Pages > Source is "GitHub Actions" in the repository settings.
 
 on:
   push:
     branches: [main]
-    paths:
-      - "site/**"
-      - "docs/**"
-      - "Readme.md"
-      - "Cargo.toml"
-      - ".github/workflows/pages.yml"
   pull_request:
     paths:
       - "site/**"
