@@ -196,6 +196,33 @@ impl Board {
         }
     }
 
+    /// Hold what the guest's writes keep in host memory (its filesystem lives there) to `bytes`
+    /// more than they keep now: past it, the guest's writes fail with ENOSPC and statfs says what
+    /// is left (`Fs::set_write_limit`). None lifts it. Host writes (`fs_write_file`) count too.
+    /// False if the machine has no filesystem.
+    pub fn set_fs_write_limit(&self, bytes: Option<u64>) -> bool {
+        self.with_fs(|fs| fs.set_write_limit(bytes)).is_some()
+    }
+
+    /// Give the guest's file at `path` (absolute) a size limit of its own, outside the write
+    /// budget (`Fs::set_allowance`): a log the host reads back, say, that should go on when the
+    /// guest's other writes are at their limit. False if there is no such file.
+    pub fn set_fs_allowance(&self, path: &str, bytes: Option<u64>) -> bool {
+        self.with_fs(|fs| match fs.lookup_path(path) {
+            Some(ino) => {
+                fs.set_allowance(ino, bytes);
+                true
+            },
+            None => false,
+        })
+        .unwrap_or(false)
+    }
+
+    /// The write budget and what is used of it, if one is set (`set_fs_write_limit`).
+    pub fn fs_write_budget(&self) -> Option<crate::dev::fs::WriteBudget> {
+        self.with_fs(|fs| fs.write_budget()).flatten()
+    }
+
     /// Write a file into the guest's filesystem from the host (absolute guest path), making its
     /// directories: how a host hands a guest its input. Write into a directory the guest has not
     /// looked at yet: its kernel caches what it has seen (cache=loose).
@@ -241,7 +268,11 @@ impl Board {
                 .map_err(err)?
             },
         };
-        p.fs.write(ino, 0, data, now).map_err(err)?;
+        let n = p.fs.write(ino, 0, data, now).map_err(err)?;
+        if n < data.len() {
+            // A file with a size limit of its own (`set_fs_allowance`) took only what fits
+            return Err(format!("{path}: errno {}: {n} of {} bytes written", fs::ENOSPC, data.len()));
+        }
         Ok(())
     }
 
