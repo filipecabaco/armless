@@ -136,6 +136,14 @@ the two compare in the same engine. On 2026-11-17, on one cloud container: nativ
 475 ns and 18 µs; under Node 175 ns, 262 ns, 586 ns and 8.6 µs (unkernel's README: 172 ns, 172 ns,
 482 ns and 57 µs, on its own machine).
 
+`sh bench/machine-syscalls.sh KERNEL [--wasm]` times the same four under a Linux guest kernel
+(machine mode): `bench/syscalls-init.c` is a static `/init` that times them with the guest's own
+clock, booted natively with the native JIT and, with `--wasm`, through armless.js. On 2026-11-17,
+on one cloud container, with Ubuntu's 6.8 arm64 generic kernel: natively 2.2–2.5 µs, 4.3–4.9 µs,
+13–15 µs and 1.8–2.1 ms; under Node 2.9 µs, 5.7 µs, 19.6 µs and 2.7 ms. That is 20–100 times
+user mode's, the price of emulating the kernel's own entry and exit, page tables and scheduler;
+unkernel's README gives 1.7 µs, 2.2 µs, 7.3 µs and 1.2 ms for qemu-system on its machine.
+
 Every pull request runs all of them on its base and then on itself, on one runner
 ([`.github/workflows/bench.yml`](../.github/workflows/bench.yml)), and puts a table of the two in
 the run's summary and in a comment on the pull request (`.github/scripts/bench-table.sh` makes it

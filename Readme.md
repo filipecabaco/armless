@@ -337,6 +337,7 @@ for armless 0.2.10 and older.
 | `node --test 'tests/js/*.test.mjs'` | user mode's API in `armless.js` on `build/armless.wasm` (build it first with `sh build-wasm.sh`): argv and env, `plain_std`, `hostname`, `reap_orphans`, `user_asleep_ms`, and their errors. Self-contained: the programs are machine code made by the test (`tests/js/prog.mjs`) and the filesystem is in memory |
 | `node tests/js/user.mjs SITE` | user mode through `armless.js` against a real program (not in CI, by hand): a `--kernel none` snowglobe site restored from its native snapshot, asked a question, saved and restored again; `--exec FSDIR PROGRAM ARGS` starts a program from a filesystem |
 | `elixir bench/run.exs` | the benchmark guest under the interpreter, the native JIT and the wasm JIT (node) |
+| `node bench/syscalls.mjs`, `sh bench/machine-syscalls.sh KERNEL [--wasm]` | what system calls cost in user mode under Node, and under a guest kernel (machine mode), natively and under Node |
 | `elixir bench/sites.exs ../snowglobe` | real workloads: built snowglobe sites running their own commands |
 | `cargo bench --bench machine` | host-side costs with criterion: an instruction interpreted and compiled, a page's compile, a snapshot |
 | `cargo bench --bench zstd` | the zstd decoder's throughput, whole and in pieces |
