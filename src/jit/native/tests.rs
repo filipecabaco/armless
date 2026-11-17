@@ -348,6 +348,55 @@ fn writes_next_to_code_keep_it_and_writes_to_it_replace_it() {
     assert!(jit.jit.page_invalidations > invalidated);
 }
 
+/// A block that rewrites an instruction further on in itself, then synchronizes (IC IVAU, DSB,
+/// ISB) as the architecture asks, runs the new instruction, not the one it was compiled from:
+/// the write drops the module, and the ISB leaves it.
+#[test]
+fn a_block_that_rewrites_itself_runs_the_new_instruction_after_an_isb() {
+    const SMC: u64 = 0x6000;
+    const NEW: u32 = 0x9100_0800; // add x0, x0, #2
+    // SMC: str w3, [x4]; ic ivau, x4; dsb ish; isb; add x0, x0, #1; b EXIT
+    let words = [
+        0xb900_0083u32,
+        0xd50b_7524,
+        0xd503_3b9f,
+        0xd503_3fdf,
+        0x9100_0400,
+        0x1400_0000 | (((EXIT as i64 - (SMC + 20) as i64) / 4) as u32 & 0x3ff_ffff),
+    ];
+    let Some(mut jit) = at_block(1) else { return };
+    let mut interp = at_block(1).unwrap();
+    interp.jit.enabled = false;
+    for c in [&mut jit, &mut interp] {
+        for (i, w) in words.iter().enumerate() {
+            c.mem.write(SMC as usize + 4 * i, &w.to_le_bytes());
+        }
+        // Compiled while its store goes to a page with no code
+        (c.x[0], c.x[3], c.x[4]) = (0, 0, 0x8000);
+        for _ in 0..4 {
+            c.pc = SMC;
+            c.jit_entry = true;
+            c.run(6);
+            c.wait_native_jit();
+        }
+        assert_eq!(c.x[0], 4);
+    }
+    let runs = jit.jit.block_runs;
+    assert!(runs > 0, "nothing ran compiled");
+    let invalidated = jit.jit.page_invalidations;
+    // Now it rewrites its own `add #1`
+    for c in [&mut jit, &mut interp] {
+        (c.x[0], c.x[3], c.x[4]) = (0, NEW as u64, SMC + 16);
+        c.pc = SMC;
+        c.jit_entry = true;
+        c.run(6);
+        assert_eq!(c.pc, EXIT);
+        assert_eq!(c.x[0], 2, "the instruction written ran, not the one compiled");
+    }
+    assert!(jit.jit.block_runs > runs, "the rewriting run was not compiled code");
+    assert!(jit.jit.page_invalidations > invalidated);
+}
+
 /// A CPU at the start of a two-instruction block (`add x0, x0, #1; b EXIT`) at CODE.
 fn at_block(threshold: u32) -> Option<Cpu<NoDevices>> {
     let mut c = Cpu::new(RAM, NoDevices);

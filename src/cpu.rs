@@ -535,6 +535,16 @@ impl<H: Host> Cpu<H> {
         unsafe { &*self.attn }
     }
 
+    /// The guest wrote `size` bytes at `pa` on a page with code. If that dropped compiled code,
+    /// the block running (perhaps the one that made the write, on the same page) must not go on
+    /// running what it was compiled from: it leaves at its next chained branch or ISB, as it does
+    /// for an interrupt, and the run loop finds what the page holds now.
+    pub(crate) fn code_written(&mut self, pa: u64, size: u32) {
+        if self.jit.code_written(pa, size) {
+            self.set_irq_dirty();
+        }
+    }
+
     /// Re-evaluate interrupts (and shared state) before the next instruction.
     #[inline(always)]
     pub(crate) fn set_irq_dirty(&self) {
@@ -1629,7 +1639,7 @@ impl<H: Host> Cpu<H> {
                 }
                 old = self.ram_load_atomic(pa, size);
             }
-            self.jit.code_written(pa, size);
+            self.code_written(pa, size);
             if self.excl().is_some_and(|e| e & !0x3f == pa & !0x3f) {
                 self.set_excl(None);
             }
@@ -1808,7 +1818,7 @@ impl<H: Host> Cpu<H> {
             let page = (pa & !0xfff) as usize;
             let has_code = self.jit.code_page.get(page >> 12).is_some_and(|&b| b != 0);
             if has_code {
-                self.jit.code_written(pa, size);
+                self.code_written(pa, size);
             } else if !unpriv
                 && page
                     .checked_add(0x1000)

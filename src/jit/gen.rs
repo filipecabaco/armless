@@ -1257,11 +1257,27 @@ impl Gen<'_> {
             }
             return true;
         }
+        if insn & 0xffff_f0ff == 0xd503_30df {
+            // ISB (any CRm): a context synchronization. Code this CPU wrote and invalidated
+            // before it must run as written, so if a write dropped compiled code (which set
+            // irq_dirty, `Cpu::code_written`), leave here for the run loop rather than go on
+            // with the rest of a block that may have been compiled from the old instructions.
+            let l = *self.l;
+            self.c.i32c(0);
+            self.c.i32_load8_u(l.irq_dirty);
+            self.c.if_(EMPTY);
+            let off = self.off + 4;
+            self.store_pc(|g| g.pc_at(off));
+            let k = self.k + 1;
+            self.exit(STATUS_DONE, k);
+            self.c.end();
+            return true;
+        }
         if insn & 0xffff_f01f == 0xd503_301f
             && matches!(field(insn, 5, 3), 4..=6)
             && insn & 0xf00 != 0
         {
-            // DSB/DMB (CRm != 0) and ISB. With several CPUs a DSB may have to
+            // DSB/DMB (CRm != 0). With several CPUs a DSB may have to
             // wait for TLB shootdowns (interpreted) and a DMB orders memory
             // for the other threads (a fence).
             if self.l.smp != 0 {
@@ -1272,9 +1288,6 @@ impl Gen<'_> {
                 }
             }
             return true;
-        }
-        if insn & 0xffff_f0ff == 0xd503_30df {
-            return true; // ISB (any CRm)
         }
         let l = *self.l;
         let mrs = insn & 0xfff0_0000 == 0xd530_0000;
