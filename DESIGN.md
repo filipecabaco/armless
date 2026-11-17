@@ -28,7 +28,7 @@ Space Mono 400 and 700 for everything, including the console. Self-hosted subset
 - **Docs:** plain list of pages on the left (current page underlined), the page, "on this page" on the right from 76rem. Tables scroll inside a ruled region.
 - **Buttons:** quiet until pointed at; primary is solid text colour. 44px tall on touch screens.
 - **Code blocks:** Space Mono like everything else, with a quiet copy button (added by `site.js`; without JavaScript the text is still selectable). Short inline code never breaks mid-token.
-- **Console:** the status line says only what the page has seen happen (starting, typing, running the loop, the shell is yours). Escape, then Tab, leaves the terminal; a polite live region reads the guest's last line to screen readers.
+- **Console:** the guest redraws the Mandelbrot set in place with busybox awk, from 4 to 64 iterations and over again, about two frames a second once warm, shaded by the log of the escape time. Each frame adds 4 MiB to a file that is deleted when the set starts over, so the memory chart climbs as the picture sharpens. The status line says only what the page has seen happen (starting, drawing, the shell is yours). Escape, then Tab, leaves the terminal; a polite live region reads the guest's last line to screen readers.
 - **Small screens:** the page list and "on this page" fold into two collapsed rows above the content.
 
 ## Rules
