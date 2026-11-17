@@ -44,6 +44,10 @@ const MAX_IN_FLIGHT: u32 = 256 * 1024;
 const RTO_MS: u64 = 1000;
 /// Frames queued for the guest at most (it is not reading them).
 const MAX_QUEUED: usize = 8192;
+/// The most TCP connections the guest may have through the stack at once. Each is a connection
+/// the host makes (natively, a thread or two), so a guest opening them without end would exhaust
+/// the host; past this a SYN is refused, as a full listen queue would be.
+pub const MAX_CONNS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
@@ -756,6 +760,11 @@ impl Stack {
 
         let Some(id) = id else {
             if flags & RST != 0 {
+                return;
+            }
+            if flags & SYN != 0 && flags & ACK == 0 && self.conns.len() >= MAX_CONNS {
+                let len = payload.len() as u32 + 1;
+                self.tcp_raw(dst, dport, sport, 0, seq.wrapping_add(len), RST | ACK, &[], &[]);
                 return;
             }
             if flags & SYN != 0 && flags & ACK == 0 {

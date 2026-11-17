@@ -161,6 +161,10 @@ Other ports reach the host as `TcpOpen` streams:
 - **Native:** a real connection, direct or tunnelled with CONNECT through the proxy.
 - **Browser:** refused unless the page takes it.
 
+The guest has at most 1024 TCP connections through the stack at once (`MAX_CONNS`, relayed
+web connections included); past that a SYN is reset, as by a full listen queue, so a guest
+can't make the host open connections (natively, threads) without end.
+
 Either host can carry chosen destinations over a WebSocket instead: a **tunnel** maps a
 name and port (or any name, on a port) to a ws:// or wss:// URL, and each connection to
 it becomes one WebSocket whose binary messages are the stream's bytes (what websockify,
