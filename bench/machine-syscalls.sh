@@ -7,8 +7,9 @@
 #
 #   sh bench/machine-syscalls.sh KERNEL [--wasm]
 #
-# KERNEL: an arm64 Linux Image (gzip, zstd or EFI zboot too), such as Ubuntu's
-# linux-image-unsigned-*-generic_*_arm64.deb's /boot/vmlinuz-* from ports.ubuntu.com.
+# KERNEL: an arm64 Linux Image (gzip, zstd or EFI zboot too). The test kernel (build-linux/Image from
+# tests/linux/build.sh) is the one these numbers are meant for: a distribution's generic kernel does
+# more on every call (Ubuntu's took 2.5-3 times as long).
 set -eu
 cd "$(dirname "$0")/.."
 KERNEL=${1:?usage: bench/machine-syscalls.sh KERNEL [--wasm]}

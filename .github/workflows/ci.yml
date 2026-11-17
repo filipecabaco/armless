@@ -170,6 +170,8 @@ jobs:
           sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-source-6.8.0" build-linux
       - name: Boot Linux to userspace
         run: sh tests/linux/boot.sh build-linux
+      - name: Free page reporting shrinks snapshots
+        run: sh tests/linux/free-pages.sh build-linux
       - name: Build busybox + glibc rootfs
         run: |
           git clone --depth 1 https://github.com/mirror/busybox "$RUNNER_TEMP/busybox"
