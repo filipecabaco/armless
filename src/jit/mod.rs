@@ -420,13 +420,13 @@ impl Jit {
     /// decoded instructions of the words written go too). A JVM, say, writes new code and data
     /// next to compiled code: dropping the whole page each time threw away code that was still
     /// right.
-    pub(crate) fn code_written(&mut self, pa: u64, size: u32) {
+    pub(crate) fn code_written(&mut self, pa: u64, size: u32) -> bool {
         let page = (pa >> 12) as usize;
         let Some(&flags) = self.code_page.get(page) else {
-            return;
+            return false;
         };
         if flags == 0 || size == 0 {
-            return;
+            return false;
         }
         // Decoded instructions alone are cheap to decode again, and dropping them lets writes to
         // the page take the fast path again: only compiled code is worth keeping
@@ -441,11 +441,11 @@ impl Jit {
                     *n += 1;
                     self.pre.forget_words(page, first, last);
                     self.code_writes_kept += 1;
-                    return;
+                    return false;
                 }
             }
             self.invalidate_page_by(page, Inval::Store);
-            return;
+            return false;
         }
         let hit = match self.covered.get(&(page as u32)) {
             Some(c) => (first..=last).any(|w| c[w / 64] & (1 << (w % 64)) != 0),
@@ -457,6 +457,7 @@ impl Jit {
             self.pre.forget_words(page, first, last);
             self.code_writes_kept += 1;
         }
+        hit
     }
     pub fn flush_all(&mut self) {
         self.flushes += 1;
