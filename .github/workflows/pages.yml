@@ -1,0 +1,72 @@
+name: Pages
+
+# Builds the site (landing page + docs) with site/build.exs and publishes it to GitHub
+# Pages. Every merge to main redeploys it: the docs are cut from Readme.md and docs/, the
+# footer carries the version from Cargo.toml, and the machine is fetched afresh.
+# site/demo.exs fetches the landing page's machine (armless.js and armless.wasm, the
+# filesystem of a published snowglobe site, xterm.js); if that fails the site still
+# deploys, and the landing page says the machine is not in this build.
+#
+# A pull request that touches the site or the docs only builds it, so a broken build shows
+# up before it reaches main. Pages > Source is "GitHub Actions" in the repository settings.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "site/**"
+      - "docs/**"
+      - "Readme.md"
+      - "Cargo.toml"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+      - uses: actions/configure-pages@v6
+        if: github.event_name != 'pull_request'
+        id: pages
+      - name: Fetch the landing page's machine
+        run: elixir site/demo.exs
+      - name: Build the site
+        run: elixir site/build.exs
+        env:
+          SITE_BASE: ${{ steps.pages.outputs.base_path || '/armless' }}/
+      - name: Check the build
+        run: |
+          test -f site/_out/index.html
+          test -f site/_out/docs/index.html
+          test -f site/_out/demo/config.json || echo "::warning::the landing page's machine was not fetched; the site says so"
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
+        with:
+          path: site/_out
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>armless: arm64 Linux in a browser tab</title>
+<meta name="description" content="armless is an AArch64 machine emulator written in Rust. It boots unmodified arm64 Linux in a browser tab through WebAssembly, and natively through a Rust crate.">
+<meta property="og:title" content="armless: arm64 Linux in a browser tab">
+<meta property="og:description" content="An AArch64 machine emulator written in Rust. The whole machine, devices included, is Rust.">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/SpaceMono-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="style.css">
+<script src="site.js" defer></script>
+<%= if @demo? do %><link rel="stylesheet" href="demo/xterm.css">
+<script src="demo.js" defer></script><% end %>
+</head>
+<body class="landing">
+<a class="skip" href="#machine">Skip to the machine</a>
+
+<header class="bar">
+  <a class="name" href="index.html">armless</a>
+  <nav aria-label="Site"><a href="docs/index.html">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>arm64 Linux,<br>in a browser tab.</h1>
+    <p class="sub">An AArch64 machine emulator written in Rust. The whole machine, devices included, is Rust.</p>
+    <p class="actions"><a class="btn btn-primary" href="docs/getting-started.html">Read the docs</a> <a class="btn" href="<%= @repo %>/releases">Releases</a></p>
+  </section>
+
+  <section class="machine" id="machine" aria-label="A machine running in this tab">
+    <div class="pane pane-console">
+      <div class="pane-bar"><span class="pane-name">/bin/sh</span>
+        <span id="keys" class="keys" hidden>
+          <button type="button" class="btn" data-send="\x03" aria-label="Send ctrl+c">^C</button>
+          <button type="button" class="btn" data-send="ls -l /tmp\n">ls -l /tmp</button>
+          <button type="button" class="btn" data-send="rm /tmp/ballast\n">rm /tmp/ballast</button>
+        </span>
+        <span class="end"><span id="status" role="status" data-state="off"><%= if @demo?, do: "needs JavaScript", else: "not in this build" %></span></span>
+      </div>
+      <div class="console">
+        <div id="terminal" role="group" aria-label="The machine's console. Ctrl+c stops the loop. Escape, then Tab, leaves the console."></div>
+        <p id="console-log" class="visually-hidden" aria-live="polite"></p>
+        <p id="console-fallback" class="fallback" <%= if @demo?, do: "hidden" %>><%= if @demo?, do: "", else: "The machine is not part of this build." %></p>
+        <noscript><p class="fallback">The machine needs JavaScript and WebAssembly.</p></noscript>
+      </div>
+    </div>
+
+    <div class="pane pane-memory">
+      <div class="pane-bar"><span class="pane-name">memory</span><span class="pane-note">vm.memory_report()</span></div>
+      <div class="memory">
+        <dl class="figures">
+          <div class="wide"><dt>linear memory</dt><dd><span id="m-linear">-</span><small>MiB</small></dd><dd class="note"><span id="m-grown">-</span> MiB since start. It never shrinks.</dd></div>
+          <div><dt>heap now</dt><dd><span id="m-live">-</span><small>MiB</small></dd></div>
+          <div><dt>heap peak</dt><dd><span id="m-peak">-</span><small>MiB</small></dd></div>
+          <div><dt>files written</dt><dd><span id="m-written">-</span><small>MiB</small></dd></div>
+          <div><dt>JIT blocks</dt><dd id="m-jit">-</dd></div>
+        </dl>
+        <figure class="chart">
+          <svg id="chart" viewBox="0 0 520 230" role="img" aria-label="Heap in use now and its peak, in MiB, over the last two minutes"></svg>
+          <figcaption><span class="key live"></span>heap now <span class="key peak"></span>heap peak</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+  <p class="caption">busybox sh from Alpine, run in armless's user mode with no kernel. Ctrl+c stops the loop. Escape, then Tab, leaves the console.</p>
+
+  <section class="embed" id="embed" aria-labelledby="embed-h">
+    <h2 id="embed-h">Embed it</h2>
+    <pre tabindex="0"><code><%= @embed %></code></pre>
+    <p><a href="docs/browser-api.html">Every option, event and call</a></p>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>armless <%= @version %>. BSD 2-Clause. <a href="https://github.com/filipecabaco/snowglobe">snowglobe</a> uses it.</span>
+  <nav aria-label="Footer"><a href="docs/index.html">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+</footer>
+</body>
+</html>
