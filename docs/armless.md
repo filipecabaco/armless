@@ -127,7 +127,11 @@ The host only sees `HttpRequest`/`WsOpen`, with full https://, wss://… URLs:
   goes direct or through the environment's proxy (CONNECT for TLS, absolute-form for
   plain HTTP, `NO_PROXY` honoured) and checks TLS against the system roots, so
   TLS-intercepting sandbox proxies work. Private addresses are refused unless
-  allowed.
+  allowed: going direct, every address a name resolves to is checked and only those are
+  dialled (so DNS rebinding can't slip past); through a proxy, which resolves names itself,
+  destinations that are private as written (IP literals in any form `inet_aton` reads,
+  `localhost` and `*.localhost`) are refused before the proxy sees them, and names are the
+  proxy's own policy.
 
 Randomness for TLS comes from the host (`Board::seed`): the browser uses
 `crypto.getRandomValues`, natively it comes from `/dev/urandom`. It is seeded again

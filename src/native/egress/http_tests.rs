@@ -263,6 +263,35 @@ fn plain_http_through_a_proxy_uses_the_absolute_target_and_its_credentials() {
     assert!(req.contains("Proxy-Authorization: Basic dTpw\r\n"), "{req}");
 }
 
+#[test]
+fn private_destinations_are_refused_before_a_proxy_sees_them() {
+    // Neither proxy listens: a refusal must come before the host dials it
+    let dead = Proxy { host: "127.0.0.1".into(), port: 1, auth: None };
+    let e = Egress {
+        https_proxy: Some(dead.clone()),
+        http_proxy: Some(dead),
+        ..Egress::default()
+    };
+    for host in ["10.1.2.3", "127.1", "2130706433", "169.254.169.254", "::1", "localhost", "api.localhost"] {
+        let err = e.connect(host, 443).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "CONNECT {host}: {err}");
+        assert!(err.to_string().contains("private"), "{err}");
+    }
+    for url in ["http://169.254.169.254/latest/meta-data/", "http://[::1]:8080/", "http://localhost/"] {
+        let Err(err) = e.request("GET", url, &[], &[]) else { panic!("GET {url} was made") };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "GET {url}: {err}");
+    }
+    // With allow_private, they go to the proxy as before
+    let (port, got) = connect_proxy("200 OK");
+    let e = Egress {
+        https_proxy: Some(Proxy { host: "127.0.0.1".into(), port, auth: None }),
+        allow_private: true,
+        ..Egress::default()
+    };
+    e.connect("10.1.2.3", 5432).unwrap();
+    assert!(got.recv().unwrap().starts_with("CONNECT 10.1.2.3:5432 HTTP/1.1\r\n"));
+}
+
 /// A proxy on loopback that answers one CONNECT with `status`, then (on 200) echoes the tunnel.
 fn connect_proxy(status: &'static str) -> (u16, mpsc::Receiver<String>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -298,11 +327,11 @@ fn tcp_through_a_proxy_is_a_connect_tunnel() {
         }),
         ..Egress::default()
     };
-    // A private destination is the proxy's business: the host does not check it
-    let mut s = e.connect("10.1.2.3", 5432).unwrap();
+    // A name is the proxy's to resolve: the host never looks it up
+    let mut s = e.connect("db.only-the-proxy-knows.example", 5432).unwrap();
     let head = got.recv().unwrap();
     assert!(
-        head.starts_with("CONNECT 10.1.2.3:5432 HTTP/1.1\r\nHost: 10.1.2.3:5432\r\n"),
+        head.starts_with("CONNECT db.only-the-proxy-knows.example:5432 HTTP/1.1\r\nHost: db.only-the-proxy-knows.example:5432\r\n"),
         "{head}"
     );
     assert!(head.contains("Proxy-Authorization: Basic YTpi\r\n"));

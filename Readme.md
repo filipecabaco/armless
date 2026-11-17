@@ -217,7 +217,8 @@ runner.start();
   `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`), with TLS checked against the system's roots
   (`SSL_CERT_FILE` included). That covers sandboxes whose only way out is a
   TLS-intercepting proxy. Private and loopback addresses are off limits unless
-  `allow_private` is set. [`examples/fetch.rs`](examples/fetch.rs) makes a request this way.
+  `allow_private` is set (through a proxy, which resolves names itself, private IP literals
+  and `localhost` names are refused before it sees them). [`examples/fetch.rs`](examples/fetch.rs) makes a request this way.
 - `Board::set_fs_cache` is the native counterpart of `fs_cache_mb`.
 - `runner::new_vm` and every `Runner` restore seed the machine from the host
   (`Board::seed`), so a restored guest gets a new VM generation id and Linux reseeds its
