@@ -120,6 +120,17 @@ and it costs compile time and code (blocks overlap). A block that branches to it
 in place instead (`loop $self` in `gen.rs`), which made the compiled loop of `cargo bench --bench
 machine` 17% faster.
 
+Carrying guest registers round a compiled loop in host registers (Cranelift variables: loaded once
+before the loop, their stores kept back round it and made where control leaves it) was tried on
+2026-11-17 too, the idea behind unkernel's registers in wasm locals. It gained nothing on the
+compiled loop above and made the benchmark guest's total 4–15% slower, depending on how much was
+carried (everything the loop reads, or only what it both reads and writes, at most six; stores kept
+back through `if`s or not). The native JIT already reuses a field's value within straight-line code
+(`known`) and defers its stores; what a carried value saves is a load that hits the cache, while it
+costs merges, register pressure and reloads after every helper call, and most of a loop's time is
+the fast TLB's checks, the budget and interrupt check, and helpers. Measured interleaved, median
+of five runs each: the TLB and TTBR phases 11–17% slower, nothing faster beyond noise.
+
 ## `cargo bench --bench machine`
 
 Host-side costs with [criterion](https://github.com/bheisler/criterion.rs): one guest
