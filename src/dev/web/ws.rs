@@ -14,6 +14,31 @@ pub const PONG: u8 = 10;
 
 /// "No status code": what a close frame without one means, and never sent (RFC 6455 7.4.1).
 pub const NO_STATUS: u16 = 1005;
+/// The close code for a message too big to process (RFC 6455 7.4.1).
+pub const TOO_BIG: u16 = 1009;
+
+/// The largest frame, and message, either end takes in: a peer can declare 2^63 bytes, and what
+/// it sends is buffered until the frame is whole.
+pub const MAX_MESSAGE: usize = 64 << 20;
+
+/// More than MAX_MESSAGE in one frame or one message.
+#[derive(Debug, PartialEq)]
+pub struct TooBig;
+
+/// Whether the frame starting `b` declares a payload longer than MAX_MESSAGE (known as soon as
+/// its length is in, long before the payload is).
+pub fn oversized(b: &[u8]) -> bool {
+    let Some(&b1) = b.get(1) else { return false };
+    let len = match b1 & 127 {
+        126 => return false, // at most 65535
+        127 => match b.get(2..10) {
+            Some(l) => u64::from_be_bytes(l.try_into().unwrap()),
+            None => return false,
+        },
+        n => n as u64,
+    };
+    len > MAX_MESSAGE as u64
+}
 
 #[derive(Debug, PartialEq)]
 pub struct Frame {
@@ -118,14 +143,19 @@ pub struct Messages {
 
 impl Messages {
     /// Take a data frame (TEXT, BINARY or CONTINUATION): the message it completes, as
-    /// (text, data).
-    pub fn push(&mut self, f: Frame) -> Option<(bool, Vec<u8>)> {
+    /// (text, data). A message that grows past MAX_MESSAGE is refused (the connection should
+    /// close with TOO_BIG).
+    pub fn push(&mut self, f: Frame) -> Result<Option<(bool, Vec<u8>)>, TooBig> {
         if f.opcode != CONTINUATION {
             self.text = f.opcode == TEXT;
             self.data.clear();
         }
+        if self.data.len() + f.payload.len() > MAX_MESSAGE {
+            self.data = Vec::new();
+            return Err(TooBig);
+        }
         self.data.extend_from_slice(&f.payload);
-        f.fin.then(|| (self.text, std::mem::take(&mut self.data)))
+        Ok(f.fin.then(|| (self.text, std::mem::take(&mut self.data))))
     }
 }
 
@@ -179,9 +209,9 @@ mod tests {
         let mut m = Messages::default();
         let (f, n) = parse(&[0x01, 0x03, 0x48, 0x65, 0x6c]).unwrap();
         assert_eq!(n, 5);
-        assert_eq!(m.push(f), None);
+        assert_eq!(m.push(f).unwrap(), None);
         let (f, _) = parse(&[0x80, 0x02, 0x6c, 0x6f]).unwrap();
-        assert_eq!(m.push(f), Some((true, b"Hello".to_vec())));
+        assert_eq!(m.push(f).unwrap(), Some((true, b"Hello".to_vec())));
     }
 
     #[test]
@@ -213,16 +243,44 @@ mod tests {
             opcode,
             payload: p.to_vec(),
         };
-        assert_eq!(m.push(frame(false, BINARY, b"lost")), None);
+        assert_eq!(m.push(frame(false, BINARY, b"lost")).unwrap(), None);
         assert_eq!(
-            m.push(frame(true, TEXT, b"kept")),
+            m.push(frame(true, TEXT, b"kept")).unwrap(),
             Some((true, b"kept".to_vec()))
         );
-        assert_eq!(m.push(frame(false, BINARY, &[1])), None);
-        assert_eq!(m.push(frame(false, CONTINUATION, &[2])), None);
+        assert_eq!(m.push(frame(false, BINARY, &[1])).unwrap(), None);
+        assert_eq!(m.push(frame(false, CONTINUATION, &[2])).unwrap(), None);
         assert_eq!(
-            m.push(frame(true, CONTINUATION, &[3])),
+            m.push(frame(true, CONTINUATION, &[3])).unwrap(),
             Some((false, vec![1, 2, 3]))
         );
+    }
+
+    #[test]
+    fn frames_and_messages_past_the_limit_are_refused() {
+        // A header declaring 2^63 bytes is known to be too big before any payload arrives
+        let mut huge = vec![0x82, 127];
+        huge.extend_from_slice(&(1u64 << 63).to_be_bytes());
+        assert!(oversized(&huge));
+        assert!(!oversized(&huge[..5]), "not until its length is in");
+        let mut big = vec![0x82, 127];
+        big.extend_from_slice(&(MAX_MESSAGE as u64 + 1).to_be_bytes());
+        assert!(oversized(&big));
+        let mut ok = vec![0x82, 127];
+        ok.extend_from_slice(&(MAX_MESSAGE as u64).to_be_bytes());
+        assert!(!oversized(&ok));
+        assert!(!oversized(&[0x82, 126, 0xff, 0xff]));
+        // Fragments that add up to more than the limit
+        let frame = |fin, opcode, p: &[u8]| Frame {
+            fin,
+            opcode,
+            payload: p.to_vec(),
+        };
+        let mut m = Messages::default();
+        let half = vec![0u8; MAX_MESSAGE / 2 + 1];
+        assert_eq!(m.push(frame(false, BINARY, &half)), Ok(None));
+        assert_eq!(m.push(frame(true, CONTINUATION, &half)), Err(TooBig));
+        // and the next message starts afresh
+        assert_eq!(m.push(frame(true, TEXT, b"x")), Ok(Some((true, b"x".to_vec()))));
     }
 }

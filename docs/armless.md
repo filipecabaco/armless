@@ -116,8 +116,17 @@ the site's CA, end inside the machine:
   (fetch() never does); a host that sends less, or more, than it said closes the
   connection. HTTP/1.0 and `connection: close` requests get a response that ends with
   the connection, as does a guest that has finished sending, after its last request.
+  Requests are parsed strictly, since the host passes them on (perhaps to a shared proxy):
+  a bare CR or LF or another control character in the head, a folded line, a header name
+  or method that is no token, or a Content-Length that isn't one plain number is a 400.
+  A body may be at most 64 MiB (`MAX_BODY`, refused with 413 as soon as the head or a
+  chunk size says more); a chunked one is read incrementally. What the guest sends while
+  its request is answered, or its WebSocket opened, is held up to a body and a head more
+  (pipelining); past that the connection closes.
 - **WebSocket upgrades** become `WsOpen` and the frames become messages. Pings are
-  answered in the machine.
+  answered in the machine. A frame or a message over 64 MiB (`MAX_WS_MESSAGE`), from the
+  guest or from a server the native host talks to, closes the WebSocket with 1009, as soon
+  as the frame's length is in.
 
 The host only sees `HttpRequest`/`WsOpen`, with full https://, wss://… URLs:
 

@@ -12,6 +12,8 @@ pub mod cert;
 pub mod tls;
 pub(crate) mod ws;
 
+pub use ws::MAX_MESSAGE as MAX_WS_MESSAGE;
+
 use sha2::{Digest, Sha256};
 
 use super::Event;
@@ -96,6 +98,15 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The largest request body the relay takes (the host needs it whole before it makes the
+/// request): beyond it the guest gets 413.
+pub const MAX_BODY: usize = 64 << 20;
+/// What a request's head may take before it is refused (431).
+const MAX_HEAD: usize = 1 << 16;
+/// The most the guest may have buffered while the relay can't use it (a request it is answering,
+/// a WebSocket being opened): a body and a head more is pipelining, past that it is a flood.
+const MAX_PENDING: usize = MAX_BODY + MAX_HEAD;
+
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -148,25 +159,58 @@ impl Head {
     }
 }
 
+/// A token (RFC 9110 5.6.2): what a method and a header name are made of.
+fn token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 fn parse_head(b: &[u8]) -> Option<Result<Head, ()>> {
     let end = find(b, b"\r\n\r\n")?;
-    let text = String::from_utf8_lossy(&b[..end]);
+    // A line ends with CRLF and holds no other control character but tab: a bare CR or LF would
+    // end a line for the next hop (a proxy, a server) that it doesn't end here, so what the guest
+    // put after it would become a header or a request of its own there
+    let head = &b[..end];
+    for (i, &c) in head.iter().enumerate() {
+        let ok = match c {
+            b'\r' => head.get(i + 1) == Some(&b'\n'),
+            b'\n' => i > 0 && head[i - 1] == b'\r',
+            b'\t' => true,
+            0..=0x1f | 0x7f => false,
+            _ => true,
+        };
+        if !ok {
+            return Some(Err(()));
+        }
+    }
+    let text = String::from_utf8_lossy(head);
     let mut lines = text.split("\r\n");
     let first = lines.next().unwrap_or("");
     let mut parts = first.split(' ');
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
         return Some(Err(()));
     };
-    let http11 = parts
-        .next()
+    if !token(method) || target.is_empty() || target.contains('\t') {
+        return Some(Err(()));
+    }
+    let version = parts.next();
+    if parts.next().is_some() || version.is_some_and(|v| !v.starts_with("HTTP/")) {
+        return Some(Err(()));
+    }
+    let http11 = version
         .and_then(|v| v.strip_prefix("HTTP/"))
         .is_some_and(|v| v != "1.0" && v != "0.9");
     let mut headers = Vec::new();
     for line in lines {
+        // No folded lines (obsolete, RFC 9112 5.2), and a name that is a token, with no space
+        // before its colon
         let Some((k, v)) = line.split_once(':') else {
             return Some(Err(()));
         };
-        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        if !token(k) {
+            return Some(Err(()));
+        }
+        headers.push((k.to_ascii_lowercase(), v.trim_matches([' ', '\t']).to_string()));
     }
     Some(Ok(Head {
         method: method.to_string(),
@@ -177,23 +221,40 @@ fn parse_head(b: &[u8]) -> Option<Result<Head, ()>> {
     }))
 }
 
+/// How far a chunked body has been read: its chunks so far, and where the next chunk's size
+/// line starts (relative to the body). Kept between calls, so each byte is looked at once.
+#[derive(Default)]
+struct Chunks {
+    at: usize,
+    out: Vec<u8>,
+}
+
+/// Why a request can't be taken.
+#[derive(Debug, PartialEq)]
+enum BadBody {
+    /// Unparseable framing (400)
+    Malformed,
+    /// More than MAX_BODY (413)
+    TooLarge,
+}
+
 /// The whole body once it is in, and where the request ends: Ok(None) while it is still
 /// arriving.
-fn body(head: &Head, b: &[u8]) -> Result<Option<(Vec<u8>, usize)>, ()> {
+fn body(head: &Head, b: &[u8], chunks: &mut Chunks) -> Result<Option<(Vec<u8>, usize)>, BadBody> {
     let body = &b[head.body_start..];
-    if head
-        .get("transfer-encoding")
-        .is_some_and(|t| t.to_ascii_lowercase().contains("chunked"))
-    {
-        let mut out = Vec::new();
-        let mut at = 0;
+    if let Some(te) = head.get("transfer-encoding") {
+        // Chunked is the only coding a request may end with that the relay can frame
+        if !te.to_ascii_lowercase().split(',').next_back().is_some_and(|t| t.trim() == "chunked") {
+            return Err(BadBody::Malformed);
+        }
         loop {
+            let at = chunks.at;
             let Some(eol) = find(&body[at..], b"\r\n") else {
-                return Ok(None);
+                return if body.len() - at > 4096 { Err(BadBody::Malformed) } else { Ok(None) };
             };
             let line = String::from_utf8_lossy(&body[at..at + eol]);
             let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-                .map_err(|_| ())?;
+                .map_err(|_| BadBody::Malformed)?;
             let data = at + eol + 2;
             if size == 0 {
                 // Trailers (ignored), then an empty line
@@ -202,27 +263,44 @@ fn body(head: &Head, b: &[u8]) -> Result<Option<(Vec<u8>, usize)>, ()> {
                 } else {
                     match find(&body[data..], b"\r\n\r\n") {
                         Some(e) => data + e + 4,
+                        None if body.len() - data > MAX_HEAD => return Err(BadBody::Malformed),
                         None => return Ok(None),
                     }
                 };
-                return Ok(Some((out, head.body_start + end)));
+                return Ok(Some((std::mem::take(&mut chunks.out), head.body_start + end)));
             }
-            // The size is the guest's: one past usize would wrap the bounds below
-            let next = data
-                .checked_add(size)
-                .and_then(|e| e.checked_add(2))
-                .ok_or(())?;
+            if chunks.out.len().saturating_add(size) > MAX_BODY {
+                return Err(BadBody::TooLarge);
+            }
+            let next = data + size + 2;
             if body.len() < next {
                 return Ok(None);
             }
-            out.extend_from_slice(&body[data..data + size]);
-            at = next;
+            if &body[data + size..next] != b"\r\n" {
+                return Err(BadBody::Malformed);
+            }
+            chunks.out.extend_from_slice(&body[data..data + size]);
+            chunks.at = next;
         }
     }
-    let n: usize = head
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // One length, or the same one repeated (RFC 9112 6.3): anything else can't frame the request
+    let mut lengths = head.headers.iter().filter(|(k, _)| k == "content-length");
+    let n = match lengths.next() {
+        None => 0,
+        Some((_, v)) => {
+            if v.is_empty() || !v.bytes().all(|c| c.is_ascii_digit()) {
+                return Err(BadBody::Malformed);
+            }
+            let n: usize = v.parse().map_err(|_| BadBody::TooLarge)?;
+            if lengths.any(|(_, w)| w != v) {
+                return Err(BadBody::Malformed);
+            }
+            n
+        },
+    };
+    if n > MAX_BODY {
+        return Err(BadBody::TooLarge);
+    }
     Ok((body.len() >= n).then(|| (body[..n].to_vec(), head.body_start + n)))
 }
 
@@ -281,6 +359,8 @@ pub struct Web {
     ws_key: String,
     /// "100 Continue" was sent
     continued: bool,
+    /// The request's chunked body, as far as it has been read
+    chunks: Chunks,
 }
 
 impl Web {
@@ -299,6 +379,7 @@ impl Web {
             ws_messages: ws::Messages::default(),
             ws_key: String::new(),
             continued: false,
+            chunks: Chunks::default(),
         }
     }
 
@@ -318,6 +399,7 @@ impl Web {
         self.phase = Phase::Request;
         self.head_only = false;
         self.continued = false;
+        self.chunks = Chunks::default();
         self.request(out);
         if self.phase == Phase::Request && self.guest_done {
             self.finish(out);
@@ -366,8 +448,17 @@ impl Web {
             Phase::Request => self.request(&mut out),
             Phase::WebSocket => self.frames(&mut out),
             // Anything else the guest sends while we answer (a pipelined request, or WebSocket
-            // frames before the socket opened) waits in the buffer
-            _ => {},
+            // frames before the socket opened) waits in the buffer, up to a limit
+            Phase::Waiting | Phase::Responding | Phase::WsOpening => {
+                if self.buf.len() > MAX_PENDING {
+                    if self.phase == Phase::WsOpening {
+                        out.events.push(Event::WsClose { id: self.id, code: ws::TOO_BIG });
+                    }
+                    self.buf = Vec::new();
+                    self.finish(&mut out);
+                }
+            },
+            Phase::Done => self.buf.clear(),
         }
         out
     }
@@ -417,7 +508,7 @@ impl Web {
         }
         let head = match parse_head(&self.buf) {
             None => {
-                if self.buf.len() > 1 << 16 {
+                if self.buf.len() > MAX_HEAD {
                     self.respond_error(
                         431,
                         "Request Header Fields Too Large",
@@ -457,14 +548,31 @@ impl Web {
             });
             return;
         }
-        let body = match body(&head, &self.buf) {
-            Err(()) => {
+        let body = match body(&head, &self.buf, &mut self.chunks) {
+            Err(BadBody::Malformed) => {
                 return self.respond_error(
                     400,
                     "Bad Request",
-                    "armless: malformed chunked body\n",
+                    "armless: malformed request body\n",
                     out,
                 )
+            },
+            Err(BadBody::TooLarge) => {
+                return self.respond_error(
+                    413,
+                    "Content Too Large",
+                    "armless: request body too large\n",
+                    out,
+                )
+            },
+            Ok(None) if self.buf.len() > MAX_PENDING + MAX_BODY => {
+                // A chunked body of tiny chunks: framing costs more than the body is allowed
+                return self.respond_error(
+                    413,
+                    "Content Too Large",
+                    "armless: request body too large\n",
+                    out,
+                );
             },
             Ok(None) => {
                 // curl waits a second for this before sending a large body
@@ -483,6 +591,7 @@ impl Web {
         let (body, end) = body;
         // A pipelined request after this one waits in the buffer
         self.buf.drain(..end);
+        self.chunks = Chunks::default();
         self.head_only = head.method.eq_ignore_ascii_case("HEAD");
         self.keep_alive = head.keep_alive();
         let url = self.url(&head, if self.https { "https" } else { "http" });
@@ -682,6 +791,9 @@ impl Web {
     /// The guest's frames: masked, and a message may span several.
     fn frames(&mut self, out: &mut Out) {
         while self.phase == Phase::WebSocket {
+            if ws::oversized(&self.buf) {
+                return self.ws_too_big(out);
+            }
             let Some((frame, used)) = ws::parse(&self.buf) else {
                 return;
             };
@@ -701,16 +813,24 @@ impl Web {
                 // Ping: answered here; the host keeps its own connection alive
                 ws::PING => self.send(&ws::encode(ws::PONG, &frame.payload, None), out),
                 ws::PONG => {},
-                _ => {
-                    if let Some((text, data)) = self.ws_messages.push(frame) {
-                        out.events.push(Event::WsMessage {
-                            id: self.id,
-                            text,
-                            data,
-                        });
-                    }
+                _ => match self.ws_messages.push(frame) {
+                    Ok(Some((text, data))) => out.events.push(Event::WsMessage {
+                        id: self.id,
+                        text,
+                        data,
+                    }),
+                    Ok(None) => {},
+                    Err(ws::TooBig) => return self.ws_too_big(out),
                 },
             }
         }
+    }
+
+    /// A frame or message over ws::MAX_MESSAGE from the guest: close both sides with 1009.
+    fn ws_too_big(&mut self, out: &mut Out) {
+        self.buf = Vec::new();
+        self.send(&ws::encode(ws::CLOSE, &ws::close_payload(ws::TOO_BIG), None), out);
+        out.events.push(Event::WsClose { id: self.id, code: ws::TOO_BIG });
+        self.finish(out);
     }
 }

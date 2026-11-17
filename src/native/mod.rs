@@ -613,8 +613,14 @@ fn websocket(
                 return;
             },
         }
-        // Whole frames from the server
-        while let Some((frame, used)) = ws::parse(&buf) {
+        // Whole frames from the server, none past ws::MAX_MESSAGE (alone or put together)
+        loop {
+            if ws::oversized(&buf) {
+                let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(ws::TOO_BIG)));
+                board.ws_close(id, ws::TOO_BIG);
+                return;
+            }
+            let Some((frame, used)) = ws::parse(&buf) else { break };
             buf.drain(..used);
             match frame.opcode {
                 ws::CLOSE => {
@@ -625,11 +631,18 @@ fn websocket(
                     let _ = conn.write_all(&client_frame(ws::PONG, &frame.payload));
                 },
                 ws::PONG => {},
-                _ => {
-                    if let Some((text, data)) = messages.push(frame) {
+                _ => match messages.push(frame) {
+                    Ok(Some((text, data))) => {
                         board.ws_send(id, text, &data);
                         backpressure(board, closed, id);
-                    }
+                    },
+                    Ok(None) => {},
+                    Err(ws::TooBig) => {
+                        let _ = conn
+                            .write_all(&client_frame(ws::CLOSE, &ws::close_payload(ws::TOO_BIG)));
+                        board.ws_close(id, ws::TOO_BIG);
+                        return;
+                    },
                 },
             }
         }
@@ -707,7 +720,14 @@ fn tunnel(
                 return;
             },
         }
-        while let Some((frame, used)) = ws::parse(&buf) {
+        loop {
+            // A frame no buffer should hold: the tunnel's far end is broken or hostile
+            if ws::oversized(&buf) {
+                let _ = conn.write_all(&client_frame(ws::CLOSE, &ws::close_payload(ws::TOO_BIG)));
+                abort(board, conns, id);
+                return;
+            }
+            let Some((frame, used)) = ws::parse(&buf) else { break };
             buf.drain(..used);
             match frame.opcode {
                 ws::CLOSE => {
