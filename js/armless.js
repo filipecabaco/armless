@@ -383,7 +383,124 @@
       tls: o.tls,
       // Guest TCP destinations carried over a WebSocket: [{ host?, port, url }]
       tunnels: (o.tunnels || []).map((t) => ({ ...t, host: t.host?.toLowerCase() })),
+      // What the guest's requests and WebSockets may reach: `allow({ url, host, port, kind })`
+      // (true, false or a promise of one) decides alone; otherwise private, loopback and
+      // link-local destinations are refused unless `allow_private`
+      allow: typeof o.allow === "function" ? o.allow : null,
+      allow_private: !!o.allow_private,
     };
+  }
+
+  // ------------------------------------------------- what the guest may reach
+
+  // A server-side runtime (Node, Bun, Deno): no browser stands between the guest and the host's
+  // network, and fetch() there hands back redirects instead of following them out of sight
+  const SERVER_SIDE = !!globalThis.process?.versions?.node || typeof globalThis.Deno !== "undefined";
+
+  function v4_private(a, b, c) {
+    return a === 0 || a === 10 || a === 127 || a >= 224 // this network, private, loopback, multicast, reserved
+      || a === 100 && (b & 0xc0) === 64 // carrier-grade NAT
+      || a === 169 && b === 254 // link-local, cloud metadata
+      || a === 172 && (b & 0xf0) === 16
+      || a === 192 && b === 168
+      || a === 192 && b === 0 && c === 0
+      || a === 198 && (b & 0xfe) === 18; // benchmarking: local proxies' fake addresses
+  }
+
+  /** The eight 16-bit groups of an IPv6 address (no brackets, no zone), or null. */
+  function v6_groups(h) {
+    let tail = null;
+    const v4 = h.match(/^(.*:)(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (v4) {
+      const b = v4.slice(2).map(Number);
+      if (b.some((x) => x > 255)) return null;
+      h = v4[1] + "0:0";
+      tail = [b[0] << 8 | b[1], b[2] << 8 | b[3]];
+    }
+    const halves = h.split("::");
+    if (halves.length > 2) return null;
+    const part = (x) => (x === "" ? [] : x.split(":").map((g) => (/^[0-9a-f]{1,4}$/i.test(g) ? parseInt(g, 16) : NaN)));
+    const head = part(halves[0]);
+    const rest = halves.length === 2 ? part(halves[1]) : [];
+    const fill = halves.length === 2 ? 8 - head.length - rest.length : 0;
+    if (fill < 0) return null;
+    const g = [...head, ...new Array(fill).fill(0), ...rest];
+    if (g.length !== 8 || g.some(Number.isNaN)) return null;
+    if (tail) g.splice(6, 2, ...tail);
+    return g;
+  }
+
+  /**
+   * Whether a host is private: loopback, private, link-local or multicast, `localhost`, or an
+   * IPv6 form that carries such an IPv4 address. `host` is a URL's hostname (IPv4 in dotted
+   * form whatever shorthand the guest wrote, IPv6 in brackets) or an address a lookup gave.
+   */
+  function private_host(host) {
+    let h = String(host).toLowerCase().replace(/\.$/, "");
+    if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+    h = h.replace(/%.*$/, "");
+    if (h === "" || h === "localhost" || h.endsWith(".localhost")) return true;
+    const v4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (v4) {
+      const b = v4.slice(1).map(Number);
+      return b.some((x) => x > 255) || v4_private(b[0], b[1], b[2]);
+    }
+    if (!h.includes(":")) return false; // a name
+    const g = v6_groups(h);
+    if (!g) return true; // no address anyone should be dialling
+    const low = () => v4_private(g[6] >> 8, g[6] & 0xff, g[7] >> 8);
+    const zero = (from, to) => g.slice(from, to).every((x) => x === 0);
+    return zero(0, 8) // unspecified
+      || zero(0, 7) && g[7] === 1 // loopback
+      || (g[0] & 0xfe00) === 0xfc00 // unique local
+      || (g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xffc0) === 0xfec0 // link- and site-local
+      || (g[0] & 0xff00) === 0xff00 // multicast
+      || zero(0, 5) && (g[5] === 0xffff || g[5] === 0) && low() // IPv4-mapped and -compatible
+      || g[0] === 0x64 && g[1] === 0xff9b && (g[2] === 1 || zero(2, 6) && low()) // NAT64
+      || g[0] === 0x2002 && v4_private(g[1] >> 8, g[1] & 0xff, g[2] >> 8) // 6to4
+      || g[0] === 0x2001 && g[1] === 0; // Teredo
+  }
+
+  /**
+   * Why the guest may not reach `url` (a request's or WebSocket's, as it will be made), or null
+   * if it may. `kind` is "http" or "websocket".
+   */
+  async function egress_refusal(o, url, kind) {
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      return `${url} is not a URL`;
+    }
+    const host = u.hostname.replace(/^\[|\]$/g, "");
+    const secure = u.protocol === "https:" || u.protocol === "wss:";
+    const port = u.port ? Number(u.port) : secure ? 443 : 80;
+    if (o.allow) {
+      let ok = false;
+      try {
+        ok = await o.allow({ url: u.href, host, port, kind });
+      } catch { /* refused */ }
+      return ok ? null : `${u.host} is not allowed for the guest`;
+    }
+    if (o.allow_private) return null;
+    // The page's own origin: what the page serves, the guest may have too (without the
+    // visitor's cookies, which are never sent)
+    if (!SERVER_SIDE && typeof location !== "undefined"
+      && location.origin === `${secure ? "https" : "http"}://${u.host}`) return null;
+    if (private_host(u.hostname)) return `${host} is a private address: not reachable from the guest`;
+    // A name, where no browser stands in the way: what it resolves to. (fetch() looks it up
+    // again, so a name whose answer changes in between gets past this: a host that must be sure
+    // runs the native host, whose Egress dials only the addresses it checked, or sets `allow`.)
+    const dns = SERVER_SIDE && !host.includes(":") && !/^[\d.]+$/.test(host)
+      ? globalThis.process?.getBuiltinModule?.("node:dns") : null;
+    if (dns) {
+      try {
+        const found = await dns.promises.lookup(host, { all: true });
+        const bad = found.find((a) => private_host(a.address));
+        if (bad) return `${host} is a private address (${bad.address}): not reachable from the guest`;
+      } catch { /* fetch() reports a name that doesn't resolve */ }
+    }
+    return null;
   }
 
   function tunnel_for(tunnels, host, port) {
@@ -1285,6 +1402,9 @@
       };
       let target = url;
       if (o.upgrade_https && target.startsWith("http:")) target = "https:" + target.slice(5);
+      const refused = await egress_refusal(o, target, "http");
+      if (refused) return fail(refused);
+      if (this._web.get(id) !== w) return;
       const h = new Headers();
       for (const [k, v] of headers) {
         try { h.append(k, v); } catch { /* a header the browser won't send */ }
@@ -1296,7 +1416,13 @@
           headers: h,
           body: /^(GET|HEAD)$/i.test(method) ? undefined : body,
           signal: w.abort?.signal,
-          redirect: "follow",
+          // Never the visitor's cookies, HTTP authentication or referrer: the guest's requests
+          // are its own, not the page's
+          credentials: "omit",
+          referrerPolicy: "no-referrer",
+          // Where fetch() hands back redirects (not in a browser, which hides them), they go to
+          // the guest, whose next request is checked as this one was
+          redirect: SERVER_SIDE ? "manual" : "follow",
         });
       } catch (err) {
         return fail(`the browser could not fetch ${target} (the server must allow CORS): ${err}`);
@@ -1384,16 +1510,35 @@
       const o = this._web_options;
       let target = url;
       if (o.upgrade_https && target.startsWith("ws:")) target = "wss:" + target.slice(3);
+      const w = { socket: null };
+      this._web.set(id, w);
+      egress_refusal(o, target, "websocket").then((refused) => {
+        if (this._web.get(id) !== w) return; // the guest gave up meanwhile
+        if (refused) {
+          this._web.delete(id);
+          this._str_call("armless_http_fail", id, refused);
+          this._drain();
+          this._poke();
+          return;
+        }
+        this._websocket_open(id, w, target, protocols);
+      });
+    }
+
+    _websocket_open(id, w, target, protocols) {
+      const o = this._web_options;
       let socket;
       try {
         socket = new o.WebSocket(target, protocols);
       } catch (err) {
+        this._web.delete(id);
         this._str_call("armless_http_fail", id, `the browser could not open ${target}: ${err}`);
-        return this._drain();
+        this._drain();
+        this._poke();
+        return;
       }
       socket.binaryType = "arraybuffer";
-      const w = { socket };
-      this._web.set(id, w);
+      w.socket = socket;
       let opened = false;
       socket.onopen = () => {
         opened = true;
@@ -1454,6 +1599,9 @@
 
   Armless.Connection = Connection;
   Armless.load = load;
+  // What the guest may reach, for hosts that build their own `allow` on it
+  Armless.private_host = private_host;
+  Armless._web_options = web_options; // for tests
 
   root.Armless = Armless;
   if (typeof module === "object" && module.exports) module.exports = { Armless };

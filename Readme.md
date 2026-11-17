@@ -146,6 +146,21 @@ vm.on("stop", ({ reason, code }) => console.log(reason, code)); // "exit", 0
   any name on that port. `url` can be a function of `{ host, port }` returning a URL or a
   promise of one, called for each connection (to add a fresh access token, say); if it
   throws or rejects, the guest's connection is refused.
+  The destination is the guest's choice: a function should check `{ host, port }` before it
+  hands out a credential.
+- `allow_private`: let the guest's requests and WebSockets reach private, loopback and
+  link-local addresses (`localhost`, 10/8, 192.168/16, 169.254/16, fc00::/7 and the IPv6
+  forms that carry them). Off by default; the page's own origin is always reachable. Under
+  Node, Bun or Deno a name is also refused if it resolves to such an address (fetch() looks
+  it up again, so for a guarantee use the native host, which dials only what it checked).
+- `allow`: `({ url, host, port, kind })` → true or false (or a promise of one), deciding
+  alone which requests (`kind` "http") and WebSockets ("websocket") go out.
+  `Armless.private_host(host)` is the default's test, to build on.
+
+The guest's requests never carry the visitor's cookies, HTTP authentication or referrer
+(`credentials: "omit"`, `referrerPolicy: "no-referrer"`). Under Node, Bun and Deno a redirect
+goes back to the guest, whose next request is checked again; a browser follows redirects
+itself, under CORS.
 
 ### Events
 

@@ -122,7 +122,10 @@ the site's CA, end inside the machine:
 The host only sees `HttpRequest`/`WsOpen`, with full https://, wss://… URLs:
 
 - **Browser:** `fetch()` and `WebSocket`, upgraded to https:// and wss:// on https
-  pages (CORS applies).
+  pages (CORS applies). Requests never carry the visitor's cookies, authentication or
+  referrer, and private destinations are refused unless the page allows them (`allow`,
+  `allow_private`); under Node, Bun and Deno names are checked by what they resolve to, and
+  redirects go back to the guest instead of being followed.
 - **Native:** `native::Egress`, a small HTTP/1.1 + WebSocket client on rustls. It
   goes direct or through the environment's proxy (CONNECT for TLS, absolute-form for
   plain HTTP, `NO_PROXY` honoured) and checks TLS against the system roots, so
