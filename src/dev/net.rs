@@ -12,6 +12,8 @@ const F_MAC: u64 = 1 << 5;
 const RX: usize = 0;
 const TX: usize = 1;
 const HDR: usize = 12;
+/// The longest frame the guest may send (an IP packet is at most 64 KiB, plus Ethernet's header).
+const MAX_FRAME: usize = 65535 + 14;
 
 pub struct Net {
     pub mac: [u8; 6],
@@ -68,7 +70,9 @@ impl Net {
             TX => {
                 let mut irq = false;
                 while let Some(chain) = t.queues[TX].pop(io) {
-                    let data = chain.read_all(io);
+                    // A frame and its header: the device offers no segmentation offload, so
+                    // nothing longer is a frame
+                    let data = chain.read_up_to(io, HDR + MAX_FRAME);
                     if data.len() > HDR {
                         self.stack.receive(&data[HDR..], &io.out);
                     }

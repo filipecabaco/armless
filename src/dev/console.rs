@@ -15,6 +15,8 @@ const RX: usize = 0;
 const TX: usize = 1;
 /// Input kept for the guest at most (a paste can be large; a flood is not).
 const MAX_PENDING: usize = 16 << 20;
+/// The most one write of the guest's is read (Linux's hvc writes a page at most).
+const MAX_WRITE: usize = 1 << 20;
 
 pub struct Console {
     pub cols: u16,
@@ -103,7 +105,7 @@ impl Console {
             TX => {
                 let mut out = Vec::new();
                 while let Some(chain) = t.queues[TX].pop(io) {
-                    out.extend(chain.read_all(io));
+                    out.extend(chain.read_up_to(io, MAX_WRITE));
                     t.complete(io, TX, chain.head, 0);
                 }
                 if !out.is_empty() {

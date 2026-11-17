@@ -41,11 +41,23 @@ impl Chain {
 
     /// Everything the driver gave the device to read.
     pub fn read_all(&self, io: &Io) -> Vec<u8> {
-        let mut out = vec![0; self.read_len()];
+        self.read_up_to(io, usize::MAX)
+    }
+
+    /// What the driver gave the device to read, up to `max` bytes. The lengths are the driver's:
+    /// a device that knows the most a request of its may hold reads no more than that, rather
+    /// than allocating what the descriptors claim (up to all of RAM, in a host heap that, in a
+    /// browser, never shrinks).
+    pub fn read_up_to(&self, io: &Io, max: usize) -> Vec<u8> {
+        let mut out = vec![0; self.read_len().min(max)];
         let mut at = 0;
         for &(addr, len) in &self.readable {
-            io.read(addr, &mut out[at..at + len as usize]);
-            at += len as usize;
+            let n = (len as usize).min(out.len() - at);
+            if n == 0 {
+                break;
+            }
+            io.read(addr, &mut out[at..at + n]);
+            at += n;
         }
         out
     }
@@ -587,6 +599,24 @@ mod tests {
         let chain = q.pop(&io).unwrap();
         assert_eq!(chain.read_all(&io), b"abcde");
         assert_eq!(chain.write_len(), 64);
+    }
+
+    #[test]
+    fn a_device_reads_no_more_than_its_requests_can_hold() {
+        let io = io();
+        let mut q = queue();
+        io.write(0x8000, b"abc");
+        io.write(0x8100, b"defgh");
+        // Lengths the driver claims are far past what is read: RAM-sized
+        desc(&io, 0, 0x8000, 3, DESC_F_NEXT, 1);
+        desc(&io, 1, 0x8100, (1 << 20) - 0x8100, 0, 0);
+        offer(&io, 0);
+        let chain = q.pop(&io).unwrap();
+        assert_eq!(chain.read_len(), 3 + (1 << 20) - 0x8100);
+        assert_eq!(chain.read_up_to(&io, 6), b"abcdef");
+        assert_eq!(chain.read_up_to(&io, 2), b"ab");
+        assert_eq!(chain.read_up_to(&io, 0), b"");
+        assert_eq!(chain.read_up_to(&io, usize::MAX).len(), chain.read_len());
     }
 
     #[test]

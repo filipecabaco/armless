@@ -19,7 +19,7 @@ pub mod virtio;
 pub mod web;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::board;
@@ -73,11 +73,18 @@ pub enum Event {
 
 type Notify = Box<dyn Fn() + Send + Sync>;
 
+/// The most console and serial output waits for the host before more is dropped.
+pub const MAX_OUTPUT: usize = 16 << 20;
+
 /// Events for the host, in order.
 pub struct Outbox {
     queue: SpinLock<VecDeque<Event>>,
     notified: AtomicBool,
     notify: SpinLock<Option<Notify>>,
+    /// Console and serial output queued, in bytes
+    output: AtomicUsize,
+    /// Console and serial output dropped because the host wasn't taking it
+    dropped: AtomicU64,
 }
 
 impl Default for Outbox {
@@ -86,6 +93,8 @@ impl Default for Outbox {
             queue: SpinLock::new(VecDeque::new()),
             notified: AtomicBool::new(false),
             notify: SpinLock::new(None),
+            output: AtomicUsize::new(0),
+            dropped: AtomicU64::new(0),
         }
     }
 }
@@ -99,6 +108,17 @@ impl Outbox {
     pub fn push(&self, e: Event) {
         {
             let mut q = self.queue.lock();
+            // Output the host isn't taking (a page in a background tab, a host that stopped
+            // reading) can't pile up without end: past MAX_OUTPUT what the guest writes is dropped,
+            // and counted, until the host drains the queue
+            if let Event::Console(b) | Event::Serial(b) = &e {
+                let queued = self.output.load(Ordering::Relaxed);
+                if queued + b.len() > MAX_OUTPUT {
+                    self.dropped.fetch_add(b.len() as u64, Ordering::Relaxed);
+                    return;
+                }
+                self.output.store(queued + b.len(), Ordering::Relaxed);
+            }
             // Output arrives a byte or a line at a time: merge it.
             match (q.back_mut(), &e) {
                 (Some(Event::Console(a)), Event::Console(b))
@@ -122,7 +142,15 @@ impl Outbox {
 
     pub fn drain(&self) -> Vec<Event> {
         self.notified.store(false, Ordering::SeqCst);
-        self.queue.lock().drain(..).collect()
+        let mut q = self.queue.lock();
+        self.output.store(0, Ordering::Relaxed);
+        q.drain(..).collect()
+    }
+
+    /// Bytes of console and serial output dropped so far because more than MAX_OUTPUT waited
+    /// for the host.
+    pub fn dropped_output(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -414,5 +442,33 @@ impl Devices {
             }
         }
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+
+    #[test]
+    fn output_the_host_is_not_taking_is_bounded_and_counted() {
+        let out = Outbox::default();
+        let line = vec![b'x'; 1 << 20];
+        for _ in 0..(MAX_OUTPUT >> 20) + 4 {
+            out.push(Event::Console(line.clone()));
+            out.push(Event::TcpClosed { id: 1 }); // interleaved: no merging to hide behind
+        }
+        let queued: usize = out
+            .drain()
+            .iter()
+            .map(|e| match e {
+                Event::Console(b) => b.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(queued, MAX_OUTPUT);
+        assert_eq!(out.dropped_output(), 4 << 20);
+        // Drained, there is room again
+        out.push(Event::Serial(b"after".to_vec()));
+        assert!(matches!(&out.drain()[..], [Event::Serial(b)] if b == b"after"));
     }
 }
