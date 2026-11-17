@@ -113,6 +113,13 @@ Lowering the threshold made every site slower, so that time is the interpreter's
 less time and java, elixir and python were 1–4% faster, but the benchmark guest's tight loops ran
 7–23% slower; even then a lower threshold did not pay. `single_pass` made every site 21–31% slower.
 
+Superblocks (compiled blocks that go on past a conditional branch, on the path not taken, instead
+of ending at it) were tried on 2026-11-17: the benchmark guest's total grew about 11%, natively
+and through the wasm JIT. Registers go through memory either way, so a longer block saves little,
+and it costs compile time and code (blocks overlap). A block that branches to its own start loops
+in place instead (`loop $self` in `gen.rs`), which made the compiled loop of `cargo bench --bench
+machine` 17% faster.
+
 ## `cargo bench --bench machine`
 
 Host-side costs with [criterion](https://github.com/bheisler/criterion.rs): one guest
