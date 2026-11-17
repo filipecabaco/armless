@@ -1,0 +1,12 @@
+#!/bin/busybox sh
+# The landing page's guest: Linux boots into this from the initramfs, which holds a static busybox
+# and the mandel script. The shell gets the console as its controlling terminal, so ctrl+c works.
+/bin/busybox --install -s /bin
+export PATH=/bin HOME=/root TERM=xterm-256color PS1='~ # '
+mount -t devtmpfs dev /dev
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t tmpfs tmp /tmp
+cd /root
+echo "Linux $(uname -r) on $(nproc) CPUs"
+while :; do setsid cttyhack sh; done

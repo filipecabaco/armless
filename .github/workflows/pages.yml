@@ -2,13 +2,18 @@ name: Pages
 
 # Builds the site (landing page + docs) with site/build.exs and publishes it to GitHub
 # Pages. Every merge to main redeploys it: the docs are cut from Readme.md and docs/, the
-# footer carries the version from Cargo.toml, and the machine is fetched afresh.
-# site/demo.exs fetches the landing page's machine (armless.js and armless.wasm, the
-# filesystem of a published snowglobe site, xterm.js); if that fails the site still
-# deploys, and the landing page says the machine is not in this build.
+# footer carries the version from Cargo.toml, and the machine is put together afresh.
 #
-# A pull request that touches the site or the docs only builds it, so a broken build shows
-# up before it reaches main. Pages > Source is "GitHub Actions" in the repository settings.
+# The landing page's machine boots Linux on several CPUs. Its kernel and busybox are built
+# the way ci.yml's linux job builds its own (tests/linux/build.sh, build-rootfs.sh), and
+# cached; site/demo.exs then fetches armless.js and its wasm from the latest release and
+# packs the initramfs (site/guest). If that fails the site still deploys, and the landing
+# page says the machine is not in this build.
+#
+# A pull request that touches the site, the docs or the guest only builds and tests it, so a
+# broken build shows up before it reaches main. The tests are site/test: the CPU count for a
+# device, the machine booted on 1 to 8 CPUs, and the docs' cutting, links and anchors.
+# Pages > Source is "GitHub Actions" in the repository settings.
 
 on:
   push:
@@ -17,6 +22,7 @@ on:
     paths:
       - "site/**"
       - "docs/**"
+      - "tests/linux/**"
       - "Readme.md"
       - "Cargo.toml"
       - ".github/workflows/pages.yml"
@@ -31,7 +37,8 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # The image whose linux-source package tests/linux builds from, as in ci.yml
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: erlef/setup-beam@v1
@@ -41,8 +48,40 @@ jobs:
       - uses: actions/configure-pages@v6
         if: github.event_name != 'pull_request'
         id: pages
-      - name: Fetch the landing page's machine
-        run: elixir site/demo.exs
+      - name: Cache the guest's kernel and busybox
+        id: guest
+        uses: actions/cache@v6
+        with:
+          path: build-linux
+          key: site-guest-linux-6.8-${{ hashFiles('tests/linux/armless_defconfig', 'tests/linux/build.sh', 'tests/linux/init.c', 'tests/linux/mkcpio.py', 'tests/linux/build-rootfs.sh') }}
+      - uses: ./.github/actions/apt
+        if: steps.guest.outputs.cache-hit != 'true'
+        with:
+          set: linux
+      - name: Build the guest's kernel and busybox
+        if: steps.guest.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/linux"
+          tar xjf /usr/src/linux-source-6.8.0/linux-source-6.8.0.tar.bz2 -C "$RUNNER_TEMP/linux"
+          sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-source-6.8.0" build-linux
+          git clone --depth 1 https://github.com/mirror/busybox "$RUNNER_TEMP/busybox"
+          sh tests/linux/build-rootfs.sh "$RUNNER_TEMP/busybox" build-linux
+      - name: Put the landing page's machine together
+        run: elixir site/demo.exs build-linux
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Test the CPU count for a device
+        run: node --test site/test/cpus.test.mjs
+      - name: Test the machine (boot, nproc, mandel, ctrl+c) on 1, 2, 4 and 8 CPUs
+        run: |
+          if [ ! -f site/static/demo/config.json ]; then
+            echo "::warning::the machine was not put together; nothing to test"
+            exit 0
+          fi
+          for n in 1 2 4 8; do node site/test/guest.mjs site/static/demo $n; done
+      - name: Test the site (docs cutting, links, anchors, mandel.awk)
+        run: elixir site/test/site_test.exs
       - name: Build the site
         run: elixir site/build.exs
         env:
@@ -51,7 +90,7 @@ jobs:
         run: |
           test -f site/_out/index.html
           test -f site/_out/docs/index.html
-          test -f site/_out/demo/config.json || echo "::warning::the landing page's machine was not fetched; the site says so"
+          test -f site/_out/demo/config.json || echo "::warning::the landing page's machine was not put together; the site says so"
       - uses: actions/upload-pages-artifact@v5
         if: github.event_name != 'pull_request'
         with:

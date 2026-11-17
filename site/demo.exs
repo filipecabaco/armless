@@ -1,56 +1,92 @@
 #!/usr/bin/env elixir
 
-# Fetches what the landing page's machine needs into site/static/demo (git-ignored):
-# armless.js and armless.wasm, the filesystem tree of a published snowglobe site, and
-# xterm.js. The machine is a program in armless's user mode (busybox's sh from that
-# site's Alpine filesystem); the filesystem's blobs stay where snowglobe keeps them and
-# are fetched by the page on first read.
+# Puts what the landing page's machine needs into site/static/demo (git-ignored):
 #
-#   elixir site/demo.exs [SNOWGLOBE_SITE_URL]
+# - armless.js, armless.wasm and armless-smp.wasm from armless's latest release
+# - xterm.js, for the console
+# - the guest: a Linux kernel and an initramfs with a static busybox and site/guest/*, from a
+#   directory where tests/linux/build.sh and build-rootfs.sh put Image and busybox
 #
-# A failed download leaves the demo out and the build goes on: the landing page says so.
+#   elixir site/demo.exs KERNEL_DIR
+#
+# Without the release files or the kernel the build goes on: the landing page says the machine
+# is not part of it.
 
 Mix.install([{:req, "~> 0.5"}])
+Logger.configure(level: :info)
 
 defmodule Demo do
-  @site "https://filipecabaco.github.io/snowglobe/curl/"
+  @release "https://api.github.com/repos/filipecabaco/armless/releases/latest"
   @xterm "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0"
   @fit "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0"
+  # armless's limit; the page gives the machine as many of these as the device can spare (cpus.js)
+  @max_cpus 8
+  @memory_mb 256
 
-  def run(argv) do
-    site = argv |> List.first(@site) |> String.trim_trailing("/") |> Kernel.<>("/")
+  def run([kernel_dir]) do
+    root = Path.expand("..", __DIR__)
     out = Path.join([__DIR__, "static", "demo"])
+    File.rm_rf!(out)
     File.mkdir_p!(out)
 
-    index = get!(site).body
-    baseurl = capture!(index, ~r/baseurl:\s*"([^"]+)"/, "the filesystem's blob address")
-    memory_mb = capture!(index, ~r/memory_mb:\s*(\d+)/, "memory_mb") |> String.to_integer()
+    # armless itself, as released
+    release = get!(@release).body
+    assets = Map.new(release["assets"], &{&1["name"], &1["browser_download_url"]})
 
-    files = [
-      {site <> "armless/armless.js", "armless.js"},
-      {site <> "armless/armless.wasm", "armless.wasm"},
-      {site <> "system/filesystem.json", "filesystem.json"},
-      {@xterm <> "/lib/xterm.js", "xterm.js"},
-      {@xterm <> "/css/xterm.css", "xterm.css"},
-      {@fit <> "/lib/addon-fit.js", "addon-fit.js"}
-    ]
-
-    for {url, name} <- files do
-      body = get!(url, decode_body: false).body
-      File.write!(Path.join(out, name), body)
-      IO.puts("demo: #{name} #{byte_size(body)} bytes")
+    for name <- ~w(armless.js armless.wasm armless-smp.wasm) do
+      url = Map.get(assets, name) || raise "#{release["tag_name"]} has no #{name}"
+      save(out, name, get!(url, decode_body: false).body)
     end
 
-    # One blob has to answer, or the machine could not start
-    probe = baseurl <> (File.read!(Path.join(out, "filesystem.json")) |> first_blob!())
-    %{status: 200} = Req.head!(probe)
+    for {url, name} <- [
+          {@xterm <> "/lib/xterm.js", "xterm.js"},
+          {@xterm <> "/css/xterm.css", "xterm.css"},
+          {@fit <> "/lib/addon-fit.js", "addon-fit.js"}
+        ] do
+      save(out, name, get!(url, decode_body: false).body)
+    end
+
+    # The guest: the kernel, gzipped (armless boots Image, gzip, zstd or EFI zboot) ...
+    image = File.read!(Path.join(kernel_dir, "Image"))
+    save(out, "Image.gz", :zlib.gzip(image))
+
+    # ... and an initramfs: busybox, the init script and the Mandelbrot set
+    guest = Path.join(__DIR__, "guest")
+
+    {_, 0} =
+      System.cmd("python3", [
+        Path.join([root, "tests", "linux", "mkcpio.py"]),
+        Path.join(out, "initrd.cpio"),
+        "init=" <> Path.join(guest, "init"),
+        "bin/busybox=" <> Path.join(kernel_dir, "busybox"),
+        "bin/mandel=" <> Path.join(guest, "mandel"),
+        "usr/share/mandel.awk=" <> Path.join(guest, "mandel.awk"),
+        "proc/",
+        "sys/",
+        "tmp/",
+        "root/"
+      ])
+
+    IO.puts("demo: initrd.cpio #{File.stat!(Path.join(out, "initrd.cpio")).size} bytes")
 
     File.write!(
       Path.join(out, "config.json"),
-      JSON.encode!(%{source: site, baseurl: baseurl, memory_mb: memory_mb, fetched: Date.utc_today()})
+      JSON.encode!(%{
+        armless: release["tag_name"],
+        max_cpus: @max_cpus,
+        memory_mb: @memory_mb,
+        cmdline: "console=hvc0 quiet rdinit=/init"
+      })
     )
 
-    IO.puts("demo: ready, blobs from #{baseurl}")
+    IO.puts("demo: ready, #{release["tag_name"]}, up to #{@max_cpus} CPUs")
+  end
+
+  def run(_), do: raise("usage: elixir site/demo.exs KERNEL_DIR")
+
+  defp save(out, name, body) do
+    File.write!(Path.join(out, name), body)
+    IO.puts("demo: #{name} #{byte_size(body)} bytes")
   end
 
   defp get!(url, opts \\ []) do
@@ -58,27 +94,13 @@ defmodule Demo do
     if resp.status != 200, do: raise("#{url}: HTTP #{resp.status}")
     resp
   end
-
-  defp capture!(text, regex, what) do
-    case Regex.run(regex, text) do
-      [_, v] -> v
-      _ -> raise "demo: could not find #{what} in the site's page"
-    end
-  end
-
-  defp first_blob!(json) do
-    case Regex.run(~r/"([0-9a-f]{10}\.bin\.zst)"/, json) do
-      [_, blob] -> blob
-      _ -> raise "demo: no blob in filesystem.json"
-    end
-  end
 end
 
 try do
   Demo.run(System.argv())
 rescue
   e ->
-    IO.warn("demo: not fetched (#{Exception.message(e)}); the landing page will say the machine is unavailable")
+    IO.warn("demo: not built (#{Exception.message(e)}); the landing page will say the machine is unavailable")
     File.rm_rf!(Path.join([__DIR__, "static", "demo"]))
     System.halt(0)
 end

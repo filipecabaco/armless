@@ -7,6 +7,15 @@
 <meta name="description" content="armless is an AArch64 machine emulator written in Rust. It boots unmodified arm64 Linux in a browser tab through WebAssembly, and natively through a Rust crate.">
 <meta property="og:title" content="armless: arm64 Linux in a browser tab">
 <meta property="og:description" content="An AArch64 machine emulator written in Rust. The whole machine, devices included, is Rust.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="armless">
+<meta property="og:url" content="<%= @site %>">
+<meta property="og:image" content="<%= @site %>og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="armless: arm64 Linux, in a browser tab. Beside the headline, the Mandelbrot set as the page's machine draws it in its console.">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="color-scheme" content="dark">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="fonts/SpaceMono-400.woff2" as="font" type="font/woff2" crossorigin>
@@ -35,13 +44,13 @@
       <div class="pane-bar"><span class="pane-name">/bin/sh</span>
         <span id="keys" class="keys" hidden>
           <button type="button" class="btn" data-send="\x03" aria-label="Send ctrl+c">^C</button>
-          <button type="button" class="btn" data-send="ls -l /tmp\n">ls -l /tmp</button>
-          <button type="button" class="btn" data-send="rm /tmp/ballast\n">rm /tmp/ballast</button>
+          <button type="button" class="btn" data-send="nproc\n">nproc</button>
+          <button type="button" class="btn" data-send="cat /proc/cpuinfo\n">cpuinfo</button>
         </span>
         <span class="end"><span id="status" role="status" data-state="off"><%= if @demo?, do: "needs JavaScript", else: "not in this build" %></span></span>
       </div>
       <div class="console">
-        <div id="terminal" role="group" aria-label="The machine's console. Ctrl+c stops the loop. Escape, then Tab, leaves the console."></div>
+        <div id="terminal" role="group" aria-label="The machine's console. Ctrl+c stops the drawing. Escape, then Tab, leaves the console."></div>
         <p id="console-log" class="visually-hidden" aria-live="polite"></p>
         <p id="console-fallback" class="fallback" <%= if @demo?, do: "hidden" %>><%= if @demo?, do: "", else: "The machine is not part of this build." %></p>
         <noscript><p class="fallback">The machine needs JavaScript and WebAssembly.</p></noscript>
@@ -49,23 +58,23 @@
     </div>
 
     <div class="pane pane-memory">
-      <div class="pane-bar"><span class="pane-name">memory</span><span class="pane-note">vm.memory_report()</span></div>
+      <div class="pane-bar"><span class="pane-name">machine</span><span class="pane-note">vm.smp_report()</span></div>
       <div class="memory">
         <dl class="figures">
-          <div class="wide"><dt>linear memory</dt><dd><span id="m-linear">-</span><small>MiB</small></dd><dd class="note"><span id="m-grown">-</span> MiB since start. It never shrinks.</dd></div>
-          <div><dt>heap now</dt><dd><span id="m-live">-</span><small>MiB</small></dd></div>
-          <div><dt>heap peak</dt><dd><span id="m-peak">-</span><small>MiB</small></dd></div>
-          <div><dt>files written</dt><dd><span id="m-written">-</span><small>MiB</small></dd></div>
+          <div class="wide"><dt>instructions per second, all CPUs</dt><dd><span id="m-mips">-</span><small>MIPS</small></dd></div>
+          <div><dt>CPUs</dt><dd id="m-cpus">-</dd><dd class="note" id="m-cores"></dd></div>
           <div><dt>JIT blocks</dt><dd id="m-jit">-</dd></div>
+          <div><dt>linear memory</dt><dd><span id="m-linear">-</span><small>MiB</small></dd></div>
         </dl>
+        <ul class="cpus" id="cpus" aria-label="Instructions per second, each CPU"></ul>
         <figure class="chart">
-          <svg id="chart" viewBox="0 0 520 230" role="img" aria-label="Heap in use now and its peak, in MiB, over the last two minutes"></svg>
-          <figcaption><span class="key live"></span>heap now <span class="key peak"></span>heap peak</figcaption>
+          <svg id="chart" viewBox="0 0 520 200" role="img" aria-label="Instructions per second across all CPUs, over the last two minutes"></svg>
+          <figcaption><span class="key live"></span>all CPUs</figcaption>
         </figure>
       </div>
     </div>
   </section>
-  <p class="caption">busybox sh from Alpine, run in armless's user mode with no kernel. Ctrl+c stops the loop. Escape, then Tab, leaves the console.</p>
+  <p class="caption">Linux 6.8, booted in this tab from an initramfs with busybox, with as many CPUs as this device can spare. One awk per CPU draws the Mandelbrot set. Ctrl+c stops it. Escape, then Tab, leaves the console.<span id="one-cpu" hidden> This browser could not isolate the page, so the machine has one CPU.</span></p>
 
   <section class="embed" id="embed" aria-labelledby="embed-h">
     <h2 id="embed-h">Embed it</h2>
