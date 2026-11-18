@@ -1393,6 +1393,10 @@ fn the_host_starts_a_process_with_pipes_and_takes_its_output_and_status() {
     step(&mut proc);
     let pid = proc.spawn(&["prog".into()], &["PATH=/usr/bin".into()], "/tmp", None).unwrap();
     assert_ne!(pid, 1000);
+    // Not yet run: work for the machine; once it waits for its stdin, only for the host
+    assert!(proc.spawn_busy());
+    step(&mut proc);
+    assert!(!proc.spawn_busy());
     assert!(proc.spawn_input(pid, b"ping"));
     proc.spawn_close_input(pid);
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1422,7 +1426,7 @@ const O_DIR: u64 = 0o2_200_000;
 
 /// read(fd, data[at..], 256), then write(1) of what it read
 fn cat(p: &mut Prog, fd: u64, at: u32) {
-    p.sys(63, &[I(fd), D(at), I(256)]).save(0x180);
+    p.sys(63, &[I(fd), D(at), I(1024)]).save(0x180);
     p.sys(64, &[I(1), D(at), W(0x180)]);
 }
 

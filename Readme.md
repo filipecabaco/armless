@@ -206,6 +206,23 @@ connections nobody accepts, and no tunnel takes, are refused.
   wake_ms, code }`, and `idle` fires when the program waits for input (not when it only sleeps
   or waits for files). An idle program costs nothing: it runs again at its next deadline
   (`wake_ms`), on input, or when a file it waits on arrives.
+- User mode, jobs beside the program: `const job = await vm.spawn({ argv: ["/bin/sh", "-s"], env:
+  ["PATH=..."], cwd: "/root" })` starts a process of its own (root, a session of its own, no
+  parent) while the machine runs, as a native host's `Process::spawn` does; it throws when the
+  machine isn't in user mode or the build has no spawn, and fetches the program's files first.
+  `job.pid`; `job.write(bytesOrString)` (false once its stdin is gone); `job.closeInput()`;
+  `job.poll()` returns `{ stdout, stderr: Uint8Array, exit }` of what it did since the last poll
+  (`exit` is null while it runs, then 0 to 255, 128 + the signal for one a signal ended; it
+  throws once the job is released; there is no output event: poll); `job.kill(sig = 15)` signals
+  its process group; `job.release()` lets go of it. `save_process()` fails while a job is held
+  (not released): a snapshot keeps no host end of a job's pipes.
+- User mode, memory: a program reads its own, as on Linux, from the frames its page tables map:
+  `/proc/<pid>/status` (`VmPeak` (as `VmSize`), `VmSize`, `VmHWM`, `VmRSS`, `RssAnon`, `RssFile`,
+  `RssShmem`, `VmData`, `VmStk`, `VmExe`), `/proc/<pid>/statm`, fields 23 and 24 of
+  `/proc/<pid>/stat`, `getrusage`'s `ru_maxrss` (self, and the children that ended) and the free
+  memory of `/proc/meminfo` and `sysinfo` (RAM less the frames in use). A page counts once
+  touched (a reservation with `PROT_NONE` or `MAP_NORESERVE` only raises the size), and a
+  copy-on-write page after a fork counts in each process.
 - `smp_report()`: with several CPUs, what they did and what their waits for one another cost:
   `{ cpus, host_cores, policy, oversubscribed, slow_waits, tlbi, ic_invals, kicks, insns: [per
   CPU], waits: { tlb, wfe, lock: { waits, spins, yields, ms, max_ms } }, workers: [{ run_ms,

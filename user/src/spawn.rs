@@ -8,7 +8,8 @@
 //!
 //! With no parent nothing reaps it but the host: a shell that waits for every child (the first
 //! process's) doesn't take its status. What it leaves running (`cmd &`) goes on, as a job's does.
-//! The host's ends of the pipes are not in a snapshot: take one with no job running.
+//! The host's ends of the pipes are not in a snapshot: take one with no job held (`spawned`
+//! empty; the browser build's `armless_user_save` refuses while one is).
 
 use std::collections::BTreeMap;
 
@@ -132,6 +133,7 @@ impl Process {
                 creds,
                 groups: Vec::new(),
                 aio: BTreeMap::new(),
+                child_maxrss: 0,
             },
         );
         // Its program loaded into its address space, which is the one the process that runs has
@@ -285,6 +287,27 @@ impl Process {
             }
         }
         self.poke();
+    }
+
+    /// Whether a process `spawn` started (or what it started in its group) is at work: not ended,
+    /// and not only waiting for something the host gives it (its stdin: a read of a pipe with no
+    /// deadline). One that runs, sleeps or waits on files is work the machine has to go on with,
+    /// as the host's own program going quiet is not.
+    pub fn spawn_busy(&self) -> bool {
+        let group: Vec<i64> = self
+            .spawned
+            .keys()
+            .flat_map(|&pid| {
+                self.proc_list()
+                    .filter(move |p| p.pgid == pid && p.zombie.is_none())
+                    .map(|p| p.pid)
+            })
+            .collect();
+        self.threads.iter().any(|t| {
+            !t.exited
+                && group.contains(&t.pid)
+                && !matches!(t.wait, Some((crate::Wait::Retry { .. }, None)))
+        })
     }
 
     /// The processes `spawn` started that haven't been released

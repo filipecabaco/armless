@@ -28,6 +28,7 @@
 //! The CPU's TLB is told of what a call changes after it (`sync_mmu`): the whole of it when pages
 //! went away or lost permissions, the pages of a break of sharing otherwise.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use armless::cpu::Cpu;
@@ -305,6 +306,22 @@ pub(crate) struct Mm {
     per_file: BTreeMap<Ino, u64>,
     /// References to take (true) or give back, for the filesystem (`Process::settle`)
     refs: Vec<(Ino, bool)>,
+    /// Pages of this space that have a frame mapped, and the most it ever had: what /proc and
+    /// getrusage report as resident. Not saved: a restored space counts what it has (`recount`).
+    rss: Cell<u64>,
+    hwm: Cell<u64>,
+}
+
+/// What a space holds, for /proc/<pid>/{status,statm} (bytes, except the resident counts: pages)
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MemStats {
+    pub size: u64,
+    pub anon: u64,
+    pub file: u64,
+    pub shmem: u64,
+    pub exe: u64,
+    pub data: u64,
+    pub stack: u64,
 }
 
 impl Mm {
@@ -328,6 +345,8 @@ impl Mm {
             free: BTreeMap::from([(mmap_floor, mmap_top)]),
             per_file: BTreeMap::new(),
             refs: Vec::new(),
+            rss: Cell::new(0),
+            hwm: Cell::new(0),
         })
     }
 
@@ -347,6 +366,8 @@ impl Mm {
             free: BTreeMap::new(),
             per_file: BTreeMap::new(),
             refs: Vec::new(),
+            rss: Cell::new(0),
+            hwm: Cell::new(0),
         }
     }
 
@@ -385,8 +406,61 @@ impl Mm {
             }
             t = e & ADDR;
         }
-        f.put(t + 8 * idx(va, 3), d);
+        let leaf = t + 8 * idx(va, 3);
+        if f.get(leaf) & 1 == 0 && d & 1 != 0 {
+            self.gain(1);
+        }
+        f.put(leaf, d);
         true
+    }
+
+    /// `n` more pages resident
+    fn gain(&self, n: u64) {
+        let r = self.rss.get() + n;
+        self.rss.set(r);
+        self.hwm.set(self.hwm.get().max(r));
+    }
+
+    fn lose(&self, n: usize) {
+        self.rss.set(self.rss.get().saturating_sub(n as u64));
+    }
+
+    /// Pages with a frame mapped now, and the most there were
+    pub(crate) fn resident(&self) -> (u64, u64) {
+        (self.rss.get(), self.hwm.get().max(self.rss.get()))
+    }
+
+    /// Counts the pages mapped (a space just restored: its peak is what it has)
+    pub(crate) fn recount(&self, f: &Frames) {
+        let n = self.leaves(f, 0, VA_END).len() as u64;
+        self.rss.set(n);
+        self.hwm.set(n);
+    }
+
+    /// What the areas hold; `stack` is the range the stack grows in
+    pub(crate) fn stats(&self, f: &Frames, stack: (u64, u64)) -> MemStats {
+        let mut m = MemStats::default();
+        for (&s, v) in &self.vmas {
+            let len = v.end - s;
+            m.size += len;
+            let res = self.leaves(f, s, v.end).len() as u64;
+            if v.file.is_some() {
+                m.file += res;
+            } else if v.shared {
+                m.shmem += res;
+            } else {
+                m.anon += res;
+            }
+            let in_stack = s < stack.1 && v.end > stack.0;
+            if in_stack {
+                m.stack += len;
+            } else if v.file.is_some() && !v.shared && v.prot & PROT_EXEC != 0 {
+                m.exe += len;
+            } else if !v.shared && v.prot & PROT_WRITE != 0 {
+                m.data += len;
+            }
+        }
+        m
     }
 
     /// The CPUs' translations of the pages at `vas` (pages that were mapped) are to go: page by
@@ -614,6 +688,7 @@ impl Mm {
                 self.lazy_less(bk.ino, Mm::data_pages(&v, s).saturating_sub(filled));
             }
         }
+        self.lose(gone.len());
         if !gone.is_empty() {
             self.trim(f, a, b);
         }
@@ -646,6 +721,7 @@ impl Mm {
                 gone.push(va);
             }
         }
+        self.lose(gone.len());
         self.forget(&gone);
         f.reap();
     }
@@ -703,6 +779,8 @@ impl Mm {
     /// False when there are no frames for the tables, and then nothing moved.
     pub(crate) fn relocate(&mut self, f: &mut Frames, old: u64, len: u64, new: u64) -> bool {
         let leaves = self.leaves(f, old, old + len);
+        // (Moving pages doesn't make more resident)
+        let peak = self.hwm.get();
         for (i, &(va, _, d)) in leaves.iter().enumerate() {
             if !self.set(f, new + (va - old), d) {
                 for &(va, _, _) in &leaves[..i] {
@@ -710,12 +788,16 @@ impl Mm {
                         f.put(s, 0);
                     }
                 }
+                self.lose(i);
+                self.hwm.set(peak);
                 return false;
             }
         }
         for &(_, slot, _) in &leaves {
             f.put(slot, 0);
         }
+        self.lose(leaves.len());
+        self.hwm.set(peak);
         // (The pages at `new` were not mapped: only the old ones can be in a TLB)
         let moved: Vec<u64> = leaves.iter().map(|&(va, _, _)| va).collect();
         for (s, v) in self.cut(old, old + len) {
@@ -816,6 +898,8 @@ impl Mm {
             free: self.free.clone(),
             per_file: self.per_file.clone(),
             refs: self.per_file.keys().map(|&i| (i, true)).collect(),
+            rss: Cell::new(0),
+            hwm: Cell::new(0),
         };
         // What is shared has all its pages first, for both sides to see the same ones (a PROT_NONE
         // one, a reservation, has none to share and costs nothing; a shared file's untouched pages
@@ -954,6 +1038,8 @@ impl Mm {
             free: BTreeMap::new(),
             per_file: BTreeMap::new(),
             refs: Vec::new(),
+            rss: Cell::new(0),
+            hwm: Cell::new(0),
         };
         if root >= ram_size
             || !root.is_multiple_of(PAGE)

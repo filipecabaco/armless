@@ -244,13 +244,20 @@ impl Process {
         v(0)
     }
 
-    /// getrusage: the time it has run, as user time
+    /// getrusage: the time it has run, as user time, and the most memory (kB) it, or the children
+    /// that ended, had resident
     pub(super) fn sys_getrusage(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
         let mut b = [0u8; 144];
         let el = self.start.elapsed();
         b[0..8].copy_from_slice(&el.as_secs().to_le_bytes());
         b[8..16].copy_from_slice(&(el.subsec_micros() as u64).to_le_bytes());
+        let maxrss = match a[0] as i64 {
+            // RUSAGE_CHILDREN
+            -1 => self.p.child_maxrss,
+            _ => self.p.mm.borrow().resident().1 * (crate::PAGE / 1024),
+        };
+        b[32..40].copy_from_slice(&maxrss.to_le_bytes());
         v(if self.write(a[1], &b) { 0 } else { -EFAULT })
     }
 
@@ -260,7 +267,7 @@ impl Process {
         let mut b = [0u8; 112];
         b[0..8].copy_from_slice(&self.start.elapsed().as_secs().to_le_bytes());
         b[32..40].copy_from_slice(&self.ram_size.to_le_bytes());
-        b[40..48].copy_from_slice(&(self.ram_size / 2).to_le_bytes());
+        b[40..48].copy_from_slice(&self.ram_free().to_le_bytes());
         b[80..82].copy_from_slice(&(self.processes() as u16).to_le_bytes());
         b[104..108].copy_from_slice(&1u32.to_le_bytes());
         v(if self.write(a[0], &b) { 0 } else { -EFAULT })

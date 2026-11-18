@@ -927,14 +927,112 @@
     /**
      * User mode: the process's state (uncompressed). It goes with the machine's (save_state_pieces,
      * save_state) as `user_state` goes with `initial_state`, and has the bytes of a native host's
-     * Process::save. Take both while the machine is stopped.
+     * Process::save. Take both while the machine is stopped. Refused while a process started with
+     * spawn() is held (not released): a snapshot keeps no host end of a job's pipes.
      */
     async save_process() {
       await this.ready;
       if (!this.user) throw new Error("armless: no user-mode process");
       const e = this.exports;
       const n = e.armless_user_save();
+      if (n === 0) throw new Error("armless: " + this._error());
       return new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice();
+    }
+
+    /**
+     * User mode: start a process beside the program, as `Process::spawn` does natively: `{ argv, env, cwd }`
+     * (`argv[0]` is found by PATH from `env` when it has no slash; `cwd` defaults to "/"). It runs as root, in a
+     * session of its own with no parent, while the machine runs (run(); a stopped machine runs nothing), with
+     * pipes for stdin, stdout and stderr the returned job holds the other ends of:
+     *
+     *   job.pid
+     *   job.write(bytesOrString)  true if accepted, false once its stdin is gone (closed, or the job released)
+     *   job.closeInput()          its reads past what is written return 0
+     *   job.poll()                what it printed since the last poll: { stdout, stderr: Uint8Array, exit }, exit
+     *                             being null while it runs, else 0..255 (128 + the signal for one a signal ended).
+     *                             Throws once the job is released. There is no event for its output: poll.
+     *   job.kill(sig = 15)        a signal for its process group: it and what it started
+     *   job.release()             done with it: its pipes let go and, once it ended, the process taken away
+     *
+     * Its program's files that the filesystem hasn't got yet are fetched first, as for `user`. Throws when the
+     * machine isn't in user mode or the build has no spawn.
+     */
+    async spawn({ argv, env = [], cwd = "/" } = {}) {
+      await this.ready;
+      if (!this.user) throw new Error("armless: spawn needs user mode");
+      const e = this.exports;
+      if (!e.armless_user_spawn) throw new Error("armless: this build has no spawn");
+      argv = typeof argv === "string" ? [argv] : argv || [];
+      if (!argv.length) throw new Error("armless: spawn needs a program (argv)");
+      const list = (items) => {
+        const s = items.map(String);
+        if (s.some((x) => x.includes("\0"))) throw new Error("armless: spawn: a NUL in an argument or variable");
+        return utf8.encode(s.map((x) => x + "\0").join(""));
+      };
+      const parts = [list(argv), list(env), utf8.encode(cwd || "/")];
+      const ptrs = parts.map((b) => this._copy_in(b));
+      let pid;
+      try {
+        for (;;) {
+          const r = Number(e.armless_user_spawn(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length));
+          if (r >= 0) { pid = r; break; }
+          if (r === -1) throw new Error("armless: spawn: " + this._error());
+          // -2: its files are on their way
+          this._drain();
+          await this._blobs_settled();
+        }
+      } finally {
+        ptrs.forEach((p, i) => e.armless_free(p, parts[i].length));
+      }
+      this._poke();
+      return this._job(pid);
+    }
+
+    _job(pid) {
+      const vm = this;
+      const big = BigInt(pid);
+      let released = false;
+      const bytes = (call) => {
+        const e = vm.exports;
+        const n = e[call]();
+        return new Uint8Array(vm.memory.buffer, e.armless_buf(), n).slice();
+      };
+      return {
+        pid,
+        write(data) {
+          if (released) return false;
+          const b = typeof data === "string" ? utf8.encode(data) : data;
+          const ok = vm._with_bytes(b, (p, n) => vm.exports.armless_user_spawn_input(big, p, n)) !== 0;
+          vm._poke();
+          return ok;
+        },
+        closeInput() {
+          if (released) return;
+          vm.exports.armless_user_spawn_close_input(big);
+          vm._poke();
+        },
+        poll() {
+          const e = vm.exports;
+          if (released || e.armless_user_spawn_poll(big) < 0) throw new Error(`armless: spawn: process ${pid} is released or unknown`);
+          const stdout = bytes("armless_user_spawn_stdout");
+          const stderr = bytes("armless_user_spawn_stderr");
+          const code = e.armless_user_spawn_exit();
+          // (A writer that was waiting on a full pipe goes on)
+          if (stdout.length || stderr.length) vm._poke();
+          return { stdout, stderr, exit: code < 0 ? null : code };
+        },
+        kill(sig = 15) {
+          if (released) return;
+          vm.exports.armless_user_spawn_kill(big, sig);
+          vm._poke();
+        },
+        release() {
+          if (released) return;
+          released = true;
+          vm.exports.armless_user_spawn_release(big);
+          vm._poke();
+        },
+      };
     }
 
     // ------------------------------------------------------------ running

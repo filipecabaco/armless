@@ -98,7 +98,49 @@ function clock_prog() {
   return p.elf();
 }
 
+/** Writes "out\n" to stdout and "err\n" to stderr, and exits with status 3 */
+function printer_prog() {
+  const p = new Prog().put(0x200, "out\nerr\n");
+  p.sys(64, [I(1), D(0x200), I(4)]).sys(64, [I(2), D(0x204), I(4)]);
+  return p.sys(94, [I(3)]).elf();
+}
+
+/** Reads its stdin, writes what it got, reads again (end of file: 0) and writes "EOF\n" */
+function stdin_prog() {
+  const p = new Prog().put(0x200, "EOF\n");
+  p.sys(63, [I(0), D(0x300), I(64)]).save(0x280);
+  p.sys(64, [I(1), D(0x300), X(0x280)]);
+  p.sys(63, [I(0), D(0x300), I(64)]).expect(0);
+  return p.sys(64, [I(1), D(0x200), I(4)]).elf();
+}
+
+/** Sleeps 60 s; its child sleeps 400 ms and writes "child\n" (a child that outlived a kill) */
+function sleeper_prog() {
+  const p = new Prog().put(0x200, "child\n").timespec(0x220, 400).timespec(0x240, 60000);
+  const child = p.fork();
+  p.sys(101, [D(0x220), I(0)]).sys(64, [I(1), D(0x200), I(6)]);
+  p.parent(child);
+  return p.sys(101, [D(0x240), I(0)]).elf();
+}
+
+/** Never ends, never waits: a branch to itself */
+function spin_prog() {
+  const p = new Prog();
+  p.code.push(0x1400_0000);
+  return p.elf();
+}
+
+/** Sleeps a minute: a program for a machine to run its jobs beside */
+function idle_prog() {
+  return new Prog().timespec(0x200, 60000).sys(101, [D(0x200), I(0)]).elf();
+}
+
 const programs = {
+  printer: printer_prog(),
+  stdin: stdin_prog(),
+  sleeper: sleeper_prog(),
+  spin: spin_prog(),
+  idle: idle_prog(),
   args: args_prog(),
   uname: uname_prog(),
   tty: tty_prog(),
@@ -378,4 +420,150 @@ test("armless_user_asleep_ms is called before each restore of a process", async 
     vm.destroy();
   });
   assert.deepEqual(calls, [["asleep", 1500], ["restore"], ["asleep", 0], ["restore"], ["asleep", 42], ["restore"]]);
+});
+
+// ------------------------------------------------------------------ spawn
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A machine with a program that stays, running, to spawn beside */
+async function host_machine() {
+  const vm = machine({ user: { argv: ["/bin/idle"], plain_std: true } });
+  await vm.ready;
+  vm.on("stop", (s) => assert.fail("the main program stopped: " + JSON.stringify(s)));
+  vm.run();
+  return vm;
+}
+
+/** Polls `job` until it has ended: {out, err, exit} (the bytes it printed, as text) */
+async function finish(job, ms = 8000) {
+  let out = "", err = "";
+  const begun = performance.now();
+  for (;;) {
+    const r = job.poll();
+    out += decode(r.stdout);
+    err += decode(r.stderr);
+    if (r.exit !== null) return { out, err, exit: r.exit };
+    assert.ok(performance.now() - begun < ms, `still running: ${JSON.stringify({ out, err })}`);
+    await sleep(5);
+  }
+}
+
+test("spawn: stdout, stderr and the exit status come back", async () => {
+  const vm = await host_machine();
+  try {
+    const job = await vm.spawn({ argv: ["/bin/printer"] });
+    assert.equal(typeof job.pid, "number");
+    assert.deepEqual(await finish(job), { out: "out\n", err: "err\n", exit: 3 });
+    job.release();
+  } finally {
+    vm.destroy();
+  }
+});
+
+test("spawn: input written and then closed reaches the process, which sees the end of file", async () => {
+  const vm = await host_machine();
+  try {
+    const job = await vm.spawn({ argv: ["stdin"], env: ["PATH=/bin"], cwd: "/" });
+    assert.equal(job.write("pi"), true);
+    assert.equal(job.write(new TextEncoder().encode("ng")), true);
+    job.closeInput();
+    assert.equal(job.write("late"), false, "its stdin is gone");
+    assert.deepEqual(await finish(job), { out: "ping" + "EOF\n", err: "", exit: 0 });
+    job.release();
+  } finally {
+    vm.destroy();
+  }
+});
+
+test("spawn: kill ends the process and what it started, as 128 + the signal", async () => {
+  const vm = await host_machine();
+  try {
+    const job = await vm.spawn({ argv: ["/bin/sleeper"] });
+    await sleep(60);
+    assert.equal(job.poll().exit, null, "still running");
+    job.kill();
+    const { out, exit } = await finish(job);
+    assert.equal(exit, 128 + 15);
+    // Its child would have written by now, if the kill had left it
+    await sleep(700);
+    assert.equal(out + decode(job.poll().stdout), "");
+    job.release();
+  } finally {
+    vm.destroy();
+  }
+});
+
+test("spawn: a released job is gone", async () => {
+  const vm = await host_machine();
+  try {
+    const job = await vm.spawn({ argv: ["/bin/printer"] });
+    await finish(job);
+    job.release();
+    assert.throws(() => job.poll(), /released/);
+    assert.equal(job.write("x"), false);
+    job.release();
+  } finally {
+    vm.destroy();
+  }
+});
+
+test("spawn: a program that isn't there, or no program, is refused", async () => {
+  const vm = await host_machine();
+  try {
+    await assert.rejects(vm.spawn({ argv: ["/bin/nothing"] }), /spawn: .*not found/);
+    await assert.rejects(vm.spawn({ argv: [] }), /needs a program/);
+    await assert.rejects(vm.spawn({ argv: ["/bin/printer", "a\0b"] }), /NUL/);
+  } finally {
+    vm.destroy();
+  }
+});
+
+test("spawn: needs user mode, and a build that has it", async () => {
+  const vm = new Armless({ wasm, memory_mb: 64, autostart: false, filesystem: filesystem(programs) });
+  await vm.ready.catch(() => {});
+  await assert.rejects(vm.spawn({ argv: ["/bin/printer"] }), /needs user mode/);
+  vm.destroy();
+  await with_exports((e) => { delete e.armless_user_spawn; }, async () => {
+    const vm = await host_machine();
+    await assert.rejects(vm.spawn({ argv: ["/bin/printer"] }), /this build has no spawn/);
+    vm.destroy();
+  });
+});
+
+test("spawn: the program beside it goes on while a job spins", async () => {
+  const vm = machine({ user: { argv: ["/bin/clock"], plain_std: true } });
+  try {
+    await vm.ready;
+    const job = await vm.spawn({ argv: ["/bin/spin"] });
+    const { stop, out } = await run_to_stop(vm);
+    assert.equal(stop.reason, "exit");
+    const nap = nap_of(out);
+    assert.ok(nap >= NAP_MS && nap < 3 * NAP_MS, `slept ${nap} ms`);
+    assert.equal(job.poll().exit, null, "the spinner ran on");
+  } finally {
+    vm.destroy();
+  }
+});
+
+test("spawn: a held job, waiting or ended, keeps a snapshot back until it is released", async () => {
+  const vm = await host_machine();
+  try {
+    const job = await vm.spawn({ argv: ["/bin/stdin"] });
+    await sleep(50);
+    assert.equal(job.poll().exit, null, "waiting for input");
+    await vm.stop();
+    await assert.rejects(vm.save_process(), /not released/);
+    job.closeInput();
+    vm.run();
+    await finish(job);
+    // Ended, but held until released
+    await vm.stop();
+    await assert.rejects(vm.save_process(), /not released/);
+    job.release();
+    const state = await vm.save_process();
+    assert.ok(state.length > 0);
+  } finally {
+    vm.destroy();
+  }
 });
