@@ -24,6 +24,8 @@ pub(crate) struct Spawned {
     stdin: Option<u32>,
     stdout: u32,
     stderr: u32,
+    /// Its end has been given to the host (`spawn_poll`)
+    exit_seen: bool,
 }
 
 /// What a started process did since the host last looked (`Process::spawn_poll`)
@@ -165,6 +167,7 @@ impl Process {
             stdin: Some(self.files.add(Kind::PipeWrite(input), 1)),
             stdout: self.files.add(Kind::PipeRead(output), 0),
             stderr: self.files.add(Kind::PipeRead(errors), 0),
+            exit_seen: false,
         };
         for d in [host.stdin.unwrap_or_default(), host.stdout, host.stderr] {
             self.files.hold(d);
@@ -225,6 +228,7 @@ impl Process {
     /// for a pid that isn't one `spawn` started, or was released).
     pub fn spawn_poll(&mut self, pid: i64) -> Option<SpawnPoll> {
         let s = self.spawned.get(&pid)?;
+        let (out_d, err_d) = (s.stdout, s.stderr);
         let mut take = |d: u32| match self.files.descs.get(&d).map(|d| d.kind.clone()) {
             Some(Kind::PipeRead(p)) => self
                 .files
@@ -234,7 +238,7 @@ impl Process {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        let (stdout, stderr) = (take(s.stdout), take(s.stderr));
+        let (stdout, stderr) = (take(out_d), take(err_d));
         if !stdout.is_empty() || !stderr.is_empty() {
             // (A writer waiting on a full pipe goes on)
             self.poke();
@@ -246,11 +250,34 @@ impl Process {
             // Gone (an exit nobody could wait for): ended
             None => Some(0),
         };
+        if exit.is_some() {
+            if let Some(s) = self.spawned.get_mut(&pid) {
+                s.exit_seen = true;
+            }
+        }
         Some(SpawnPoll {
             stdout,
             stderr,
             exit,
         })
+    }
+
+    /// The held processes with something for the host: output not taken yet, or an end not yet
+    /// given by `spawn_poll`. A host that wants to know when to poll asks this after each run.
+    pub fn spawn_pending(&self) -> Vec<i64> {
+        let waiting = |d: u32| match self.files.descs.get(&d).map(|d| &d.kind) {
+            Some(Kind::PipeRead(p)) => self.files.pipes.get(p).is_some_and(|p| !p.buf.is_empty()),
+            _ => false,
+        };
+        self.spawned
+            .iter()
+            .filter(|(&pid, s)| {
+                waiting(s.stdout)
+                    || waiting(s.stderr)
+                    || (!s.exit_seen && self.proc_ref(pid).is_none_or(|p| p.zombie.is_some()))
+            })
+            .map(|(&pid, _)| pid)
+            .collect()
     }
 
     /// `sig` for the process group of process `pid` (`spawn`'s): it and what it started that is

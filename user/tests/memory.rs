@@ -131,6 +131,29 @@ fn touching_pages_raises_vmrss_and_unmapping_lowers_it() {
     assert_eq!(rss[3], rss[1]);
     assert_eq!(field(&d[3], "VmSize"), field(&d[0], "VmSize"));
     assert_eq!(field(&d[3], "VmHWM"), rss[2]);
+    // The stack is what it has used, not the 8 MB it may grow into
+    assert!(field(&d[0], "VmStk") < 256, "{}", field(&d[0], "VmStk"));
+    // The peak size: what it was with the mapping, which is gone
+    assert_eq!(field(&d[3], "VmPeak"), field(&d[1], "VmSize"));
+    assert!(field(&d[3], "VmPeak") > field(&d[3], "VmSize"));
+    assert!(d.iter().all(|d| field(d, "VmPeak") >= field(d, "VmSize")));
+}
+
+#[test]
+fn a_vfork_child_that_ends_leaves_its_parents_peak_out_of_the_childrens() {
+    // The child of a vfork has its parent's address space until it execs: what the space held
+    // is not the child's
+    let mut p = program();
+    p.map(0, 64 << 12, 3, 0).touch(0, 64);
+    // clone(CLONE_VM | CLONE_VFORK | SIGCHLD): the child ends at once
+    p.sys(220, &[I(0x4111), I(0), I(0), I(0), I(0)]);
+    p.code.push(0);
+    let child = p.code.len() - 1;
+    p.parent(child);
+    p.sys(260, &[I(u64::MAX), I(0), I(0), I(0)]);
+    p.maxrss(u64::MAX);
+    let out = run_prog(p);
+    assert_eq!(u64::from_le_bytes(out[..8].try_into().unwrap()), 0);
 }
 
 #[test]

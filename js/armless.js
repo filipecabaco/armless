@@ -28,7 +28,7 @@
 //
 // Events: "ready", "console", "serial", "progress" ({file, loaded, total}),
 // "blob" (name), "tcp-connection" (Connection), "stop" ({reason}), "error", and in user mode
-// "idle".
+// "idle" and "spawn-output" ({pid}: a job started with spawn() has output or ended, to poll).
 (function (root) {
   "use strict";
 
@@ -872,6 +872,7 @@
       const result = e.armless_user_run(USER_SLICE_MS);
       this._user_waiting = result === 1;
       this._drain();
+      this._spawn_events();
       if (result === 0) {
         this._user_idle = false;
         return this._schedule(0);
@@ -950,7 +951,8 @@
      *   job.closeInput()          its reads past what is written return 0
      *   job.poll()                what it printed since the last poll: { stdout, stderr: Uint8Array, exit }, exit
      *                             being null while it runs, else 0..255 (128 + the signal for one a signal ended).
-     *                             Throws once the job is released. There is no event for its output: poll.
+     *                             Throws once the job is released. The machine emits "spawn-output" ({ pid }) once
+     *                             when a job has something to poll (output, or its end), until it is polled.
      *   job.kill(sig = 15)        a signal for its process group: it and what it started
      *   job.release()             done with it: its pipes let go and, once it ended, the process taken away
      *
@@ -988,10 +990,29 @@
       return this._job(pid);
     }
 
+    /** Spawned jobs with something to poll, said once each until polled: "spawn-output" ({ pid }). */
+    _spawn_events() {
+      const e = this.exports;
+      if (!this._jobs?.size || !e.armless_user_spawn_pending) return;
+      const n = e.armless_user_spawn_pending();
+      if (!n) return;
+      const v = new DataView(this.memory.buffer, e.armless_buf(), n);
+      for (let i = 0; i + 8 <= n; i += 8) {
+        const pid = Number(v.getBigInt64(i, true));
+        const job = this._jobs.get(pid);
+        if (job && !job.notified) {
+          job.notified = true;
+          this.emit("spawn-output", { pid });
+        }
+      }
+    }
+
     _job(pid) {
       const vm = this;
       const big = BigInt(pid);
       let released = false;
+      const state = { notified: false };
+      (this._jobs ??= new Map()).set(pid, state);
       const bytes = (call) => {
         const e = vm.exports;
         const n = e[call]();
@@ -1016,6 +1037,7 @@
           if (released || e.armless_user_spawn_poll(big) < 0) throw new Error(`armless: spawn: process ${pid} is released or unknown`);
           const stdout = bytes("armless_user_spawn_stdout");
           const stderr = bytes("armless_user_spawn_stderr");
+          state.notified = false;
           const code = e.armless_user_spawn_exit();
           // (A writer that was waiting on a full pipe goes on)
           if (stdout.length || stderr.length) vm._poke();
@@ -1029,6 +1051,7 @@
         release() {
           if (released) return;
           released = true;
+          vm._jobs.delete(pid);
           vm.exports.armless_user_spawn_release(big);
           vm._poke();
         },

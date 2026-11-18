@@ -1420,6 +1420,52 @@ fn the_host_starts_a_process_with_pipes_and_takes_its_output_and_status() {
     assert!(proc.waiting_for_input());
 }
 
+#[test]
+fn the_host_is_told_what_a_started_process_has_for_it_and_a_snapshot_waits_for_its_release() {
+    // The same program as above: it prints "out\n", reads its stdin to the end, and exits 3
+    let mut p = Prog::default();
+    p.put(0x200, b"out\n");
+    p.sys(173, &[]);
+    let at = p.code.len();
+    p.code.push(0);
+    p.out(0x200, 4);
+    p.sys(63, &[I(0), D(0x300), I(4)]).expect(4);
+    p.sys(63, &[I(0), D(0x300), I(4)]).expect(0);
+    p.sys(94, &[I(3)]);
+    p.code[at] = 0xb500_0000 | ((p.code.len() - at) as u32) << 5;
+    p.sys(63, &[I(0), D(0x300), I(1)]);
+    let mut vm = machine_with_prog(&p.elf());
+    let board = vm.board.clone();
+    let mut proc = Process::exec(&mut vm.cpus[0], board, &["/usr/bin/prog".into()], &[], "/").unwrap();
+    let ms = std::time::Duration::from_millis(20);
+    proc.run_on(&mut vm.cpus, ms);
+    let pid = proc.spawn(&["prog".into()], &["PATH=/usr/bin".into()], "/tmp", None).unwrap();
+    // Not run yet: nothing for the host
+    assert!(proc.spawn_pending().is_empty());
+    proc.run_on(&mut vm.cpus, ms);
+    assert_eq!(proc.spawn_pending(), [pid], "it printed");
+    // A snapshot is refused while it is held
+    let err = proc.save_checked(&vm.cpus[0]).unwrap_err();
+    assert!(err.contains("not released"), "{err}");
+    assert_eq!(proc.spawn_poll(pid).unwrap().stdout, b"out\n");
+    assert!(proc.spawn_pending().is_empty(), "taken");
+    assert!(proc.spawn_input(pid, b"ping"));
+    proc.spawn_close_input(pid);
+    let begun = std::time::Instant::now();
+    while proc.spawn_pending().is_empty() {
+        proc.run_on(&mut vm.cpus, ms);
+        assert!(begun.elapsed() < std::time::Duration::from_secs(10), "it never ended");
+    }
+    // Its end is said until a poll has given it, and not after
+    assert_eq!(proc.spawn_pending(), [pid]);
+    assert_eq!(proc.spawn_poll(pid).unwrap().exit, Some(3));
+    assert!(proc.spawn_pending().is_empty());
+    // Ended but held: still no snapshot; released: one
+    assert!(proc.save_checked(&vm.cpus[0]).is_err());
+    proc.spawn_release(pid);
+    assert!(proc.save_checked(&vm.cpus[0]).is_ok());
+}
+
 const ENOENT: i64 = -2;
 /// O_RDONLY | O_DIRECTORY | O_CLOEXEC
 const O_DIR: u64 = 0o2_200_000;

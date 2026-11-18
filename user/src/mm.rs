@@ -310,12 +310,16 @@ pub(crate) struct Mm {
     /// getrusage report as resident. Not saved: a restored space counts what it has (`recount`).
     rss: Cell<u64>,
     hwm: Cell<u64>,
+    /// The largest the areas' total size was when last looked at (an area added, or some taken)
+    peak_size: Cell<u64>,
 }
 
 /// What a space holds, for /proc/<pid>/{status,statm} (bytes, except the resident counts: pages)
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MemStats {
     pub size: u64,
+    /// The most `size` has been, as far as it was looked at (every area added or taken away is)
+    pub peak: u64,
     pub anon: u64,
     pub file: u64,
     pub shmem: u64,
@@ -347,6 +351,7 @@ impl Mm {
             refs: Vec::new(),
             rss: Cell::new(0),
             hwm: Cell::new(0),
+            peak_size: Cell::new(0),
         })
     }
 
@@ -368,6 +373,7 @@ impl Mm {
             refs: Vec::new(),
             rss: Cell::new(0),
             hwm: Cell::new(0),
+            peak_size: Cell::new(0),
         }
     }
 
@@ -453,14 +459,27 @@ impl Mm {
             }
             let in_stack = s < stack.1 && v.end > stack.0;
             if in_stack {
-                m.stack += len;
+                // (As Linux's: what the stack has grown to, not the room it may grow in)
+                m.stack += res * PAGE;
             } else if v.file.is_some() && !v.shared && v.prot & PROT_EXEC != 0 {
                 m.exe += len;
             } else if !v.shared && v.prot & PROT_WRITE != 0 {
                 m.data += len;
             }
         }
+        self.peak_size.set(self.peak_size.get().max(m.size));
+        m.peak = self.peak_size.get();
         m
+    }
+
+    /// The areas' total size, in bytes
+    fn vsize(&self) -> u64 {
+        self.vmas.iter().map(|(&s, v)| v.end - s).sum()
+    }
+
+    /// Keeps the peak of the size: called where it can fall (areas taken) and where it rises
+    fn note_size(&self) {
+        self.peak_size.set(self.peak_size.get().max(self.vsize()));
     }
 
     /// The CPUs' translations of the pages at `vas` (pages that were mapped) are to go: page by
@@ -555,6 +574,8 @@ impl Mm {
 
     /// Takes `a..b` out of the areas: the pieces taken.
     fn cut(&mut self, a: u64, b: u64) -> Vec<(u64, Vma)> {
+        // (What grew in place, a break or a remap, is seen here before it goes)
+        self.note_size();
         self.split(a);
         self.split(b);
         let keys: Vec<u64> = self.vmas.range(a..b).map(|(&s, _)| s).collect();
@@ -637,6 +658,7 @@ impl Mm {
         }
         self.vmas.insert(a, Vma { end: b, ..v });
         self.merge(a, b);
+        self.note_size();
     }
 
     /// The tables `a..b` reaches that have no page left in them, given back.
@@ -900,6 +922,7 @@ impl Mm {
             refs: self.per_file.keys().map(|&i| (i, true)).collect(),
             rss: Cell::new(0),
             hwm: Cell::new(0),
+            peak_size: Cell::new(0),
         };
         // What is shared has all its pages first, for both sides to see the same ones (a PROT_NONE
         // one, a reservation, has none to share and costs nothing; a shared file's untouched pages
@@ -1040,6 +1063,7 @@ impl Mm {
             refs: Vec::new(),
             rss: Cell::new(0),
             hwm: Cell::new(0),
+            peak_size: Cell::new(0),
         };
         if root >= ram_size
             || !root.is_multiple_of(PAGE)

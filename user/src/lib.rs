@@ -1508,6 +1508,18 @@ impl Process {
 
     // ------------------------------------------------------------ snapshots
 
+    /// `save`, refused while a process the host started (`spawn`) is held: a snapshot keeps no
+    /// host end of its pipes, so one taken then would be a job half done, silently.
+    pub fn save_checked<H: Host>(&mut self, cpu: &Cpu<H>) -> Result<Vec<u8>, String> {
+        let held = self.spawned.len();
+        if held != 0 {
+            return Err(format!(
+                "{held} spawned process(es) not released: a snapshot doesn't keep the host's ends of their pipes"
+            ));
+        }
+        Ok(self.save(cpu))
+    }
+
     /// The processes' state for a snapshot (the machine's own snapshot holds its memory and
     /// filesystem): every process (its address space, descriptors, signals) and thread, its
     /// waits as time left, the descriptions the descriptors refer to, the terminal, the clock.

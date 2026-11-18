@@ -213,11 +213,11 @@ connections nobody accepts, and no tunnel takes, are refused.
   `job.pid`; `job.write(bytesOrString)` (false once its stdin is gone); `job.closeInput()`;
   `job.poll()` returns `{ stdout, stderr: Uint8Array, exit }` of what it did since the last poll
   (`exit` is null while it runs, then 0 to 255, 128 + the signal for one a signal ended; it
-  throws once the job is released; there is no output event: poll); `job.kill(sig = 15)` signals
+  throws once the job is released; the machine emits `spawn-output` `{ pid }` once when a job has something to poll, until it is polled); `job.kill(sig = 15)` signals
   its process group; `job.release()` lets go of it. `save_process()` fails while a job is held
   (not released): a snapshot keeps no host end of a job's pipes.
 - User mode, memory: a program reads its own, as on Linux, from the frames its page tables map:
-  `/proc/<pid>/status` (`VmPeak` (as `VmSize`), `VmSize`, `VmHWM`, `VmRSS`, `RssAnon`, `RssFile`,
+  `/proc/<pid>/status` (`VmPeak`, `VmSize`, `VmHWM`, `VmRSS`, `RssAnon`, `RssFile`,
   `RssShmem`, `VmData`, `VmStk`, `VmExe`), `/proc/<pid>/statm`, fields 23 and 24 of
   `/proc/<pid>/stat`, `getrusage`'s `ru_maxrss` (self, and the children that ended) and the free
   memory of `/proc/meminfo` and `sysinfo` (RAM less the frames in use). A page counts once
