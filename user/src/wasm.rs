@@ -262,14 +262,13 @@ pub extern "C" fn armless_user_kill(sig: u32) {
 #[no_mangle]
 pub extern "C" fn armless_user_save() -> u32 {
     PROCESS.with_borrow_mut(|p| match p.as_mut() {
-        Some(p) if !p.spawned().is_empty() => {
-            set_error(format!(
-                "{} spawned process(es) not released: a snapshot doesn't keep the host's ends of their pipes",
-                p.spawned().len()
-            ));
-            0
+        Some(p) => match p.save_checked(&vm().cpus[0]) {
+            Ok(state) => out(state),
+            Err(e) => {
+                set_error(e);
+                0
+            },
         },
-        Some(p) => out(p.save(&vm().cpus[0])),
         None => {
             set_error("no process");
             0
@@ -352,6 +351,15 @@ pub extern "C" fn armless_user_spawn_poll(pid: i64) -> i32 {
     let found = polled.is_some();
     POLLED.set(polled);
     if found { 0 } else { -1 }
+}
+
+/// The spawned processes with something for the host: output not taken yet, or an end
+/// `armless_user_spawn_poll` hasn't given: their pids, 8 bytes each (little-endian i64), at
+/// `armless_buf`; the length in bytes. Ask after each `armless_user_run` to know when to poll.
+#[no_mangle]
+pub extern "C" fn armless_user_spawn_pending() -> u32 {
+    let pids = PROCESS.with_borrow(|p| p.as_ref().map(|p| p.spawn_pending()).unwrap_or_default());
+    out(pids.iter().flat_map(|p| p.to_le_bytes()).collect())
 }
 
 /// What the last `armless_user_spawn_poll` took of stdout: its length (see `armless_buf`).

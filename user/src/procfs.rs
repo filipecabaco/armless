@@ -192,8 +192,7 @@ impl Process {
         } else {
             format!(
                 "VmPeak:\t{} kB\nVmSize:\t{} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nRssAnon:\t{} kB\nRssFile:\t{} kB\nRssShmem:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmExe:\t{} kB\n",
-                // (The peak size isn't kept: it is the size now)
-                kb(st.size),
+                kb(st.peak),
                 kb(st.size),
                 pk(hwm),
                 pk(rss),

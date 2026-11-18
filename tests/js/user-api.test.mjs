@@ -567,3 +567,68 @@ test("spawn: a held job, waiting or ended, keeps a snapshot back until it is rel
     vm.destroy();
   }
 });
+
+test("spawn: the machine says once when a job has output or has ended, until it is polled", async () => {
+  const vm = await host_machine();
+  try {
+    const events = [];
+    vm.on("spawn-output", (e) => events.push(e.pid));
+    const job = await vm.spawn({ argv: ["/bin/printer"] });
+    const begun = performance.now();
+    while (!events.length) {
+      assert.ok(performance.now() - begun < 5000, "no event");
+      await sleep(5);
+    }
+    assert.deepEqual(events, [job.pid]);
+    // Said once, whatever the slices that follow: nothing is polled
+    await sleep(100);
+    assert.deepEqual(events, [job.pid]);
+    const r = job.poll();
+    assert.ok(r.stdout.length > 0 || r.exit !== null);
+    // Polled and taken: quiet, even when its end comes after (the next poll says it, or an event does)
+    const seen = events.length;
+    const done = await finish(job);
+    assert.equal(done.exit, 3);
+    assert.ok(events.length >= seen);
+    await sleep(100);
+    const quiet = events.length;
+    await sleep(100);
+    assert.equal(events.length, quiet, "nothing more once it is all taken");
+    job.release();
+  } finally {
+    vm.destroy();
+  }
+});
+
+test("spawn: a job at work isn't the program going quiet, one waiting for its stdin is", async () => {
+  // The program waits on the terminal for input: idle, and waiting for input
+  const vm = machine({ user: { argv: ["/bin/stdin"] } });
+  try {
+    await vm.ready;
+    vm.run();
+    const until = async (fn, what) => {
+      const begun = performance.now();
+      while (!fn()) {
+        assert.ok(performance.now() - begun < 5000, what);
+        await sleep(5);
+      }
+    };
+    await until(() => vm.user_status.waiting_for_input, "the program never waited for input");
+    // A job that sleeps is work: not quiet
+    const sleeper = await vm.spawn({ argv: ["/bin/sleeper"] });
+    await until(() => !vm.user_status.waiting_for_input, "a sleeping job counted as quiet");
+    sleeper.kill();
+    await finish(sleeper);
+    sleeper.release();
+    await until(() => vm.user_status.waiting_for_input, "quiet again once it is gone");
+    // One that only waits for the host's input to its stdin is not
+    const reader = await vm.spawn({ argv: ["/bin/stdin"] });
+    await sleep(100);
+    assert.equal(vm.user_status.waiting_for_input, true);
+    reader.closeInput();
+    await finish(reader);
+    reader.release();
+  } finally {
+    vm.destroy();
+  }
+});

@@ -226,7 +226,12 @@ impl Process {
             self.close_fd(fd);
         }
         // The address space goes with its last user (a vfork parent may still have it)
-        let peak_kb = self.p.mm.borrow().resident().1 * (crate::PAGE / 1024);
+        // (A vfork child's space is its parent's until it execs: its peak is not the child's)
+        let peak_kb = if crate::mm::SharedMm::strong_count(&self.p.mm) == 1 {
+            self.p.mm.borrow().resident().1 * (crate::PAGE / 1024)
+        } else {
+            0
+        };
         let mm = std::mem::replace(&mut self.p.mm, crate::mm::SharedMm::new(Mm::husk()));
         if crate::mm::SharedMm::strong_count(&mm) == 1 {
             let refs = {

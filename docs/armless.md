@@ -622,6 +622,7 @@ and then, instead of a boot:
 | `armless_user_spawn_input(pid, ptr, len)` | bytes for its stdin: 1 accepted, 0 it has none any more |
 | `armless_user_spawn_close_input(pid)` | the end of its stdin |
 | `armless_user_spawn_poll(pid)` | takes what it did since the last poll: -1 for a pid that is unknown or released, else 0. Read it with `armless_user_spawn_stdout()` and `armless_user_spawn_stderr()` (each returns its length, the bytes at `armless_buf`) and `armless_user_spawn_exit()` (-1 while it runs, else 0 to 255, 128 + the signal); they answer for the last poll |
+| `armless_user_spawn_pending()` | the spawned processes with output not taken or an end not given by a poll: their pids, 8 bytes each (little-endian i64) at `armless_buf`, the length in bytes. `armless.js` asks after each run and emits `spawn-output` |
 | `armless_user_spawn_kill(pid, sig)` | a signal for its process group: it and what it started |
 | `armless_user_spawn_release(pid)` | done with it: its pipes let go and, once it ended, the process taken away |
 
@@ -642,12 +643,15 @@ natively.
 **Memory.** Each process's resident pages are counted from its page tables (`mm.rs`: a counter
 that rises when a page gets a frame and falls when it loses one, not saved: a restored process
 counts what it has, and its peak is that): `/proc/<pid>/status` (`VmSize`, `VmHWM`, `VmRSS`,
-`RssAnon`, `RssFile`, `RssShmem`, `VmData`, `VmStk`, `VmExe`; `VmPeak` is the size now),
+`RssAnon`, `RssFile`, `RssShmem`, `VmData`, `VmStk` (the pages the stack uses), `VmExe`; `VmPeak` the largest size seen when areas were added or taken away),
 `/proc/<pid>/statm`, `/proc/<pid>/stat` fields 23 and 24, and `getrusage` (`ru_maxrss` in kB
 for `RUSAGE_SELF`, and for `RUSAGE_CHILDREN` the largest peak of a child that ended). A
 copy-on-write page after a fork counts in each process, lazy file pages once they are filled, and
 `PROT_NONE` and `MAP_NORESERVE` areas for the pages touched only. `/proc/meminfo` and `sysinfo`
-free memory is RAM less the frames in use (pages and page tables).
+free memory is RAM less the frames in use (pages and page tables). Against a guest kernel the anonymous
+count is the same (Bun's REPL: `RssAnon` 4.3 MB here, 4.5 MB with a kernel) and the file-backed one
+is smaller (12 MB, 33 MB): a kernel maps the pages around a fault that are in its page cache, this
+maps the page that was touched.
 
 Not yet: signals for faults (a fault ends the process, SIGSEGV is not delivered to a
 handler), more than one vCPU in a page, and the hypervisor backends (an SVC at EL0 traps to EL1 in
