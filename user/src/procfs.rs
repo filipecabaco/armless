@@ -44,6 +44,7 @@ impl Process {
             b"comm" => comm(p).into_iter().chain(*b"\n").collect(),
             b"stat" => self.stat_line(p).into_bytes(),
             b"status" => self.status_text(p).into_bytes(),
+            b"statm" => self.statm(p).into_bytes(),
             _ => return None,
         })
     }
@@ -141,20 +142,22 @@ impl Process {
         n.max(1)
     }
 
-    /// /proc/<pid>/stat: its 52 fields, zero where nothing is known (times, faults, memory)
+    /// /proc/<pid>/stat: its 52 fields, zero where nothing is known (times, faults)
     fn stat_line(&self, p: &Proc) -> String {
         let (state, _) = self.state(p);
         let comm = String::from_utf8_lossy(&comm(p)).into_owned();
         let threads = self.thread_count(p);
+        let (st, rss, _) = self.mem_of(p);
         // pid (comm) state ppid pgrp session tty_nr tpgid flags, minflt to cstime (8), priority
-        // nice num_threads itrealvalue starttime vsize rss
+        // nice num_threads itrealvalue starttime, vsize (bytes), rss (pages)
         let mut s = format!(
-            "{} ({comm}) {state} {} {} {} 0 -1 0 {}20 0 {threads} 0 0 0 0",
+            "{} ({comm}) {state} {} {} {} 0 -1 0 {}20 0 {threads} 0 0 {} {rss}",
             p.pid,
             p.ppid,
             p.pgid,
             p.sid,
-            "0 ".repeat(8)
+            "0 ".repeat(8),
+            st.size
         );
         // rsslim to cnswap (13), exit_signal, then processor to exit_code (14)
         s += &" 0".repeat(13);
@@ -164,13 +167,48 @@ impl Process {
         s
     }
 
+    /// /proc/<pid>/statm: size resident shared text lib data dt, in pages
+    fn statm(&self, p: &Proc) -> String {
+        let (st, rss, _) = self.mem_of(p);
+        let pages = |b: u64| b / crate::PAGE;
+        format!(
+            "{} {rss} {} {} 0 {} 0\n",
+            pages(st.size),
+            st.file + st.shmem,
+            pages(st.exe),
+            pages(st.data + st.stack)
+        )
+    }
+
     /// /proc/<pid>/status: the lines busybox and procps read
     fn status_text(&self, p: &Proc) -> String {
         let (state, word) = self.state(p);
+        let (st, rss, hwm) = self.mem_of(p);
+        let kb = |b: u64| b / 1024;
+        let pk = |n: u64| n * (crate::PAGE / 1024);
+        // (A process that ended has no memory: Linux leaves these lines out)
+        let vm = if p.zombie.is_some() {
+            String::new()
+        } else {
+            format!(
+                "VmPeak:\t{} kB\nVmSize:\t{} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nRssAnon:\t{} kB\nRssFile:\t{} kB\nRssShmem:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmExe:\t{} kB\n",
+                // (The peak size isn't kept: it is the size now)
+                kb(st.size),
+                kb(st.size),
+                pk(hwm),
+                pk(rss),
+                pk(st.anon),
+                pk(st.file),
+                pk(st.shmem),
+                kb(st.data),
+                kb(st.stack),
+                kb(st.exe),
+            )
+        };
         let ids = |v: [u32; 3]| format!("{}\t{}\t{}\t{}", v[0], v[1], v[2], v[1]);
         let groups: String = p.groups.iter().map(|g| format!("{g} ")).collect();
         format!(
-            "Name:\t{}\nUmask:\t{:04o}\nState:\t{state} ({word})\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\nGid:\t{}\nFDSize:\t64\nGroups:\t{groups}\nThreads:\t{}\n",
+            "Name:\t{}\nUmask:\t{:04o}\nState:\t{state} ({word})\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\nGid:\t{}\nFDSize:\t64\nGroups:\t{groups}\n{vm}Threads:\t{}\n",
             String::from_utf8_lossy(&comm(p)),
             p.umask,
             p.ppid,

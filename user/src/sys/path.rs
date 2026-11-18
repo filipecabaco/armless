@@ -66,7 +66,8 @@ impl Process {
                 .into_bytes(),
             b"/proc/meminfo" => {
                 let kb = self.ram_size / 1024;
-                format!("MemTotal:       {kb} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\n", kb / 2, kb / 2).into_bytes()
+                let free = self.ram_free() / 1024;
+                format!("MemTotal:       {kb} kB\nMemFree:        {free} kB\nMemAvailable:   {free} kB\n").into_bytes()
             },
             b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
             // The interfaces netlink.rs has, with nothing counted (ifconfig reads their list here)

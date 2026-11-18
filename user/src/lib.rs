@@ -274,6 +274,8 @@ pub(crate) struct Proc {
     pub groups: Vec<u32>,
     /// AIO contexts by id (aio.rs)
     pub aio: BTreeMap<u64, aio::Aio>,
+    /// The most (kB) any of its children that ended had resident, for getrusage(RUSAGE_CHILDREN)
+    pub child_maxrss: u64,
 }
 
 /// Who a process is: its real, effective and saved user and group ids. A program starts as root;
@@ -793,6 +795,7 @@ impl Process {
                 creds: Creds::default(),
                 groups: Vec::new(),
                 aio: BTreeMap::new(),
+                child_maxrss: 0,
             },
             procs: BTreeMap::new(),
             threads: Vec::new(),
@@ -1076,6 +1079,23 @@ impl Process {
             && self.threads.iter().any(|t| {
                 !t.exited && t.tty_wait && matches!(t.wait, Some((Wait::Retry { .. }, _)))
             })
+    }
+
+    /// What process `p` has of memory (/proc/<pid>/status, statm and stat): its areas' sizes,
+    /// pages resident by kind, and the peak resident count. An ended process has none.
+    pub(crate) fn mem_of(&self, p: &Proc) -> (mm::MemStats, u64, u64) {
+        let m = p.mm.borrow();
+        let stack = (
+            mm::VA_END - PAGE - STACK_SIZE,
+            mm::VA_END - PAGE,
+        );
+        let (rss, hwm) = m.resident();
+        (m.stats(&self.frames.borrow(), stack), rss, hwm)
+    }
+
+    /// Bytes of RAM not held by a frame (pages, page tables)
+    pub(crate) fn ram_free(&self) -> u64 {
+        self.ram_size.saturating_sub(self.frames_in_use() * PAGE)
     }
 
     /// Frames of RAM in use: the pages of every process that has one, and their page tables.
@@ -1722,6 +1742,7 @@ impl Process {
                     creds,
                     groups,
                     aio,
+                    child_maxrss: 0,
                 },
             );
         }
@@ -1811,6 +1832,9 @@ impl Process {
             held.iter().map(|m| &**m),
             shm.frames().chain(file_pages.values().copied()),
         )?;
+        for m in &held {
+            m.recount(&frames);
+        }
         drop(held);
         files.net.load_cm(&mut r, ver)?;
         // Before ARMLUSR7 only ITIMER_REAL was kept

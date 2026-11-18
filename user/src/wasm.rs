@@ -19,6 +19,7 @@ use armless::wasm::{now_ms, out, set_error, slice, string, vm};
 use armless::Event;
 
 use crate::host::{self, Instant};
+use crate::spawn::SpawnPoll;
 use crate::{ExecError, ExecOptions, Process, Status, StdStreams};
 
 std::thread_local! {
@@ -30,6 +31,8 @@ std::thread_local! {
     static PLAIN_STD: Cell<bool> = const { Cell::new(false) };
     /// `armless_user_hostname`: the bytes of the next exec's hostname.
     static HOSTNAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// What the last `armless_user_spawn_poll` took, for the calls that return it.
+    static POLLED: RefCell<Option<SpawnPoll>> = const { RefCell::new(None) };
     /// What `armless_user_asleep_ms` set for the next `armless_user_restore`.
     static ASLEEP: Cell<Duration> = const { Cell::new(Duration::ZERO) };
 }
@@ -200,7 +203,11 @@ pub extern "C" fn armless_user_waiting_on_blobs() -> u32 {
 /// tells a REPL at its prompt from a program that only sleeps or waits on files.
 #[no_mangle]
 pub extern "C" fn armless_user_waiting_for_input() -> u32 {
-    PROCESS.with_borrow(|p| p.as_ref().is_some_and(|p| p.waiting_for_input()) as u32)
+    // (Not while a spawned process is at work: the machine isn't quiet)
+    PROCESS.with_borrow(|p| {
+        p.as_ref()
+            .is_some_and(|p| p.waiting_for_input() && !p.spawn_busy()) as u32
+    })
 }
 
 /// The program's exit status (128 + the signal for one a signal ended), or -1 while it runs.
@@ -248,14 +255,135 @@ pub extern "C" fn armless_user_kill(sig: u32) {
 }
 
 /// The process's state for a snapshot (`Process::save`): its length (see `armless_buf`), 0 when
-/// there is no process. The machine's own state (`armless_save_*`) holds its memory, CPU and
-/// filesystem; take both with the CPU stopped.
+/// it can't be taken (the reason in `armless_error`): there is no process, or a process started
+/// with `armless_user_spawn` is still held (not released), whose pipes' host ends a snapshot
+/// doesn't keep. The machine's own state (`armless_save_*`) holds its memory, CPU and filesystem;
+/// take both with the CPU stopped.
 #[no_mangle]
 pub extern "C" fn armless_user_save() -> u32 {
     PROCESS.with_borrow_mut(|p| match p.as_mut() {
+        Some(p) if !p.spawned().is_empty() => {
+            set_error(format!(
+                "{} spawned process(es) not released: a snapshot doesn't keep the host's ends of their pipes",
+                p.spawned().len()
+            ));
+            0
+        },
         Some(p) => out(p.save(&vm().cpus[0])),
-        None => 0,
+        None => {
+            set_error("no process");
+            0
+        },
     })
+}
+
+// ---------------------------------------------------------------- processes beside the program
+
+/// Start `argv[0]` as a process of its own beside the program (`Process::spawn`): its own session,
+/// no parent, as root, with pipes for stdin, stdout and stderr whose other ends are the host's
+/// (`armless_user_spawn_input` and `_poll`). `argv` and `env` are NUL-separated lists, `cwd` the
+/// working directory. It runs while the host runs the machine (`armless_user_run`). Returns the pid,
+/// -2 when its program's files are still being fetched (blob events were raised: provide them,
+/// then call again), -1 on failure (see `armless_error`; also when there is no program).
+///
+/// # Safety
+/// Each pointer must reference its length of readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_user_spawn(
+    argv: u32,
+    argv_len: u32,
+    env: u32,
+    env_len: u32,
+    cwd: u32,
+    cwd_len: u32,
+) -> i64 {
+    // SAFETY: the caller's promise
+    let (argv, env, cwd) = unsafe {
+        (
+            string(argv, argv_len),
+            string(env, env_len),
+            string(cwd, cwd_len),
+        )
+    };
+    let (argv, env) = (list(&argv), list(&env));
+    let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
+    seed();
+    PROCESS.with_borrow_mut(|p| {
+        let Some(p) = p.as_mut() else {
+            set_error("no process");
+            return -1;
+        };
+        match p.spawn(&argv, &env, &cwd, None) {
+            Ok(pid) => pid,
+            Err(ExecError::Need(_)) => -2,
+            Err(ExecError::Fail(e)) => {
+                set_error(e);
+                -1
+            },
+        }
+    })
+}
+
+/// Bytes for the stdin of the spawned process `pid`: 1 if accepted, 0 if it has no stdin any more
+/// (closed, or not a process that is held).
+///
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_user_spawn_input(pid: i64, ptr: u32, len: u32) -> i32 {
+    let data = slice(ptr, len);
+    PROCESS.with_borrow_mut(|p| p.as_mut().is_some_and(|p| p.spawn_input(pid, data)) as i32)
+}
+
+/// The end of the stdin of the spawned process `pid`: its reads past what is left return 0.
+#[no_mangle]
+pub extern "C" fn armless_user_spawn_close_input(pid: i64) {
+    PROCESS.with_borrow_mut(|p| p.as_mut().map(|p| p.spawn_close_input(pid)));
+}
+
+/// Takes what the spawned process `pid` did since the last poll: -1 for a pid that isn't a held
+/// spawned process (unknown, or released), 0 otherwise. Read it with the calls that follow, which
+/// answer for this poll until the next one: `armless_user_spawn_stdout` and
+/// `armless_user_spawn_stderr` (what it printed: each returns its length, the bytes at
+/// `armless_buf` until the next call that fills it), and `armless_user_spawn_exit`.
+#[no_mangle]
+pub extern "C" fn armless_user_spawn_poll(pid: i64) -> i32 {
+    let polled = PROCESS.with_borrow_mut(|p| p.as_mut().and_then(|p| p.spawn_poll(pid)));
+    let found = polled.is_some();
+    POLLED.set(polled);
+    if found { 0 } else { -1 }
+}
+
+/// What the last `armless_user_spawn_poll` took of stdout: its length (see `armless_buf`).
+#[no_mangle]
+pub extern "C" fn armless_user_spawn_stdout() -> u32 {
+    out(POLLED.with_borrow_mut(|p| p.as_mut().map(|p| std::mem::take(&mut p.stdout)).unwrap_or_default()))
+}
+
+/// What the last `armless_user_spawn_poll` took of stderr: its length (see `armless_buf`).
+#[no_mangle]
+pub extern "C" fn armless_user_spawn_stderr() -> u32 {
+    out(POLLED.with_borrow_mut(|p| p.as_mut().map(|p| std::mem::take(&mut p.stderr)).unwrap_or_default()))
+}
+
+/// The exit status the last `armless_user_spawn_poll` saw: -1 while it runs, else 0 to 255 (128
+/// plus the signal for one a signal ended).
+#[no_mangle]
+pub extern "C" fn armless_user_spawn_exit() -> i32 {
+    POLLED.with_borrow(|p| p.as_ref().and_then(|p| p.exit).unwrap_or(-1))
+}
+
+/// A signal for the process group of the spawned process `pid`: it and what it started.
+#[no_mangle]
+pub extern "C" fn armless_user_spawn_kill(pid: i64, sig: u32) {
+    PROCESS.with_borrow_mut(|p| p.as_mut().map(|p| p.spawn_kill(pid, sig)));
+}
+
+/// Done with the spawned process `pid`: its pipes let go and, once it has ended, the process taken
+/// away. It no longer polls (-1), and no longer holds a snapshot back.
+#[no_mangle]
+pub extern "C" fn armless_user_spawn_release(pid: i64) {
+    PROCESS.with_borrow_mut(|p| p.as_mut().map(|p| p.spawn_release(pid)));
 }
 
 /// How long the state the next `armless_user_restore` restores was saved for, in ms: the process's

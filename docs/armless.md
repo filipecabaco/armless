@@ -617,7 +617,19 @@ and then, instead of a boot:
 | `armless_user_input(ptr, len)`, `armless_user_close_input()`, `armless_user_resize(cols, rows)` | the terminal |
 | `armless_user_reap_orphans(on)` | the first process reaps its orphans (after `armless_user_exec`, before it runs) |
 | `armless_user_kill(sig)` | a signal for the program, as kill(2) sends it (SIGINT for a stop button) |
-| `armless_user_save()` | the process's state, at `armless_buf` |
+| `armless_user_save()` | the process's state, at `armless_buf`; 0 with the reason in `armless_error` when there is no process or a spawned one is still held (not released) |
+| `armless_user_spawn(argv, len, env, len, cwd, len)` | start a process beside the program (`Process::spawn`: root, a session of its own, no parent; pipes for stdin, stdout and stderr whose host ends the module holds), as `armless_user_exec` takes its lists: its pid, -2 its files are being fetched (blob events: provide them, call again), -1 failed (`armless_error`). It runs while `armless_user_run` does |
+| `armless_user_spawn_input(pid, ptr, len)` | bytes for its stdin: 1 accepted, 0 it has none any more |
+| `armless_user_spawn_close_input(pid)` | the end of its stdin |
+| `armless_user_spawn_poll(pid)` | takes what it did since the last poll: -1 for a pid that is unknown or released, else 0. Read it with `armless_user_spawn_stdout()` and `armless_user_spawn_stderr()` (each returns its length, the bytes at `armless_buf`) and `armless_user_spawn_exit()` (-1 while it runs, else 0 to 255, 128 + the signal); they answer for the last poll |
+| `armless_user_spawn_kill(pid, sig)` | a signal for its process group: it and what it started |
+| `armless_user_spawn_release(pid)` | done with it: its pipes let go and, once it ended, the process taken away |
+
+A spawned process that runs, sleeps or waits on files is work for the machine: `armless_user_run`
+keeps running (or reports its deadline in `armless_user_wake_ms`), and `armless_user_waiting_for_input`
+is 0 while one is at work. One only waiting for its stdin, which the host gives, is not. Snapshots
+don't keep the host's ends of the pipes, so `armless_user_save` refuses while one is held;
+`armless.js` wraps all of this in `vm.spawn()` (see the Readme).
 
 What the program writes comes out of `armless_events` as console output, and the files it
 reads that aren't there yet as blob events, so the event loop a host has for Linux serves it
@@ -626,6 +638,16 @@ too. A snapshot is the pair a native host makes: the machine's state, the bytes 
 (`armless_user_save`), restored machine first. A site snowglobe saved natively
 (`state.bin.zst` and `user.bin`) restores in a page, and a pair saved in a page restores
 natively.
+
+**Memory.** Each process's resident pages are counted from its page tables (`mm.rs`: a counter
+that rises when a page gets a frame and falls when it loses one, not saved: a restored process
+counts what it has, and its peak is that): `/proc/<pid>/status` (`VmSize`, `VmHWM`, `VmRSS`,
+`RssAnon`, `RssFile`, `RssShmem`, `VmData`, `VmStk`, `VmExe`; `VmPeak` is the size now),
+`/proc/<pid>/statm`, `/proc/<pid>/stat` fields 23 and 24, and `getrusage` (`ru_maxrss` in kB
+for `RUSAGE_SELF`, and for `RUSAGE_CHILDREN` the largest peak of a child that ended). A
+copy-on-write page after a fork counts in each process, lazy file pages once they are filled, and
+`PROT_NONE` and `MAP_NORESERVE` areas for the pages touched only. `/proc/meminfo` and `sysinfo`
+free memory is RAM less the frames in use (pages and page tables).
 
 Not yet: signals for faults (a fault ends the process, SIGSEGV is not delivered to a
 handler), more than one vCPU in a page, and the hypervisor backends (an SVC at EL0 traps to EL1 in

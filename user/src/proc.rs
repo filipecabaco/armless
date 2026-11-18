@@ -226,6 +226,7 @@ impl Process {
             self.close_fd(fd);
         }
         // The address space goes with its last user (a vfork parent may still have it)
+        let peak_kb = self.p.mm.borrow().resident().1 * (crate::PAGE / 1024);
         let mm = std::mem::replace(&mut self.p.mm, crate::mm::SharedMm::new(Mm::husk()));
         if crate::mm::SharedMm::strong_count(&mm) == 1 {
             let refs = {
@@ -276,6 +277,9 @@ impl Process {
         };
         self.p.zombie = Some(status);
         let (ppid, exit_signal) = (self.p.ppid, self.p.exit_signal);
+        if let Some(q) = self.proc_mut(ppid) {
+            q.child_maxrss = q.child_maxrss.max(peak_kb);
+        }
         if self.p.orphan || self.proc_ref(ppid).is_some_and(|q| q.sig.children_vanish()) {
             self.p.reap = true;
         }
@@ -664,6 +668,7 @@ impl Process {
             creds: self.p.creds,
             groups: self.p.groups.clone(),
             aio: BTreeMap::new(),
+            child_maxrss: 0,
         };
         self.procs.insert(id, child);
         self.threads.push(Thread {
