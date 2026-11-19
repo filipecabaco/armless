@@ -199,6 +199,71 @@ impl Process {
         }
     }
 
+    /// utimensat(dirfd, path, times, flags): sets a file's access and change times (now, when
+    /// `times` is NULL or a time is UTIME_NOW; left as it is with UTIME_OMIT). A NULL path is
+    /// futimens on `dirfd`. What is not there is ENOENT: busybox's touch makes the file only
+    /// when it is told so.
+    pub(super) fn sys_utimensat(&mut self, a: &[u64; 6]) -> Ret {
+        let v = Ret::Val;
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        const UTIME_NOW: u64 = (1 << 30) - 1;
+        const UTIME_OMIT: u64 = (1 << 30) - 2;
+        let (dirfd, path, flags) = (a[0] as i32, a[1], a[3]);
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return v(-EINVAL);
+        }
+        let wall = self.now_ns(0);
+        let now = (wall / 1_000_000_000, (wall % 1_000_000_000) as u32);
+        // Each of the two times: None leaves it, Some sets it
+        let mut times = [Some(now); 2];
+        if a[2] != 0 {
+            for (n, t) in times.iter_mut().enumerate() {
+                let at = a[2] + 16 * n as u64;
+                let (Some(s), Some(ns)) = (self.u64_at(at), self.u64_at(at + 8)) else {
+                    return v(-EFAULT);
+                };
+                *t = match ns {
+                    UTIME_NOW => Some(now),
+                    UTIME_OMIT => None,
+                    ns if ns < 1_000_000_000 => Some((s, ns as u32)),
+                    _ => return v(-EINVAL),
+                };
+            }
+        }
+        let ino = if path == 0 || flags & AT_EMPTY_PATH != 0 && self.cstr(path).is_empty() {
+            match self.files.get(dirfd).map(|d| &d.kind) {
+                Some(Kind::File { ino, .. } | Kind::Dir { ino, .. }) => Some(*ino),
+                Some(_) => None,
+                None => return v(-EBADF),
+            }
+        } else {
+            let p = self.cstr(path);
+            match self.lookup(dirfd, &p, flags & AT_SYMLINK_NOFOLLOW == 0) {
+                Ok(ino) => Some(ino),
+                // A device or a /proc file: there, with times of its own
+                Err(e) => match self.stat_path(dirfd, &p, flags) {
+                    Ok(_) => None,
+                    Err(_) => return v(e),
+                },
+            }
+        };
+        if let Some(ino) = ino {
+            self.fs(|fs| {
+                if let Some(i) = fs.get_mut(ino) {
+                    if let Some(t) = times[0] {
+                        i.atime = t;
+                    }
+                    if let Some(t) = times[1] {
+                        i.mtime = t;
+                    }
+                    i.ctime = now;
+                }
+            });
+        }
+        v(0)
+    }
+
     /// fchown(fd, uid, gid), fchownat(dirfd, path, uid, gid, flags): -1 leaves one; root
     /// may give a file to anyone, its owner only to one of its own groups
     pub(super) fn sys_fchown(&mut self, nr: u64, a: &[u64; 6]) -> Ret {

@@ -1975,3 +1975,47 @@ fn a_process_restored_after_the_longest_sleep_goes_on() {
     ok(&status);
     assert_eq!(out, b"w");
 }
+
+#[test]
+fn utimensat_sets_a_files_times_and_says_a_missing_one_is_not_there() {
+    // busybox's touch makes the file only when utimensat says ENOENT
+    const ENOENT: i64 = -2;
+    const EINVAL: i64 = -22;
+    const UTIME_OMIT: u64 = (1 << 30) - 2;
+    let at_fdcwd = I(0xffff_ff9c);
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/touched\0").put(0x220, b"/dev/null\0");
+    let times = |a: (u64, u64), m: (u64, u64)| [a.0, a.1, m.0, m.1].map(u64::to_le_bytes).concat();
+    p.put(0x600, &times((1000, 5), (2000, 7)));
+    p.put(0x620, &times((0, UTIME_OMIT), (3000, 0)));
+    p.put(0x640, &times((0, 1_000_000_000), (0, 0)));
+    p.sys(88, &[at_fdcwd, D(0x200), I(0), I(0)]).expect(ENOENT);
+    p.sys(88, &[at_fdcwd, D(0x200), D(0x600), I(0)])
+        .expect(ENOENT);
+    // openat(O_WRONLY | O_CREAT), then the times it is given
+    p.sys(56, &[at_fdcwd, D(0x200), I(0o101), I(0o644)])
+        .expect(3);
+    p.sys(88, &[at_fdcwd, D(0x200), D(0x600), I(0)]).expect(0);
+    p.sys(79, &[at_fdcwd, D(0x200), D(0x400), I(0)]).expect(0); // newfstatat
+    for (off, v) in [(72, 1000), (80, 5), (88, 2000), (96, 7)] {
+        p.arg(0, W(0x400 + off));
+        p.expect(v);
+    }
+    // futimens (a NULL path): UTIME_OMIT leaves the access time
+    p.sys(88, &[I(3), I(0), D(0x620), I(0)]).expect(0);
+    p.sys(80, &[I(3), D(0x400)]).expect(0);
+    for (off, v) in [(72, 1000), (88, 3000), (96, 0)] {
+        p.arg(0, W(0x400 + off));
+        p.expect(v);
+    }
+    // Times no clock has, flags it doesn't know, a descriptor that isn't open
+    p.sys(88, &[at_fdcwd, D(0x200), D(0x640), I(0)])
+        .expect(EINVAL);
+    p.sys(88, &[at_fdcwd, D(0x200), I(0), I(0x8000)])
+        .expect(EINVAL);
+    p.sys(88, &[I(40), I(0), I(0), I(0)]).expect(-9);
+    // A device is there
+    p.sys(88, &[at_fdcwd, D(0x220), I(0), I(0)]).expect(0);
+    let (_, status) = run_linked(p);
+    ok(&status);
+}
