@@ -27,7 +27,7 @@
 
 <header class="bar">
   <a class="name" href="../index.html">armless</a>
-  <nav aria-label="Site"><a href="index.html" aria-current="true">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+  <nav aria-label="Site"><a href="../examples/index.html">examples</a> <a href="index.html" aria-current="true">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
 </header>
 
 <div class="shell">

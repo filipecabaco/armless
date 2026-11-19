@@ -92,12 +92,20 @@ a.btn:not(.btn-primary) { border-color: var(--line); color: var(--muted); }
   .pane-bar .end, .keys + .end { margin-left: auto; }
 }
 
-#status::before { content: ""; display: inline-block; width: 0.5rem; height: 0.5rem; margin-right: 0.5rem; border: 1px solid var(--faint); border-radius: 50%; vertical-align: 0.02em; }
-#status[data-state="ready"]::before { background: var(--text); border-color: var(--text); }
-#status[data-state="error"]::before, #status[data-state="stopped"]::before { background: var(--error); border-color: var(--error); }
+.status::before { content: ""; display: inline-block; width: 0.5rem; height: 0.5rem; margin-right: 0.5rem; border: 1px solid var(--faint); border-radius: 50%; vertical-align: 0.02em; }
+.status[data-state="ready"]::before { background: var(--text); border-color: var(--text); }
+.status[data-state="error"]::before, .status[data-state="stopped"]::before { background: var(--error); border-color: var(--error); }
 
-.console { background: var(--console); color: var(--console-ink); padding: 0.8rem 0.5rem 0.5rem 1rem; flex: 1; min-height: 28rem; display: flex; flex-direction: column; }
-#terminal { flex: 1; min-height: 26rem; }
+/* Every machine is one height, whatever it prints and whatever is beside it: the console scrolls
+   (xterm's scrollback), and so does a side pane taller than the row */
+.console { background: var(--console); color: var(--console-ink); padding: 0.8rem 0.5rem 0.5rem 1rem; height: 28rem; flex: none; display: flex; flex-direction: column; }
+.terminal { flex: 1; min-height: 0; }
+@media (min-width: 64rem) {
+  .machine { grid-template-rows: 34rem; }
+  .machine > .pane { min-height: 0; overflow: hidden; }
+  .machine > .pane > .console { height: auto; flex: 1; min-height: 0; }
+  .machine .memory, .machine .side-body { flex: 1; min-height: 0; overflow-y: auto; }
+}
 .console .xterm { padding: 0; }
 .console:focus-within { outline: 2px solid var(--text); outline-offset: -2px; }
 .console .xterm-viewport { background: transparent !important; }
@@ -112,6 +120,7 @@ a.btn:not(.btn-primary) { border-color: var(--line); color: var(--muted); }
 .figures dd { margin: 0.15rem 0 0; font-size: 1.5rem; line-height: 1.2; font-variant-numeric: tabular-nums; font-weight: 700; }
 .figures dd small { margin-left: 0.4rem; font-size: 0.75rem; font-weight: 400; color: var(--faint); }
 .figures .wide dd:first-of-type { font-size: 2.4rem; letter-spacing: -0.02em; }
+.figures dd.word { font-size: 1.05rem; line-height: 1.9; }
 .figures dd.note { margin-top: 0.2rem; font-size: 0.75rem; font-weight: 400; color: var(--faint); }
 .chart { margin: 0; }
 .chart svg { display: block; width: 100%; height: auto; }
@@ -126,10 +135,60 @@ svg .peak { fill: none; stroke: var(--faint); stroke-width: 1.25; stroke-dasharr
 
 .caption { max-width: 80rem; margin: 0.9rem auto 0; padding: 0 var(--gutter); color: var(--muted); font-size: 0.875rem; }
 
-.embed { max-width: 80rem; margin: 0 auto; padding: clamp(3rem, 8vw, 6rem) var(--gutter) clamp(3rem, 8vw, 5rem); }
-.embed h2 { margin: 0 0 1.2rem; font-size: 1.125rem; font-weight: 700; letter-spacing: -0.01em; }
+.embed, .band { max-width: 80rem; margin: 0 auto; padding: clamp(3rem, 8vw, 6rem) var(--gutter) clamp(3rem, 8vw, 5rem); }
+.band + .embed { padding-top: 0; }
+.embed h2, .band h2 { margin: 0 0 1.2rem; font-size: 1.125rem; font-weight: 700; letter-spacing: -0.01em; }
 .embed pre { max-width: 58rem; }
-.embed p { margin: 1.2rem 0 0; font-size: 0.875rem; }
+.embed p, .band > p { margin: 1.2rem 0 0; font-size: 0.875rem; }
+
+/* ===== Examples: one page each, and the list of them ===== */
+.eyebrow { margin: 0 0 1rem; font-size: 0.8125rem; color: var(--faint); }
+.eyebrow a { color: var(--faint); }
+.examples { list-style: none; margin: 0; padding: 0; max-width: 58rem; border-top: 1px solid var(--line); }
+.examples li { border-bottom: 1px solid var(--line); }
+.examples a { display: grid; grid-template-columns: 2.5rem minmax(0, 1fr); gap: 0.2rem 1rem; padding: 1.1rem 0; text-decoration: none; }
+.examples .n { color: var(--faint); font-size: 0.8125rem; padding-top: 0.1rem; font-variant-numeric: tabular-nums; }
+.examples .t { font-weight: 700; }
+.examples .d { grid-column: 2; color: var(--muted); font-size: 0.875rem; }
+.examples a:hover .t { text-decoration: underline; text-decoration-color: var(--edge); text-underline-offset: 0.2em; }
+.example-body { max-width: 80rem; margin: 0 auto; padding: clamp(2.5rem, 6vw, 4rem) var(--gutter) clamp(3rem, 8vw, 5rem); }
+.example-body .pager { max-width: 50rem; }
+
+/* Side panes of the examples: a second console, the egress log, the snapshot's controls */
+.side-body { padding: 1.25rem 1rem 1.5rem; display: flex; flex-direction: column; gap: 1.2rem; min-width: 0; }
+.side-body .figures { margin: 0; }
+.side-h { margin: 0; font-size: 0.75rem; font-weight: 400; color: var(--faint); }
+.note { margin: 0; color: var(--faint); font-size: 0.8125rem; }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 1.5rem; }
+.steps li { display: grid; grid-template-columns: 1.6rem minmax(0, 1fr); gap: 0 0.8rem; }
+.step-n { display: grid; place-items: center; width: 1.6rem; height: 1.6rem; border: 1px solid var(--edge); border-radius: 50%; font-size: 0.75rem; color: var(--muted); }
+.step-h { margin: 0.1rem 0 0.3rem; font-size: 0.875rem; font-weight: 700; }
+.steps .btn { display: flex; width: 100%; margin: 0.6rem 0 0.3rem; }
+.steps .btn:not(.btn-primary) { border-color: var(--edge); color: var(--text); }
+.steps .btn:disabled { opacity: 0.45; cursor: default; }
+.steps .btn:disabled:hover { background: transparent; color: inherit; }
+.steps .btn-primary:disabled:hover { background: var(--text); color: var(--ground); }
+.tries { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.9rem; }
+.tries .btn { justify-content: flex-start; margin: 0 0 0.25rem -0.9rem; color: var(--text); font-weight: 700; white-space: normal; text-align: left; }
+.tries .btn:disabled { opacity: 0.45; cursor: default; }
+.allow { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.allow legend { padding: 0; margin-bottom: 0.4rem; font-size: 0.75rem; color: var(--faint); }
+.allow label { display: flex; align-items: center; gap: 0.6rem; font-size: 0.875rem; min-height: 2rem; cursor: pointer; }
+.allow input { accent-color: var(--text); width: 1rem; height: 1rem; }
+.allow .note { margin-top: 0.3rem; }
+.requests { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.1rem; font-size: 0.8125rem; }
+@media (max-width: 63.99rem) { .requests { max-height: 20rem; overflow-y: auto; } }
+.requests li { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr); gap: 0 0.75rem; padding: 0.45rem 0; border-bottom: 1px solid var(--line); }
+.requests li.empty { display: block; color: var(--faint); border: 0; }
+.requests .url { overflow-wrap: anywhere; }
+.requests .why { grid-column: 2; color: var(--faint); font-size: 0.75rem; }
+.verdict-tag { font-weight: 700; }
+.requests li[data-ok="false"] .verdict-tag { color: var(--error); }
+.verdict { margin: 0; padding: 0.7rem 1rem; min-height: 2.9rem; border-top: 1px solid var(--line); font-size: 0.8125rem; color: var(--muted); }
+.verdict:empty::before { content: "comparing the two reads"; color: var(--faint); }
+.verdict[data-state="different"] { color: var(--text); }
+.verdict[data-state="same"] { color: var(--error); }
+@media (min-width: 64rem) { .machine:has(> .pane-console + .pane-console) { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
 
 pre {
   font-family: var(--mono);
@@ -221,7 +280,7 @@ pre code { background: none; padding: 0; font-size: inherit; overflow-wrap: norm
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
 @media (forced-colors: active) { .btn, pre, .table-wrap, .machine { border: 1px solid CanvasText; } }
 @media print {
-  .bar, .side, .toc, .pager, .skip, .machine, .foot { display: none; }
+  .bar, .side, .toc, .pager, .skip, .demo, .foot { display: none; }
   body { background: #fff; color: #000; }
   pre { background: #fff; border: 1px solid #999; color: #000; }
 }

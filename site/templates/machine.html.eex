@@ -1,0 +1,21 @@
+<%!-- A machine and its caption, on the landing page and the example pages. site/static/machine.js
+    finds its parts by data-part; data-machine names the script that drives it. --%>
+<div class="demo" data-machine="<%= @machine %>">
+  <section class="machine" id="machine" aria-label="A machine running in this tab">
+    <div class="pane pane-console">
+      <div class="pane-bar"><span class="pane-name"><%= Site.h(@pane) %></span>
+        <span data-part="keys" class="keys" hidden></span>
+        <span class="end"><span data-part="status" class="status" role="status" data-state="off"><%= if @demo?, do: "needs JavaScript", else: "not in this build" %></span></span>
+      </div>
+      <div class="console">
+        <div data-part="terminal" class="terminal" role="group" aria-label="The machine's console. Escape, then Tab, leaves the console."></div>
+        <p data-part="log" class="visually-hidden" aria-live="polite"></p>
+        <p data-part="fallback" class="fallback" <%= if @demo?, do: "hidden" %>><%= if @demo?, do: "", else: "The machine is not part of this build." %></p>
+        <noscript><p class="fallback">The machine needs JavaScript and WebAssembly.</p></noscript>
+      </div>
+    </div>
+
+<%= @side %>
+  </section>
+  <p class="caption"><%= @caption %><span data-part="one-cpu" hidden> This browser could not isolate the page, so the machine has one CPU.</span></p>
+</div>

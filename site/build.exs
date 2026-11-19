@@ -6,7 +6,9 @@
 #
 # The docs are not written twice: every page is cut from Readme.md (by its
 # `##` headings) or is one of the files under docs/. The landing page is
-# site/templates/index.html.eex, written by hand.
+# site/templates/index.html.eex, written by hand. Each example is a page of its own,
+# examples/<slug>.html, from site/examples/<slug>.md (see @examples), listed on
+# examples/index.html and the landing page.
 #
 # SITE_BASE is the path the site is served from ("/armless/" on GitHub Pages).
 # Only the 404 page needs it, because it is served from any depth.
@@ -45,6 +47,17 @@ defmodule Site do
      [{:section, "Filesystem images"}, {:section, "Testing"}, {:section, "Releases"}],
      "Building test filesystems, the test suites, and how a release is published."}
   ]
+
+  # The examples, in the order they are listed: site/examples/<slug>.md, each a page with a
+  # machine on it. Its front matter has the title, the description (the page's claim, and its
+  # share card's text), the script under site/static that drives the machine, the console pane's
+  # name and the caption under the machine, and optionally `side`, the pane beside the console
+  # (site/templates/side/<side>.html.eex, metrics by default); its body is what the page says
+  # below the machine.
+  @examples ~w(trench-run native-snapshot fresh-randomness time-asleep no-kernel egress)
+
+  # The landing page's machine: the trench run, as on its example page
+  @landing_caption "Linux 6.18, booted in this tab from an initramfs with busybox, with as many CPUs as this device can spare. One awk per CPU draws a trench run, a new one every time. Ctrl+c stops it. Escape, then Tab, leaves the console."
 
   def run do
     # ARMLESS_SRC points at another checkout of the repository to cut the docs from
@@ -93,6 +106,35 @@ defmodule Site do
       File.write!(Path.join([out, "docs", p.slug <> ".html"]), html)
     end
 
+    examples = Enum.map(@examples, &example(Path.join([__DIR__, "examples", &1 <> ".md"])))
+    File.mkdir_p!(Path.join(out, "examples"))
+
+    for {ex, i} <- Enum.with_index(examples) do
+      html =
+        EEx.eval_file(template("example.html.eex"),
+          assigns: [
+            ex: ex,
+            n: number(i + 1),
+            machine: machine(ex.machine, ex.pane, ex.caption, demo?, ex.side),
+            prev: if(i > 0, do: Enum.at(examples, i - 1)),
+            next: Enum.at(examples, i + 1),
+            demo?: demo?,
+            version: version,
+            repo: @repo,
+            site: @site
+          ]
+        )
+
+      File.write!(Path.join([out, "examples", ex.slug <> ".html"]), html)
+    end
+
+    File.write!(
+      Path.join([out, "examples", "index.html"]),
+      EEx.eval_file(template("examples.html.eex"),
+        assigns: [list: example_list(examples, ""), version: version, repo: @repo, site: @site]
+      )
+    )
+
     File.write!(
       Path.join(out, "index.html"),
       EEx.eval_file(template("index.html.eex"),
@@ -101,7 +143,9 @@ defmodule Site do
           repo: @repo,
           site: @site,
           demo?: demo?,
-          embed: embed(readme)
+          embed: embed(readme),
+          machine: machine("trench", "/bin/sh", @landing_caption, demo?, "metrics"),
+          examples: example_list(examples, "examples/")
         ]
       )
     )
@@ -113,8 +157,80 @@ defmodule Site do
       EEx.eval_file(template("404.html.eex"), assigns: [base: base, repo: @repo])
     )
 
-    IO.puts("site: #{length(pages)} doc pages + landing into #{Path.relative_to_cwd(out)}")
+    IO.puts("site: #{length(pages)} doc pages, #{length(examples)} examples + landing into #{Path.relative_to_cwd(out)}")
   end
+
+  # ---- examples ------------------------------------------------------------
+
+  @example_keys ~w(title description script pane caption)
+
+  @doc false
+  def example(path) do
+    {meta, body} = front_matter(File.read!(path))
+    slug = Path.basename(path, ".md")
+
+    for key <- @example_keys, not Map.has_key?(meta, key) do
+      raise "#{Path.relative_to_cwd(path)}: no #{key} in its front matter"
+    end
+
+    {html, _toc} = body |> render() |> add_ids()
+
+    %{
+      slug: slug,
+      title: meta["title"],
+      description: meta["description"],
+      script: meta["script"],
+      # trench.js drives the machine marked data-machine="trench"
+      machine: Path.basename(meta["script"], ".js"),
+      pane: meta["pane"],
+      caption: meta["caption"],
+      side: Map.get(meta, "side", "metrics"),
+      html: html
+    }
+  end
+
+  # `key: value` lines between two `---` lines, then the page's markdown
+  @doc false
+  def front_matter(text) do
+    case Regex.run(~r/\A---\n(.*?)\n---\n(.*)\z/s, text) do
+      [_, head, body] ->
+        meta =
+          for line <- String.split(head, "\n"), String.trim(line) != "", into: %{} do
+            case String.split(line, ":", parts: 2) do
+              [k, v] -> {String.trim(k), String.trim(v)}
+              _ -> raise "front matter line without a key: #{inspect(line)}"
+            end
+          end
+
+        {meta, String.trim(body)}
+
+      nil ->
+        raise "no front matter (--- lines) at the top"
+    end
+  end
+
+  defp machine(name, pane, caption, demo?, side) do
+    side = EEx.eval_file(template(Path.join("side", side <> ".html.eex")), assigns: [demo?: demo?])
+
+    EEx.eval_file(template("machine.html.eex"),
+      assigns: [machine: name, pane: pane, caption: h(caption), demo?: demo?, side: side]
+    )
+  end
+
+  # The list of examples, linked from `dir` (where their pages are, seen from the page it is on)
+  @doc false
+  def example_list(examples, dir) do
+    items =
+      examples
+      |> Enum.with_index(1)
+      |> Enum.map_join("\n", fn {ex, n} ->
+        ~s(<li><a href="#{dir}#{ex.slug}.html"><span class="n">#{number(n)}</span><span class="t">#{h(ex.title)}</span><span class="d">#{h(ex.description)}</span></a></li>)
+      end)
+
+    ~s(<ol class="examples">\n#{items}\n</ol>)
+  end
+
+  defp number(n), do: n |> Integer.to_string() |> String.pad_leading(2, "0")
 
   # The browser snippet of the Quick start, as the README has it
   @doc false

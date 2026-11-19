@@ -1,18 +1,22 @@
 name: Pages
 
-# Builds the site (landing page + docs) with site/build.exs and publishes it to GitHub
-# Pages. Every merge to main redeploys it: the docs are cut from Readme.md and docs/, the
-# footer carries the version from Cargo.toml, and the machine is put together afresh.
+# Builds the site (landing page, examples and docs) with site/build.exs and publishes it to
+# GitHub Pages. Every merge to main redeploys it: the docs are cut from Readme.md and docs/, the
+# footer carries the version from Cargo.toml, and the machines are put together afresh.
 #
-# The landing page's machine boots Linux on several CPUs. Its kernel and busybox are built
-# the way ci.yml's linux job builds its own (tests/linux/build.sh, build-rootfs.sh), and
-# cached; site/demo.exs then fetches armless.js and its wasm from the latest release and
-# packs the initramfs (site/guest). If that fails the site still deploys, and the landing
-# page says the machine is not in this build.
+# The machines boot Linux on several CPUs. Their kernel (Linux 6.18, as ci.yml's: 6.10 and later
+# take a VM generation ID from the device tree, which the fresh-randomness example shows) and
+# busybox are built the way ci.yml's linux job builds its own (tests/linux/build.sh,
+# build-rootfs.sh), and cached. site/demo.exs then fetches armless.js and its wasm from the
+# latest release, packs the initramfs (site/guest) and the user-mode examples' filesystem, and
+# has a native armless-run, built from the release's tag so the formats match, boot the guest
+# and save it for the examples that restore a native snapshot. If any of that fails the site
+# still deploys, and the pages say what is not in this build.
 #
 # A pull request that touches the site, the docs or the guest only builds and tests it, so a
 # broken build shows up before it reaches main. The tests are site/test: the CPU count for a
-# device, the machine booted on 1 to 8 CPUs, and the docs' cutting, links and anchors.
+# device, the machine booted on 1 to 8 CPUs, the examples' machines, and the docs' cutting,
+# links and anchors.
 # Pages > Source is "GitHub Actions" in the repository settings.
 
 on:
@@ -38,7 +42,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    # The kernel ci.yml's linux job tests, and snowglobe's machines run
+    # The kernel ci.yml's linux job tests
     env:
       LINUX_VERSION: 6.18.60
       LINUX_SHA256: 3c2f44ef6acc021a7ad444d9a2e6ec1ef488ff09368793d0004a6080f69d621e
@@ -71,8 +75,32 @@ jobs:
           sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-$LINUX_VERSION" build-linux
           git clone --depth 1 https://github.com/mirror/busybox "$RUNNER_TEMP/busybox"
           sh tests/linux/build-rootfs.sh "$RUNNER_TEMP/busybox" build-linux
-      - name: Put the landing page's machine together
-        run: elixir site/demo.exs build-linux
+      # The native snapshot's armless-run: the latest release's, as the wasm site/demo.exs fetches
+      - name: Check out the latest release
+        id: release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          git fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag"
+          git worktree add "$RUNNER_TEMP/release" "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        if: steps.release.outcome == 'success'
+        with:
+          workspaces: "${{ runner.temp }}/release -> build"
+          key: site-${{ steps.release.outputs.tag }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build armless-run at the latest release
+        id: native
+        if: steps.release.outcome == 'success'
+        continue-on-error: true
+        run: |
+          cargo build --release --manifest-path "$RUNNER_TEMP/release/Cargo.toml" --bin armless-run
+          echo "bin=$RUNNER_TEMP/release/build/release/armless-run" >> "$GITHUB_OUTPUT"
+      - name: Put the machines together
+        run: elixir site/demo.exs build-linux ${{ steps.native.outputs.bin }}
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -85,6 +113,13 @@ jobs:
             exit 0
           fi
           for n in 1 2 4 8; do node site/test/guest.mjs site/static/demo $n; done
+      - name: Test the examples' machines (native snapshot, fresh randomness, user mode, time asleep, egress)
+        run: |
+          if [ ! -f site/static/demo/config.json ]; then
+            echo "::warning::the machines were not put together; nothing to test"
+            exit 0
+          fi
+          node site/test/examples.mjs site/static/demo
       - name: Test the site (docs cutting, links, anchors, trench.awk)
         run: elixir site/test/site_test.exs
       - name: Build the site
@@ -95,7 +130,9 @@ jobs:
         run: |
           test -f site/_out/index.html
           test -f site/_out/docs/index.html
-          test -f site/_out/demo/config.json || echo "::warning::the landing page's machine was not put together; the site says so"
+          test -f site/_out/examples/index.html
+          test -f site/_out/demo/config.json || echo "::warning::the machines were not put together; the site says so"
+          test -f site/_out/demo/native.bin.zst || echo "::warning::no native snapshot; its examples say so"
       - uses: actions/upload-pages-artifact@v5
         if: github.event_name != 'pull_request'
         with:

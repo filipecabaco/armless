@@ -1,0 +1,14 @@
+<%!-- What the guest asked to reach and what the page's allow() said (egress.js) --%>
+    <div class="pane pane-side">
+      <div class="pane-bar"><span class="pane-name">egress</span><span class="pane-note">allow({ url, host, port, kind })</span></div>
+      <div class="side-body">
+        <fieldset class="allow">
+          <legend>hosts the guest may reach</legend>
+          <label><input type="checkbox" value="api.github.com" checked> api.github.com</label>
+          <label><input type="checkbox" value="httpbin.org"> httpbin.org</label>
+          <p class="note">Private and loopback addresses are refused whatever the list says.</p>
+        </fieldset>
+        <h3 class="side-h">requests</h3>
+        <ol class="requests" data-requests aria-live="polite"><li class="empty">None yet.</li></ol>
+      </div>
+    </div>

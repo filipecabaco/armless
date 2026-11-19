@@ -11,7 +11,7 @@
 <body class="docs lost">
 <header class="bar">
   <a class="name" href="<%= @base %>">armless</a>
-  <nav aria-label="Site"><a href="<%= @base %>docs/index.html">docs</a> <a href="<%= @repo %>">source</a></nav>
+  <nav aria-label="Site"><a href="<%= @base %>examples/index.html">examples</a> <a href="<%= @base %>docs/index.html">docs</a> <a href="<%= @repo %>">source</a></nav>
 </header>
 <main class="doc lost-body">
   <h1>That page is not here</h1>

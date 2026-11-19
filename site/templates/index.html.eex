@@ -22,14 +22,15 @@
 <link rel="stylesheet" href="style.css">
 <script src="site.js" defer></script>
 <%= if @demo? do %><link rel="stylesheet" href="demo/xterm.css">
-<script src="demo.js" defer></script><% end %>
+<script src="machine.js" defer></script>
+<script src="trench.js" defer></script><% end %>
 </head>
 <body class="landing">
 <a class="skip" href="#machine">Skip to the machine</a>
 
 <header class="bar">
   <a class="name" href="index.html">armless</a>
-  <nav aria-label="Site"><a href="docs/index.html">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+  <nav aria-label="Site"><a href="examples/index.html">examples</a> <a href="docs/index.html">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
 </header>
 
 <main>
@@ -39,42 +40,13 @@
     <p class="actions"><a class="btn btn-primary" href="docs/getting-started.html">Read the docs</a> <a class="btn" href="<%= @repo %>/releases">Releases</a></p>
   </section>
 
-  <section class="machine" id="machine" aria-label="A machine running in this tab">
-    <div class="pane pane-console">
-      <div class="pane-bar"><span class="pane-name">/bin/sh</span>
-        <span id="keys" class="keys" hidden>
-          <button type="button" class="btn" data-send="\x03" aria-label="Send ctrl+c">^C</button>
-          <button type="button" class="btn" data-send="nproc\n">nproc</button>
-          <button type="button" class="btn" data-send="cat /proc/cpuinfo\n">cpuinfo</button>
-        </span>
-        <span class="end"><span id="status" role="status" data-state="off"><%= if @demo?, do: "needs JavaScript", else: "not in this build" %></span></span>
-      </div>
-      <div class="console">
-        <div id="terminal" role="group" aria-label="The machine's console. Ctrl+c stops the drawing. Escape, then Tab, leaves the console."></div>
-        <p id="console-log" class="visually-hidden" aria-live="polite"></p>
-        <p id="console-fallback" class="fallback" <%= if @demo?, do: "hidden" %>><%= if @demo?, do: "", else: "The machine is not part of this build." %></p>
-        <noscript><p class="fallback">The machine needs JavaScript and WebAssembly.</p></noscript>
-      </div>
-    </div>
+<%= @machine %>
 
-    <div class="pane pane-memory">
-      <div class="pane-bar"><span class="pane-name">machine</span><span class="pane-note">vm.smp_report()</span></div>
-      <div class="memory">
-        <dl class="figures">
-          <div class="wide"><dt>instructions per second, all CPUs</dt><dd><span id="m-mips">-</span><small>MIPS</small></dd></div>
-          <div><dt>CPUs</dt><dd id="m-cpus">-</dd><dd class="note" id="m-cores"></dd></div>
-          <div><dt>JIT blocks</dt><dd id="m-jit">-</dd></div>
-          <div><dt>linear memory</dt><dd><span id="m-linear">-</span><small>MiB</small></dd></div>
-        </dl>
-        <ul class="cpus" id="cpus" aria-label="Instructions per second, each CPU"></ul>
-        <figure class="chart">
-          <svg id="chart" viewBox="0 0 520 200" role="img" aria-label="Instructions per second across all CPUs, over the last two minutes"></svg>
-          <figcaption><span class="key live"></span>all CPUs</figcaption>
-        </figure>
-      </div>
-    </div>
+  <section class="band" id="examples" aria-labelledby="examples-h">
+    <h2 id="examples-h">Examples</h2>
+    <%= @examples %>
+    <p><a href="examples/index.html">All examples</a></p>
   </section>
-  <p class="caption">Linux 6.18, booted in this tab from an initramfs with busybox, with as many CPUs as this device can spare. One awk per CPU draws a trench run, a new one every time. Ctrl+c stops it. Escape, then Tab, leaves the console.<span id="one-cpu" hidden> This browser could not isolate the page, so the machine has one CPU.</span></p>
 
   <section class="embed" id="embed" aria-labelledby="embed-h">
     <h2 id="embed-h">Embed it</h2>
@@ -85,7 +57,7 @@
 
 <footer class="foot">
   <span>armless <%= @version %>. BSD 2-Clause. <a href="https://github.com/filipecabaco/snowglobe">snowglobe</a> uses it.</span>
-  <nav aria-label="Footer"><a href="docs/index.html">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+  <nav aria-label="Footer"><a href="examples/index.html">examples</a> <a href="docs/index.html">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
 </footer>
 </body>
 </html>

@@ -8,5 +8,14 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t tmpfs tmp /tmp
 cd /root
+# A machine with a network (the egress example's): armless's router answers at .1, DNS included
+if [ -e /sys/class/net/eth0 ]; then
+  ip link set lo up
+  ip addr add 192.168.86.100/24 dev eth0
+  ip link set eth0 up
+  ip route add default via 192.168.86.1
+  mkdir -p /etc
+  echo "nameserver 192.168.86.1" > /etc/resolv.conf
+fi
 echo "Linux $(uname -r) on $(nproc) CPUs"
 while :; do setsid cttyhack sh; done
