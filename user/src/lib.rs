@@ -774,7 +774,7 @@ impl Process {
             for page in 0..cpu.machine.code_pages.len() {
                 purge(page as u64);
             }
-            cpu.tlb_shootdown(&[], true);
+            cpu.tlb_flush_everywhere();
         }
         let mut frames = mm::Frames::new(ram.alias(), purge);
         let mm = layout.space(&mut frames)?;

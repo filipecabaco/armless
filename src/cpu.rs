@@ -1117,6 +1117,14 @@ impl<H: Host> Cpu<H> {
         self.tlb_sync();
     }
 
+    /// Drops every translation here and has every other CPU drop all of its own when it next
+    /// runs, without waiting: for when no CPU runs guest code (a CPU that wasn't run since the
+    /// machine was made or restored counts as running, so `tlb_shootdown` would wait for it)
+    pub fn tlb_flush_everywhere(&mut self) {
+        self.tlbi_broadcast(smp::TLB_ALL);
+        self.tlb_sync_gen = 0;
+    }
+
     /// Whoever runs this CPU stopped running guest code on it (until its next `run`): a TLB
     /// shootdown doesn't wait for it, nor does user mode, which waits for a CPU to have left the
     /// guest before it frees what that CPU ran (`Machine::preempt`).
