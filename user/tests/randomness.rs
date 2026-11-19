@@ -56,3 +56,40 @@ fn every_restore_of_a_saved_process_draws_its_own_random_bytes() {
         }
     }
 }
+
+/// A program that maps 8 MiB, then for each page: `body` (with x19 at the page, x1 at hand)
+fn each_page(p: &mut Prog, body: &[u32]) {
+    p.sys(222, &[I(0), I(8 << 20), I(3), I(0x22), I(u64::MAX), I(0)]); // mmap(RW, PRIVATE|ANON)
+    p.code.push(0xaa00_03f3); // mov x19, x0
+    p.code.push(0xd281_0014); // movz x20, #2048 (pages)
+    p.code.extend_from_slice(body);
+    p.code.push(0x9140_0673); // add x19, x19, #4096
+    p.code.push(0xd100_0694); // sub x20, x20, #1
+    let back = -(body.len() as i32 + 2);
+    p.code.push(0xb500_0014 | (((back as u32) & 0x7ffff) << 5)); // cbnz x20, back to the body
+}
+
+#[test]
+fn a_program_started_on_a_restored_machine_gets_memory_that_is_zero() {
+    // The saved program writes a word into each page of 8 MiB, then waits for a line
+    let mut p = Prog::default();
+    each_page(&mut p, &[0xd280_0021, 0xf900_0261]); // movz x1, #1; str x1, [x19]
+    p.sys(63, &[I(0), D(0x100), I(1)]);
+    let mut vm = machine();
+    let mut proc = start(&mut vm, p);
+    until_idle(&mut proc, &mut vm);
+    let state = vm.save_state();
+    drop((proc, vm));
+
+    // A program started instead of it, on the restored machine: each of its pages reads zero
+    let mut p = Prog::default();
+    p.code.push(0xd280_0015); // movz x21, #0
+    each_page(&mut p, &[0xf940_0261, 0xaa01_02b5]); // ldr x1, [x19]; orr x21, x21, x1
+    p.code.push(0xaa15_03e0); // mov x0, x21
+    p.expect(0);
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    let mut fresh = start(&mut vm, p);
+    let (_, status) = run(&mut fresh, &mut vm);
+    ok(&status);
+}

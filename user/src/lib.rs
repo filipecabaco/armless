@@ -764,6 +764,16 @@ impl Process {
                 machine.invalidate_code(page as u32, usize::MAX);
             }
         });
+        // A machine restored from a snapshot holds the saved program's memory: a program started
+        // on it instead (a fresh one, on the snapshot's filesystem) gets RAM that is zero, as
+        // the frames take every frame they never handed out to be, and none of what the CPUs
+        // decoded from the old
+        if cpu.machine.restored.load(Ordering::SeqCst) {
+            ram.discard(0, ram.len());
+            for page in 0..cpu.machine.code_pages.len() {
+                purge(page as u64);
+            }
+        }
         let mut frames = mm::Frames::new(ram.alias(), purge);
         let mm = layout.space(&mut frames)?;
         let mut p = Process {
