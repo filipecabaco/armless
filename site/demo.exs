@@ -184,7 +184,17 @@ defmodule Demo do
   end
 
   defp get!(url, opts \\ []) do
-    resp = Req.get!(url, [retry: :transient, max_retries: 2] ++ opts)
+    # api.github.com refuses a runner's anonymous requests once its address has used its quota
+    auth =
+      case {URI.parse(url).host, System.get_env("GITHUB_TOKEN")} do
+        {"api.github.com", token} when is_binary(token) and token != "" ->
+          [auth: {:bearer, token}]
+
+        _ ->
+          []
+      end
+
+    resp = Req.get!(url, [retry: :transient, max_retries: 2] ++ auth ++ opts)
     if resp.status != 200, do: raise("#{url}: HTTP #{resp.status}")
     resp
   end
