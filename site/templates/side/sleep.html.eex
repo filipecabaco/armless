@@ -1,0 +1,31 @@
+<%!-- Three steps: a timer is set, the process is saved, and it is restored one of two ways, each
+    saying beforehand when the timer will fire (sleep.js) --%>
+    <div class="pane pane-side">
+      <div class="pane-bar"><span class="pane-name">the timer</span><span class="pane-note">save_process(), user_asleep_ms</span></div>
+      <div class="side-body">
+        <ol class="steps">
+          <li data-step="set">
+            <span class="step-n">1</span>
+            <div><p class="step-h">A 60-second timer</p><p class="note" data-timer>being set in the console</p></div>
+          </li>
+          <li data-step="save">
+            <span class="step-n">2</span>
+            <div>
+              <p class="step-h">Save the process, timer and all</p>
+              <p class="note" data-saved>Into this browser: you can close the tab and come back.</p>
+              <button type="button" class="btn btn-primary" data-save disabled>save and stop</button>
+            </div>
+          </li>
+          <li data-step="restore">
+            <span class="step-n">3</span>
+            <div>
+              <p class="step-h">Restore it, one of two ways</p>
+              <button type="button" class="btn" data-restore="asleep" disabled>told how long it was saved</button>
+              <p class="note" data-predict="asleep">Its clocks move on by that time.</p>
+              <button type="button" class="btn" data-restore="none" disabled>told nothing</button>
+              <p class="note" data-predict="none">To it, no time passed.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+    </div>

@@ -1,0 +1,17 @@
+<%!-- The machine's own figures: instructions per second, CPUs, JIT blocks, memory (machine.js report()) --%>
+    <div class="pane pane-memory">
+      <div class="pane-bar"><span class="pane-name">machine</span><span class="pane-note">vm.memory_report()</span></div>
+      <div class="memory">
+        <dl class="figures">
+          <div class="wide"><dt>instructions per second, all CPUs</dt><dd><span data-part="m-mips">-</span><small>MIPS</small></dd></div>
+          <div><dt>CPUs</dt><dd data-part="m-cpus">-</dd><dd class="note" data-part="m-cores"></dd></div>
+          <div><dt>JIT blocks</dt><dd data-part="m-jit">-</dd></div>
+          <div><dt>linear memory</dt><dd><span data-part="m-linear">-</span><small>MiB</small></dd></div>
+        </dl>
+        <ul class="cpus" data-part="cpus" aria-label="Instructions per second, each CPU"></ul>
+        <figure class="chart">
+          <svg data-part="chart" viewBox="0 0 520 200" role="img" aria-label="Instructions per second across all CPUs, over the last two minutes"></svg>
+          <figcaption><span class="key live"></span>all CPUs</figcaption>
+        </figure>
+      </div>
+    </div>

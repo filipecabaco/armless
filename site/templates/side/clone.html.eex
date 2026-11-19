@@ -1,0 +1,14 @@
+<%!-- A second machine beside the first, restored from the same snapshot (clones.js). It is a
+    machine of its own: machine.js looks for its parts inside data-machine="clone-b", and the
+    first machine's parts come before it in the page, so the first finds its own. --%>
+    <div class="pane pane-console" data-machine="clone-b">
+      <div class="pane-bar"><span class="pane-name">copy 2</span>
+        <span class="end"><span data-part="status" class="status" role="status" data-state="off"><%= if @demo?, do: "needs JavaScript", else: "not in this build" %></span></span>
+      </div>
+      <div class="console">
+        <div data-part="terminal" class="terminal" role="group" aria-label="The second copy's console. Escape, then Tab, leaves the console."></div>
+        <p data-part="log" class="visually-hidden" aria-live="polite"></p>
+        <p data-part="fallback" class="fallback" <%= if @demo?, do: "hidden" %>><%= if @demo?, do: "", else: "The machine is not part of this build." %></p>
+      </div>
+      <p class="verdict" data-verdict aria-live="polite"></p>
+    </div>

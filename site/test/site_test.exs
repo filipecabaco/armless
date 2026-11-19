@@ -118,6 +118,32 @@ defmodule SiteTest do
     end
   end
 
+  describe "examples" do
+    test "front matter is key: value lines, the rest is the page's markdown" do
+      {meta, body} = Site.front_matter("---\ntitle: A: b\nscript: x.js\n\n---\n\n## Body\n")
+      assert meta == %{"title" => "A: b", "script" => "x.js"}
+      assert body == "## Body"
+      assert_raise RuntimeError, ~r/no front matter/, fn -> Site.front_matter("## Body\n") end
+    end
+
+    test "every example has its front matter, and the script it names is in site/static" do
+      for path <- Path.wildcard(Path.join([Path.expand("..", __DIR__), "examples", "*.md"])) do
+        ex = Site.example(path)
+        assert File.exists?(Path.join([Path.expand("..", __DIR__), "static", ex.script])), "#{ex.slug}: no #{ex.script}"
+        assert ex.html =~ "<h2"
+        # the script mounts the machine marked with its own name
+        assert File.read!(Path.join([Path.expand("..", __DIR__), "static", ex.script])) =~ ~s(data-machine="#{ex.machine}")
+      end
+    end
+
+    test "the list links each example from where it is shown, numbered, escaped" do
+      list = Site.example_list([%{slug: "a", title: "A <b>", description: "d"}, %{slug: "b", title: "B", description: "e"}], "examples/")
+      assert list =~ ~s(href="examples/a.html")
+      assert list =~ ~s(<span class="n">02</span>)
+      assert list =~ "A &lt;b&gt;"
+    end
+  end
+
   describe "trench.awk" do
     @awk Path.join([Path.expand("..", __DIR__), "guest", "trench.awk"])
     @run 120
@@ -176,6 +202,47 @@ defmodule SiteBuildTest do
           do: "#{Path.relative_to(page, out)} -> #{ref}: #{problem}"
 
     assert broken == []
+  end
+
+  test "every example's side pane is a template, and each page's scripts are in the build" do
+    out = Path.join(@site, "_out")
+
+    for path <- Path.wildcard(Path.join([@site, "examples", "*.md"])) do
+      ex = Site.example(path)
+      assert File.exists?(Path.join([@site, "templates", "side", ex.side <> ".html.eex"])), "#{ex.slug}: no side #{ex.side}"
+      html = File.read!(Path.join([out, "examples", ex.slug <> ".html"]))
+      assert html =~ ~s(data-machine="#{ex.machine}")
+    end
+  end
+
+  test "every example has a page, listed on the examples page and the landing page" do
+    out = Path.join(@site, "_out")
+    examples = Path.wildcard(Path.join([@site, "examples", "*.md"])) |> Enum.map(&Path.basename(&1, ".md"))
+    assert examples != []
+    list = File.read!(Path.join([out, "examples", "index.html"]))
+    landing = File.read!(Path.join(out, "index.html"))
+
+    for slug <- examples do
+      assert File.exists?(Path.join([out, "examples", slug <> ".html"]))
+      assert list =~ ~s(href="#{slug}.html")
+      assert landing =~ ~s(href="examples/#{slug}.html")
+    end
+  end
+
+  test "a page with a machine has every part machine.js looks for" do
+    out = Path.join(@site, "_out")
+
+    for page <- [Path.join(out, "index.html") | Path.wildcard(Path.join([out, "examples", "*.html"]))],
+        html = File.read!(page),
+        html =~ "data-machine=" do
+      # Every console, and the figures where a page shows them
+      console = ~w(status keys terminal log fallback one-cpu)
+      figures = if html =~ ~s(data-part="cpus"), do: ~w(m-mips m-cpus m-cores m-jit m-linear chart), else: []
+
+      for part <- console ++ figures do
+        assert html =~ ~s(data-part="#{part}"), "#{Path.relative_to(page, out)}: no #{part}"
+      end
+    end
   end
 
   defp check(page, ref) do
