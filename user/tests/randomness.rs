@@ -101,6 +101,7 @@ fn a_program_started_on_a_restored_machine_gets_memory_that_is_zero() {
     // ... also once the saved one ran there again first, its translations in the CPUs' TLBs
     let mut vm = machine();
     vm.load_state(&state).unwrap();
+    #[cfg(feature = "native-jit")]
     for c in vm.cpus.iter_mut() {
         c.enable_native_jit();
     }
