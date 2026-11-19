@@ -18,7 +18,7 @@ Mix.install([{:mdex, "~> 0.13"}])
 defmodule Site do
   @repo "https://github.com/filipecabaco/armless"
   # Where the site is published; share cards need absolute URLs
-  @site "https://filipecabaco.github.io/armless/"
+  @site "https://armless.dev/"
 
   # {slug, nav title, group, sources, description}
   # A source is :intro (Readme.md before its first `##`), {:section, "Heading"}
