@@ -74,7 +74,7 @@
       </div>
     </div>
   </section>
-  <p class="caption">Linux 6.8, booted in this tab from an initramfs with busybox, with as many CPUs as this device can spare. One awk per CPU draws a trench run, a new one every time. Ctrl+c stops it. Escape, then Tab, leaves the console.<span id="one-cpu" hidden> This browser could not isolate the page, so the machine has one CPU.</span></p>
+  <p class="caption">Linux 6.18, booted in this tab from an initramfs with busybox, with as many CPUs as this device can spare. One awk per CPU draws a trench run, a new one every time. Ctrl+c stops it. Escape, then Tab, leaves the console.<span id="one-cpu" hidden> This browser could not isolate the page, so the machine has one CPU.</span></p>
 
   <section class="embed" id="embed" aria-labelledby="embed-h">
     <h2 id="embed-h">Embed it</h2>
