@@ -98,6 +98,16 @@ function clock_prog() {
   return p.elf();
 }
 
+/** Sleeps NAP_MS, then draws 16 bytes with getrandom and writes them */
+function random_prog() {
+  const p = new Prog();
+  p.timespec(0x220, NAP_MS);
+  p.sys(101, [D(0x220), I(0)]);
+  p.sys(278, [D(0x300), I(16), I(0)]);
+  p.sys(64, [I(1), D(0x300), I(16)]);
+  return p.elf();
+}
+
 /** Writes "out\n" to stdout and "err\n" to stderr, and exits with status 3 */
 function printer_prog() {
   const p = new Prog().put(0x200, "out\nerr\n");
@@ -146,6 +156,7 @@ const programs = {
   tty: tty_prog(),
   orphans: orphans_prog(),
   clock: clock_prog(),
+  random: random_prog(),
   // Not an executable: its exec fails once its blob has come
   junk: new TextEncoder().encode("not an ELF\n"),
 };
@@ -225,11 +236,11 @@ async function with_exports(edit, fn) {
 }
 
 /**
- * The clock program, saved while it sleeps: {state, process}, the machine's and the process's,
- * and the filesystem it ran from.
+ * The clock program (or `program`), saved while it sleeps: {state, process}, the machine's and
+ * the process's, and the filesystem it ran from.
  */
-async function saved_while_sleeping() {
-  const vm = machine({ user: { argv: ["/bin/clock"], plain_std: true } });
+async function saved_while_sleeping(program = "/bin/clock") {
+  const vm = machine({ user: { argv: [program], plain_std: true } });
   try {
     await vm.ready;
     vm.on("stop", (s) => assert.fail("stopped before it was saved: " + JSON.stringify(s)));
@@ -420,6 +431,49 @@ test("armless_user_asleep_ms is called before each restore of a process", async 
     vm.destroy();
   });
   assert.deepEqual(calls, [["asleep", 1500], ["restore"], ["asleep", 0], ["restore"], ["asleep", 42], ["restore"]]);
+});
+
+// ------------------------------------------------------------------ randomness
+
+test("every restore is seeded afresh, after the state is in", async () => {
+  const { state, process } = await saved_while_sleeping("/bin/random");
+  const calls = [];
+  await with_exports((e, memory) => {
+    const finish = e.armless_state_finish, seed = e.armless_seed;
+    e.armless_state_finish = (...a) => { calls.push(["restore"]); return finish(...a); };
+    e.armless_seed = (p, n) => {
+      calls.push(["seed", Buffer.from(new Uint8Array(memory.buffer, p, n)).toString("hex")]);
+      return seed(p, n);
+    };
+  }, async () => {
+    const vm = machine({ initial_state: state, user_state: process });
+    await vm.ready;
+    await vm.restore_state(state, { user_state: process });
+    await vm.restore_state(state, { user_state: process });
+    vm.destroy();
+  });
+  assert.deepEqual(calls.map((c) => c[0]), ["restore", "seed", "restore", "seed", "restore", "seed"]);
+  const seeds = calls.filter((c) => c[0] === "seed").map((c) => c[1]);
+  assert.equal(new Set(seeds).size, 3, "a new seed each time: " + seeds);
+  assert.ok(seeds.every((s) => s.length === 64), "32 bytes each");
+});
+
+test("copies of one saved process draw their own random bytes", async () => {
+  const { state, process } = await saved_while_sleeping("/bin/random");
+  const draws = [];
+  for (let i = 0; i < 2; i++) {
+    const vm = machine({ initial_state: state, user_state: process, user_asleep_ms: 60_000 });
+    try {
+      await vm.ready;
+      const { stop, out } = await run_to_stop(vm);
+      assert.equal(stop.reason, "exit", JSON.stringify(stop));
+      assert.equal(out.length, 16);
+      draws.push(Buffer.from(out).toString("hex"));
+    } finally {
+      vm.destroy();
+    }
+  }
+  assert.notEqual(draws[0], draws[1]);
 });
 
 // ------------------------------------------------------------------ spawn

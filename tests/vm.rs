@@ -154,3 +154,89 @@ fn snapshot_one_cpu() {
 fn snapshot_two_cpus() {
     snapshot_flow(2);
 }
+
+/// What `/dev/urandom` gives on each CPU (`taskset`), once a newline reaches the shell that waits
+/// for one: `R<cpu>:<hex>` lines up to `marker`.
+fn draws(m: &Machine, marker: &str) -> Vec<String> {
+    m.runner.board.console_input(b"\n");
+    let out = m
+        .screen
+        .wait_for(&format!("{marker}\r\n"), Duration::from_secs(120));
+    let draws: Vec<String> = out
+        .split(|c: char| c.is_whitespace())
+        .filter(|w| w.starts_with('R') && w.contains(':'))
+        .map(str::to_string)
+        .collect();
+    assert!(!draws.is_empty(), "no draws in {out:?}");
+    draws
+}
+
+/// A machine restored from `state`, running
+fn restored(dir: &Path, cpus: usize, state: &[u8]) -> Machine {
+    let mut m = machine(dir, cpus, false);
+    m.runner.load_state(state).unwrap();
+    m.runner.start();
+    m
+}
+
+/// Copies of one snapshot don't draw the same random bytes, not even the first ones they draw,
+/// on any CPU: each restore gives the guest a new VM generation ID, and Linux reseeds at once.
+/// Taken while a shell waits for a line, so what it reads comes right after the restore. Needs a
+/// kernel with the vmgenid driver (snowglobe's has it): skipped on one without.
+fn fresh_randomness(cpus: usize) {
+    let Some(dir) = assets() else {
+        eprintln!("skipping: set ARMLESS_9PFS to a directory made by tests/fs/make-9pfs.sh");
+        return;
+    };
+    let mut a = machine(&dir, cpus, true);
+    a.runner.start();
+    a.screen.wait_for("READY", Duration::from_secs(120));
+    // Linux reseeds on a new generation ID only with its vmgenid driver, which takes one from a
+    // device tree from 6.10 (CONFIG_VMGENID). Without it nothing reseeds the copies but Linux's own
+    // timer, so what they draw first may be alike: nothing to test.
+    let out = run(&a, "[ -d /sys/bus/platform/drivers/vmgenid ] || echo NO-VMGENID", "V");
+    if out.contains("NO-VMGENID") {
+        eprintln!("skipping: this kernel has no vmgenid driver (Linux 6.10+, CONFIG_VMGENID)");
+        return;
+    }
+    // Linux's generator is ready (it was seeded at boot) before the snapshot is taken
+    run(&a, "head -c 16 /dev/urandom > /dev/null", "W");
+    let each = (0..cpus)
+        .map(|c| {
+            format!(
+                "echo R{c}:$(taskset -c {c} head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \\n')"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    a.runner
+        .board
+        .console_input(format!("echo WAITING; read -r go; {each}; echo DREW\n").as_bytes());
+    a.screen.wait_for("WAITING\r\n", Duration::from_secs(120));
+    let state = a.runner.save_state();
+
+    let original = draws(&a, "DREW");
+    let copies: Vec<Vec<String>> = (0..2)
+        .map(|_| draws(&restored(&dir, cpus, &state), "DREW"))
+        .collect();
+    let all: Vec<&String> = original.iter().chain(copies.iter().flatten()).collect();
+    for (i, x) in all.iter().enumerate() {
+        for y in &all[i + 1..] {
+            assert_ne!(
+                x.split(':').nth(1),
+                y.split(':').nth(1),
+                "two draws alike: {all:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fresh_randomness_one_cpu() {
+    fresh_randomness(1);
+}
+
+#[test]
+fn fresh_randomness_two_cpus() {
+    fresh_randomness(2);
+}

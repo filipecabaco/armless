@@ -72,9 +72,8 @@ impl Process {
             nr::TRUNCATE => self.sys_truncate(&a),
             nr::FCHMOD | nr::FCHMODAT => self.sys_fchmod(nr, &a),
             nr::FCHOWN | nr::FCHOWNAT => self.sys_fchown(nr, &a),
-            nr::UTIMENSAT | nr::SYNC | nr::FSYNC | nr::FDATASYNC | nr::SYNCFS | nr::FADVISE64 => {
-                v(0)
-            },
+            nr::UTIMENSAT => self.sys_utimensat(&a),
+            nr::SYNC | nr::FSYNC | nr::FDATASYNC | nr::SYNCFS | nr::FADVISE64 => v(0),
             nr::FLOCK => self.flock(fd0, a[1]),
             nr::STATFS | nr::FSTATFS => self.sys_statfs(&a),
             nr::UMASK => self.sys_umask(&a),
