@@ -429,6 +429,141 @@ fn a_unix_link_reaches_its_socket_and_nothing_else_leaves_with_egress_denied() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn a_link_dialer_opens_the_links_connections_and_none_leaves_it_to_the_host() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    // A socket the host could reach itself, and a link whose socket isn't there: the dialer
+    // answers that one (as a sandboxed host's program asks whoever made the socket), and leaves
+    // the other to the host
+    let dir = std::env::temp_dir().join(format!("armless-dialer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let real = dir.join("real.sock");
+    let _ = std::fs::remove_file(&real);
+    let server = UnixListener::bind(&real).unwrap();
+    std::thread::spawn(move || {
+        let (mut s, _) = server.accept().unwrap();
+        s.write_all(b"by the host").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+    });
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let b = board(true);
+    let (obs, _) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    host.set_links(vec![
+        Tunnel { host: Some("db".into()), port: 5432, url: "unix:///nowhere/l.sock".into() },
+        Tunnel { host: Some("cache".into()), port: 6379, url: format!("unix://{}", real.display()) },
+    ]);
+    {
+        let asked = asked.clone();
+        host.set_link_dialer(Arc::new(move |t: &Tunnel| {
+            asked.lock().unwrap().push(t.url.clone());
+            if t.url != "unix:///nowhere/l.sock" {
+                return None;
+            }
+            let (mine, mut theirs) = UnixStream::pair().unwrap();
+            std::thread::spawn(move || {
+                theirs.write_all(b"by the dialer").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+            });
+            Some(Ok(TcpStream::from(std::os::fd::OwnedFd::from(mine))))
+        }));
+    }
+    let mut g = Guest::on_board(b.clone());
+    for (name, sport, port, want) in [("db", 40040, 5432, &b"by the dialer"[..]), ("cache", 40041, 6379, b"by the host")] {
+        let ip = g.resolve(name, 1).unwrap();
+        g.syn(ip, sport, port);
+        let sa = seg(&mut g, "the SYN-ACK", |s| s.has(SYN | ACK) && s.dport == sport);
+        g.ack(ip, sport, port, sa.seq.wrapping_add(1));
+        let d = seg(&mut g, "the bytes", |s| !s.payload.is_empty() && s.dport == sport);
+        assert_eq!(d.payload, want, "{name}");
+    }
+    assert_eq!(asked.lock().unwrap().len(), 2, "the dialer is asked for every link connection");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_link_its_dialer_fails_is_refused_and_forgotten() {
+    // The dialer's own error stands: the host doesn't try the address after it
+    let b = board(true);
+    let (obs, _) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    host.set_links(vec![Tunnel { host: Some("db".into()), port: 5432, url: "unix:///nowhere/l.sock".into() }]);
+    host.set_link_dialer(Arc::new(|_: &Tunnel| {
+        Some(Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "not yours")))
+    }));
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("db", 1).unwrap();
+    g.syn(ip, 40050, 5432);
+    seg(&mut g, "a reset", |s| s.has(RST) && s.dport == 40050);
+    untracked(&host);
+}
+
+#[test]
+fn a_link_dialer_is_asked_for_links_only() {
+    // A connection no link takes goes out as before, past the dialer
+    let outside = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = outside.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (mut s, _) = outside.accept().unwrap();
+        s.write_all(b"outside").unwrap();
+        thread::sleep(Duration::from_secs(1));
+    });
+    let asked = Arc::new(Mutex::new(0));
+    let b = board(true);
+    let (obs, _) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    host.set_links(vec![Tunnel { host: Some("db".into()), port: 5432, url: "unix:///nowhere/l.sock".into() }]);
+    {
+        let asked = asked.clone();
+        host.set_link_dialer(Arc::new(move |_: &Tunnel| {
+            *asked.lock().unwrap() += 1;
+            None
+        }));
+    }
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("localhost", 1).unwrap();
+    g.syn(ip, 40060, port);
+    let sa = seg(&mut g, "the SYN-ACK", |s| s.has(SYN | ACK) && s.dport == 40060);
+    g.ack(ip, 40060, port, sa.seq.wrapping_add(1));
+    let d = seg(&mut g, "the bytes", |s| !s.payload.is_empty() && s.dport == 40060);
+    assert_eq!(d.payload, b"outside");
+    assert_eq!(*asked.lock().unwrap(), 0, "the dialer is not asked for a connection no link takes");
+}
+
+#[test]
+fn a_new_link_dialer_takes_the_new_connections() {
+    use std::os::unix::net::UnixStream;
+    // Each dialer answers with its own name
+    let dialer = |name: &'static [u8]| -> crate::native::LinkDialer {
+        Arc::new(move |_: &Tunnel| {
+            let (mine, mut theirs) = UnixStream::pair().unwrap();
+            thread::spawn(move || {
+                theirs.write_all(name).unwrap();
+                thread::sleep(Duration::from_secs(1));
+            });
+            Some(Ok(TcpStream::from(std::os::fd::OwnedFd::from(mine))))
+        })
+    };
+    let b = board(true);
+    let (obs, _) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    // Given before the links: it waits for them
+    host.set_link_dialer(dialer(b"first"));
+    host.set_links(vec![Tunnel { host: Some("db".into()), port: 5432, url: "unix:///nowhere/l.sock".into() }]);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("db", 1).unwrap();
+    for (sport, want) in [(40070, &b"first"[..]), (40071, b"second")] {
+        if sport == 40071 {
+            host.set_link_dialer(dialer(b"second"));
+        }
+        g.syn(ip, sport, 5432);
+        let sa = seg(&mut g, "the SYN-ACK", |s| s.has(SYN | ACK) && s.dport == sport);
+        g.ack(ip, sport, 5432, sa.seq.wrapping_add(1));
+        let d = seg(&mut g, "the bytes", |s| !s.payload.is_empty() && s.dport == sport);
+        assert_eq!(d.payload, want);
+    }
+}
+
 /// How the guest ends a connection it has just written to.
 #[derive(Clone, Copy, Debug)]
 enum Ending {

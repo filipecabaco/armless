@@ -4,7 +4,8 @@
 //! * the web relay's requests (`HttpRequest`, `WsOpen`) made with a built-in HTTP client
 //! * other TCP connections the guest opens, as real connections, or through a WebSocket
 //!   tunnel for the destinations [`HostOptions::tunnels`] names, or to the address a link the
-//!   host's program set ([`NativeHost::set_links`]) names
+//!   host's program set ([`NativeHost::set_links`]) names, or that its dialer
+//!   ([`NativeHost::set_link_dialer`]) opens
 //! * connections into the guest (port forwarding) from host sockets
 //! * the network's retransmit timer
 //!
@@ -118,6 +119,19 @@ impl Tunnel {
 
 pub type Observer = Box<dyn FnMut(&Event) + Send>;
 
+/// Opens a link's connection in the host's place: for a host whose program may not connect to a
+/// Unix socket itself (a sandbox that refuses them), which asks whoever made the socket for a
+/// connection instead. Called on a thread of its own, once per connection the guest opens to the
+/// link; `None` leaves it to the host, which connects to the link's address as without a dialer.
+pub type LinkDialer = Arc<dyn Fn(&Tunnel) -> Option<std::io::Result<TcpStream>> + Send + Sync>;
+
+/// The links, and who opens their connections.
+#[derive(Default)]
+struct Links {
+    list: Vec<Tunnel>,
+    dialer: Option<LinkDialer>,
+}
+
 /// A link's connection: straight to its address, whatever it is. A Unix socket's is carried as a
 /// TcpStream (the host pumps it the same way; only TCP options fail, and are ignored).
 fn link(l: &Tunnel) -> std::io::Result<TcpStream> {
@@ -161,7 +175,7 @@ pub struct NativeHost {
     /// What `set_links` last gave. Shared with the event loop rather than sent to it, so that a
     /// connection the guest opens after the call returns follows the new links (a message could
     /// still be behind the guest's event in the loop).
-    links: Arc<Mutex<Vec<Tunnel>>>,
+    links: Arc<Mutex<Links>>,
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(test)]
     conns: Shared,
@@ -245,7 +259,7 @@ impl NativeHost {
                 let _ = tx.send(Msg::Wake);
             }));
         }
-        let links = Arc::new(Mutex::new(Vec::new()));
+        let links = Arc::new(Mutex::new(Links::default()));
         let conns: Shared = Arc::default();
         let thread = {
             let board = board.clone();
@@ -277,7 +291,13 @@ impl NativeHost {
     /// whatever the egress allows (a private address, `Egress::deny_all`). New connections
     /// follow the new links; open ones stay as they are.
     pub fn set_links(&self, links: Vec<Tunnel>) {
-        *self.links.lock().unwrap() = links;
+        self.links.lock().unwrap().list = links;
+    }
+
+    /// Have `dialer` open the links' connections (see [`LinkDialer`]). New connections use it;
+    /// open ones stay as they are.
+    pub fn set_link_dialer(&self, dialer: LinkDialer) {
+        self.links.lock().unwrap().dialer = Some(dialer);
     }
 
     /// Look at the events again (after something was delivered elsewhere).
@@ -301,7 +321,7 @@ fn event_loop(
     mut observer: Observer,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
-    links: Arc<Mutex<Vec<Tunnel>>>,
+    links: Arc<Mutex<Links>>,
     conns: Shared,
 ) {
     let egress = Arc::new(options.egress.clone());
@@ -400,17 +420,20 @@ fn event_loop(
                     let closed = watch(&conns, id);
                     // A link: a direct connection to its address (a Unix socket or a TCP
                     // one), the host's own choice
-                    let found = links
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .find(|t| t.matches(&host, port))
-                        .filter(|t| t.unix_path().is_some() || t.tcp_address().is_some())
-                        .cloned();
+                    let (found, dialer) = {
+                        let links = links.lock().unwrap();
+                        let found = links
+                            .list
+                            .iter()
+                            .find(|t| t.matches(&host, port))
+                            .filter(|t| t.unix_path().is_some() || t.tcp_address().is_some())
+                            .cloned();
+                        (found, links.dialer.clone())
+                    };
                     if let Some(l) = found {
                         let (board, conns, tx) = (board.clone(), conns.clone(), tx.clone());
                         std::thread::spawn(move || {
-                            match link(&l) {
+                            match dialer.and_then(|d| d(&l)).unwrap_or_else(|| link(&l)) {
                                 Ok(s) => {
                                     board.tcp_accept(id);
                                     attach(&board, &conns, &closed, id, s);
