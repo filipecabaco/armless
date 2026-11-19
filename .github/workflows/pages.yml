@@ -104,6 +104,8 @@ jobs:
           test -x build/release/armless-run
           echo "bin=$PWD/build/release/armless-run" >> "$GITHUB_OUTPUT"
       - name: Put the machines together
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: elixir site/demo.exs build-linux ${{ steps.native.outputs.bin }}
       - uses: actions/setup-node@v7
         with:
