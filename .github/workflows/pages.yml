@@ -96,9 +96,13 @@ jobs:
         id: native
         if: steps.release.outcome == 'success'
         continue-on-error: true
+        # From inside the checkout: cargo takes .cargo/config.toml (target-dir = "build") from
+        # where it runs, not from the manifest's directory
+        working-directory: ${{ runner.temp }}/release
         run: |
-          cargo build --release --manifest-path "$RUNNER_TEMP/release/Cargo.toml" --bin armless-run
-          echo "bin=$RUNNER_TEMP/release/build/release/armless-run" >> "$GITHUB_OUTPUT"
+          cargo build --release --bin armless-run
+          test -x build/release/armless-run
+          echo "bin=$PWD/build/release/armless-run" >> "$GITHUB_OUTPUT"
       - name: Put the machines together
         run: elixir site/demo.exs build-linux ${{ steps.native.outputs.bin }}
       - uses: actions/setup-node@v7
@@ -132,7 +136,14 @@ jobs:
           test -f site/_out/docs/index.html
           test -f site/_out/examples/index.html
           test -f site/_out/demo/config.json || echo "::warning::the machines were not put together; the site says so"
-          test -f site/_out/demo/native.bin.zst || echo "::warning::no native snapshot; its examples say so"
+          if [ ! -f site/_out/demo/native.bin.zst ]; then
+            # armless-run built and still no snapshot is a broken build, not a missing release
+            if [ "${{ steps.native.outcome }}" = "success" ]; then
+              echo "::error::armless-run was built but made no native snapshot"
+              exit 1
+            fi
+            echo "::warning::no native snapshot; its examples say so"
+          fi
       - uses: actions/upload-pages-artifact@v5
         if: github.event_name != 'pull_request'
         with:
