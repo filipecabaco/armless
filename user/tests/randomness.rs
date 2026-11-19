@@ -71,13 +71,17 @@ fn each_page(p: &mut Prog, body: &[u32]) {
 
 #[test]
 fn a_program_started_on_a_restored_machine_gets_memory_that_is_zero() {
-    // The saved program writes a word into each page of 8 MiB, then waits for a line
+    // The saved program writes a word into each page of 8 MiB and waits for a line, then does it
+    // again: restored, it writes them again and waits, its translations warm in the TLBs
     let mut p = Prog::default();
-    each_page(&mut p, &[0xd280_0021, 0xf900_0261]); // movz x1, #1; str x1, [x19]
-    p.sys(63, &[I(0), D(0x100), I(1)]);
+    for _ in 0..2 {
+        each_page(&mut p, &[0xd280_0021, 0xf900_0261]); // movz x1, #1; str x1, [x19]
+        p.sys(63, &[I(0), D(0x100), I(1)]);
+    }
     let mut vm = machine();
     let mut proc = start(&mut vm, p);
     until_idle(&mut proc, &mut vm);
+    let saved = proc.save(&vm.cpus[0]);
     let state = vm.save_state();
     drop((proc, vm));
 
@@ -87,9 +91,23 @@ fn a_program_started_on_a_restored_machine_gets_memory_that_is_zero() {
     each_page(&mut p, &[0xf940_0261, 0xaa01_02b5]); // ldr x1, [x19]; orr x21, x21, x1
     p.code.push(0xaa15_03e0); // mov x0, x21
     p.expect(0);
+    let fresh = p.elf();
     let mut vm = machine();
     vm.load_state(&state).unwrap();
-    let mut fresh = start(&mut vm, p);
-    let (_, status) = run(&mut fresh, &mut vm);
+    let mut p = Process::exec_bytes(&mut vm.cpus[0], Some(vm.board.clone()), &fresh, &["p".into()], &[]).unwrap();
+    let (_, status) = run(&mut p, &mut vm);
+    ok(&status);
+
+    // ... also once the saved one ran there again first, its translations in the CPUs' TLBs
+    let mut vm = machine();
+    vm.load_state(&state).unwrap();
+    for c in vm.cpus.iter_mut() {
+        c.enable_native_jit();
+    }
+    let mut old = Process::restore(&mut vm.cpus[0], None, &saved, Duration::ZERO).unwrap();
+    old.input(b"\n");
+    until_idle(&mut old, &mut vm);
+    let mut p = Process::exec_bytes(&mut vm.cpus[0], Some(vm.board.clone()), &fresh, &["p".into()], &[]).unwrap();
+    let (_, status) = run(&mut p, &mut vm);
     ok(&status);
 }
