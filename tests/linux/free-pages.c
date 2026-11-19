@@ -1,5 +1,6 @@
 // PID 1 for the free page reporting test (tests/linux/free-pages.sh): writes 200 MiB, frees it,
-// waits long enough for the kernel to report it (page reporting runs 2 s after pages free up), then
+// waits long enough for the kernel to report it (page reporting runs 2 s after pages free up, and
+// 6.18 reports a free list in passes 2 s apart: 8 s left 145 MiB of 200 reported on CI), then
 // says so and idles, for armless-run --save-after to snapshot the machine. Raw syscalls, no libc.
 
 typedef unsigned long u64;
@@ -38,7 +39,7 @@ void _start(void) {
     for (u64 i = 0; i < len; i += 4096) p[i] = (char)((i >> 12) | 1);
     sys6(215, (i64)p, len, 0, 0, 0, 0); // munmap
     out("free-pages: wrote and freed 200 MiB\n");
-    nap(8);
+    nap(30);
     out("ARMLESS-FREED-AND-WAITED\n");
     for (;;) nap(60);
 }

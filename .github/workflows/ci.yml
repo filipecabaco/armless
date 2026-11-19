@@ -138,6 +138,9 @@ jobs:
   linux:
     needs: packages
     runs-on: ubuntu-24.04
+    env:
+      LINUX_VERSION: 6.18.60
+      LINUX_SHA256: 3c2f44ef6acc021a7ad444d9a2e6ec1ef488ff09368793d0004a6080f69d621e
     steps:
       - uses: actions/checkout@v7
       # Ubuntu packages, from GitHub's cache (the packages job fetched them there)
@@ -156,18 +159,23 @@ jobs:
         with:
           workspaces: ". -> build"
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The kernel snowglobe's machines run (internal/boot/kernel.Dockerfile there): 6.10 and later
+      # take a VM generation ID from the device tree (CONFIG_VMGENID), so a restore reseeds Linux's
+      # generator, which tests/vm.rs checks
       - name: Cache kernel
         id: kcache
         uses: actions/cache@v6
         with:
           path: build-linux
-          key: linux-6.8-${{ hashFiles('tests/linux/armless_defconfig', 'tests/linux/init.c', 'tests/linux/mkcpio.py') }}
+          key: linux-${{ env.LINUX_VERSION }}-${{ hashFiles('tests/linux/armless_defconfig', 'tests/linux/init.c', 'tests/linux/mkcpio.py') }}
       - name: Build kernel and initramfs
         if: steps.kcache.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/linux"
-          tar xjf /usr/src/linux-source-6.8.0/linux-source-6.8.0.tar.bz2 -C "$RUNNER_TEMP/linux"
-          sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-source-6.8.0" build-linux
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/linux.tar.xz" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_VERSION.tar.xz"
+          echo "$LINUX_SHA256  $RUNNER_TEMP/linux.tar.xz" | sha256sum -c -
+          tar xJf "$RUNNER_TEMP/linux.tar.xz" -C "$RUNNER_TEMP/linux"
+          sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-$LINUX_VERSION" build-linux
       - name: Boot Linux to userspace
         run: sh tests/linux/boot.sh build-linux
       - name: Free page reporting shrinks snapshots
