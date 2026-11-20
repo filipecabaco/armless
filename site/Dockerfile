@@ -1,5 +1,6 @@
-# The site as Fly serves it: what site/build.exs made (site/_out), by site/server.exs (Francis),
-# which sends the headers that make its pages cross-origin isolated.
+# The site as Fly serves it: site/server.exs (Francis) renders each page from its template under
+# site/templates, with what site/build.exs gathered (site/_out: site.etf and static/), and sends
+# the headers that make its pages cross-origin isolated.
 FROM elixir:1.20-alpine
 
 RUN mix local.hex --force && mix local.rebar --force
@@ -7,12 +8,14 @@ ENV MIX_INSTALL_DIR=/opt/mix-installs SITE_DIR=/srv PORT=8080
 
 WORKDIR /app
 COPY server.exs .
-# Its dependencies compiled now, not as a machine starts
+COPY templates templates
+# Its dependencies and templates compiled now, not as a machine starts
 RUN elixir server.exs --no-start
 
 COPY _out /srv
-# A gzipped copy beside each file that compresses (the blobs, Image.gz and snapshots already are)
-RUN find /srv -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' \
+# A gzipped copy beside each static file that compresses (the blobs, Image.gz and snapshots
+# already are)
+RUN find /srv/static -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' \
       -o -name '*.wasm' -o -name '*.svg' -o -name '*.cpio' -o -name '*.md' \) -exec gzip -k9 {} \;
 
 # A VM for a machine of 256 MB and a shared CPU: one scheduler (and one dirty CPU one), no

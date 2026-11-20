@@ -1,5 +1,5 @@
 # armless's site on Fly: `elixir site/build.exs`, then `fly deploy` from site/ (Dockerfile:
-# site/_out served by site/server.exs, which sends the cross-origin isolation headers)
+# site/server.exs renders the pages from site/templates and site/_out, with the isolation headers)
 app = "armless"
 primary_region = "ams"
 

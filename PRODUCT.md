@@ -8,7 +8,7 @@ web
 
 ## Stack
 
-Delegated. Chosen: a small Elixir build script (`site/build.exs`, MDEx via `Mix.install`, with `site/demo.exs` for the landing page machine) that turns the markdown in `docs/` and the README into static HTML under `site/_out`, deployed to GitHub Pages by a workflow. The landing page is hand-written HTML/CSS. No JavaScript framework.
+Delegated. Chosen: a small Elixir build script (`site/build.exs`, MDEx via `Mix.install`, with `site/demo.exs` for the landing page machine) that renders the markdown in `docs/` and the README into `site/_out`, served on Fly by a Francis server (`site/server.exs`) with a route and EEx template per page. The pages are hand-written HTML/CSS templates. No JavaScript framework.
 
 ## Users
 

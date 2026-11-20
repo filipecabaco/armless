@@ -1,8 +1,8 @@
 name: Site
 
-# Builds the site (landing page, examples and docs) with site/build.exs and deploys it to Fly
-# (site/fly.toml: site/_out served by site/server.exs, which sends the headers that make its pages
-# cross-origin isolated). Every merge to main redeploys it: the docs are cut from Readme.md and
+# Gathers the site's content (landing page, examples and docs) with site/build.exs and deploys it
+# to Fly (site/fly.toml: site/server.exs renders each page from its template and site/_out, and
+# sends the headers that make its pages cross-origin isolated). Every merge to main redeploys it: the docs are cut from Readme.md and
 # docs/, the footer carries the version from Cargo.toml, and the machines are put together afresh.
 #
 # The machines run armless as built from this commit: armless.wasm and armless-smp.wasm by
@@ -131,19 +131,20 @@ jobs:
             exit 0
           fi
           node site/test/examples.mjs site/static/demo
-      - name: Test the site (docs cutting, links, anchors, trench.awk) and its server
+      - name: Test the site (docs cutting, trench.awk) and its server (routes, old addresses, headers)
         run: |
           elixir site/test/site_test.exs
           elixir site/test/server_test.exs
       - name: Build the site
         run: elixir site/build.exs
+      # Every page crawled from / through the server: links, assets and anchors
+      - name: Test the build's links and anchors, as the server serves it
+        run: elixir site/test/links_test.exs
       - name: Check the build
         run: |
-          test -f site/_out/index.html
-          test -f site/_out/docs/index.html
-          test -f site/_out/examples/index.html
-          test -f site/_out/demo/config.json || echo "::warning::the machines were not put together; the site says so"
-          if [ ! -f site/_out/demo/native.bin.zst ]; then
+          test -f site/_out/site.etf
+          test -f site/_out/static/demo/config.json || echo "::warning::the machines were not put together; the site says so"
+          if [ ! -f site/_out/static/demo/native.bin.zst ]; then
             # armless-run built and still no snapshot is a broken build, not a missing release
             if [ "${{ steps.native.outcome }}" = "success" ]; then
               echo "::error::armless-run was built but made no native snapshot"
@@ -151,7 +152,7 @@ jobs:
             fi
             echo "::warning::no native snapshot; its examples say so"
           fi
-          if [ ! -d site/_out/demo/py ]; then
+          if [ ! -d site/_out/static/demo/py ]; then
             echo "::warning::no python filesystem; the race says so"
           fi
       - uses: superfly/flyctl-actions/setup-flyctl@1.6
