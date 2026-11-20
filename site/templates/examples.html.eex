@@ -9,22 +9,22 @@
 <meta property="og:description" content="What armless does, each shown by a machine running in the page.">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="armless">
-<meta property="og:url" content="<%= @site %>examples/index.html">
-<meta property="og:image" content="<%= @site %>og.png">
+<meta property="og:url" content="<%= @site %>/examples">
+<meta property="og:image" content="<%= @site %>/og.png">
 <meta property="og:image:type" content="image/png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="armless: arm64 Linux, in a browser tab. Beside the headline, the Mandelbrot set as the page's machine draws it in its console.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="color-scheme" content="dark">
-<link rel="icon" href="../favicon.svg" type="image/svg+xml">
-<link rel="preload" href="../fonts/SpaceMono-400.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="../style.css">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/fonts/SpaceMono-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body class="landing">
 <header class="bar">
-  <a class="name" href="../index.html">armless</a>
-  <nav aria-label="Site"><a href="index.html" aria-current="page">examples</a> <a href="../docs/index.html">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+  <a class="name" href="/">armless</a>
+  <nav aria-label="Site"><a href="/examples" aria-current="page">examples</a> <a href="/docs">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
 </header>
 
 <main>
@@ -40,7 +40,7 @@
 
 <footer class="foot">
   <span>armless <%= @version %>. BSD 2-Clause.</span>
-  <nav aria-label="Footer"><a href="../docs/index.html">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
+  <nav aria-label="Footer"><a href="/docs">docs</a> <a href="<%= @repo %>/releases">releases</a> <a href="<%= @repo %>">source</a></nav>
 </footer>
 </body>
 </html>

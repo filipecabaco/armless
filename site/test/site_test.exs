@@ -1,8 +1,8 @@
 #!/usr/bin/env elixir
 
-# Tests for the site: how site/build.exs cuts and links the docs, that a full build leaves no
-# broken link or anchor, and that site/guest/trench.awk's CPUs together draw exactly the
-# picture one CPU draws.
+# Tests for the site: how site/build.exs cuts and links the docs, and that
+# site/guest/trench.awk's CPUs together draw exactly the picture one CPU draws. That a full
+# build, as the server serves it, leaves no broken link or anchor is site/test/links_test.exs.
 #
 #   elixir site/test/site_test.exs
 #
@@ -18,7 +18,7 @@ defmodule SiteTest do
   describe "cutting the README" do
     test "splits at ## headings, keeps the intro, and leaves fenced code alone" do
       readme =
-        Site.parse_readme("""
+        Site.Build.parse_readme("""
         # armless
 
         The intro.
@@ -44,7 +44,7 @@ defmodule SiteTest do
 
     test "a section on its own page has its ### headings promoted, outside code only" do
       body = "### Options\n\ntext\n\n```md\n### keep\n```\n\n#### Deeper"
-      promoted = Site.promote(body)
+      promoted = Site.Build.promote(body)
       assert promoted =~ ~r/^## Options$/m
       assert promoted =~ ~r/^### keep$/m
       assert promoted =~ ~r/^### Deeper$/m
@@ -53,7 +53,7 @@ defmodule SiteTest do
 
   describe "headings" do
     test "get ids, unique within a page, and a named permalink" do
-      {html, toc} = Site.add_ids("<h2>Calls</h2><p>x</p><h2>Calls</h2><h3><code>armless-run --stats</code></h3>")
+      {html, toc} = Site.Build.add_ids("<h2>Calls</h2><p>x</p><h2>Calls</h2><h3><code>armless-run --stats</code></h3>")
       assert [{2, "calls", "Calls"}, {2, "calls-1", "Calls"}, {3, "armless-run---stats", _}] = toc
       assert html =~ ~s(<h2 id="calls">)
       assert html =~ ~s(<h2 id="calls-1">)
@@ -61,15 +61,15 @@ defmodule SiteTest do
     end
 
     test "slugs follow GitHub's" do
-      assert Site.slug("Quick start") == "quick-start"
-      assert Site.slug("The web relay (dev/web)") == "the-web-relay-devweb"
+      assert Site.Build.slug("Quick start") == "quick-start"
+      assert Site.Build.slug("The web relay (dev/web)") == "the-web-relay-devweb"
     end
   end
 
   describe "rendering" do
     test "tables scroll in a labelled region, code blocks are focusable, options can be linked" do
       html =
-        Site.render("""
+        Site.Build.render("""
         | option | meaning |
         |---|---|
         | `predecode_mb` | a cap |
@@ -88,7 +88,7 @@ defmodule SiteTest do
     end
 
     test "the landing page's snippet is the README's browser example, escaped" do
-      embed = Site.embed(%{"Quick start" => "### Browser\n\n```html\n<script src=\"armless.js\"></script>\n```\n"})
+      embed = Site.Build.embed(%{"Quick start" => "### Browser\n\n```html\n<script src=\"armless.js\"></script>\n```\n"})
       assert embed == "&lt;script src=&quot;armless.js&quot;&gt;&lt;/script&gt;"
     end
   end
@@ -103,15 +103,15 @@ defmodule SiteTest do
 
     test "an anchor on another page goes to that page", ctx do
       page = %{ctx.page | html: ~s(<a href="#building">b</a><a href="#what-it-has">w</a>)}
-      out = Site.rewrite_links(page, ctx.owners, ctx.files, Path.expand("../..", __DIR__))
-      assert out =~ ~s(href="getting-started.html#building")
+      out = Site.Build.rewrite_links(page, ctx.owners, ctx.files, Path.expand("../..", __DIR__))
+      assert out =~ ~s(href="/docs/getting-started#building")
       assert out =~ ~s(href="#what-it-has")
     end
 
     test "a docs file becomes its page, a repository file goes to GitHub", ctx do
       page = %{ctx.page | html: ~s(<a href="docs/armless.md#snapshots">d</a><a href="LICENSE">l</a><a href="lib/zstd">z</a><a href="https://v86.example">x</a>)}
-      out = Site.rewrite_links(page, ctx.owners, ctx.files, Path.expand("../..", __DIR__))
-      assert out =~ ~s(href="design.html#snapshots")
+      out = Site.Build.rewrite_links(page, ctx.owners, ctx.files, Path.expand("../..", __DIR__))
+      assert out =~ ~s(href="/docs/design#snapshots")
       assert out =~ ~s(href="https://github.com/filipecabaco/armless/blob/main/LICENSE")
       assert out =~ ~s(href="https://github.com/filipecabaco/armless/tree/main/lib/zstd")
       assert out =~ ~s(href="https://v86.example")
@@ -120,27 +120,22 @@ defmodule SiteTest do
 
   describe "examples" do
     test "front matter is key: value lines, the rest is the page's markdown" do
-      {meta, body} = Site.front_matter("---\ntitle: A: b\nscript: x.js\n\n---\n\n## Body\n")
+      {meta, body} = Site.Build.front_matter("---\ntitle: A: b\nscript: x.js\n\n---\n\n## Body\n")
       assert meta == %{"title" => "A: b", "script" => "x.js"}
       assert body == "## Body"
-      assert_raise RuntimeError, ~r/no front matter/, fn -> Site.front_matter("## Body\n") end
+      assert_raise RuntimeError, ~r/no front matter/, fn -> Site.Build.front_matter("## Body\n") end
     end
 
     test "every example has its front matter, and the script it names is in site/static" do
       for path <- Path.wildcard(Path.join([Path.expand("..", __DIR__), "examples", "*.md"])) do
-        ex = Site.example(path)
+        ex = Site.Build.example(path)
         assert File.exists?(Path.join([Path.expand("..", __DIR__), "static", ex.script])), "#{ex.slug}: no #{ex.script}"
         assert ex.html =~ "<h2"
         # the script mounts the machine marked with its own name
         assert File.read!(Path.join([Path.expand("..", __DIR__), "static", ex.script])) =~ ~s(data-machine="#{ex.machine}")
+        # and the pane beside its console is a template
+        assert File.exists?(Path.join([Path.expand("..", __DIR__), "templates", "side", ex.side <> ".html.eex"])), "#{ex.slug}: no side #{ex.side}"
       end
-    end
-
-    test "the list links each example from where it is shown, numbered, escaped" do
-      list = Site.example_list([%{slug: "a", title: "A <b>", description: "d"}, %{slug: "b", title: "B", description: "e"}], "examples/")
-      assert list =~ ~s(href="examples/a.html")
-      assert list =~ ~s(<span class="n">02</span>)
-      assert list =~ "A &lt;b&gt;"
     end
   end
 
@@ -175,91 +170,6 @@ defmodule SiteTest do
       assert frame(1, 64, 22, 30, 1) != frame(1, 64, 22, 30, 2)
       assert frame(1, 64, 22, 30, 7) == frame(1, 64, 22, 30, 7)
       assert frame(1, 64, 22, 30, 7) != frame(1, 64, 22, 31, 7)
-    end
-  end
-end
-
-defmodule SiteBuildTest do
-  use ExUnit.Case
-
-  @site Path.expand("..", __DIR__)
-
-  setup_all do
-    Site.run()
-    :ok
-  end
-
-  test "every page and asset it links to exists, and every anchor is on its page" do
-    out = Path.join(@site, "_out")
-    pages = Path.wildcard(Path.join(out, "**/*.html")) |> Enum.reject(&String.ends_with?(&1, "404.html"))
-    assert length(pages) > 5
-
-    broken =
-      for page <- pages,
-          [_, ref] <- Regex.scan(~r/(?:href|src)="([^"]+)"/, File.read!(page)),
-          not String.starts_with?(ref, ["http://", "https://", "mailto:", "data:"]),
-          problem = check(page, ref),
-          do: "#{Path.relative_to(page, out)} -> #{ref}: #{problem}"
-
-    assert broken == []
-  end
-
-  test "every example's side pane is a template, and each page's scripts are in the build" do
-    out = Path.join(@site, "_out")
-
-    for path <- Path.wildcard(Path.join([@site, "examples", "*.md"])) do
-      ex = Site.example(path)
-      assert File.exists?(Path.join([@site, "templates", "side", ex.side <> ".html.eex"])), "#{ex.slug}: no side #{ex.side}"
-      html = File.read!(Path.join([out, "examples", ex.slug <> ".html"]))
-      assert html =~ ~s(data-machine="#{ex.machine}")
-    end
-  end
-
-  test "every example has a page, listed on the examples page and the landing page" do
-    out = Path.join(@site, "_out")
-    examples = Path.wildcard(Path.join([@site, "examples", "*.md"])) |> Enum.map(&Path.basename(&1, ".md"))
-    assert examples != []
-    list = File.read!(Path.join([out, "examples", "index.html"]))
-    landing = File.read!(Path.join(out, "index.html"))
-
-    for slug <- examples do
-      assert File.exists?(Path.join([out, "examples", slug <> ".html"]))
-      assert list =~ ~s(href="#{slug}.html")
-      assert landing =~ ~s(href="examples/#{slug}.html")
-    end
-  end
-
-  test "a page with a machine has every part machine.js looks for" do
-    out = Path.join(@site, "_out")
-
-    for page <- [Path.join(out, "index.html") | Path.wildcard(Path.join([out, "examples", "*.html"]))],
-        html = File.read!(page),
-        html =~ "data-machine=" do
-      # Every console, and the figures where a page shows them
-      console = ~w(status keys terminal log fallback one-cpu)
-      figures = if html =~ ~s(data-part="cpus"), do: ~w(m-mips m-cpus m-cores m-jit m-linear chart), else: []
-
-      for part <- console ++ figures do
-        assert html =~ ~s(data-part="#{part}"), "#{Path.relative_to(page, out)}: no #{part}"
-      end
-    end
-  end
-
-  defp check(page, ref) do
-    [path, frag] =
-      case String.split(ref, "#", parts: 2) do
-        [p] -> [p, nil]
-        [p, f] -> [p, f]
-      end
-
-    path = path |> String.split("?") |> hd()
-    target = if path == "", do: page, else: Path.expand(path, Path.dirname(page))
-    target = if File.dir?(target), do: Path.join(target, "index.html"), else: target
-
-    cond do
-      not File.exists?(target) -> "missing"
-      frag && not (File.read!(target) =~ ~s(id="#{frag}")) -> "no such anchor"
-      true -> nil
     end
   end
 end

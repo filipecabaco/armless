@@ -21,7 +21,7 @@ reseeds it.
 ## What is running
 
 The two consoles above are two machines in this tab. Both restore the snapshot from
-[the native example](native-snapshot.html), saved at a shell prompt. Each one reads
+[the native example](/examples/native-snapshot), saved at a shell prompt. Each one reads
 `head -c 16 /dev/urandom` as soon as it is restored. The line under the second copy compares
 the two reads.
 

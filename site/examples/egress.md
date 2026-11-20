@@ -43,4 +43,4 @@ const vm = new Armless({
 Without `allow`, a guest may reach any public address and the page's own origin. A native host
 gets the same controls and more: `ports` limits the TCP ports the guest can reach at all, and a
 write budget caps what it can write to its filesystem (`ENOSPC`, with a real `statfs`). See the
-[native API](../docs/native-api.html).
+[native API](/docs/native-api).

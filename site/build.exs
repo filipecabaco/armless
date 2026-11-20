@@ -1,24 +1,23 @@
 #!/usr/bin/env elixir
 
-# Builds the armless site into site/_out.
+# Gathers the armless site into site/_out, for site/server.exs to serve.
 #
 #   elixir site/build.exs
 #
-# The docs are not written twice: every page is cut from Readme.md (by its
-# `##` headings) or is one of the files under docs/. The landing page is
-# site/templates/index.html.eex, written by hand. Each example is a page of its own,
-# examples/<slug>.html, from site/examples/<slug>.md (see @examples), listed on
-# examples/index.html and the landing page.
+# No HTML is written here: site/server.exs renders each route from a template under
+# site/templates. What this makes is what those routes need and the server shouldn't redo on
+# each request:
 #
-# SITE_BASE is the path the site is served from ("/armless/" on GitHub Pages).
-# Only the 404 page needs it, because it is served from any depth.
+#   _out/site.etf   the content: the docs pages, cut from Readme.md (by its `##` headings) or one
+#                   of the files under docs/ (see @pages), rendered from markdown, their links made
+#                   site paths; the examples, from site/examples/<slug>.md (see @examples); the
+#                   landing page's snippet; the version; whether the machines are in the build
+#   _out/static/    site/static as it is (scripts, styles, fonts, and demo/: the machines)
 
 Mix.install([{:mdex, "~> 0.13"}])
 
-defmodule Site do
+defmodule Site.Build do
   @repo "https://github.com/filipecabaco/armless"
-  # Where the site is published; share cards need absolute URLs
-  @site "https://filipecabaco.github.io/armless/"
 
   # {slug, nav title, group, sources, description}
   # A source is :intro (Readme.md before its first `##`), {:section, "Heading"}
@@ -56,21 +55,24 @@ defmodule Site do
   # below the machine.
   @examples ~w(trench-run native-snapshot fresh-randomness time-asleep no-kernel egress)
 
-  # The landing page's machine: the trench run, as on its example page
-  @landing_caption "Linux 6.18, booted in this tab from an initramfs with busybox, with as many CPUs as this device can spare. One awk per CPU draws a trench run, a new one every time. Ctrl+c stops it. Escape, then Tab, leaves the console."
-
   def run do
-    # ARMLESS_SRC points at another checkout of the repository to cut the docs from
-    root = System.get_env("ARMLESS_SRC") || Path.expand("..", __DIR__)
     out = Path.join(__DIR__, "_out")
     File.rm_rf!(out)
-    File.mkdir_p!(Path.join(out, "docs"))
-    File.cp_r!(Path.join(__DIR__, "static"), out)
-    File.write!(Path.join(out, ".nojekyll"), "")
+    File.mkdir_p!(out)
+    File.cp_r!(Path.join(__DIR__, "static"), Path.join(out, "static"))
 
+    content = content()
+    File.write!(Path.join(out, "site.etf"), :erlang.term_to_binary(content, compressed: 6))
+
+    IO.puts("site: #{length(content.pages)} doc pages, #{length(content.examples)} examples into #{Path.relative_to_cwd(out)}")
+  end
+
+  # Everything the server's routes render, as one term (site/server.exs reads it as it starts)
+  @doc false
+  def content do
+    # ARMLESS_SRC points at another checkout of the repository to cut the docs from
+    root = System.get_env("ARMLESS_SRC") || Path.expand("..", __DIR__)
     readme = parse_readme(File.read!(Path.join(root, "Readme.md")))
-    version = version(Path.join(root, "Cargo.toml"))
-    demo? = File.exists?(Path.join([__DIR__, "static", "demo", "config.json"]))
 
     pages =
       for {slug, title, group, sources, desc} <- @pages do
@@ -81,83 +83,15 @@ defmodule Site do
 
     owners = for p <- pages, {_, id, _} <- p.toc, into: %{}, do: {id, p.slug}
     files = for p <- pages, f <- source_files(p), into: %{}, do: {f, p.slug}
-
     pages = Enum.map(pages, &%{&1 | html: rewrite_links(&1, owners, files, root)})
 
-    layout = template("layout.html.eex")
-
-    for {p, i} <- Enum.with_index(pages) do
-      prev = if i > 0, do: Enum.at(pages, i - 1)
-      next = Enum.at(pages, i + 1)
-
-      html =
-        EEx.eval_file(layout,
-          assigns: [
-            page: p,
-            nav: nav(pages, p.slug),
-            prev: prev,
-            next: next,
-            version: version,
-            repo: @repo,
-            site: @site
-          ]
-        )
-
-      File.write!(Path.join([out, "docs", p.slug <> ".html"]), html)
-    end
-
-    examples = Enum.map(@examples, &example(Path.join([__DIR__, "examples", &1 <> ".md"])))
-    File.mkdir_p!(Path.join(out, "examples"))
-
-    for {ex, i} <- Enum.with_index(examples) do
-      html =
-        EEx.eval_file(template("example.html.eex"),
-          assigns: [
-            ex: ex,
-            n: number(i + 1),
-            machine: machine(ex.machine, ex.pane, ex.caption, demo?, ex.side),
-            prev: if(i > 0, do: Enum.at(examples, i - 1)),
-            next: Enum.at(examples, i + 1),
-            demo?: demo?,
-            version: version,
-            repo: @repo,
-            site: @site
-          ]
-        )
-
-      File.write!(Path.join([out, "examples", ex.slug <> ".html"]), html)
-    end
-
-    File.write!(
-      Path.join([out, "examples", "index.html"]),
-      EEx.eval_file(template("examples.html.eex"),
-        assigns: [list: example_list(examples, ""), version: version, repo: @repo, site: @site]
-      )
-    )
-
-    File.write!(
-      Path.join(out, "index.html"),
-      EEx.eval_file(template("index.html.eex"),
-        assigns: [
-          version: version,
-          repo: @repo,
-          site: @site,
-          demo?: demo?,
-          embed: embed(readme),
-          machine: machine("trench", "/bin/sh", @landing_caption, demo?, "metrics"),
-          examples: example_list(examples, "examples/")
-        ]
-      )
-    )
-
-    base = System.get_env("SITE_BASE", "/armless/")
-
-    File.write!(
-      Path.join(out, "404.html"),
-      EEx.eval_file(template("404.html.eex"), assigns: [base: base, repo: @repo])
-    )
-
-    IO.puts("site: #{length(pages)} doc pages, #{length(examples)} examples + landing into #{Path.relative_to_cwd(out)}")
+    %{
+      version: version(Path.join(root, "Cargo.toml")),
+      demo?: File.exists?(Path.join([__DIR__, "static", "demo", "config.json"])),
+      embed: embed(readme),
+      pages: pages,
+      examples: Enum.map(@examples, &example(Path.join([__DIR__, "examples", &1 <> ".md"])))
+    }
   end
 
   # ---- examples ------------------------------------------------------------
@@ -209,37 +143,12 @@ defmodule Site do
     end
   end
 
-  defp machine(name, pane, caption, demo?, side) do
-    side = EEx.eval_file(template(Path.join("side", side <> ".html.eex")), assigns: [demo?: demo?])
-
-    EEx.eval_file(template("machine.html.eex"),
-      assigns: [machine: name, pane: pane, caption: h(caption), demo?: demo?, side: side]
-    )
-  end
-
-  # The list of examples, linked from `dir` (where their pages are, seen from the page it is on)
-  @doc false
-  def example_list(examples, dir) do
-    items =
-      examples
-      |> Enum.with_index(1)
-      |> Enum.map_join("\n", fn {ex, n} ->
-        ~s(<li><a href="#{dir}#{ex.slug}.html"><span class="n">#{number(n)}</span><span class="t">#{h(ex.title)}</span><span class="d">#{h(ex.description)}</span></a></li>)
-      end)
-
-    ~s(<ol class="examples">\n#{items}\n</ol>)
-  end
-
-  defp number(n), do: n |> Integer.to_string() |> String.pad_leading(2, "0")
-
   # The browser snippet of the Quick start, as the README has it
   @doc false
   def embed(readme) do
     [_, code] = Regex.run(~r/```html\n(.*?)```/s, Map.fetch!(readme, "Quick start"))
     code |> String.trim_trailing() |> h()
   end
-
-  defp template(name), do: Path.join([__DIR__, "templates", name])
 
   defp version(cargo) do
     case Regex.run(~r/^version\s*=\s*"([^"]+)"/m, File.read!(cargo)) do
@@ -410,7 +319,7 @@ defmodule Site do
         whole
 
       owner ->
-        ~s(href="#{owner}.html##{id}")
+        ~s(href="#{doc_path(owner)}##{id}")
     end
   end
 
@@ -432,25 +341,14 @@ defmodule Site do
         "#{@repo}/#{kind}/main/#{full}#{suffix}"
 
       slug ->
-        "#{slug}.html#{suffix}"
+        doc_path(slug) <> suffix
     end
   end
 
-  # ---- navigation ----------------------------------------------------------
-
-  defp nav(pages, current) do
-    pages
-    |> Enum.chunk_by(& &1.group)
-    |> Enum.map_join("\n", fn [%{group: group} | _] = ps ->
-      items =
-        Enum.map_join(ps, "\n", fn p ->
-          cur = if p.slug == current, do: ~s( aria-current="page"), else: ""
-          ~s(<li><a href="#{p.slug}.html"#{cur}>#{h(p.title)}</a></li>)
-        end)
-
-      ~s(<p class="nav-group">#{h(group)}</p><ul>#{items}</ul>)
-    end)
-  end
+  # A doc page's path on the site: the overview is /docs itself
+  @doc false
+  def doc_path("index"), do: "/docs"
+  def doc_path(slug), do: "/docs/" <> slug
 
   def h(text) do
     text
@@ -463,4 +361,4 @@ defmodule Site do
 end
 
 # site/test/site_test.exs loads this file for its functions, without building
-unless System.get_env("SITE_BUILD") == "test", do: Site.run()
+unless System.get_env("SITE_BUILD") == "test", do: Site.Build.run()

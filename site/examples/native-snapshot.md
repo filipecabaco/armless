@@ -10,7 +10,7 @@ caption: The snapshot was made when this site was built. A native armless-run bo
 
 No kernel boots on this page. When the site was built, a native `armless-run`
 (Rust, Cranelift JIT) booted the same Linux 6.18 kernel and busybox initramfs as the
-[trench run](trench-run.html). It typed one line into the guest's console, which wrote where and
+[trench run](/examples/trench-run). It typed one line into the guest's console, which wrote where and
 when the guest was running to `/root/origin`, and then saved the whole machine: CPU registers,
 devices, and 256 MiB of RAM, most of it zero. Compressed with zstd, the snapshot is a few MB.
 

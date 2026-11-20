@@ -4,7 +4,8 @@
 //
 // - native-snapshot: the native snapshot restores and says where it was saved
 // - fresh-randomness: two restores of it read different bytes from /dev/urandom
-// - no-kernel: sh in user mode, ps and /proc/self/status
+// - no-kernel: sh in user mode, ps and /proc/self/status; and the race, the same python3 with no
+//   kernel and under Linux (demo/py), each answering a line with its own release
 // - time-asleep: a saved process's pending sleep comes due at once when restored told it slept
 //   past it, and keeps its time left when told nothing
 // - egress: allow() is asked for each request, and a refused one is a 502 in the guest (a private
@@ -125,6 +126,27 @@ await example("egress: allow() is asked, and a refused request is a 502 in the g
   if (!asked.includes("10.0.0.1")) throw new Error(`allow() was asked about ${JSON.stringify(asked)}`);
   m.vm.destroy();
 });
+
+if (config.python) {
+  await example("no-kernel: the same python3 with no kernel and under Linux, os.stat and a child in both", async () => {
+    const py = { json: at("py/filesystem.json"), baseurl: at("py/blobs") + "/" };
+    const line = 'import os, subprocess; print("RACE", os.uname().release, os.stat("/usr/bin/python3").st_size > 0, subprocess.run(["sh", "-c", "exit 7"]).returncode)\n';
+    const sides = [
+      [{ user: { argv: ["python3"], env: ["PATH=/usr/bin:/bin", "HOME=/root", "TERM=xterm"], cwd: "/root" } }, "6.6.0-armless-user"],
+      [{ boot: { kernel: at("Image.gz"), initrd: at("initrd.cpio"), cmdline: `${config.cmdline} python` } }, config.linux],
+    ];
+    for (const [options, release] of sides) {
+      const m = await machine({ filesystem: py, ...options });
+      await m.wait(/>>> $/, "python3's prompt");
+      m.type(line);
+      const [, got, ok, code] = await m.wait(/^RACE (\S+) (\S+) (\d+)\s*$/m, "python3's answer");
+      if (!got.startsWith(release) || ok !== "True" || code !== "7") throw new Error(`said ${got} ${ok} ${code}, wanted ${release} True 7`);
+      m.vm.destroy();
+    }
+  });
+} else {
+  console.log("skip: no-kernel's race (no python filesystem in this build)");
+}
 
 console.log(failed ? `examples.mjs: failed (${secs()})` : `examples.mjs: passed in ${secs()}`);
 process.exit(failed ? 1 : 0);

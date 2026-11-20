@@ -5,17 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Page not found · armless</title>
 <meta name="color-scheme" content="dark">
-<link rel="icon" href="<%= @base %>favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="<%= @base %>style.css">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
 </head>
 <body class="docs lost">
 <header class="bar">
-  <a class="name" href="<%= @base %>">armless</a>
-  <nav aria-label="Site"><a href="<%= @base %>examples/index.html">examples</a> <a href="<%= @base %>docs/index.html">docs</a> <a href="<%= @repo %>">source</a></nav>
+  <a class="name" href="/">armless</a>
+  <nav aria-label="Site"><a href="/examples">examples</a> <a href="/docs">docs</a> <a href="<%= @repo %>">source</a></nav>
 </header>
 <main class="doc lost-body">
   <h1>That page is not here</h1>
-  <p>The address does not match a page of this site. The docs start at the <a href="<%= @base %>docs/index.html">overview</a>.</p>
+  <p>The address does not match a page of this site. The docs start at the <a href="/docs">overview</a>.</p>
 </main>
 </body>
 </html>
