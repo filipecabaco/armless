@@ -17,5 +17,14 @@ if [ -e /sys/class/net/eth0 ]; then
   mkdir -p /etc
   echo "nameserver 192.168.86.1" > /etc/resolv.conf
 fi
+# The race (examples/no-kernel): `python` on the command line. The machine has the race's
+# filesystem as its 9p root; Linux mounts it and runs its python3, the same file the machine with
+# no kernel runs
+if grep -qw python /proc/cmdline; then
+  mount -t 9p -o trans=virtio,version=9p2000.L,cache=loose host9p /mnt
+  for d in proc dev sys tmp; do mount --bind /$d /mnt/$d; done
+  echo "Linux $(uname -r), python3 from 9p"
+  while :; do setsid cttyhack chroot /mnt /bin/busybox env -i PATH=/usr/bin:/bin HOME=/root TERM=xterm-256color /usr/bin/python3; done
+fi
 echo "Linux $(uname -r) on $(nproc) CPUs"
 while :; do setsid cttyhack sh; done

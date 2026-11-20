@@ -76,25 +76,17 @@
       filesystem: { json: at("demo/fs/filesystem.json"), baseurl: at("demo/fs/blobs/") },
       user: { argv: ["sh"], env, cwd: "/root" },
     }),
-    fetching: "fetching armless and busybox",
-    starting: "starting sh, no kernel",
     keys: [["date", "date +%T\n"], ["jobs", "jobs\n"]],
     command: () => `${timer}\n`,
     running: /^timer set at/m,
-    status: () => "a timer is set. step 2: save it",
+    status: "a timer is set. step 2: save it",
   });
   const { vm, term, set } = machine;
   saveButton.disabled = false;
   show();
 
   // The page's clock for when the timer was set: the moment the shell said so
-  const decoder = new TextDecoder();
-  let out = "";
-  vm.on("console", (b) => {
-    if (timerAt) return;
-    out += decoder.decode(b, { stream: true });
-    if (/^timer set at/m.test(out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""))) { timerAt = Date.now(); show(); }
-  });
+  machine.waitFor(/^timer set at/m).then(() => { timerAt = Date.now(); show(); });
 
   const note = (text) => term.write(`\r\n\x1b[2m-- ${text} --\x1b[0m\r\n`);
 

@@ -1,23 +1,22 @@
-// A machine on one of the site's pages: Linux booted from an initramfs on several CPUs, its console
-// in xterm.js, and armless's own report of what each CPU is doing beside it. Nothing here is
-// simulated: the numbers come from vm.memory_report(), the text is what the guest writes, and the
-// status line only says what the page has seen happen.
+// A machine on one of the site's pages: Linux booted from an initramfs on several CPUs, a snapshot
+// restored, or a program with no kernel; its console in xterm.js, and armless's own report of what
+// each CPU is doing beside it. Nothing here is simulated: the numbers come from
+// vm.memory_report(), the text is what the guest writes, and the status line only says what the
+// page has seen happen.
 //
 //   const m = await ArmlessMachine.mount(root, {
 //     keys: [["^C", "\x03", "Send ctrl+c"], ["nproc", "nproc\n"]],  // buttons that type into the console
-//     command: (cols, rows) => "trench 80 24\n",  // typed at the first prompt, unless the visitor got there first
+//     command: (cols, rows) => "trench 80 24\n",  // typed once it is up, unless the visitor got there first
 //     running: /frame 1:/,                         // what the guest prints once the command runs
-//     status: (cpus) => "flying the trench",       // the status line then
+//     status: (cpus) => "flying the trench",       // the status line then (or a string)
 //     // Armless options over the defaults (the demo's kernel and initramfs, booted on as many
 //     // CPUs as the device can spare): a snapshot, user mode, a network...
 //     options: (at, config) => ({ cpus: 1, initial_state: at("demo/native.bin.zst") }),
-//     restored: true,                              // no prompt comes: type the command once it runs
-//     fetching: "fetching armless and a snapshot", // what the console says while it loads
-//     starting: "restoring",                       // the status line once it runs
 //     needs: "native",                             // a flag of demo/config.json the example needs
+//     on: { blob: fn },                            // listeners on the machine from the moment it is made
 //   });
-//   (and `on: { blob: fn }`: listeners on the machine from the moment it is made)
-//   m.vm, m.term, m.set(state, text), m.type(text), m.yours(), m.startedAt (performance.now())
+//   m.vm, m.term, m.set(state, text), m.type(text), m.yours(), m.startedAt (performance.now()),
+//   m.waitFor(regex, { fresh }): the first match in the console's text (from now on, with fresh)
 //
 // `root` holds the markup of site/templates/machine.html.eex, whose parts are found by data-part;
 // the metrics are drawn where the page has them. Paths are taken relative to this file, so a
@@ -43,9 +42,9 @@
     return scripts.get(src);
   };
 
-  // More than one CPU needs a cross-origin isolated page. GitHub Pages can't send the headers, so
-  // sw.js adds them: the first visit installs it and reloads once. Where that can't happen the
-  // machine runs on one CPU, and says so.
+  // More than one CPU needs a cross-origin isolated page. site/server.exs sends the headers; on a
+  // host that can't, sw.js adds them: the first visit installs it and reloads once. Where neither
+  // can happen the machine runs on one CPU, and says so.
   let isolating = null;
   function isolate() {
     return (isolating ??= (async () => {
@@ -63,6 +62,16 @@
       }
     })());
   }
+
+  const plain = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // What the console says while a machine loads, and the status line once it runs, by what the
+  // machine is: a program with no kernel, a restored snapshot, or Linux to boot
+  const phrases = (extra) =>
+    extra.user ? ["fetching armless. no kernel to fetch", "starting, no kernel"]
+    : extra.initial_state ? ["fetching armless and a snapshot", "restoring"]
+    : ["fetching armless, Linux and its initramfs", "booting Linux"];
 
   function mount(root, opts = {}) {
     const $ = (part) => root.querySelector(`[data-part="${part}"]`);
@@ -90,11 +99,14 @@
 
     return (async () => {
       set("loading", "loading");
-      const config = await fetch(at("demo/config.json")).then((r) => (r.ok ? r.json() : Promise.reject(new Error("the machine is not part of this build"))));
-      // An asset only some builds have (config.json says): the native snapshot
-      if (opts.needs && !config[opts.needs]) throw new Error("this example's snapshot is not part of this build");
-      await Promise.all([load(at("cpus.js")), load(at("demo/xterm.js")), load(at("demo/addon-fit.js")), load(at("demo/armless.js"))]);
+      const [config] = await Promise.all([
+        fetch(at("demo/config.json")).then((r) => (r.ok ? r.json() : Promise.reject(new Error("the machine is not part of this build")))),
+        load(at("cpus.js")), load(at("demo/xterm.js")), load(at("demo/addon-fit.js")), load(at("demo/armless.js")),
+      ]);
+      // An asset only some builds have (config.json says): the native snapshot, python3's files
+      if (opts.needs && !config[opts.needs]) throw new Error("this example's files are not part of this build");
       const extra = opts.options ? opts.options(at, config) : {};
+      const [fetching, starting] = phrases(extra);
       const cores = navigator.hardwareConcurrency || 0;
       let cpus = extra.cpus;
       if (!cpus) {
@@ -129,7 +141,7 @@
       term.loadAddon(fit);
       term.open($("terminal"));
       fit.fit();
-      term.write(`\x1b[2m${opts.fetching || "fetching armless, Linux and its initramfs"}\x1b[0m\r\n`);
+      term.write(`\x1b[2m${fetching}\x1b[0m\r\n`);
 
       // A terminal must not keep the keyboard: Escape then Tab leaves it, as the caption says
       let escAt = 0;
@@ -156,108 +168,79 @@
       // before it is ready)
       for (const [event, fn] of Object.entries(opts.on || {})) vm.on(event, fn);
 
-      // What the guest printed, as text: for the prompt and status checks and the screen reader log
+      // The console as text, without its escape sequences: its last few thousand characters, and
+      // what is waited for in them. `base` counts what came before `seen`.
       const decoder = new TextDecoder();
-      let tail = "";
-      let started = false;   // the machine is running
-      let typed = false;     // the page gave the shell its command
-      let running = false;   // the guest printed what says the command runs
-      let yours = false;     // the visitor took over
-      let promptSeen = false;
+      let seen = "", base = 0;
+      const waits = [];
+      // A wait that matched is resolved and done (false); one that didn't goes on waiting (true)
+      const pending = (w) => {
+        const m = w.re.exec(seen.slice(Math.max(0, w.from - base)));
+        if (m) w.resolve(m);
+        return !m;
+      };
+      const waitFor = (re, { fresh = false } = {}) => new Promise((resolve) => {
+        const w = { re, resolve, from: fresh ? base + seen.length : 0 };
+        if (pending(w)) waits.push(w);
+      });
+      vm.on("console", (bytes) => {
+        term.write(bytes);
+        seen += plain(decoder.decode(bytes, { stream: true }));
+        if (seen.length > 8000) { base += seen.length - 4000; seen = seen.slice(-4000); }
+        for (let i = waits.length - 1; i >= 0; i--) if (!pending(waits[i])) waits.splice(i, 1);
+        announce();
+      });
+      vm.on("error", (e) => fail("the machine stopped: " + (e.message || e)));
+      vm.on("stop", ({ reason }) => set("stopped", "stopped (" + reason + ")"));
 
-      // What is left to type of the page's command. The visitor taking over sends it at once, so
-      // what they type or a key sends starts on a prompt of its own instead of running into it
+      // The visitor taking over: the page types nothing more of its command. What is left of it
+      // goes at once, so what they type starts on a prompt of its own instead of running into it
+      let yours = false;
       let rest = "";
+      // The page's command is typed (or it has none): from then on only ctrl+c takes over
+      let typed = !opts.command;
       const takeOver = () => {
         if (rest) { vm.console_input(rest); rest = ""; }
         if (yours) return;
         yours = true;
-        if (started) set("ready", "the shell is yours");
+        set("ready", "the shell is yours");
       };
-
-      vm.on("console", (bytes) => {
-        term.write(bytes);
-        tail = (tail + decoder.decode(bytes, { stream: true })).slice(-4000);
-        if (!promptSeen && /#\s*$/.test(tail.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""))) {
-          promptSeen = true;
-          setTimeout(start, 300);
-        }
-        check();
-        announce();
-      });
-      // Whether the command runs yet: on each output, and once it is typed (its output can come
-      // back before the last key's pause is over)
-      function check() {
-        if (!typed || running || yours) return;
-        if (opts.running?.test(tail)) {
-          running = true;
-          set("ready", opts.status ? opts.status(cpus) : "running");
-        } else if (/not found|rror/.test(tail)) {
-          takeOver();
-        }
-      }
-      vm.on("error", (e) => fail("the machine stopped: " + (e.message || e)));
-      vm.on("stop", ({ reason }) => set("stopped", "stopped (" + reason + ")"));
-
-      // The terminal also answers the guest's queries through onData, so only keys and pastes count
-      term.onKey(({ domEvent }) => {
-        if (domEvent.ctrlKey && domEvent.key.toLowerCase() === "c") takeOver();
-        else if (!typed) takeOver();
-      });
-      term.textarea?.addEventListener("paste", takeOver);
-      term.onData((data) => { if (started) vm.console_input(data); });
-
-      const resize = () => {
-        fit.fit();
-        if (started) vm.console_resize(term.cols, term.rows);
-      };
-      new ResizeObserver(resize).observe($("terminal"));
-
-      // The page types the example's command, unless the visitor got there first
-      async function start() {
-        if (yours) return;
-        if (!opts.command) return takeOver();
-        set("loading", "starting");
-        rest = opts.command(term.cols, term.rows);
-        if (reduced) { vm.console_input(rest); rest = ""; }
-        while (rest && !yours) {
-          vm.console_input(rest[0]);
-          rest = rest.slice(1);
-          await new Promise((r) => setTimeout(r, 45));
-        }
-        typed = true;
-        // A command with nothing in particular to wait for runs once it is typed
-        if (!opts.running && !yours) set("ready", opts.status ? opts.status(cpus) : "running");
-        check();
-      }
 
       // A polite log of the guest's last line, for screen readers, at most every two seconds
       const log = $("log");
       let said = "", announceTimer = 0;
       function announce() {
-        if (announceTimer) return;
+        if (announceTimer || !log) return;
         announceTimer = setTimeout(() => {
           announceTimer = 0;
-          const lines = tail.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-          const last = lines.at(-1) ?? "";
-          if (log && last && last !== said) log.textContent = said = last;
+          const last = seen.slice(-400).split(/\r?\n/).map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+          if (last && last !== said) log.textContent = said = last;
         }, 2000);
       }
 
       await vm.ready;
       vm.run();
       const startedAt = performance.now();
-      started = true;
-      resize();
-      set("loading", opts.starting || "booting Linux");
-      if (opts.restored) {
-        // A restored shell already printed its prompt, before it was saved
-        promptSeen = true;
-        setTimeout(start, 500);
-      } else {
-        // If the prompt went by unrecognised, start anyway once the shell has had time to settle
-        setTimeout(() => { if (!promptSeen) { promptSeen = true; start(); } }, 30000);
-      }
+      set("loading", starting);
+
+      // The visitor's keys, once it runs. The terminal also answers the guest's queries through
+      // onData, so only keys and pastes count as taking over.
+      term.onKey(({ domEvent }) => {
+        if (!typed || (domEvent.ctrlKey && domEvent.key.toLowerCase() === "c")) takeOver();
+      });
+      term.textarea?.addEventListener("paste", takeOver);
+      term.onData((data) => vm.console_input(data));
+      let fitting = 0;
+      new ResizeObserver(() => {
+        if (fitting) return;
+        fitting = requestAnimationFrame(() => {
+          fitting = 0;
+          fit.fit();
+          vm.console_resize(term.cols, term.rows);
+        });
+      }).observe($("terminal"));
+      fit.fit();
+      vm.console_resize(term.cols, term.rows);
 
       const keys = $("keys") || document.createElement("span");
       for (const [label, send, aria] of opts.keys || []) {
@@ -272,12 +255,39 @@
       }
       keys.hidden = !keys.childElementCount;
 
+      // The page types its command once the machine is up (a shell's prompt; a restored one
+      // printed its prompt before it was saved), at most 30 s on, unless the visitor got there
+      // first; then the status says it runs once the guest says so, or gives up the console on
+      // an error
+      if (opts.command) (async () => {
+        await Promise.race([extra.initial_state ? sleep(500) : waitFor(/#\s*$/).then(() => sleep(300)), sleep(30000)]);
+        if (yours) return;
+        set("loading", "starting");
+        const ran = Promise.race([
+          waitFor(opts.running ?? /(?:)/, { fresh: true }).then(() => true),
+          waitFor(/not found|rror/, { fresh: true }).then(() => false),
+        ]);
+        rest = opts.command(term.cols, term.rows);
+        while (rest && !yours) {
+          const n = reduced ? rest.length : 1;
+          vm.console_input(rest.slice(0, n));
+          rest = rest.slice(n);
+          await sleep(45);
+        }
+        typed = true;
+        const ok = await ran;
+        if (yours) return;
+        if (!ok) return takeOver();
+        set("ready", typeof opts.status === "function" ? opts.status(cpus) : opts.status ?? "running");
+      })();
+
       if ($("cpus")) report(vm, cpus);
       return {
         vm,
         term,
         set,
         startedAt,
+        waitFor,
         // Type into the console as the visitor, who has the shell from then on
         type: (data) => { takeOver(); vm.console_input(data); },
         yours: takeOver,
@@ -298,7 +308,8 @@
       const rates = [...root.querySelectorAll("[data-cpu-rate]")];
 
       const sample = () => {
-        if (document.hidden) { last = null; return; }
+        // (Nothing to show of a hidden tab or a stopped machine)
+        if (document.hidden || !vm.running) { last = null; return; }
         let r;
         try { r = vm.memory_report({ scan: false }); } catch { return; }
         const now = performance.now();
@@ -354,5 +365,5 @@
       `<path class="live" d="${line}"/>`;
   }
 
-  window.ArmlessMachine = { mount };
+  window.ArmlessMachine = { mount, plain };
 })();

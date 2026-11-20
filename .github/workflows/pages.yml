@@ -1,23 +1,26 @@
-name: Pages
+name: Site
 
-# Builds the site (landing page, examples and docs) with site/build.exs and publishes it to
-# GitHub Pages. Every merge to main redeploys it: the docs are cut from Readme.md and docs/, the
-# footer carries the version from Cargo.toml, and the machines are put together afresh.
+# Builds the site (landing page, examples and docs) with site/build.exs and deploys it to Fly
+# (site/fly.toml: site/_out served by site/server.exs, which sends the headers that make its pages
+# cross-origin isolated). Every merge to main redeploys it: the docs are cut from Readme.md and
+# docs/, the footer carries the version from Cargo.toml, and the machines are put together afresh.
 #
-# The machines boot Linux on several CPUs. Their kernel (Linux 6.18, as ci.yml's: 6.10 and later
-# take a VM generation ID from the device tree, which the fresh-randomness example shows) and
-# busybox are built the way ci.yml's linux job builds its own (tests/linux/build.sh,
-# build-rootfs.sh), and cached. site/demo.exs then fetches armless.js and its wasm from the
-# latest release, packs the initramfs (site/guest) and the user-mode examples' filesystem, and
-# has a native armless-run, built from the release's tag so the formats match, boot the guest
-# and save it for the examples that restore a native snapshot. If any of that fails the site
-# still deploys, and the pages say what is not in this build.
+# The machines run armless as built from this commit: armless.wasm and armless-smp.wasm by
+# build-wasm.sh, and a native armless-run, which boots the guest and saves it for the examples
+# that restore a native snapshot (the same commit, so the formats match). Their kernel (Linux
+# 6.18, as ci.yml's: 6.10 and later take a VM generation ID from the device tree, which the
+# fresh-randomness example shows) and busybox are built the way ci.yml's linux job builds its own
+# (tests/linux/build.sh, build-rootfs.sh), and cached. site/demo.exs packs the initramfs
+# (site/guest), the user-mode examples' filesystem, and the race's (Alpine's python3, from its
+# packages). If any of that fails the site still deploys, and the pages say what is not in it.
 #
-# A pull request that touches the site, the docs or the guest only builds and tests it, so a
-# broken build shows up before it reaches main. The tests are site/test: the CPU count for a
-# device, the machine booted on 1 to 8 CPUs, the examples' machines, and the docs' cutting,
-# links and anchors.
-# Pages > Source is "GitHub Actions" in the repository settings.
+# A pull request that touches the site, the docs, the guest or armless only builds and tests it,
+# so a broken build shows up before it reaches main. The tests are site/test: the CPU count for a
+# device, the machine booted on 1 to 8 CPUs, the examples' machines, the server, and the docs'
+# cutting, links and anchors.
+#
+# Deploying needs the repository secret FLY_API_TOKEN: a deploy token of the Fly app armless
+# (fly tokens create deploy -a armless).
 
 on:
   push:
@@ -27,6 +30,10 @@ on:
       - "site/**"
       - "docs/**"
       - "tests/linux/**"
+      - "src/**"
+      - "user/**"
+      - "js/**"
+      - "build-wasm.sh"
       - "Readme.md"
       - "Cargo.toml"
       - ".github/workflows/pages.yml"
@@ -36,7 +43,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  group: site-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -52,9 +59,6 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
-      - uses: actions/configure-pages@v6
-        if: github.event_name != 'pull_request'
-        id: pages
       - name: Cache the guest's kernel and busybox
         id: guest
         uses: actions/cache@v6
@@ -75,41 +79,42 @@ jobs:
           sh tests/linux/build.sh "$RUNNER_TEMP/linux/linux-$LINUX_VERSION" build-linux
           git clone --depth 1 https://github.com/mirror/busybox "$RUNNER_TEMP/busybox"
           sh tests/linux/build-rootfs.sh "$RUNNER_TEMP/busybox" build-linux
-      # The native snapshot's armless-run: the latest release's, as the wasm site/demo.exs fetches
-      - name: Check out the latest release
-        id: release
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
-          git fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag"
-          git worktree add "$RUNNER_TEMP/release" "$tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@v2
-        if: steps.release.outcome == 'success'
+      - uses: ./.github/actions/apt
         with:
-          workspaces: "${{ runner.temp }}/release -> build"
-          key: site-${{ steps.release.outputs.tag }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build armless-run at the latest release
-        id: native
-        if: steps.release.outcome == 'success'
-        continue-on-error: true
-        # From inside the checkout: cargo takes .cargo/config.toml (target-dir = "build") from
-        # where it runs, not from the manifest's directory
-        working-directory: ${{ runner.temp }}/release
+          set: wasm
+      - name: Toolchain
         run: |
+          rustup target add wasm32-unknown-unknown
+          rustup component add rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build"
+          key: site
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # armless as this commit has it: the page's wasm (one CPU, and several) and the native
+      # armless-run that saves the snapshot those restore
+      - name: Build armless.wasm, armless-smp.wasm and armless-run
+        id: native
+        run: |
+          sh build-wasm.sh
+          SMP=1 sh build-wasm.sh
           cargo build --release --bin armless-run
-          test -x build/release/armless-run
+          mkdir -p "$RUNNER_TEMP/armless"
+          cp js/armless.js build/armless.wasm build/armless-smp.wasm "$RUNNER_TEMP/armless/"
           echo "bin=$PWD/build/release/armless-run" >> "$GITHUB_OUTPUT"
+          echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) (${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
       - name: Put the machines together
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          ARMLESS_BUILD: ${{ runner.temp }}/armless
+          ARMLESS_VERSION: ${{ steps.native.outputs.version }}
         run: elixir site/demo.exs build-linux ${{ steps.native.outputs.bin }}
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      # The files python3 reads before its first >>>, which the race downloads before it starts
+      - name: List the race's startup files
+        run: |
+          if [ -f site/static/demo/config.json ]; then node site/py-startup.mjs site/static/demo; fi
       - name: Test the CPU count for a device
         run: node --test site/test/cpus.test.mjs
       - name: Test the machine (boot, nproc, trench, ctrl+c) on 1, 2, 4 and 8 CPUs
@@ -119,19 +124,19 @@ jobs:
             exit 0
           fi
           for n in 1 2 4 8; do node site/test/guest.mjs site/static/demo $n; done
-      - name: Test the examples' machines (native snapshot, fresh randomness, user mode, time asleep, egress)
+      - name: Test the examples' machines (native snapshot, fresh randomness, user mode, time asleep, egress, the race)
         run: |
           if [ ! -f site/static/demo/config.json ]; then
             echo "::warning::the machines were not put together; nothing to test"
             exit 0
           fi
           node site/test/examples.mjs site/static/demo
-      - name: Test the site (docs cutting, links, anchors, trench.awk)
-        run: elixir site/test/site_test.exs
+      - name: Test the site (docs cutting, links, anchors, trench.awk) and its server
+        run: |
+          elixir site/test/site_test.exs
+          elixir site/test/server_test.exs
       - name: Build the site
         run: elixir site/build.exs
-        env:
-          SITE_BASE: ${{ steps.pages.outputs.base_path || '/armless' }}/
       - name: Check the build
         run: |
           test -f site/_out/index.html
@@ -146,21 +151,14 @@ jobs:
             fi
             echo "::warning::no native snapshot; its examples say so"
           fi
-      - uses: actions/upload-pages-artifact@v5
+          if [ ! -d site/_out/demo/py ]; then
+            echo "::warning::no python filesystem; the race says so"
+          fi
+      - uses: superfly/flyctl-actions/setup-flyctl@1.6
         if: github.event_name != 'pull_request'
-        with:
-          path: site/_out
-
-  deploy:
-    if: github.event_name != 'pull_request'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+      - name: Deploy to Fly
+        if: github.event_name != 'pull_request'
+        working-directory: site
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only --ha=false

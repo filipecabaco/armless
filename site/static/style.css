@@ -292,3 +292,17 @@ pre code { background: none; padding: 0; font-size: inherit; overflow-wrap: norm
 .cpu-bar span { display: block; height: 100%; width: 0; background: var(--text); transition: width 400ms var(--out); }
 .cpu-rate { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
 @media (prefers-reduced-motion: reduce) { .cpu-bar span { transition: none; } }
+
+/* The race (examples/no-kernel): two consoles of equal width, and across both what each took */
+.demo[data-machine="race"] .machine { grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 64rem) { .demo[data-machine="race"] .machine { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.race { grid-column: 1 / -1; padding: 1rem 1rem 1.1rem; gap: 0.9rem; }
+.score { width: 100%; border-collapse: collapse; font-size: 0.875rem; font-variant-numeric: tabular-nums; }
+.score th, .score td { text-align: left; padding: 0.4rem 0.75rem 0.4rem 0; border-bottom: 1px solid var(--line); font-weight: 400; }
+.score thead th { color: var(--faint); font-size: 0.75rem; }
+.score tbody th { color: var(--muted); width: 34%; }
+.score td { color: var(--text); width: 33%; }
+.race .verdict { border-top: 0; padding: 0; min-height: 1.5rem; }
+.race .verdict:empty::before { content: "downloading, then racing to the first >>>"; }
+.race-keys { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.race-keys .side-h { margin-right: 0.25rem; }

@@ -1,0 +1,34 @@
+<%!-- The race (race.js): the machine that boots Linux to run the same python3, beside the one that
+    runs it with no kernel; then, across both, what each took to get there and buttons that type
+    the same line into both. machine.js finds the second machine's parts inside
+    data-machine="race-b". --%>
+    <div class="pane pane-console" data-machine="race-b">
+      <div class="pane-bar"><span class="pane-name">Linux 6.18, then python3</span>
+        <span class="end"><span data-part="status" class="status" role="status" data-state="off"><%= if @demo?, do: "needs JavaScript", else: "not in this build" %></span></span>
+      </div>
+      <div class="console">
+        <div data-part="terminal" class="terminal" role="group" aria-label="The console of the machine that boots Linux. Escape, then Tab, leaves the console."></div>
+        <p data-part="log" class="visually-hidden" aria-live="polite"></p>
+        <p data-part="fallback" class="fallback" <%= if @demo?, do: "hidden" %>><%= if @demo?, do: "", else: "The machine is not part of this build." %></p>
+      </div>
+    </div>
+    <div class="pane race" data-race>
+      <table class="score">
+        <caption class="visually-hidden">The two machines, side by side</caption>
+        <thead><tr><th scope="col"></th><th scope="col">python3, no kernel</th><th scope="col">Linux 6.18, then python3</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">downloaded before it starts</th><td data-score="bytes-u">-</td><td data-score="bytes-k">-</td></tr>
+          <tr><th scope="row">from its start to its first <code>&gt;&gt;&gt;</code></th><td data-score="ready-u">-</td><td data-score="ready-k">-</td></tr>
+          <tr><th scope="row">answers its system calls</th><td>armless</td><td>Linux</td></tr>
+        </tbody>
+      </table>
+      <p class="verdict" data-verdict aria-live="polite"></p>
+      <div class="race-keys">
+        <span class="side-h">type into both</span>
+        <button type="button" class="btn" data-send='import os; os.uname().release' disabled>who answers</button>
+        <button type="button" class="btn" data-send='import time; t = time.perf_counter(); _ = sum(i * i for i in range(10**6)); round(time.perf_counter() - t, 2)' disabled>a million squares</button>
+        <button type="button" class="btn" data-send='import os, time; t = time.perf_counter(); _ = [os.stat("/usr/bin/python3") for _ in range(20000)]; round(time.perf_counter() - t, 2)' disabled>20,000 system calls</button>
+        <button type="button" class="btn" data-send='import subprocess; subprocess.run(["sh", "-c", "echo a child, pid $$"]).returncode' disabled>a child process</button>
+        <button type="button" class="btn" data-send='import sqlite3; sqlite3.connect(":memory:").execute("select sqlite_version()").fetchone()' disabled>sqlite3</button>
+      </div>
+    </div>

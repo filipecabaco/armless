@@ -5,7 +5,7 @@
   const root = document.querySelector('[data-machine="egress"]');
   const list = root.querySelector("[data-requests]");
   const boxes = [...root.querySelectorAll('.allow input[type="checkbox"]')];
-  const allowed = () => new Set(boxes.filter((b) => b.checked).map((b) => b.value));
+  const allowed = (host) => boxes.some((b) => b.checked && b.value === host);
 
   function log(url, ok, why) {
     list.querySelector(".empty")?.remove();
@@ -26,7 +26,7 @@
         allow: ({ url, host }) => {
           let ok = false, why;
           if (Armless.private_host(host)) why = "a private address";
-          else if (allowed().has(host)) { ok = true; why = "on the list"; }
+          else if (allowed(host)) { ok = true; why = "on the list"; }
           else why = "not on the list";
           log(url, ok, why);
           return ok;
@@ -39,6 +39,6 @@
       ["10.0.0.1", "wget -qO- http://10.0.0.1/\n"],
     ],
     command: () => "wget -qO- http://api.github.com/zen; echo\n",
-    status: () => "networked. the shell is yours",
+    status: "networked. the shell is yours",
   });
 })();

@@ -7,32 +7,19 @@
   const verdict = second.querySelector("[data-verdict]");
   const read = "head -c 16 /dev/urandom | od -An -tx1\n";
   const line = /^((?: [0-9a-f]{2}){16})\s*$/m;
-  const plain = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
   const bytes = [null, null];
 
   const copy = (root, i) =>
     ArmlessMachine.mount(root, {
       needs: "native",
       options: (at) => ({ cpus: 1, initial_state: at("demo/native.bin.zst") }),
-      restored: true,
-      fetching: `fetching copy ${i + 1} of the snapshot`,
-      starting: "restoring",
       keys: i === 0 ? [["urandom", read]] : [],
       command: () => read,
       running: line,
-      status: () => "restored, and read 16 bytes",
-    }).then((m) => {
-      const decoder = new TextDecoder();
-      let out = "";
-      m.vm.on("console", (b) => {
-        if (bytes[i]) return;
-        out += decoder.decode(b, { stream: true });
-        const found = line.exec(plain(out));
-        if (found) {
-          bytes[i] = found[1].trim();
-          judge();
-        }
-      });
+      status: "restored, and read 16 bytes",
+    }).then((m) => m.waitFor(line, { fresh: true })).then((found) => {
+      bytes[i] = found[1].trim();
+      judge();
     });
 
   function judge() {

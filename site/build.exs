@@ -10,7 +10,7 @@
 # examples/<slug>.html, from site/examples/<slug>.md (see @examples), listed on
 # examples/index.html and the landing page.
 #
-# SITE_BASE is the path the site is served from ("/armless/" on GitHub Pages).
+# SITE_BASE is the path the site is served from ("/" on Fly, the default).
 # Only the 404 page needs it, because it is served from any depth.
 
 Mix.install([{:mdex, "~> 0.13"}])
@@ -150,7 +150,7 @@ defmodule Site do
       )
     )
 
-    base = System.get_env("SITE_BASE", "/armless/")
+    base = System.get_env("SITE_BASE", "/")
 
     File.write!(
       Path.join(out, "404.html"),
