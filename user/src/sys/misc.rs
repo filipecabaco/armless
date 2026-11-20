@@ -244,16 +244,22 @@ impl Process {
         v(0)
     }
 
-    /// getrusage: the time it has run, as user time, and the most memory (kB) it, or the children
-    /// that ended, had resident
+    /// getrusage: the CPU time it (RUSAGE_SELF), the calling thread (RUSAGE_THREAD) or its
+    /// children that ended (RUSAGE_CHILDREN) used, as user time (timer.rs counts no system
+    /// time), and the most memory (kB) it or those children had resident
     pub(super) fn sys_getrusage(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
+        let who = a[0] as i64;
+        let ns = match who {
+            0 => self.timers.proc_cpu_ns(self.p.pid),
+            -1 => self.p.child_cpu,
+            1 => self.now_ns(3),
+            _ => return v(-EINVAL),
+        };
         let mut b = [0u8; 144];
-        let el = self.start.elapsed();
-        b[0..8].copy_from_slice(&el.as_secs().to_le_bytes());
-        b[8..16].copy_from_slice(&(el.subsec_micros() as u64).to_le_bytes());
-        let maxrss = match a[0] as i64 {
-            // RUSAGE_CHILDREN
+        b[0..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+        b[8..16].copy_from_slice(&(ns % 1_000_000_000 / 1000).to_le_bytes());
+        let maxrss = match who {
             -1 => self.p.child_maxrss,
             _ => self.p.mm.borrow().resident().1 * (crate::PAGE / 1024),
         };
@@ -261,14 +267,35 @@ impl Process {
         v(if self.write(a[1], &b) { 0 } else { -EFAULT })
     }
 
-    /// sysinfo
+    /// times: the process's CPU time and its children's that ended (user time: no system time
+    /// is counted), in clock ticks of 100 Hz, and the ticks since the machine started
+    pub(super) fn sys_times(&mut self, a: &[u64; 6]) -> Ret {
+        let tick = |ns: u64| ns / 10_000_000;
+        if a[0] != 0 {
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&tick(self.timers.proc_cpu_ns(self.p.pid)).to_le_bytes());
+            b[16..24].copy_from_slice(&tick(self.p.child_cpu).to_le_bytes());
+            if !self.write(a[0], &b) {
+                return Ret::Val(-EFAULT);
+            }
+        }
+        Ret::Val(tick(self.now_ns(1)) as i64)
+    }
+
+    /// sysinfo: the time since the machine started, the load averages (fixed point, 16 bits of
+    /// fraction), the RAM and what of it is free, and how many processes there are
     pub(super) fn sys_sysinfo(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
         let mut b = [0u8; 112];
-        b[0..8].copy_from_slice(&self.start.elapsed().as_secs().to_le_bytes());
+        b[0..8].copy_from_slice(&(self.now_ns(1) / 1_000_000_000).to_le_bytes());
+        let load = self.timers.sys.load(crate::host::Instant::now(), self.runnable());
+        for (i, l) in load.iter().enumerate() {
+            let fixed = (l * 65536.0) as u64;
+            b[8 + 8 * i..16 + 8 * i].copy_from_slice(&fixed.to_le_bytes());
+        }
         b[32..40].copy_from_slice(&self.ram_size.to_le_bytes());
         b[40..48].copy_from_slice(&self.ram_free().to_le_bytes());
-        b[80..82].copy_from_slice(&(self.processes() as u16).to_le_bytes());
+        b[80..82].copy_from_slice(&(self.processes().min(u16::MAX as usize) as u16).to_le_bytes());
         b[104..108].copy_from_slice(&1u32.to_le_bytes());
         v(if self.write(a[0], &b) { 0 } else { -EFAULT })
     }
@@ -280,7 +307,7 @@ impl Process {
         for (i, s) in [
             "Linux",
             self.hostname.as_str(),
-            "6.6.0-armless-user",
+            crate::procfs::RELEASE,
             "#1",
             "aarch64",
             "",

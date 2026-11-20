@@ -510,6 +510,26 @@ x0–x5, answers it in x0, and resumes at ELR.
   `$ORIGIN` from it: `/usr/bin/java` links into the JDK); `fd/N` says what each descriptor is open
   on, as Linux does (a path, `pipe:[N]`, `socket:[N]`, `anon_inode:[...]`), for realpath in Zig,
   Bun and Deno; `fdinfo/N` its position and flags.
+- **/proc and /sys** (procfs.rs, loadavg.rs): what top, free, uptime, nproc and ps read, and what
+  language runtimes size themselves by. Each process has `stat` (its CPU time as utime, its
+  children's that ended as cutime, its start time, the CPU it is on), `status` (with
+  `Cpus_allowed_list` and the context-switch lines), `statm`, `io`, `environ` and `auxv` (as exec
+  gave them), `maps` (its areas, the file each maps, `[heap]` and `[stack]`: glibc's
+  `pthread_getattr_np` finds the main thread's stack there), `limits`, `cgroup`, `mounts`,
+  `mountinfo`, the links `exe`, `cwd` and `root`, and the directories `fd`, `fdinfo` and `task`
+  (one per thread, with its `stat`, `status`, `comm` and `cmdline`); `/proc/<pid>` lists them. The
+  machine has `stat` (each CPU's busy and idle time, btime, processes, procs_running), `uptime`,
+  `loadavg` (1, 5 and 15 minute averages of the threads that run or could, as Linux averages
+  them), `meminfo` (Linux's lines, no swap; Cached is files' pages), `version`, `filesystems`,
+  `/proc/sys/kernel/{ostype,osrelease,version,hostname,pid_max,threads-max,random/boot_id,
+  random/uuid}`, `/proc/sys/vm/{overcommit_memory,max_map_count}`, `/proc/sys/fs/{file-max,
+  nr_open}`, `/sys/devices/system/cpu/{online,possible,present,kernel_max}`, the
+  `transparent_hugepage` size, and a cgroup v2 root with no limits (`cpu.max`, `memory.max`,
+  `memory.current`, `pids.max`, `cgroup.controllers`). `chdir("/proc")` works with no /proc in
+  the image (busybox's top reads from there). `sysinfo` has the uptime and the load averages,
+  `times` and `getrusage` the CPU time (the process's, a thread's, the children's that ended).
+  CPU time is the host time a thread held a CPU, all of it user time: there is no system time.
+  Not yet: per-process I/O counts (`io` is zeros), context switches per process, `smaps`.
 - **Blocking:** a call that can't complete (a read of the terminal or a pipe, a poll, a wait
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
@@ -534,7 +554,10 @@ x0–x5, answers it in x0, and resumes at ELR.
   the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
   and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
   are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
-  The state is `ARMLUSR7`: 0.15's `ARMLUSR6` with each thread's scheduling, each process's
+  The state is `ARMLUSRC` (0.26), which ends with a section of each process's start time, children's
+  CPU time, environment and auxiliary vector and that section's length (an `ARMLUSRB` state is
+  what is before it, and loads: /proc then says the machine's start, and no environment nor
+  auxiliary vector). Before it, `ARMLUSR7`: 0.15's `ARMLUSR6` with each thread's scheduling, each process's
   groups and AIO contexts, the armed timers (CPU time counted so far, and the POSIX ones), the
   descriptors and senders of what waits at sockets, and timerfds; `ARMLUSR6` is 0.14's
   `ARMLUSR5` with each process's ids and interval timer, the System V segments, the shared file

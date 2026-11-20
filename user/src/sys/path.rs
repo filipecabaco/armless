@@ -36,16 +36,16 @@ impl Process {
 
     /// Contents made here for the /proc files programs read
     pub(super) fn proc_file(&self, path: &[u8]) -> Option<Vec<u8>> {
-        // /proc/self/fdinfo/N: its position, flags (O_CLOEXEC with them, in octal), and for a
+        // /proc/self/fdinfo/N (or /proc/<its pid>/fdinfo/N): its position, flags (O_CLOEXEC with them, in octal), and for a
         // pidfd its process (-1 once it was waited for), as Linux says them
-        if let Some(fd) = path
-            .strip_prefix(b"/proc/self/fdinfo/")
-            .and_then(|n| std::str::from_utf8(n).ok()?.parse::<i32>().ok())
-        {
+        if let Some(fd) = self.own_fd(path, b"fdinfo/") {
             let d = self.files.get(fd)?;
             let cloexec = self.files.fds.get(&fd).is_some_and(|&(_, c)| c);
             let pos = match d.kind {
-                Kind::File { pos, .. } | Kind::Dir { pos, .. } | Kind::Mem { pos, .. } => pos,
+                Kind::File { pos, .. }
+                | Kind::Dir { pos, .. }
+                | Kind::VDir { pos, .. }
+                | Kind::Mem { pos, .. } => pos,
                 _ => 0,
             };
             let flags = d.flags | if cloexec { O_CLOEXEC } else { 0 };
@@ -56,7 +56,7 @@ impl Process {
             }
             return Some(s.into_bytes());
         }
-        if let Some(f) = self.pid_file(path) {
+        if let Some(f) = self.pid_file(path).or_else(|| self.sys_file(path)) {
             return Some(f);
         }
         Some(match path {
@@ -64,12 +64,6 @@ impl Process {
                 .map(|i| format!("processor\t: {i}\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd aes pmull sha1 sha2 crc32 atomics sha3 sm3 sm4 sha512\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n"))
                 .collect::<String>()
                 .into_bytes(),
-            b"/proc/meminfo" => {
-                let kb = self.ram_size / 1024;
-                let free = self.ram_free() / 1024;
-                format!("MemTotal:       {kb} kB\nMemFree:        {free} kB\nMemAvailable:   {free} kB\n").into_bytes()
-            },
-            b"/proc/self/mounts" | b"/proc/mounts" => b"host9p / 9p rw 0 0\nproc /proc proc rw 0 0\n".to_vec(),
             // The interfaces netlink.rs has, with nothing counted (ifconfig reads their list here)
             b"/proc/net/dev" | b"/proc/self/net/dev" => {
                 let mut s = String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
@@ -79,9 +73,6 @@ impl Process {
                 }
                 s.into_bytes()
             },
-            b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
-            b"/proc/sys/kernel/hostname" => format!("{}\n", self.hostname).into_bytes(),
-            b"/sys/fs/cgroup/cpu.max" => b"max 100000\n".to_vec(),
             _ => return None,
         })
     }
@@ -105,6 +96,7 @@ impl Process {
         }
         let dir = match self.files.get(dirfd).map(|d| &d.kind) {
             Some(Kind::Dir { ino, .. }) => self.fs(|fs| files::path_of(fs, *ino))?,
+            Some(Kind::VDir { path, .. }) => path.clone(),
             _ if dirfd == AT_FDCWD => self.fs(|fs| files::path_of(fs, self.p.cwd))?,
             _ => return None,
         };
@@ -176,6 +168,14 @@ impl Process {
                     return Ret::Val(-ENXIO);
                 }
                 let d = self.files.add(kind, status);
+                return Ret::Val(self.new_fd(d, 0, cloexec));
+            }
+            // A directory made here (O_DIRECTORY or not, as Linux opens a directory read-only)
+            if let Some(dir) = self.vdir(path).map(|_| crate::procfs::trim_slashes(path).to_vec()) {
+                if flags & O_ACCMODE != 0 {
+                    return Ret::Val(-EISDIR);
+                }
+                let d = self.files.add(Kind::VDir { path: dir, pos: 0 }, status);
                 return Ret::Val(self.new_fd(d, 0, cloexec));
             }
             if let Some(data) = self.proc_file(path) {
@@ -275,6 +275,7 @@ impl Process {
                 size: data.len() as u64,
                 ..Stat::device(S_IFREG | 0o444, 0)
             },
+            Kind::VDir { .. } => Stat::device(S_IFDIR | 0o555, 0),
             Kind::PipeRead(_) | Kind::PipeWrite(_) => Stat::device(S_IFIFO | 0o600, 0),
             Kind::Sock(_) => Stat::device(files::S_IFSOCK | 0o777, 0),
             Kind::Event { .. }
@@ -311,11 +312,26 @@ impl Process {
         if path == b"/proc" || path == b"/dev" {
             return Ok(Stat::device(S_IFDIR | 0o555, 0));
         }
-        // A process's directory, while there is that process
+        // A process's directory, while there is that process, and the directories under it
         match self.pid_dir(path) {
             Some(true) => return Ok(Stat::device(S_IFDIR | 0o555, 0)),
             Some(false) => return Err(-ENOENT),
             None => {},
+        }
+        if self.vdir(path).is_some() {
+            return Ok(Stat::device(S_IFDIR | 0o555, 0));
+        }
+        // Its links (exe, cwd, root, its own descriptors'), followed or not
+        if self.pid_link(path).is_some() || self.own_fd(path, b"fd/").is_some() {
+            if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                return Ok(Stat::device(armless::dev::fs::S_IFLNK | 0o777, 0));
+            }
+            if let Some(fd) = self.own_fd(path, b"fd/") {
+                return self.stat_fd(fd).map_err(|_| -ENOENT);
+            }
+            if let Some(target) = self.pid_link(path) {
+                return self.stat_path(AT_FDCWD, &target, flags);
+            }
         }
         if flags & AT_SYMLINK_NOFOLLOW == 0 {
             let start = self.start_dir(dirfd)?;
@@ -381,12 +397,10 @@ impl Process {
     pub(super) fn sys_readlinkat(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
         let path = self.cstr(a[1]);
-        let target = if path == b"/proc/self/exe" || path == b"/proc/thread-self/exe" {
-            Ok(self.p.exe.clone())
-        } else if let Some(fd) = path
-            .strip_prefix(b"/proc/self/fd/")
-            .and_then(|n| std::str::from_utf8(n).ok()?.parse::<i32>().ok())
-        {
+        let path = self.under_special(a[0] as i32, &path).unwrap_or(path);
+        let target = if let Some(t) = self.pid_link(&path) {
+            Ok(t)
+        } else if let Some(fd) = self.own_fd(&path, b"fd/") {
             // What it is open on, as Linux says it: realpath in Zig, Bun and Deno is
             // open, then this link (the Supabase CLI resolves its project root so)
             match self.files.get(fd).map(|d| d.kind.clone()) {
@@ -412,6 +426,7 @@ impl Process {
                 Some(Kind::TimerFd(_)) => Ok(b"anon_inode:[timerfd]".to_vec()),
                 Some(Kind::Epoll { .. }) => Ok(b"anon_inode:[eventpoll]".to_vec()),
                 Some(Kind::Mem { .. }) => Ok(format!("/dev/fd/{fd}").into_bytes()),
+                Some(Kind::VDir { path, .. }) => Ok(path),
                 None => Err(-ENOENT),
             }
         } else {
@@ -436,12 +451,30 @@ impl Process {
     pub(super) fn sys_getdents64(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
         let fd0 = a[0] as i32;
-        let Some(Desc {
-            kind: Kind::Dir { ino, pos },
-            ..
-        }) = self.files.get(fd0).cloned()
-        else {
-            return v(if self.files.get(fd0).is_some() { -ENOTDIR } else { -EBADF });
+        let (ino, pos) = match self.files.get(fd0).map(|d| d.kind.clone()) {
+            Some(Kind::Dir { ino, pos }) => (ino, pos),
+            // A directory made here: its entries as they are now (an ended process has none)
+            Some(Kind::VDir { path, pos }) => {
+                let entries = self.vdir(&path).unwrap_or_default();
+                return match Process::vdir_dirents(entries, pos, a[2] as usize) {
+                    Ok((bytes, next)) => {
+                        if !self.write(a[1], &bytes) {
+                            return v(-EFAULT);
+                        }
+                        if let Some(Desc {
+                            kind: Kind::VDir { pos, .. },
+                            ..
+                        }) = self.files.get_mut(fd0)
+                        {
+                            *pos = next;
+                        }
+                        v(bytes.len() as i64)
+                    },
+                    Err(e) => v(e),
+                };
+            },
+            Some(_) => return v(-ENOTDIR),
+            None => return v(-EBADF),
         };
         let listed = if self.is_proc_dir(ino) {
             Some(self.proc_dirents(ino, pos, a[2] as usize))
@@ -483,7 +516,12 @@ impl Process {
     /// chdir
     pub(super) fn sys_chdir(&mut self, a: &[u64; 6]) -> Ret {
         let v = Ret::Val;
-        match self.lookup(AT_FDCWD, &self.cstr(a[0]), true) {
+        let path = self.cstr(a[0]);
+        // /proc is a directory of the filesystem, made if the image has none (top works in it)
+        if crate::procfs::trim_slashes(&path) == b"/proc" {
+            self.make_proc_dir();
+        }
+        match self.lookup(AT_FDCWD, &path, true) {
             Ok(ino)
                 if self
                     .fs(|fs| fs.get(ino).is_some_and(|i| i.is_dir()))

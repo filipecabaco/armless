@@ -193,9 +193,11 @@ fn a_saved_state_with_a_hostname_that_does_not_fit_is_refused() {
     let mut p = start_with(&mut vm, p, &opts);
     let (_, status) = run_until_idle(&mut p, &mut vm);
     assert!(matches!(status, Status::Idle(Some(_))), "{status:?}");
-    let process = p.save(&vm.cpus[0]);
+    let mut process = p.save(&vm.cpus[0]);
     let state = vm.save_state();
     drop((p, vm));
+    // (Its hostname last, as ARMLUSRB has it)
+    to_armlusrb(&mut process);
 
     let with = |name: &[u8]| {
         let mut forged = process[..process.len() - (8 + "pod-7a".len())].to_vec();
@@ -248,6 +250,7 @@ fn a_state_saved_before_the_options_has_the_terminal_and_armless() {
     let mut process = p.save(&vm.cpus[0]);
     let state = vm.save_state();
     drop((p, vm));
+    to_armlusrb(&mut process);
     // ARMLUSRA: neither the standard streams nor the hostname at the end
     process.truncate(process.len() - (8 + 8 + "pod-7a".len()));
     process[..8].copy_from_slice(b"ARMLUSRA");
