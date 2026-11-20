@@ -218,7 +218,7 @@ impl Process {
             nr::GETRANDOM => self.sys_getrandom(&a),
             nr::PRLIMIT64 | nr::GETRLIMIT | nr::SETRLIMIT => self.sys_rlimit(nr, &a),
             nr::GETRUSAGE => self.sys_getrusage(&a),
-            nr::TIMES => v((self.start.elapsed().as_millis() / 10) as i64),
+            nr::TIMES => self.sys_times(&a),
             nr::SYSINFO => self.sys_sysinfo(&a),
             nr::UNAME => self.sys_uname(&a),
             _ => {

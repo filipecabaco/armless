@@ -343,6 +343,7 @@ fn a_state_saved_before_orphans_were_reaped_loads_with_none_reaped() {
     let mut vm = machine_with_cpus(1);
     let p = start_orphan(&mut vm, zombie_grandchild_after(paused(), false), true);
     let (mut process, state) = save_when_idle(p, vm);
+    to_armlusrb(&mut process);
     // ARMLUSR9: no reaping option at the end (nor ARMLUSRB's standard streams and hostname after
     // it), nor an orphan flag after the one process's command line ("p\0")
     process.truncate(process.len() - (8 + 8 + 8 + "armless".len()));

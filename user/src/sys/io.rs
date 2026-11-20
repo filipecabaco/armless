@@ -47,7 +47,7 @@ impl Process {
             Kind::Out => Err(Ret::Val(-EBADF)),
             Kind::Zero => Ok(vec![0; max]),
             Kind::Random => Ok(host::random_bytes(max)),
-            Kind::Dir { .. } => Err(Ret::Val(-EISDIR)),
+            Kind::Dir { .. } | Kind::VDir { .. } => Err(Ret::Val(-EISDIR)),
             Kind::Mem { data, pos } => {
                 let start = at.unwrap_or(pos).min(data.len() as u64) as usize;
                 let out = data[start..start.saturating_add(max).min(data.len())].to_vec();
@@ -212,7 +212,7 @@ impl Process {
                 Ok(data.len())
             },
             Kind::Null | Kind::Zero | Kind::Random => Ok(data.len()),
-            Kind::Dir { .. } => Err(Ret::Val(-EISDIR)),
+            Kind::Dir { .. } | Kind::VDir { .. } => Err(Ret::Val(-EISDIR)),
             Kind::Mem { .. } => Err(Ret::Val(-EBADF)),
             Kind::File { ino, pos } => {
                 let now = self.now_secs();
@@ -556,9 +556,9 @@ impl Process {
                 }
                 v(new)
             },
-            Kind::Dir { .. } | Kind::Mem { .. } if whence == 0 && off >= 0 => {
+            Kind::Dir { .. } | Kind::VDir { .. } | Kind::Mem { .. } if whence == 0 && off >= 0 => {
                 if let Some(Desc {
-                    kind: Kind::Dir { pos, .. } | Kind::Mem { pos, .. },
+                    kind: Kind::Dir { pos, .. } | Kind::VDir { pos, .. } | Kind::Mem { pos, .. },
                     ..
                 }) = self.files.get_mut(fd0)
                 {

@@ -175,6 +175,8 @@ pub(crate) struct Timers {
     cpu_thread: BTreeMap<i64, u64>,
     /// The thread whose slice is running, and since when (counted by `charge_cpu`)
     running: Vec<Option<(i64, i64, Instant)>>,
+    /// Each CPU's busy time and the load averages (loadavg.rs)
+    pub(crate) sys: crate::loadavg::SysStats,
 }
 
 /// How many times a timer `left` ns from its due time (negative: past it) with `interval` has
@@ -525,9 +527,13 @@ impl Process {
         if self.proc_ref(pid).is_none() {
             return;
         }
-        let ns = at.elapsed().as_nanos() as u64;
+        let now = Instant::now();
+        let ns = now.saturating_duration_since(at).as_nanos() as u64;
         *self.timers.cpu_proc.entry(pid).or_default() += ns;
         *self.timers.cpu_thread.entry(tid).or_default() += ns;
+        self.timers.sys.charge(self.cpu, ns);
+        let n = self.runnable();
+        self.timers.sys.sample(now, n);
         // (Threads that ended leave their counts: the process's own have them)
         if self.timers.cpu_thread.len() > self.threads.len() + 16 {
             let threads = &self.threads;

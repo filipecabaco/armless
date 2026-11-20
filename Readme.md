@@ -223,6 +223,12 @@ connections nobody accepts, and no tunnel takes, are refused.
   memory of `/proc/meminfo` and `sysinfo` (RAM less the frames in use). A page counts once
   touched (a reservation with `PROT_NONE` or `MAP_NORESERVE` only raises the size), and a
   copy-on-write page after a fork counts in each process.
+- User mode, /proc and /sys: busybox's `top`, `free`, `uptime`, `nproc` and `ps` work with no
+  kernel. Each process's `stat` has its CPU time (and its children's), start time and CPU;
+  `/proc/stat`, `/proc/uptime` and `/proc/loadavg` the CPUs' busy and idle time and the load
+  averages; and a program finds its `maps`, `auxv`, `environ`, `limits`, `fd/` and `task/`, the
+  CPUs online in `/sys/devices/system/cpu`, and a cgroup with no limits, as runtimes look for
+  them. CPU time is all user time.
 - `smp_report()`: with several CPUs, what they did and what their waits for one another cost:
   `{ cpus, host_cores, policy, oversubscribed, slow_waits, tlbi, ic_invals, kicks, insns: [per
   CPU], waits: { tlb, wfe, lock: { waits, spins, yields, ms, max_ms } }, workers: [{ run_ms,

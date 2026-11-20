@@ -323,3 +323,13 @@ pub fn ok(status: &Status) {
     );
 }
 
+
+/// A process state cut back to ARMLUSRB: without ARMLUSRC's section at the end (each process's
+/// start time, children's CPU time, environment and auxiliary vector), whose length is its last
+/// 8 bytes
+pub fn to_armlusrb(process: &mut Vec<u8>) {
+    assert_eq!(&process[..8], b"ARMLUSRC");
+    let len = u64::from_le_bytes(process[process.len() - 8..].try_into().unwrap()) as usize;
+    process.truncate(process.len() - 8 - len);
+    process[..8].copy_from_slice(b"ARMLUSRB");
+}

@@ -1,6 +1,6 @@
 [package]
 name = "armless-gpu"
-version = "0.28.1"
+version = "0.29.0"
 edition = "2021"
 publish = false
 description = "WebGPU compute for armless guests: a small wire protocol a guest speaks over a connection, and a host that runs it on wgpu"

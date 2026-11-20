@@ -29,7 +29,7 @@ Where to look to change something, and which tests say it still works. Each modu
 |---|---|
 | The dispatcher, one arm a call | `sys/mod.rs` (numbers named in `sys/nr.rs`) |
 | read, write, readv/writev, pread/pwrite, sendfile, lseek | `sys/io.rs` |
-| open, stat, statx, readlink, getdents, /proc and /dev files | `sys/path.rs`; `/proc/<pid>` in `procfs.rs` |
+| open, stat, statx, readlink, getdents, /proc and /dev files | `sys/path.rs`; /proc's and /sys's files and directories in `procfs.rs`, the CPUs' busy time and load averages in `loadavg.rs` |
 | mkdir, unlink, rename, link, symlink, truncate, chmod, chown, utimens | `sys/file.rs` |
 | close, dup, fcntl, pipe, eventfd, close_range | `sys/fd.rs` |
 | ppoll, pselect6, epoll | `sys/poll.rs` |
@@ -67,6 +67,7 @@ Where to look to change something, and which tests say it still works. Each modu
 | `tests/js/*.test.mjs` (CI, `node --test`) | `armless.js`'s user-mode API on the wasm build, with programs as machine code (`tests/js/prog.mjs`, the twin of `user/tests/prog/`) |
 | `user/tests/exec.rs` | programs as aarch64 machine code: exec, files, memory, signals, the terminal |
 | `user/tests/kernel.rs` | what services rely on: ids, processes, /proc, locks, shared memory, saved and restored processes |
+| `user/tests/procfs.rs` | /proc and /sys as top, free, uptime and runtimes read them: CPU time, load, uptime, maps, auxv, fd and task directories |
 | `user/tests/sockets.rs` | sockets |
 | `user/tests/errors.rs` | wrong arguments get Linux's errors, never a host panic |
 | `user/tests/smoke.rs` | every system call user mode answers, with zero and junk arguments, never panics |
