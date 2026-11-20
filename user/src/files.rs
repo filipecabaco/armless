@@ -75,6 +75,12 @@ pub(crate) enum Kind {
         ino: Ino,
         pos: u64,
     },
+    /// A directory made here (procfs.rs: /proc/<pid> and those under it, /sys's), by its path,
+    /// and how many of its entries getdents gave already
+    VDir {
+        path: Vec<u8>,
+        pos: u64,
+    },
     /// Contents made here (/proc files), read-only (shared: a description is cloned on each read)
     Mem {
         data: std::sync::Arc<[u8]>,
@@ -369,6 +375,11 @@ impl Files {
                     w.u(*ino);
                     w.u(*pos);
                 },
+                Kind::VDir { path, pos } => {
+                    w.u(16);
+                    w.b(path);
+                    w.u(*pos);
+                },
                 Kind::Mem { data, pos } => {
                     w.u(6);
                     w.b(data);
@@ -463,6 +474,11 @@ impl Files {
                 13 => Kind::Pidfd { pid: r.u()? as i64 },
                 14 => Kind::TimerFd(crate::timerfd::Timer::load(r, asleep)?),
                 15 => Kind::Out,
+                // (From ARMLUSRC)
+                16 => Kind::VDir {
+                    path: r.b()?.to_vec(),
+                    pos: r.u()?,
+                },
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {
