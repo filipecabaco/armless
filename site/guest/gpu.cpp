@@ -1,201 +1,469 @@
-// The GPU example's guest program (site/examples/gpu.md): WebGPU compute on the visitor's GPU from
-// inside the machine. It asks gpu.internal:7070 for a GPU (armless-gpu.js answers it with the
-// page's WebGPU), runs a Mandelbrot set as a WGSL compute shader there, runs the same on the
-// guest's own (emulated) CPU, and draws the GPU's in the console with both times.
+// The GPU example's guest program (site/examples/gpu.md): a 3D scene raymarched in real time on the
+// visitor's GPU, from inside the machine, drawn in the console. It asks gpu.internal:7070 for a GPU
+// (armless-gpu.js answers it with the page's WebGPU) and renders each frame with a WGSL compute
+// shader there; `c` switches to the same renderer on the guest's own (emulated) CPU, to compare.
 //
-//   gpu [COLS ROWS]
+//   gpu [COLS ROWS] [--frames N]       (no size: the console's)
 //
+// --frames N renders N frames on the GPU and N on the CPU, then says how long each took on average.
 // Built static for the guest against gpu/guest's webgpu_cpp.h, which speaks armless-gpu's protocol
 // instead of a driver (site's pages.yml):
-//   zig c++ -target aarch64-linux-musl -O2 -static -std=c++17 -I gpu/guest/include site/guest/gpu.cpp -o gpu
+//   zig c++ -target aarch64-linux-musl -O2 -s -static -std=c++17 -I gpu/guest/include site/guest/gpu.cpp -o gpu
 #include <webgpu/webgpu_cpp.h>
 
 #include <chrono>
+#include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
 #include <vector>
 
-// The picture computed both ways: the same size and iterations, so the times compare
-static const uint32_t W = 640, H = 320, ITERS = 256;
-static const float CX = -0.65f, CY = 0.0f, SCALE = 1.25f;
+// ------------------------------------------------------------------------------------- the scene
+//
+// The same scene twice, kept line for line alike: a torus turning over a checkered floor, a ball
+// bouncing round it, soft shadows, ambient occlusion and fog, the camera circling. Pixels are
+// 0x00BBGGRR.
 
 static const char * SHADER = R"(
-struct Params { w: u32, h: u32, iters: u32, pad: u32, cx: f32, cy: f32, scale: f32, pad2: f32 };
+struct Params { w: u32, h: u32, t: f32, pad: f32 };
 @group(0) @binding(0) var<storage, read> p: Params;
 @group(0) @binding(1) var<storage, read_write> out: array<u32>;
+
+fn rot(v: vec2<f32>, a: f32) -> vec2<f32> {
+  let c = cos(a);
+  let s = sin(a);
+  return vec2<f32>(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
+// x: the distance, y: the material (0 floor, 1 torus, 2 ball)
+fn scene(q: vec3<f32>, t: f32) -> vec2<f32> {
+  var r = q - vec3<f32>(0.0, 0.1, 0.0);
+  let xz = rot(r.xz, t * 0.7);
+  r = vec3<f32>(xz.x, r.y, xz.y);
+  let xy = rot(r.xy, t * 0.5);
+  r = vec3<f32>(xy.x, xy.y, r.z);
+  let torus = length(vec2<f32>(length(r.xz) - 0.9, r.y)) - 0.28;
+  let c = vec3<f32>(1.7 * sin(t * 0.9), -0.65 + 0.35 * abs(sin(t * 2.1)), 1.7 * cos(t * 0.9));
+  let ball = length(q - c) - 0.35;
+  var d = vec2<f32>(q.y + 1.0, 0.0);
+  if (torus < d.x) { d = vec2<f32>(torus, 1.0); }
+  if (ball < d.x) { d = vec2<f32>(ball, 2.0); }
+  return d;
+}
+
+fn normal(q: vec3<f32>, t: f32) -> vec3<f32> {
+  let e = 0.001;
+  let a = scene(q + vec3<f32>(e, -e, -e), t).x;
+  let b = scene(q + vec3<f32>(-e, -e, e), t).x;
+  let c = scene(q + vec3<f32>(-e, e, -e), t).x;
+  let d = scene(q + vec3<f32>(e, e, e), t).x;
+  return normalize(vec3<f32>(a - b - c + d, -a - b + c + d, -a + b - c + d));
+}
+
+fn shadow(o: vec3<f32>, l: vec3<f32>, t: f32) -> f32 {
+  var res = 1.0;
+  var s = 0.02;
+  for (var i = 0; i < 24; i++) {
+    let h = scene(o + l * s, t).x;
+    res = min(res, 8.0 * h / s);
+    s += clamp(h, 0.02, 0.25);
+    if (res < 0.01 || s > 6.0) { break; }
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+fn occlusion(o: vec3<f32>, n: vec3<f32>, t: f32) -> f32 {
+  var occ = 0.0;
+  for (var i = 1; i <= 4; i++) {
+    let h = 0.06 * f32(i);
+    occ += h - scene(o + n * h, t).x;
+  }
+  return clamp(1.0 - 3.0 * occ, 0.0, 1.0);
+}
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (id.x >= p.w || id.y >= p.h) { return; }
-  let x0 = p.cx + (f32(id.x) / f32(p.w) - 0.5) * p.scale * 2.0;
-  let y0 = p.cy + (f32(id.y) / f32(p.h) - 0.5) * p.scale;
-  var x = 0.0;
-  var y = 0.0;
-  var i = 0u;
-  loop {
-    if (i >= p.iters || x * x + y * y > 4.0) { break; }
-    let xt = x * x - y * y + x0;
-    y = 2.0 * x * y + y0;
-    x = xt;
-    i = i + 1u;
+  let t = p.t;
+  let a = t * 0.25;
+  let ro = vec3<f32>(4.2 * sin(a), 0.9, 4.2 * cos(a));
+  let fwd = normalize(vec3<f32>(0.0, -0.2, 0.0) - ro);
+  let right = normalize(cross(fwd, vec3<f32>(0.0, 1.0, 0.0)));
+  let up = cross(right, fwd);
+  let aspect = f32(p.w) / f32(p.h);
+  let u = ((f32(id.x) + 0.5) / f32(p.w) * 2.0 - 1.0) * aspect;
+  let v = 1.0 - (f32(id.y) + 0.5) / f32(p.h) * 2.0;
+  let rd = normalize(fwd + right * (u * 0.9) + up * (v * 0.9));
+  let sky = mix(vec3<f32>(0.55, 0.7, 0.95), vec3<f32>(0.1, 0.15, 0.35), clamp(rd.y * 1.5 + 0.2, 0.0, 1.0));
+  var col = sky;
+  var dist = 0.0;
+  var mat = -1.0;
+  for (var i = 0; i < 80; i++) {
+    let h = scene(ro + rd * dist, t);
+    if (h.x < 0.002 * dist) { mat = h.y; break; }
+    dist += h.x;
+    if (dist > 20.0) { break; }
   }
-  out[id.y * p.w + id.x] = i;
+  if (mat >= 0.0) {
+    let q = ro + rd * dist;
+    let n = normal(q, t);
+    let l = normalize(vec3<f32>(0.6, 0.8, 0.4));
+    var base = vec3<f32>(1.0, 0.55, 0.15);
+    if (mat < 0.5) {
+      let check = (i32(floor(q.x)) + i32(floor(q.z))) & 1;
+      base = select(vec3<f32>(0.25, 0.27, 0.32), vec3<f32>(0.62, 0.64, 0.7), check == 1);
+    } else if (mat > 1.5) {
+      base = vec3<f32>(0.2, 0.45, 1.0);
+    }
+    let sh = shadow(q + n * 0.02, l, t);
+    let ao = occlusion(q, n, t);
+    let diff = max(dot(n, l), 0.0) * sh;
+    var spec = pow(max(dot(reflect(rd, n), l), 0.0), 24.0) * sh * 0.6;
+    if (mat < 0.5) { spec = 0.0; }
+    col = base * (0.25 * ao + diff) + vec3<f32>(spec);
+    col = mix(col, sky, 1.0 - exp(-0.02 * dist * dist));
+  }
+  let g = sqrt(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0))) * 255.0;
+  out[id.y * p.w + id.x] = u32(g.x) | (u32(g.y) << 8u) | (u32(g.z) << 16u);
 }
 )";
 
-struct Params {
-    uint32_t w, h, iters, pad;
-    float cx, cy, scale, pad2;
+struct V3 {
+    float x, y, z;
+};
+static V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+static V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static V3 operator*(V3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
+static float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static float len(V3 a) { return std::sqrt(dot(a, a)); }
+static V3 norm(V3 a) { return a * (1.0f / len(a)); }
+static V3 cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static V3 mix(V3 a, V3 b, float k) { return a * (1 - k) + b * k; }
+static void rot(float & x, float & y, float a) {
+    float c = std::cos(a), s = std::sin(a), nx = c * x - s * y;
+    y = s * x + c * y;
+    x = nx;
+}
+
+struct Hit {
+    float d, mat;
+};
+static Hit scene(V3 q, float t) {
+    V3 r = q - V3{0, 0.1f, 0};
+    rot(r.x, r.z, t * 0.7f);
+    rot(r.x, r.y, t * 0.5f);
+    float torus = std::sqrt((std::sqrt(r.x * r.x + r.z * r.z) - 0.9f) * (std::sqrt(r.x * r.x + r.z * r.z) - 0.9f) + r.y * r.y) - 0.28f;
+    V3 c{1.7f * std::sin(t * 0.9f), -0.65f + 0.35f * std::fabs(std::sin(t * 2.1f)), 1.7f * std::cos(t * 0.9f)};
+    float ball = len(q - c) - 0.35f;
+    Hit h{q.y + 1.0f, 0};
+    if (torus < h.d) h = {torus, 1};
+    if (ball < h.d) h = {ball, 2};
+    return h;
+}
+static V3 normal(V3 q, float t) {
+    const float e = 0.001f;
+    float a = scene(q + V3{e, -e, -e}, t).d, b = scene(q + V3{-e, -e, e}, t).d;
+    float c = scene(q + V3{-e, e, -e}, t).d, d = scene(q + V3{e, e, e}, t).d;
+    return norm({a - b - c + d, -a - b + c + d, -a + b - c + d});
+}
+static float shadow(V3 o, V3 l, float t) {
+    float res = 1, s = 0.02f;
+    for (int i = 0; i < 24; i++) {
+        float h = scene(o + l * s, t).d;
+        res = std::fmin(res, 8.0f * h / s);
+        s += clampf(h, 0.02f, 0.25f);
+        if (res < 0.01f || s > 6.0f) break;
+    }
+    return clampf(res, 0, 1);
+}
+static float occlusion(V3 o, V3 n, float t) {
+    float occ = 0;
+    for (int i = 1; i <= 4; i++) {
+        float h = 0.06f * float(i);
+        occ += h - scene(o + n * h, t).d;
+    }
+    return clampf(1 - 3 * occ, 0, 1);
+}
+static uint32_t pixel(uint32_t x, uint32_t y, uint32_t w, uint32_t h, float t) {
+    float a = t * 0.25f;
+    V3 ro{4.2f * std::sin(a), 0.9f, 4.2f * std::cos(a)};
+    V3 fwd = norm(V3{0, -0.2f, 0} - ro), right = norm(cross(fwd, V3{0, 1, 0})), up = cross(right, fwd);
+    float aspect = float(w) / float(h);
+    float u = ((float(x) + 0.5f) / float(w) * 2 - 1) * aspect, v = 1 - (float(y) + 0.5f) / float(h) * 2;
+    V3 rd = norm(fwd + right * (u * 0.9f) + up * (v * 0.9f));
+    V3 sky = mix({0.55f, 0.7f, 0.95f}, {0.1f, 0.15f, 0.35f}, clampf(rd.y * 1.5f + 0.2f, 0, 1));
+    V3 col = sky;
+    float dist = 0, mat = -1;
+    for (int i = 0; i < 80; i++) {
+        Hit hh = scene(ro + rd * dist, t);
+        if (hh.d < 0.002f * dist) {
+            mat = hh.mat;
+            break;
+        }
+        dist += hh.d;
+        if (dist > 20) break;
+    }
+    if (mat >= 0) {
+        V3 q = ro + rd * dist, n = normal(q, t), l = norm(V3{0.6f, 0.8f, 0.4f});
+        V3 base{1.0f, 0.55f, 0.15f};
+        if (mat < 0.5f) {
+            int check = (int(std::floor(q.x)) + int(std::floor(q.z))) & 1;
+            base = check == 1 ? V3{0.62f, 0.64f, 0.7f} : V3{0.25f, 0.27f, 0.32f};
+        } else if (mat > 1.5f) {
+            base = {0.2f, 0.45f, 1.0f};
+        }
+        float sh = shadow(q + n * 0.02f, l, t), ao = occlusion(q, n, t);
+        float diff = std::fmax(dot(n, l), 0) * sh;
+        V3 refl = rd - n * (2 * dot(n, rd));
+        float spec = mat < 0.5f ? 0 : std::pow(std::fmax(dot(refl, l), 0), 24.0f) * sh * 0.6f;
+        col = base * (0.25f * ao + diff) + V3{spec, spec, spec};
+        col = mix(col, sky, 1 - std::exp(-0.02f * dist * dist));
+    }
+    auto ch = [](float c) { return uint32_t(std::sqrt(clampf(c, 0, 1)) * 255); };
+    return ch(col.x) | (ch(col.y) << 8) | (ch(col.z) << 16);
+}
+
+// ----------------------------------------------------------------------------------- the console
+
+static termios saved;
+static bool raw = false;
+static void restore() {
+    std::fputs("\x1b[0m\x1b[?25h\n", stdout);
+    std::fflush(stdout);
+    if (raw) tcsetattr(0, TCSANOW, &saved);
+}
+static void on_signal(int) {
+    restore();
+    std::_Exit(130);
+}
+
+// A 0x00BBGGRR pixel as a colour of xterm's 6x6x6 cube
+static int cube(uint32_t px) {
+    auto c = [](uint32_t v) { return int((v * 5 + 127) / 255); };
+    return 16 + 36 * c(px & 255) + 6 * c((px >> 8) & 255) + c((px >> 16) & 255);
+}
+
+// Two pixels a cell (the upper half block: foreground on top, background below), a colour said
+// only when it changes, the frame drawn over the last one
+static void draw(const std::vector<uint32_t> & px, uint32_t w, uint32_t h, const std::string & header) {
+    std::string s = "\x1b[H\x1b[0m" + header + "\x1b[K\r\n";
+    for (uint32_t r = 0; r + 1 < h; r += 2) {
+        int fg = -1, bg = -1;
+        for (uint32_t c = 0; c < w; c++) {
+            int top = cube(px[r * w + c]), bot = cube(px[(r + 1) * w + c]);
+            char buf[32];
+            if (top != fg && bot != bg) std::snprintf(buf, sizeof buf, "\x1b[38;5;%d;48;5;%dm", top, bot);
+            else if (top != fg) std::snprintf(buf, sizeof buf, "\x1b[38;5;%dm", top);
+            else if (bot != bg) std::snprintf(buf, sizeof buf, "\x1b[48;5;%dm", bot);
+            else buf[0] = 0;
+            s += buf;
+            s += "\xe2\x96\x80";
+            fg = top;
+            bg = bot;
+        }
+        s += "\x1b[0m";
+        if (r + 3 < h) s += "\r\n";
+    }
+    std::fwrite(s.data(), 1, s.size(), stdout);
+    std::fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------------------- the GPU
+
+struct Gpu {
+    wgpu::Instance instance;
+    wgpu::Device device;
+    wgpu::Queue queue;
+    wgpu::ComputePipeline pipeline;
+    wgpu::Buffer params, out, back;
+    wgpu::BindGroup group;
+    std::string name;
+    size_t bytes = 0;
 };
 
-static double ms_since(std::chrono::steady_clock::time_point t) {
-    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
-}
+struct Params {
+    uint32_t w, h;
+    float t, pad;
+};
 
-// The same loop as the shader, in f32, on the guest's CPU
-static std::vector<uint32_t> on_cpu() {
-    std::vector<uint32_t> out(W * H);
-    for (uint32_t py = 0; py < H; py++) {
-        for (uint32_t px = 0; px < W; px++) {
-            float x0 = CX + (float(px) / float(W) - 0.5f) * SCALE * 2.0f;
-            float y0 = CY + (float(py) / float(H) - 0.5f) * SCALE;
-            float x = 0, y = 0;
-            uint32_t i = 0;
-            while (i < ITERS && x * x + y * y <= 4.0f) {
-                float xt = x * x - y * y + x0;
-                y = 2.0f * x * y + y0;
-                x = xt;
-                i++;
-            }
-            out[py * W + px] = i;
-        }
-    }
-    return out;
-}
-
-static std::string view(wgpu::StringView s) { return std::string(std::string_view(s)); }
-
-int main(int argc, char ** argv) {
-    int cols = argc > 2 ? std::atoi(argv[1]) : 100, rows = argc > 2 ? std::atoi(argv[2]) : 30;
-    if (cols < 20) cols = 20;
-    if (rows < 8) rows = 8;
-
-    wgpu::Instance instance = wgpu::CreateInstance();
+static bool open_gpu(Gpu & g, uint32_t w, uint32_t h) {
+    g.instance = wgpu::CreateInstance();
     wgpu::Adapter adapter;
-    instance.WaitAny(instance.RequestAdapter(nullptr, wgpu::CallbackMode::WaitAnyOnly,
-                                             [&](wgpu::RequestAdapterStatus s, wgpu::Adapter a, wgpu::StringView) {
-                                                 if (s == wgpu::RequestAdapterStatus::Success) adapter = a;
-                                             }),
-                     UINT64_MAX);
-    if (!adapter) {
-        std::printf("No GPU answered at gpu.internal:7070: this browser has no WebGPU here.\n");
-        return 2;
-    }
+    g.instance.WaitAny(g.instance.RequestAdapter(nullptr, wgpu::CallbackMode::WaitAnyOnly,
+                                                 [&](wgpu::RequestAdapterStatus s, wgpu::Adapter a, wgpu::StringView) {
+                                                     if (s == wgpu::RequestAdapterStatus::Success) adapter = a;
+                                                 }),
+                       UINT64_MAX);
+    if (!adapter) return false;
     wgpu::AdapterInfo info;
     adapter.GetInfo(&info);
-    std::string name = view(info.description);
-    if (name.empty()) name = view(info.vendor) + " " + view(info.architecture) + " " + view(info.device);
-    std::printf("GPU: %s\n", name.c_str());
-
-    wgpu::Device device;
-    instance.WaitAny(adapter.RequestDevice(nullptr, wgpu::CallbackMode::WaitAnyOnly,
-                                           [&](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView) {
-                                               if (s == wgpu::RequestDeviceStatus::Success) device = d;
-                                           }),
-                     UINT64_MAX);
-    if (!device) {
-        std::printf("The GPU gave no device.\n");
-        return 2;
-    }
-    wgpu::Queue queue = device.GetQueue();
+    auto str = [](wgpu::StringView v) { return std::string(std::string_view(v)); };
+    g.name = str(info.description);
+    if (g.name.empty()) g.name = str(info.vendor) + " " + str(info.architecture) + " " + str(info.device);
+    g.instance.WaitAny(adapter.RequestDevice(nullptr, wgpu::CallbackMode::WaitAnyOnly,
+                                             [&](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView) {
+                                                 if (s == wgpu::RequestDeviceStatus::Success) g.device = d;
+                                             }),
+                       UINT64_MAX);
+    if (!g.device) return false;
+    g.queue = g.device.GetQueue();
 
     wgpu::ShaderSourceWGSL wgsl;
     wgsl.code = SHADER;
     wgpu::ShaderModuleDescriptor smd;
     smd.nextInChain = &wgsl;
     wgpu::ComputePipelineDescriptor pd;
-    pd.compute.module = device.CreateShaderModule(&smd);
+    pd.compute.module = g.device.CreateShaderModule(&smd);
     pd.compute.entryPoint = "main";
-    wgpu::ComputePipeline pipeline = device.CreateComputePipeline(&pd);
+    g.pipeline = g.device.CreateComputePipeline(&pd);
 
-    const size_t bytes = size_t(W) * H * 4;
+    g.bytes = size_t(w) * h * 4;
     wgpu::BufferDescriptor bd;
     bd.size = sizeof(Params);
     bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
-    wgpu::Buffer params = device.CreateBuffer(&bd);
-    bd.size = bytes;
+    g.params = g.device.CreateBuffer(&bd);
+    bd.size = g.bytes;
     bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
-    wgpu::Buffer out = device.CreateBuffer(&bd);
+    g.out = g.device.CreateBuffer(&bd);
     bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
-    wgpu::Buffer back = device.CreateBuffer(&bd);
+    g.back = g.device.CreateBuffer(&bd);
 
     wgpu::BindGroupEntry entries[2];
     entries[0].binding = 0;
-    entries[0].buffer = params;
+    entries[0].buffer = g.params;
     entries[1].binding = 1;
-    entries[1].buffer = out;
+    entries[1].buffer = g.out;
     wgpu::BindGroupDescriptor bgd;
-    bgd.layout = pipeline.GetBindGroupLayout(0);
+    bgd.layout = g.pipeline.GetBindGroupLayout(0);
     bgd.entryCount = 2;
     bgd.entries = entries;
-    wgpu::BindGroup group = device.CreateBindGroup(&bgd);
+    g.group = g.device.CreateBindGroup(&bgd);
+    return true;
+}
 
-    // On the GPU: the parameters in, the pass, the picture back (all of it timed, transfers included)
-    auto t0 = std::chrono::steady_clock::now();
-    Params pv{W, H, ITERS, 0, CX, CY, SCALE, 0};
-    queue.WriteBuffer(params, 0, &pv, sizeof pv);
-    wgpu::CommandEncoder enc = device.CreateCommandEncoder();
+static bool render_gpu(Gpu & g, std::vector<uint32_t> & px, uint32_t w, uint32_t h, float t) {
+    Params pv{w, h, t, 0};
+    g.queue.WriteBuffer(g.params, 0, &pv, sizeof pv);
+    wgpu::CommandEncoder enc = g.device.CreateCommandEncoder();
     wgpu::ComputePassEncoder pass = enc.BeginComputePass();
-    pass.SetPipeline(pipeline);
-    pass.SetBindGroup(0, group);
-    pass.DispatchWorkgroups((W + 7) / 8, (H + 7) / 8);
+    pass.SetPipeline(g.pipeline);
+    pass.SetBindGroup(0, g.group);
+    pass.DispatchWorkgroups((w + 7) / 8, (h + 7) / 8);
     pass.End();
-    enc.CopyBufferToBuffer(out, 0, back, 0, bytes);
+    enc.CopyBufferToBuffer(g.out, 0, g.back, 0, g.bytes);
     wgpu::CommandBuffer cmds = enc.Finish();
-    queue.Submit(1, &cmds);
+    g.queue.Submit(1, &cmds);
     bool mapped = false;
-    instance.WaitAny(back.MapAsync(wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
-                                   [&](wgpu::MapAsyncStatus s, wgpu::StringView) { mapped = s == wgpu::MapAsyncStatus::Success; }),
-                     UINT64_MAX);
-    const uint32_t * gpu = mapped ? static_cast<const uint32_t *>(back.GetConstMappedRange(0, bytes)) : nullptr;
-    double gpu_ms = ms_since(t0);
-    if (!gpu) {
-        std::printf("The GPU's result didn't come back.\n");
-        return 1;
+    g.instance.WaitAny(g.back.MapAsync(wgpu::MapMode::Read, 0, g.bytes, wgpu::CallbackMode::WaitAnyOnly,
+                                       [&](wgpu::MapAsyncStatus s, wgpu::StringView) { mapped = s == wgpu::MapAsyncStatus::Success; }),
+                       UINT64_MAX);
+    const uint32_t * got = mapped ? static_cast<const uint32_t *>(g.back.GetConstMappedRange(0, g.bytes)) : nullptr;
+    if (got) std::memcpy(px.data(), got, g.bytes);
+    g.back.Unmap();
+    return got != nullptr;
+}
+
+static void render_cpu(std::vector<uint32_t> & px, uint32_t w, uint32_t h, float t) {
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) px[y * w + x] = pixel(x, y, w, h, t);
     }
+}
 
-    // On the guest's CPU, emulated
-    t0 = std::chrono::steady_clock::now();
-    std::vector<uint32_t> cpu = on_cpu();
-    double cpu_ms = ms_since(t0);
-    size_t same = 0;
-    for (size_t i = 0; i < size_t(W) * H; i++) same += gpu[i] == cpu[i];
+// ----------------------------------------------------------------------------------------- main
 
-    // The GPU's picture, sampled to the console's size, darkest outside to brightest near the set
-    static const char shades[] = " .:-=+*#%@";
-    static const int colors[] = {17, 18, 19, 20, 21, 27, 33, 39, 45, 51, 87, 123, 159, 195, 230, 229, 228, 227, 226, 220};
-    const int lines = rows - 4;
-    std::string frame;
-    for (int r = 0; r < lines; r++) {
-        for (int c = 0; c < cols; c++) {
-            uint32_t n = gpu[(uint32_t(r) * H / lines) * W + uint32_t(c) * W / cols];
-            if (n >= ITERS) {
-                frame += ' ';
-                continue;
+int main(int argc, char ** argv) {
+    int cols = 100, rows = 30, frames = 0;
+    std::vector<int> nums;
+    for (int i = 1; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) frames = std::atoi(argv[++i]);
+        else nums.push_back(std::atoi(argv[i]));
+    }
+    // The size given, or else the console's
+    winsize ws{};
+    if (nums.size() >= 2) cols = nums[0], rows = nums[1];
+    else if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) cols = ws.ws_col - 1, rows = ws.ws_row - 1;
+    if (cols < 20) cols = 20;
+    if (rows < 8) rows = 8;
+    const uint32_t w = uint32_t(cols), h = uint32_t(rows - 1) * 2;
+
+    Gpu g;
+    if (!open_gpu(g, w, h)) {
+        std::printf("No GPU answered at gpu.internal:7070: this browser has no WebGPU here.\n");
+        return 2;
+    }
+    std::printf("GPU: %s\n", g.name.c_str());
+    std::vector<uint32_t> px(size_t(w) * h);
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    // Timing only: N frames each way, then the averages
+    if (frames > 0) {
+        double sums[2] = {0, 0};
+        for (int on_cpu = 0; on_cpu < 2; on_cpu++) {
+            for (int f = 0; f < frames; f++) {
+                auto t0 = now();
+                if (on_cpu) render_cpu(px, w, h, float(f) * 0.1f);
+                else if (!render_gpu(g, px, w, h, float(f) * 0.1f)) return 1;
+                sums[on_cpu] += ms(t0, now());
             }
-            int k = int(n * 19 / 40 > 19 ? 19 : n * 19 / 40);
-            char buf[32];
-            std::snprintf(buf, sizeof buf, "\x1b[38;5;%dm%c", colors[k], shades[k / 2]);
-            frame += buf;
         }
-        frame += "\x1b[0m\n";
+        std::printf("%ux%u pixels, %d frames each: GPU %.1f ms a frame, this machine's CPU %.1f ms a frame (%.1fx)\n",
+                    w, h, frames, sums[0] / frames, sums[1] / frames, sums[0] > 0 ? sums[1] / sums[0] : 0.0);
+        return 0;
     }
-    std::fputs(frame.c_str(), stdout);
-    std::printf("%ux%u, %u iterations: GPU %.1f ms (transfers included), this machine's CPU %.1f ms: %.0fx\n",
-                W, H, ITERS, gpu_ms, cpu_ms, gpu_ms > 0 ? cpu_ms / gpu_ms : 0.0);
-    std::printf("%.2f%% of the pixels agree (the GPU's f32 may round differently at the edge)\n", 100.0 * same / (double(W) * H));
-    back.Unmap();
-    return 0;
+
+    if (isatty(0) && tcgetattr(0, &saved) == 0) {
+        termios t = saved;
+        t.c_lflag &= ~(ICANON | ECHO);
+        t.c_cc[VMIN] = 0;
+        t.c_cc[VTIME] = 0;
+        raw = tcsetattr(0, TCSANOW, &t) == 0;
+    }
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+    std::fputs("\x1b[2J\x1b[?25l", stdout);
+
+    bool on_cpu = false;
+    double fps = 0, render_ms = 0;
+    auto start = now(), last = start;
+    for (;;) {
+        float t = float(ms(start, now()) / 1000.0);
+        auto t0 = now();
+        if (on_cpu) render_cpu(px, w, h, t);
+        else if (!render_gpu(g, px, w, h, t)) break;
+        double took = ms(t0, now());
+        render_ms = render_ms == 0 ? took : render_ms * 0.8 + took * 0.2;
+        char header[256];
+        std::snprintf(header, sizeof header, "\x1b[1m%s\x1b[0m  %s  %4.1f fps  %6.1f ms a frame   c: %s  q: quit",
+                      on_cpu ? "this machine's CPU (emulated)" : g.name.c_str(), on_cpu ? "" : "(GPU)", fps, render_ms,
+                      on_cpu ? "back to the GPU" : "the same on the CPU");
+        draw(px, w, h, header);
+        auto t1 = now();
+        double frame = ms(last, t1);
+        last = t1;
+        fps = fps == 0 ? 1000.0 / frame : fps * 0.8 + (1000.0 / frame) * 0.2;
+        char key[16];
+        ssize_t n = read(0, key, sizeof key);
+        for (ssize_t i = 0; i < n; i++) {
+            if (key[i] == 'c' || key[i] == 'C') {
+                on_cpu = !on_cpu;
+                fps = 0;
+                render_ms = 0;
+            }
+            if (key[i] == 'q' || key[i] == 'Q') {
+                restore();
+                return 0;
+            }
+        }
+    }
+    restore();
+    return 1;
 }

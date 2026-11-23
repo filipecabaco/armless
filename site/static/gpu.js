@@ -1,4 +1,4 @@
-// The GPU example (site/examples/gpu.md): site/guest/gpu.cpp in the initramfs, run at the first
+// The GPU example (site/examples/gpu.md): site/guest/gpu.cpp in the initramfs, a 3D scene raymarched in real time, run at the first
 // prompt. The machine has a network device for the GPU's connection alone (allow() lets nothing
 // out), and armless-gpu.js answers the guest's connections to gpu.internal:7070 with this page's
 // WebGPU. Without WebGPU they are refused, and the program says so.
@@ -11,7 +11,7 @@
     scripts: ["demo/armless-gpu.js"],
     options: () => ({ network: { allow: () => false } }),
     made: (vm) => ArmlessGPU.attach(vm, { max_memory: 256 * 1048576 }),
-    keys: [["^C", "\x03", "Send ctrl+c"], ["gpu", "gpu\n", "Run it again"], ["cpuinfo", "cat /proc/cpuinfo\n"]],
+    keys: [["c", "c", "Render on the GPU or on the emulated CPU"], ["q", "q", "Stop it"], ["gpu", "gpu\n", "Run it again"]],
     command: run,
     running: /GPU: |No GPU answered/,
     status: "asking for a GPU",
@@ -20,5 +20,5 @@
   const said = await m.waitFor(/^GPU: (.+)$|No GPU answered/m);
   // After mount's own status for the same line (set as the command is seen running)
   await new Promise((resolve) => setTimeout(resolve, 0));
-  m.set("ready", said?.[1] ? `computed on ${said[1].trim()}. the shell is yours` : "no WebGPU in this browser, the program says. the shell is yours");
+  m.set("ready", said?.[1] ? `raymarching on ${said[1].trim()}. c: the same on the CPU, q: stop` : "no WebGPU in this browser, the program says. the shell is yours");
 })();
