@@ -24,7 +24,7 @@ armless started as a fork of [v86](https://github.com/copy/v86).
 - **Filesystem:** a 9p root built from content-addressed blobs, fetched on first read.
   Large files are split into chunks, so a read fetches only what it covers.
 - **Network:** virtio-net with an in-process TCP/IP stack. DHCP, DNS and ping are answered
-  locally. HTTP and HTTPS (ports 80 and 443; HTTPS ends in the machine with a CA the guest
+  locally. HTTP and HTTPS (ports 80 and 443, or through `proxy.internal:3128` as HTTPS_PROXY; HTTPS ends in the machine with a CA the guest
   trusts) and WebSockets reach the host as requests to make: a page answers them with
   `fetch()` and `WebSocket`, a native host with its own HTTP client, proxies included.
   Other TCP connections become streams the host accepts, refuses, or carries over a
