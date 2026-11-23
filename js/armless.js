@@ -1522,6 +1522,24 @@
     }
 
     /** One of the guest's HTTP(S) requests, made with fetch(). */
+    // The length of what's at a URL, from a request for its first byte (Content-Range: bytes 0-0/N),
+    // or null when the server doesn't say
+    async _http_length(url, headers, w) {
+      const h = new Headers(headers);
+      h.set("range", "bytes=0-0");
+      try {
+        const r = await this._web_options.fetch(url, {
+          method: "GET", headers: h, signal: w.abort?.signal,
+          credentials: "omit", referrerPolicy: "no-referrer", redirect: "follow",
+        });
+        const total = r.status === 206 ? /\/(\d+)\s*$/.exec(r.headers.get("content-range") || "")?.[1] : null;
+        r.body?.cancel().catch(() => {});
+        return total ?? null;
+      } catch {
+        return null;
+      }
+    }
+
     async _http(id, method, url, headers, body) {
       const o = this._web_options;
       const w = { abort: typeof AbortController === "function" ? new AbortController() : null };
@@ -1584,8 +1602,17 @@
       response.headers.forEach((v, k) => { if (!HTTP_SKIP.test(k)) pairs.push(k, v); });
       // The body's length, which the machine frames the guest's response by (and a HEAD's says),
       // unless the browser decoded the body (Content-Encoding): then it isn't the bytes that come
-      const length = response.headers.get("content-length");
-      if (length !== null && !response.headers.get("content-encoding")) pairs.push("content-length", length);
+      let length = response.headers.get("content-length");
+      if (response.headers.get("content-encoding")) length = null;
+      // A HEAD whose body the server would compress has no length the guest can use (the browser
+      // asks for compression, and a page can't stop it), yet a HEAD is how clients size a download:
+      // Ollama sizes each blob by it, and downloads nothing for a blob that says none. One byte of
+      // the same URL is never compressed, and its Content-Range says the whole length
+      if (length === null && /^HEAD$/i.test(method) && response.status === 200) {
+        length = await this._http_length(response.url || target, h, w);
+        if (this._web.get(id) !== w) return;
+      }
+      if (length !== null) pairs.push("content-length", length);
       const reason = utf8.encode(response.statusText || "OK");
       const hb = utf8.encode(pairs.join("\0"));
       const rp = this._copy_in(reason);
