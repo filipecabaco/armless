@@ -104,6 +104,10 @@ test("a HEAD with no length is sized by a request for its first byte", async () 
     const { vm, calls, fetches } = relay({ fetch: (url, init) => { fetches.push({ url, init }); return answers(true)(url, init); } });
     await vm._http(1, "HEAD", "http://93.184.215.14/v2/x/blobs/sha256:00", [["accept", "*/*"]], new Uint8Array());
     assert.deepEqual(fetches.map(({ init }) => init.method), ["HEAD", "GET"]);
+    // The probe asks the server: a browser's cache answers a range of a compressed response in
+    // the compressed bytes
+    assert.equal(fetches[0].init.cache, undefined);
+    assert.equal(fetches[1].init.cache, "no-store");
     assert.equal(new Headers(fetches[1].init.headers).get("accept"), "*/*", "the probe asks as the guest did");
     assert.match(respond(calls)[5], /(^|\0)content-length\x0011343($|\0)/);
   }
@@ -113,6 +117,14 @@ test("a HEAD with no length is sized by a request for its first byte", async () 
     await vm._http(1, "HEAD", "http://93.184.215.14/x", [], new Uint8Array());
     assert.doesNotMatch(respond(calls)[5], /content-length/);
   }
+});
+
+test("a guest's request for a range goes past the browser's cache", async () => {
+  const { vm, fetches } = relay();
+  await vm._http(1, "GET", "http://93.184.215.14/blob", [["range", "bytes=0-11342"]], new Uint8Array());
+  await vm._http(2, "GET", "http://93.184.215.14/blob", [], new Uint8Array());
+  assert.equal(fetches[0].init.cache, "no-store");
+  assert.equal(fetches[1].init.cache, undefined, "a whole response may come from the cache");
 });
 
 test("a name that resolves to a private address is refused server-side", async () => {
