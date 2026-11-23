@@ -33,6 +33,7 @@ on:
       - "src/**"
       - "user/**"
       - "js/**"
+      - "gpu/**"
       - "build-wasm.sh"
       - "Readme.md"
       - "Cargo.toml"
@@ -100,13 +101,22 @@ jobs:
           SMP=1 sh build-wasm.sh
           cargo build --release --bin armless-run
           mkdir -p "$RUNNER_TEMP/armless"
-          cp js/armless.js build/armless.wasm build/armless-smp.wasm "$RUNNER_TEMP/armless/"
+          cp js/armless.js js/armless-gpu.js build/armless.wasm build/armless-smp.wasm "$RUNNER_TEMP/armless/"
           echo "bin=$PWD/build/release/armless-run" >> "$GITHUB_OUTPUT"
           echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) (${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
+      # The GPU example's program (site/guest/gpu.cpp): static for the guest against gpu/guest's
+      # WebGPU header, cross-compiled with Zig as gpu/guest/build-llama.sh does
+      - name: Build the GPU example's guest program
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install --quiet ziglang==0.17.1
+          "$RUNNER_TEMP/zig/bin/python" -m ziglang c++ -target aarch64-linux-musl -O2 -s -static -std=c++17 -Wall -Wextra \
+            -I gpu/guest/include site/guest/gpu.cpp -o "$RUNNER_TEMP/gpu"
       - name: Put the machines together
         env:
           ARMLESS_BUILD: ${{ runner.temp }}/armless
           ARMLESS_VERSION: ${{ steps.native.outputs.version }}
+          GPU_DEMO: ${{ runner.temp }}/gpu
         run: elixir site/demo.exs build-linux ${{ steps.native.outputs.bin }}
       - uses: actions/setup-node@v7
         with:

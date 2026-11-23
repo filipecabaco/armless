@@ -35,11 +35,12 @@ defmodule Demo do
     File.mkdir_p!(out)
 
     # armless itself: as built from this checkout (ARMLESS_BUILD: a directory with armless.js,
-    # armless.wasm and armless-smp.wasm, as build-wasm.sh makes them), or as released
+    # armless.wasm and armless-smp.wasm, as build-wasm.sh makes them, and armless-gpu.js), or as
+    # released
     version =
       case System.get_env("ARMLESS_BUILD") do
         dir when is_binary(dir) and dir != "" ->
-          for name <- ~w(armless.js armless.wasm armless-smp.wasm) do
+          for name <- ~w(armless.js armless.wasm armless-smp.wasm armless-gpu.js) do
             save(out, name, File.read!(Path.join(dir, name)))
           end
 
@@ -49,7 +50,7 @@ defmodule Demo do
           release = get!(@release).body
           assets = Map.new(release["assets"], &{&1["name"], &1["browser_download_url"]})
 
-          for name <- ~w(armless.js armless.wasm armless-smp.wasm) do
+          for name <- ~w(armless.js armless.wasm armless-smp.wasm armless-gpu.js) do
             url = Map.get(assets, name) || raise "#{release["tag_name"]} has no #{name}"
             save(out, name, get!(url, decode_body: false).body)
           end
@@ -69,23 +70,28 @@ defmodule Demo do
     image = File.read!(Path.join(kernel_dir, "Image"))
     save(out, "Image.gz", :zlib.gzip(image))
 
-    # ... and an initramfs: busybox, the init script and the trench run
+    # ... and an initramfs: busybox, the init script and the trench run, and the GPU example's
+    # program when it was built (GPU_DEMO: site/guest/gpu.cpp compiled for the guest, pages.yml)
     guest = Path.join(__DIR__, "guest")
 
+    gpu =
+      case System.get_env("GPU_DEMO") do
+        path when is_binary(path) and path != "" -> ["bin/gpu=" <> Path.expand(path)]
+        _ -> []
+      end
+
     {_, 0} =
-      System.cmd("python3", [
-        Path.join([root, "tests", "linux", "mkcpio.py"]),
-        Path.join(out, "initrd.cpio"),
-        "init=" <> Path.join(guest, "init"),
-        "bin/busybox=" <> Path.join(kernel_dir, "busybox"),
-        "bin/trench=" <> Path.join(guest, "trench"),
-        "usr/share/trench.awk=" <> Path.join(guest, "trench.awk"),
-        "proc/",
-        "mnt/",
-        "sys/",
-        "tmp/",
-        "root/"
-      ])
+      System.cmd(
+        "python3",
+        [
+          Path.join([root, "tests", "linux", "mkcpio.py"]),
+          Path.join(out, "initrd.cpio"),
+          "init=" <> Path.join(guest, "init"),
+          "bin/busybox=" <> Path.join(kernel_dir, "busybox"),
+          "bin/trench=" <> Path.join(guest, "trench"),
+          "usr/share/trench.awk=" <> Path.join(guest, "trench.awk")
+        ] ++ gpu ++ ["proc/", "mnt/", "sys/", "tmp/", "root/"]
+      )
 
     IO.puts("demo: initrd.cpio #{File.stat!(Path.join(out, "initrd.cpio")).size} bytes")
 
@@ -107,7 +113,8 @@ defmodule Demo do
         memory_mb: @memory_mb,
         cmdline: @cmdline,
         native: native?,
-        python: python?
+        python: python?,
+        gpu: gpu != []
       })
     )
 

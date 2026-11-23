@@ -32,6 +32,8 @@ defmodule Site.Build do
      "Options, events and calls of the armless.js Armless class."},
     {"native-api", "Native API", "Use", [{:section, "Native API", promote: true}],
      "Using the armless crate from Rust: NativeHost, Runner and the egress proxy settings."},
+    {"gpu", "GPU", "Use", [{:file, "docs/gpu.md"}],
+     "WebGPU compute for guests: the visitor's GPU in a page, the host's natively, and llama.cpp on it."},
     {"how-it-works", "How it works", "Internals", [{:section, "How it works", promote: true}],
      "The interpreter, the JIT, hardware backends, the MMU, SMP, devices, snapshots and the browser memory model."},
     {"design", "Design notes", "Internals", [{:file, "docs/armless.md"}],
@@ -53,7 +55,7 @@ defmodule Site.Build do
   # name and the caption under the machine, and optionally `side`, the pane beside the console
   # (site/templates/side/<side>.html.eex, metrics by default); its body is what the page says
   # below the machine.
-  @examples ~w(trench-run native-snapshot fresh-randomness time-asleep no-kernel egress)
+  @examples ~w(trench-run native-snapshot fresh-randomness time-asleep no-kernel egress gpu)
 
   def run do
     out = Path.join(__DIR__, "_out")
