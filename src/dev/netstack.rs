@@ -48,6 +48,10 @@ const MAX_QUEUED: usize = 8192;
 /// the host makes (natively, a thread or two), so a guest opening them without end would exhaust
 /// the host; past this a SYN is refused, as a full listen queue would be.
 pub const MAX_CONNS: usize = 1024;
+/// The web relay's HTTP proxy (`Web::proxy`): HTTPS_PROXY=http://proxy.internal:3128 tunnels a
+/// program's HTTPS through the relay, as its own connections to port 443 would go.
+pub const PROXY_HOST: &str = "proxy.internal";
+pub const PROXY_PORT: u16 = 3128;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
@@ -814,9 +818,13 @@ impl Stack {
                 c.guest_window = window;
                 c.mss = parse_mss(&t[20..off]).unwrap_or(536).min(MSS);
                 let host = self.host_of(dst);
-                if dport == 80 || (dport == 443 && self.tls.is_some()) {
-                    // The web relay answers this one itself
-                    c.web = Some(Box::new(Web::new(id, dport == 443, host)));
+                if dport == 80 || (dport == 443 && self.tls.is_some()) || (dport == PROXY_PORT && host == PROXY_HOST) {
+                    // The web relay answers this one itself (the proxy's CONNECT first, for it)
+                    c.web = Some(Box::new(if dport == PROXY_PORT && host == PROXY_HOST {
+                        Web::proxy(id, self.tls.is_some())
+                    } else {
+                        Web::new(id, dport == 443, host)
+                    }));
                     self.conns.insert(id, c);
                     self.accept(id);
                     return;

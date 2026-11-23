@@ -965,3 +965,18 @@ fn segments_with_options_and_frames_of_other_kinds_are_handled() {
         "the guest's MSS of 512"
     );
 }
+
+#[test]
+fn proxy_internal_3128_is_the_relays_proxy_and_other_hosts_3128_goes_out() {
+    let mut g = Guest::new();
+    // The proxy's name: answered inside the machine (accepted at once, no TcpOpen for the host)
+    let proxy = g.resolve(PROXY_HOST, 1).unwrap();
+    g.syn(proxy, 40300, PROXY_PORT);
+    assert!(g.events().is_empty(), "the relay takes it");
+    let s = g.segs();
+    assert!(s.len() == 1 && s[0].has(SYN | ACK), "accepted: {s:?}");
+    // Another host's port 3128 is the guest's own TCP, for the host to open
+    let other = g.resolve("squid.example", 1).unwrap();
+    let (_, host) = g.open(other, 40301, PROXY_PORT, 1460);
+    assert_eq!(host, "squid.example");
+}

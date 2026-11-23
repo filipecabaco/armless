@@ -990,3 +990,75 @@ fn a_websocket_frame_or_message_past_the_limit_closes_it() {
     let out = web.from_guest(&frag(true, 0, half), None, &mut rng);
     assert!(closed_too_big(&out), "{:?}", out.events);
 }
+
+/// Through the proxy: a CONNECT, answered in the clear, then the tunnel's TLS (sent with the
+/// CONNECT, as clients may) relayed as a connection to that host's port 443 would be.
+#[test]
+fn the_proxy_tunnels_a_connect_to_port_443_through_the_relay() {
+    let mut p = Pair::new("registry.example", None);
+    p.web = Web::proxy(1, true);
+    p.client
+        .writer()
+        .write_all(b"GET /v2/a/b/manifests/latest HTTP/1.1\r\nHost: registry.example\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    // The CONNECT and the ClientHello in one segment
+    let mut wire = b"CONNECT registry.example:443 HTTP/1.1\r\nHost: registry.example:443\r\n\r\n".to_vec();
+    while p.client.wants_write() {
+        p.client.write_tls(&mut wire).unwrap();
+    }
+    let out = p.web.from_guest(&wire, Some(&mut p.keys), &mut p.rng);
+    let established = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+    assert!(out.to_guest.starts_with(established), "{:?}", String::from_utf8_lossy(&out.to_guest[..60.min(out.to_guest.len())]));
+    p.take(Out { to_guest: out.to_guest[established.len()..].to_vec(), events: out.events, close: out.close });
+    p.pump();
+    let Some(Event::HttpRequest { method, url, .. }) = p.events.pop() else {
+        panic!("no request: {:?}", p.events)
+    };
+    assert_eq!((method.as_str(), url.as_str()), ("GET", "https://registry.example/v2/a/b/manifests/latest"));
+    let out = p.web.respond(200, "OK", &[("Content-Length".into(), "2".into())]);
+    p.take(out);
+    let out = p.web.body(b"{}");
+    p.take(out);
+    let out = p.web.end();
+    p.take(out);
+    let text = String::from_utf8_lossy(&p.plain).into_owned();
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n") && text.ends_with("\r\n\r\n{}"), "{text}");
+}
+
+/// A CONNECT that comes in pieces is waited for; a plain request is relayed as port 80's.
+#[test]
+fn the_proxy_waits_for_the_whole_connect_and_tunnels_port_80_in_the_clear() {
+    let mut rng = Rng::default();
+    let mut web = Web::proxy(1, true);
+    let out = web.from_guest(b"CONNECT plain.example:80 HTT", None, &mut rng);
+    assert!(out.to_guest.is_empty() && out.events.is_empty() && !out.close);
+    let out = web.from_guest(b"P/1.1\r\n\r\nGET /x HTTP/1.1\r\nHost: plain.example\r\n\r\n", None, &mut rng);
+    assert_eq!(out.to_guest, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+    let Some(Event::HttpRequest { url, .. }) = out.events.first() else {
+        panic!("no request: {:?}", out.events)
+    };
+    assert_eq!(url, "http://plain.example/x");
+}
+
+/// Anything but CONNECT to 443 or 80 is refused, and so is 443 without the site's CA.
+#[test]
+fn the_proxy_refuses_what_it_does_not_tunnel() {
+    let mut rng = Rng::default();
+    for (can_tls, request, status) in [
+        (true, &b"GET http://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n"[..], "405"),
+        (true, b"CONNECT a.example:22 HTTP/1.1\r\n\r\n", "403"),
+        (true, b"CONNECT a.example HTTP/1.1\r\n\r\n", "403"),
+        (true, b"CONNECT user@a.example:443 HTTP/1.1\r\n\r\n", "403"),
+        (false, b"CONNECT a.example:443 HTTP/1.1\r\n\r\n", "403"),
+    ] {
+        let mut web = Web::proxy(1, can_tls);
+        let out = web.from_guest(request, None, &mut rng);
+        let text = String::from_utf8_lossy(&out.to_guest).into_owned();
+        assert!(text.starts_with(&format!("HTTP/1.1 {status} ")), "{}: {text}", String::from_utf8_lossy(request));
+        assert!(out.close && out.events.is_empty());
+    }
+    // A CONNECT that never ends
+    let mut web = Web::proxy(1, true);
+    let out = web.from_guest(&vec![b'a'; 9000], None, &mut rng);
+    assert!(String::from_utf8_lossy(&out.to_guest).starts_with("HTTP/1.1 431 ") && out.close);
+}

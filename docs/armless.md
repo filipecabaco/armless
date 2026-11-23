@@ -113,8 +113,11 @@ the site's CA, end inside the machine:
   bodies, `Expect: 100-continue`, and requests answered one at a time (a pipelined one
   waits in the buffer, and is a new `HttpRequest` once the response before it ends).
   Responses are streamed with the host's Content-Length, or chunked when it gave none
-  (fetch() never does); a host that sends less, or more, than it said closes the
-  connection. HTTP/1.0 and `connection: close` requests get a response that ends with
+  (a page passes fetch()'s on, unless the browser decoded the body, so a HEAD says the
+  length too); a host that sends less, or more, than it said closes the connection. A
+  page's fetch() follows redirects out of sight, so a GET it followed reaches the guest
+  as a 307 to where it ended: a client that wants a redirect's Location (Ollama's
+  downloads do) has one. HTTP/1.0 and `connection: close` requests get a response that ends with
   the connection, as does a guest that has finished sending, after its last request.
   Requests are parsed strictly, since the host passes them on (perhaps to a shared proxy):
   a bare CR or LF or another control character in the head, a folded line, a header name
@@ -123,6 +126,13 @@ the site's CA, end inside the machine:
   chunk size says more); a chunked one is read incrementally. What the guest sends while
   its request is answered, or its WebSocket opened, is held up to a body and a head more
   (pipelining); past that the connection closes.
+- **An HTTP proxy** at `proxy.internal:3128` (`Web::proxy`): a `CONNECT host:443` (or
+  `:80`) is answered with 200, and the tunnel is relayed as a connection to that host and
+  port would be. Anything else is refused (405, or 403 for other ports, and for 443
+  without the site's CA). A guest that sets `HTTPS_PROXY=http://proxy.internal:3128`
+  goes out as it would behind any proxy, which resolves names for it: Go programs then
+  skip their checks on what a name resolves to (Ollama's on a registry's redirect), which
+  the machine's private addresses for names would fail.
 - **WebSocket upgrades** become `WsOpen` and the frames become messages. Pings are
   answered in the machine. A frame or a message over 64 MiB (`MAX_WS_MESSAGE`), from the
   guest or from a server the native host talks to, closes the WebSocket with 1009, as soon

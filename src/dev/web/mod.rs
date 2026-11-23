@@ -306,6 +306,8 @@ fn body(head: &Head, b: &[u8], chunks: &mut Chunks) -> Result<Option<(Vec<u8>, u
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Phase {
+    /// A connection to the proxy (`Web::proxy`), reading its CONNECT
+    Connect,
     /// Reading the request
     Request,
     /// Waiting for the host to answer
@@ -361,9 +363,73 @@ pub struct Web {
     continued: bool,
     /// The request's chunked body, as far as it has been read
     chunks: Chunks,
+    /// A proxy connection may tunnel to port 443 (the machine has the site's CA)
+    can_tls: bool,
 }
 
+/// What a CONNECT may ask for, at most (its request line and headers).
+const MAX_CONNECT: usize = 8 << 10;
+
 impl Web {
+    /// A connection to the proxy (proxy.internal:3128): the guest's `CONNECT host:443` (or :80)
+    /// is answered with 200, and what follows is relayed as a connection to that host and port
+    /// would be. A program behind HTTPS_PROXY reaches the web through the relay as one that
+    /// connects itself does; Go's resolves no names itself then (the proxy does), so its checks
+    /// on where a name resolves to don't meet the machine's own addresses for names.
+    pub fn proxy(id: u32, can_tls: bool) -> Web {
+        Web {
+            phase: Phase::Connect,
+            can_tls,
+            ..Web::new(id, false, "proxy.internal".into())
+        }
+    }
+
+    /// The proxy's CONNECT, as far as it has come.
+    fn connect(&mut self, keys: Option<&mut TlsKeys>, rng: &mut Rng) -> Out {
+        let mut out = Out::default();
+        let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if self.buf.len() > MAX_CONNECT {
+                self.respond_error(431, "Request Header Fields Too Large", "CONNECT too long\n", &mut out);
+            }
+            return out;
+        };
+        let head = String::from_utf8_lossy(&self.buf[..end]).into_owned();
+        let rest = self.buf[end + 4..].to_vec();
+        self.buf.clear();
+        let mut words = head.lines().next().unwrap_or("").split_whitespace();
+        let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+        if method != "CONNECT" {
+            self.respond_error(405, "Method Not Allowed", "this proxy only tunnels: CONNECT host:443\n", &mut out);
+            return out;
+        }
+        let (host, port) = match target.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() && !h.contains(['/', '@']) => (h.trim_start_matches('[').trim_end_matches(']'), p.parse::<u16>().ok()),
+            _ => ("", None),
+        };
+        match port {
+            Some(443) if self.can_tls => {
+                self.https = true;
+                self.tls = Some(Tls::default());
+            },
+            Some(80) => {},
+            _ => {
+                self.respond_error(403, "Forbidden", "this proxy tunnels to ports 443 and 80\n", &mut out);
+                return out;
+            },
+        }
+        self.host = host.to_string();
+        self.phase = Phase::Request;
+        // In the clear, before the tunnel's own bytes (the guest's TLS, when it is 443)
+        out.to_guest.extend_from_slice(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        if !rest.is_empty() {
+            let more = self.from_guest(&rest, keys, rng);
+            out.to_guest.extend_from_slice(&more.to_guest);
+            out.events.extend(more.events);
+            out.close |= more.close;
+        }
+        out
+    }
+
     pub fn new(id: u32, https: bool, host: String) -> Web {
         Web {
             id,
@@ -380,6 +446,7 @@ impl Web {
             ws_key: String::new(),
             continued: false,
             chunks: Chunks::default(),
+            can_tls: false,
         }
     }
 
@@ -426,6 +493,10 @@ impl Web {
 
     /// Bytes from the guest.
     pub fn from_guest(&mut self, data: &[u8], keys: Option<&mut TlsKeys>, rng: &mut Rng) -> Out {
+        if self.phase == Phase::Connect {
+            self.buf.extend_from_slice(data);
+            return self.connect(keys, rng);
+        }
         let mut out = Out::default();
         let plain = match &mut self.tls {
             Some(t) => {
@@ -459,6 +530,8 @@ impl Web {
                 }
             },
             Phase::Done => self.buf.clear(),
+            // Read before any of this, at the top
+            Phase::Connect => {},
         }
         out
     }
@@ -469,7 +542,7 @@ impl Web {
         self.guest_done = true;
         if matches!(
             self.phase,
-            Phase::Request | Phase::WsOpening | Phase::WebSocket
+            Phase::Connect | Phase::Request | Phase::WsOpening | Phase::WebSocket
         ) {
             if self.phase == Phase::WebSocket {
                 out.events.push(Event::WsClose {

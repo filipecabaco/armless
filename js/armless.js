@@ -668,7 +668,7 @@
       const e = this.exports;
       if (!e.armless_mem_report) throw new Error("armless: this build has no memory report");
       const n = e.armless_mem_report();
-      const r = JSON.parse(new TextDecoder().decode(new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice()));
+      const r = JSON.parse(new TextDecoder().decode(new Uint8Array(this.memory.buffer, (e.armless_buf() >>> 0), n).slice()));
       // The memory may have grown since the report was made: its size now
       r.memory = this.memory.buffer.byteLength;
       if (scan) {
@@ -940,7 +940,7 @@
       const e = this.exports;
       const n = e.armless_user_save();
       if (n === 0) throw new Error("armless: " + this._error());
-      return new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice();
+      return new Uint8Array(this.memory.buffer, (e.armless_buf() >>> 0), n).slice();
     }
 
     /**
@@ -999,7 +999,7 @@
       if (!this._jobs?.size || !e.armless_user_spawn_pending) return;
       const n = e.armless_user_spawn_pending();
       if (!n) return;
-      const v = new DataView(this.memory.buffer, e.armless_buf(), n);
+      const v = new DataView(this.memory.buffer, (e.armless_buf() >>> 0), n);
       for (let i = 0; i + 8 <= n; i += 8) {
         const pid = Number(v.getBigInt64(i, true));
         const job = this._jobs.get(pid);
@@ -1019,7 +1019,7 @@
       const bytes = (call) => {
         const e = vm.exports;
         const n = e[call]();
-        return new Uint8Array(vm.memory.buffer, e.armless_buf(), n).slice();
+        return new Uint8Array(vm.memory.buffer, (e.armless_buf() >>> 0), n).slice();
       };
       return {
         pid,
@@ -1283,7 +1283,7 @@
         // A machine built before the snapshot came in pieces: the one buffer
         if (!e.armless_save_begin) {
           const n = e.armless_save_state();
-          return [new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice()];
+          return [new Uint8Array(this.memory.buffer, (e.armless_buf() >>> 0), n).slice()];
         }
         this._debug_sample("save begins");
         if (e.armless_save_begin() !== 0) throw new Error("armless: snapshot: " + this._error());
@@ -1291,7 +1291,7 @@
         const pieces = [];
         try {
           for (let n; (n = e.armless_save_next()) !== 0;) {
-            pieces.push(new Uint8Array(this.memory.buffer, e.armless_buf(), n).slice());
+            pieces.push(new Uint8Array(this.memory.buffer, (e.armless_buf() >>> 0), n).slice());
           }
         } catch (err) {
           e.armless_save_abort();
@@ -1368,11 +1368,11 @@
 
     _error() {
       const e = this.exports;
-      return new TextDecoder().decode(new Uint8Array(this.memory.buffer, e.armless_error(), e.armless_error_len()).slice());
+      return new TextDecoder().decode(new Uint8Array(this.memory.buffer, (e.armless_error() >>> 0), e.armless_error_len()).slice());
     }
 
     _copy_in(bytes) {
-      const p = this.exports.armless_alloc(bytes.length);
+      const p = (this.exports.armless_alloc(bytes.length) >>> 0);
       new Uint8Array(this.memory.buffer, p, bytes.length).set(bytes);
       return p;
     }
@@ -1414,7 +1414,7 @@
         for (;;) {
           const n = this.exports.armless_events();
           if (!n) break;
-          const buf = new Uint8Array(this.memory.buffer, this.exports.armless_buf(), n).slice();
+          const buf = new Uint8Array(this.memory.buffer, (this.exports.armless_buf() >>> 0), n).slice();
           const dv = new DataView(buf.buffer);
           for (let at = 0; at < n;) {
             const type = buf[at];
@@ -1561,8 +1561,31 @@
         return fail(`the browser could not fetch ${target} (the server must allow CORS): ${err}`);
       }
       if (this._web.get(id) !== w) return;
+      // A redirect the browser followed (it hides each one): the guest is told where it ended, as
+      // a 307 to there, rather than handed the end's response as the first URL's. Clients that
+      // need to see the redirect (Ollama's downloads take the Location of a registry's blob URL)
+      // see one, and the rest follow it to the same place.
+      // (A HEAD gets the end's headers: what it asks for is the body's length, which a redirect
+      // with none would say is 0)
+      if (!SERVER_SIDE && response.redirected && response.url && response.url !== target && /^GET$/i.test(method)) {
+        w.abort?.abort();
+        const reason = utf8.encode("Temporary Redirect");
+        const hb = utf8.encode(["location", response.url, "content-length", "0"].join("\0"));
+        const rp = this._copy_in(reason);
+        this._with_bytes(hb, (p, n) => this._call("armless_http_respond", id, 307, rp, reason.length, p, n));
+        this.exports.armless_free(rp, reason.length);
+        this._web.delete(id);
+        this._call("armless_http_end", id);
+        this._drain();
+        this._poke();
+        return;
+      }
       const pairs = [];
       response.headers.forEach((v, k) => { if (!HTTP_SKIP.test(k)) pairs.push(k, v); });
+      // The body's length, which the machine frames the guest's response by (and a HEAD's says),
+      // unless the browser decoded the body (Content-Encoding): then it isn't the bytes that come
+      const length = response.headers.get("content-length");
+      if (length !== null && !response.headers.get("content-encoding")) pairs.push("content-length", length);
       const reason = utf8.encode(response.statusText || "OK");
       const hb = utf8.encode(pairs.join("\0"));
       const rp = this._copy_in(reason);
