@@ -89,6 +89,32 @@ test("a public destination is fetched without the page's cookies or referrer", a
   assert.ok(calls.some(([n, i]) => n === "armless_http_end" && i === 1));
 });
 
+test("a HEAD with no length is sized by a request for its first byte", async () => {
+  // As Hugging Face answers a small file it would compress: no Content-Length on the HEAD
+  const answers = (sized) => async (url, init) => {
+    const range = new Headers(init.headers).get("range");
+    if (init.method === "HEAD") return new Response(null, { status: 200 });
+    assert.equal(range, "bytes=0-0");
+    return sized
+      ? new Response("C", { status: 206, headers: { "content-range": "bytes 0-0/11343" } })
+      : new Response("whole", { status: 200 });
+  };
+  const respond = (calls) => calls.find(([n]) => n === "armless_http_respond");
+  {
+    const { vm, calls, fetches } = relay({ fetch: (url, init) => { fetches.push({ url, init }); return answers(true)(url, init); } });
+    await vm._http(1, "HEAD", "http://93.184.215.14/v2/x/blobs/sha256:00", [["accept", "*/*"]], new Uint8Array());
+    assert.deepEqual(fetches.map(({ init }) => init.method), ["HEAD", "GET"]);
+    assert.equal(new Headers(fetches[1].init.headers).get("accept"), "*/*", "the probe asks as the guest did");
+    assert.match(respond(calls)[5], /(^|\0)content-length\x0011343($|\0)/);
+  }
+  {
+    // A server that ignores the range says nothing of the length, so neither does the guest's HEAD
+    const { vm, calls } = relay({ fetch: answers(false) });
+    await vm._http(1, "HEAD", "http://93.184.215.14/x", [], new Uint8Array());
+    assert.doesNotMatch(respond(calls)[5], /content-length/);
+  }
+});
+
 test("a name that resolves to a private address is refused server-side", async () => {
   // The names resolve as this stub of node:dns says
   const answers = {
