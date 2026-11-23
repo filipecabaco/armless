@@ -237,9 +237,27 @@ struct Session<'a> {
     /// need them submitted first; a guest writing a few bytes of parameters before every dispatch
     /// paid for both hundreds of times per step. Copies keep the order in one submission.
     staging: Vec<Staging>,
+    /// Dispatches recorded since the last submission (`SUBMIT_EVERY`)
+    recorded: u32,
+    /// The last periodic submission: the next one waits for it, so a guest can't queue work
+    /// without bound ahead of the GPU (at most two batches are in flight)
+    in_flight: Option<wgpu::SubmissionIndex>,
+    /// Bytes of large writes since the queue was last submitted. wgpu keeps each one's copy until
+    /// then, outside the guest's memory budget: past `PENDING_WRITES` the queue is submitted.
+    pending_writes: u64,
     /// The first error since the last reply.
     error: Arc<Mutex<Option<String>>>,
+    /// Why the device was lost, once it is: every reply from then on says so
+    lost: Arc<Mutex<Option<String>>>,
 }
+
+/// Bytes of large writes wgpu may hold copies of before the queue is submitted (and waited for).
+const PENDING_WRITES: u64 = 256 << 20;
+
+/// Dispatches recorded before what was recorded is submitted, though the guest asks for nothing
+/// back yet. A guest's forward pass is thousands of dispatches; as one command buffer it can run
+/// long enough for the OS's GPU watchdog to take the device (macOS does, as a lost device).
+const SUBMIT_EVERY: u32 = 64;
 
 /// Writes up to this size are staged; larger ones go to the queue (after what was recorded).
 const SMALL_WRITE: usize = 64 << 10;
@@ -259,6 +277,13 @@ impl<'a> Session<'a> {
         device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
             e.lock().unwrap().get_or_insert_with(|| err.to_string());
         }));
+        // A lost device is what the guest is told, at every reply from then on, rather than the
+        // invalid objects that follow
+        let lost = Arc::new(Mutex::new(None::<String>));
+        let l = lost.clone();
+        device.set_device_lost_callback(move |reason, msg| {
+            *l.lock().unwrap() = Some(format!("the GPU device was lost ({reason:?}): {msg}"));
+        });
         Session {
             gpu,
             device,
@@ -266,7 +291,11 @@ impl<'a> Session<'a> {
             objects: HashMap::new(),
             encoder: None,
             staging: Vec::new(),
+            recorded: 0,
+            in_flight: None,
+            pending_writes: 0,
             error,
+            lost,
         }
     }
 
@@ -305,26 +334,41 @@ impl<'a> Session<'a> {
         self.error.lock().unwrap().get_or_insert_with(|| msg.into());
     }
 
-    /// A reply: `OK` and `payload`, or the pending error.
+    /// A reply: `OK` and `payload`, or the pending error (the lost device's, once it is lost).
     fn reply(&self, payload: Vec<u8>) -> Vec<u8> {
-        match self.error.lock().unwrap().take() {
+        let error = self.error.lock().unwrap().take();
+        match self.lost.lock().unwrap().clone().or(error) {
             Some(e) => [ERR].into_iter().chain(e.into_bytes()).collect(),
             None => [OK].into_iter().chain(payload).collect(),
         }
     }
 
-    /// Submits what was recorded, staged writes in their places.
-    fn submit(&mut self) {
+    /// Submits what was recorded, staged writes in their places. The submission, if there was one.
+    fn submit(&mut self) -> Option<wgpu::SubmissionIndex> {
         for st in self.staging.drain(..) {
+            // Only what was written (the rest of the buffer is never copied from), as a range wgpu
+            // maps: a multiple of 8 bytes
             let mut bytes = st.bytes;
-            bytes.resize(STAGING as usize, 0);
-            if let Ok(mut view) = st.buffer.slice(..).get_mapped_range_mut() {
-                view.copy_from_slice(&bytes);
+            bytes.resize(bytes.len().next_multiple_of(wgpu::MAP_ALIGNMENT as usize).min(STAGING as usize), 0);
+            if !bytes.is_empty() {
+                if let Ok(mut view) = st.buffer.slice(..bytes.len() as u64).get_mapped_range_mut() {
+                    view.copy_from_slice(&bytes);
+                }
             }
             st.buffer.unmap();
         }
-        if let Some(enc) = self.encoder.take() {
-            self.queue.submit([enc.finish()]);
+        self.recorded = 0;
+        let enc = self.encoder.take()?;
+        self.pending_writes = 0;
+        Some(self.queue.submit([enc.finish()]))
+    }
+
+    /// The periodic submission (`SUBMIT_EVERY`): waits for the one before it, so the GPU has
+    /// this batch to run while that one finishes, and the guest no more than that ahead of it.
+    fn submit_batch(&mut self) {
+        let index = self.submit();
+        if let Some(prev) = std::mem::replace(&mut self.in_flight, index) {
+            let _ = self.device.poll(wgpu::PollType::Wait { submission_index: Some(prev), timeout: None });
         }
     }
 
@@ -436,10 +480,21 @@ impl<'a> Session<'a> {
                 let (id, offset) = (d.u32()?, d.u64()?);
                 let data = d.rest();
                 let b = self.buffer(id).ok_or_else(|| bad("no such buffer"))?.clone();
+                if data.is_empty() {
+                    return Ok(None);
+                }
                 // After what was recorded before it, before what is recorded after it
                 if data.len() > SMALL_WRITE || !data.len().is_multiple_of(4) || !offset.is_multiple_of(4) {
                     self.submit();
                     self.queue.write_buffer(&b, offset, data);
+                    // wgpu holds the write's copy until the queue is next submitted: a guest that
+                    // only writes would have the host hold them without bound
+                    self.pending_writes += data.len() as u64;
+                    if self.pending_writes >= PENDING_WRITES {
+                        let index = self.queue.submit([]);
+                        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None });
+                        self.pending_writes = 0;
+                    }
                 } else {
                     self.stage_write(&b, offset, data);
                 }
@@ -542,6 +597,10 @@ impl<'a> Session<'a> {
                     pass.dispatch_workgroups(x, y, z);
                 }
                 self.encoder = Some(enc);
+                self.recorded += 1;
+                if self.recorded >= SUBMIT_EVERY {
+                    self.submit_batch();
+                }
             },
             Op::CopyBuffer => {
                 let (src, so, dst, dof, size) = (d.u32()?, d.u64()?, d.u32()?, d.u64()?, d.u64()?);

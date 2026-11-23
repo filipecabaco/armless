@@ -42,6 +42,10 @@
   const DEFAULT_MAX_OBJECTS = 1 << 20;
   const DEFAULT_MAX_CONNECTIONS = 16;
   const HIGH_WATER = 32 << 20;
+  // Dispatches recorded before they are submitted, though the guest asks for nothing back yet: a
+  // forward pass is thousands of them, and as one command buffer it can run long enough for the
+  // OS's GPU watchdog to take the device (as gpu/src/server.rs's SUBMIT_EVERY)
+  const SUBMIT_EVERY = 64;
 
   /**
    * What a guest may take of the GPU and holds now, for all of its connections together: a guest
@@ -170,6 +174,7 @@
       this.device = null;
       this.objects = new Map();
       this.encoder = null;
+      this.recorded = 0; // dispatches in the encoder (SUBMIT_EVERY)
       this.error = null; // the first error since the last reply
       this.scope = false; // an error scope is open (from the first command after the last reply)
       this.frames = new Frames();
@@ -233,6 +238,9 @@
     forget(o) {
       if (o.kind === "buffer") {
         this.budget.memory -= o.v.size;
+        // What was recorded with it runs first, as it was sent first: a buffer destroyed before the
+        // encoder using it is submitted fails that whole submission
+        if (this.encoder && !this.closed) this.submit();
         o.v.destroy();
       }
     }
@@ -325,6 +333,7 @@
     }
 
     submit() {
+      this.recorded = 0;
       if (this.encoder) {
         this.device.queue.submit([this.encoder.finish()]);
         this.encoder = null;
@@ -459,6 +468,7 @@
           for (const [g, bg] of groups) pass.setBindGroup(g, bg);
           pass.dispatchWorkgroups(x, y, z);
           pass.end();
+          if (++this.recorded >= SUBMIT_EVERY) this.submit();
           return;
         }
         case Op.CopyBuffer: {
