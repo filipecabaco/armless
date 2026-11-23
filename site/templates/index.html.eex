@@ -36,7 +36,7 @@
 <main>
   <section class="hero">
     <h1>arm64 Linux,<br>in a browser tab.</h1>
-    <p class="sub">An AArch64 machine emulator written in Rust. The whole machine, devices included, is Rust.</p>
+    <p class="sub">An AArch64 machine emulator written in Rust. The whole machine, devices included, is Rust, and its programs can <a href="/examples/gpu">compute on your GPU</a> through WebGPU.</p>
     <p class="actions"><a class="btn btn-primary" href="/docs/getting-started">Read the docs</a> <a class="btn" href="<%= @repo %>/releases">Releases</a></p>
   </section>
 

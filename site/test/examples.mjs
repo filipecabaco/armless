@@ -10,6 +10,7 @@
 //   past it, and keeps its time left when told nothing
 // - egress: allow() is asked for each request, and a refused one is a 502 in the guest (a private
 //   address, so nothing leaves this machine)
+// - gpu: the guest's WebGPU program runs, and with no GPU answering gpu.internal says so
 //
 //   node site/test/examples.mjs [DEMO_DIR]
 import fs from "node:fs";
@@ -126,6 +127,23 @@ await example("egress: allow() is asked, and a refused request is a 502 in the g
   if (!asked.includes("10.0.0.1")) throw new Error(`allow() was asked about ${JSON.stringify(asked)}`);
   m.vm.destroy();
 });
+
+if (config.gpu) {
+  await example("gpu: the guest's WebGPU program runs, and says so when no GPU answers gpu.internal", async () => {
+    // As the page's machine, without armless-gpu.js (Node here has no WebGPU): its connection to
+    // gpu.internal:7070 is refused, and the program says the page has no WebGPU
+    const m = await machine({
+      boot: { kernel: at("Image.gz"), initrd: at("initrd.cpio"), cmdline: config.cmdline },
+      network: { allow: () => false },
+    });
+    await m.wait(/# $/m, "a prompt");
+    m.type("gpu 60 20; echo RC=$?\n");
+    await m.wait(/No GPU answered at gpu\.internal:7070[\s\S]*^RC=2/m, "the program's word that no GPU answered");
+    m.vm.destroy();
+  });
+} else {
+  console.log("skip: gpu (no GPU example program in this build)");
+}
 
 if (config.python) {
   await example("no-kernel: the same python3 with no kernel and under Linux, os.stat and a child in both", async () => {

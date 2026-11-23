@@ -14,6 +14,8 @@
 //     options: (at, config) => ({ cpus: 1, initial_state: at("demo/native.bin.zst") }),
 //     needs: "native",                             // a flag of demo/config.json the example needs
 //     on: { blob: fn },                            // listeners on the machine from the moment it is made
+//     scripts: ["demo/armless-gpu.js"],            // more of the build's scripts, loaded with armless.js
+//     made: (vm) => ArmlessGPU.attach(vm),         // the machine, as soon as it is made (before it runs)
 //   });
 //   m.vm, m.term, m.set(state, text), m.type(text), m.yours(), m.startedAt (performance.now()),
 //   m.waitFor(regex, { fresh }): the first match in the console's text (from now on, with fresh)
@@ -102,6 +104,7 @@
       const [config] = await Promise.all([
         fetch(at("demo/config.json")).then((r) => (r.ok ? r.json() : Promise.reject(new Error("the machine is not part of this build")))),
         load(at("cpus.js")), load(at("demo/xterm.js")), load(at("demo/addon-fit.js")), load(at("demo/armless.js")),
+        ...(opts.scripts || []).map((path) => load(at(path))),
       ]);
       // An asset only some builds have (config.json says): the native snapshot, python3's files
       if (opts.needs && !config[opts.needs]) throw new Error("this example's files are not part of this build");
@@ -167,6 +170,7 @@
       // The page's own listeners, on from the start (a user-mode program's files are fetched
       // before it is ready)
       for (const [event, fn] of Object.entries(opts.on || {})) vm.on(event, fn);
+      opts.made?.(vm);
 
       // The console as text, without its escape sequences: its last few thousand characters, and
       // what is waited for in them. `base` counts what came before `seen`.
