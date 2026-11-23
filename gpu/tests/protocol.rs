@@ -242,3 +242,50 @@ fn a_read_counts_against_the_budget_and_fits_in_a_frame() {
     assert!(err.contains("smaller than a frame"), "{err}");
     c.finish().unwrap();
 }
+
+#[test]
+fn a_long_run_of_dispatches_is_submitted_in_pieces_and_keeps_its_order() {
+    // More dispatches than the server records before it submits (64), three times over, with a
+    // small (staged) write in the middle: each lands after what was sent before it
+    let Some(mut c) = client() else { return };
+    let v = c.create_buffer(4, usage::STORAGE | usage::COPY_DST | usage::COPY_SRC).unwrap();
+    c.write_buffer(v, 0, &0u32.to_le_bytes()).unwrap();
+    let shader = c
+        .create_shader(
+            "@group(0) @binding(0) var<storage, read_write> v: array<u32>;
+             @compute @workgroup_size(1) fn inc() { v[0] = v[0] + 1u; }",
+        )
+        .unwrap();
+    let p = c.create_pipeline(shader, "inc").unwrap();
+    let g = c.create_bind_group(p, 0, &[(0, v, 0, 0)]).unwrap();
+    for i in 0..200 {
+        if i == 100 {
+            c.write_buffer(v, 0, &1000u32.to_le_bytes()).unwrap();
+        }
+        c.dispatch(p, &[(0, g)], 1, 1, 1).unwrap();
+    }
+    let out = c.read_buffer(v, 0, 4).unwrap();
+    assert_eq!(u32::from_le_bytes(out[..4].try_into().unwrap()), 1100, "1000, then the last 100 dispatches");
+}
+
+#[test]
+fn an_empty_write_is_nothing_and_the_connection_goes_on() {
+    let Some(mut c) = client() else { return };
+    let v = c.create_buffer(16, usage::STORAGE | usage::COPY_DST | usage::COPY_SRC).unwrap();
+    c.write_buffer(v, 0, &[]).unwrap();
+    c.write_buffer(v, 4, &[7, 0, 0, 0]).unwrap();
+    assert_eq!(c.read_buffer(v, 4, 4).unwrap(), [7, 0, 0, 0]);
+}
+
+#[test]
+fn many_large_writes_are_flushed_as_they_pile_up_and_the_last_one_stands() {
+    // 5 × 64 MiB: past the 256 MiB of write copies the host lets wgpu hold before it submits
+    let Some(mut c) = client() else { return };
+    let n = 64u64 << 20;
+    let v = c.create_buffer(n, usage::STORAGE | usage::COPY_DST | usage::COPY_SRC).unwrap();
+    for round in 1..=5u8 {
+        c.write_buffer(v, 0, &vec![round; n as usize]).unwrap();
+    }
+    assert_eq!(c.read_buffer(v, n - 4, 4).unwrap(), [5, 5, 5, 5]);
+    c.finish().unwrap();
+}

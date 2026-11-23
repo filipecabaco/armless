@@ -182,7 +182,16 @@ WebGPU's `GPUBufferUsage` bits. `gpu/src/wire.rs` has the full list and a client
 
 Dispatches and copies are recorded into one command encoder, submitted when the GPU has to
 catch up: before a write (so a write never overtakes a dispatch sent before it), a read, or
-`Finish`.
+`Finish`, and every 64 dispatches in between. A guest's forward pass is thousands of dispatches;
+as one command buffer it could run long enough for the OS's GPU watchdog to take the device
+(macOS reports that as a lost device). Both hosts do this. Natively each such submission waits for
+the one before it, so a guest is never more than two batches ahead of the GPU; and wgpu's copies
+of large writes are flushed once 256 MiB of them wait, so a guest that only writes can't pile
+them up. A lost device makes every reply from then on an error that says so.
+
+A message is at most 256 MiB. `gpu/guest`'s header writes and map-reads in 64 MiB pieces, so a
+model's tensor of any size gets through. A map read must lie inside its buffer, and
+`GetMappedRange` gives null outside the range mapped, as WebGPU's.
 
 ## Not yet
 

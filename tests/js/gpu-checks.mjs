@@ -151,6 +151,44 @@ async function protocol() {
       `${msg}; ${msg4}; ${g.session.budget.memory} bytes held`);
   }
   {
+    // More dispatches than are recorded before a submission (64), three times over, with a write
+    // in the middle: each lands after what was sent before it
+    const g = fake();
+    g.send(op(Op.CreateBuffer).u32(1).u64(4).u32(0x80 | 0x8 | 0x4));
+    g.send(op(Op.WriteBuffer).u32(1).u64(0).bytes(Uint8Array.of(0, 0, 0, 0)));
+    g.send(op(Op.CreateShader).u32(2).str(`@group(0) @binding(0) var<storage, read_write> v: array<u32>;
+      @compute @workgroup_size(1) fn inc() { v[0] = v[0] + 1u; }`));
+    g.send(op(Op.CreatePipeline).u32(3).u32(2).str("inc"));
+    g.send(op(Op.CreateBindGroup).u32(4).u32(3).u32(0).u32(1).u32(0).u32(1).u64(0).u64(0));
+    for (let i = 0; i < 200; i++) {
+      if (i === 100) g.send(op(Op.WriteBuffer).u32(1).u64(0).bytes(new Uint8Array(new Uint32Array([1000]).buffer)));
+      g.send(op(Op.Dispatch).u32(3).u32(1).u32(0).u32(4).u32(1).u32(1).u32(1));
+    }
+    g.send(op(Op.ReadBuffer).u32(1).u64(0).u64(4));
+    const r = await g.reply();
+    const v = r.ok ? new Uint32Array(r.d.rest().slice().buffer)[0] : new TextDecoder().decode(r.d.rest());
+    check("a long run of dispatches is submitted in pieces and keeps its order", v === 1100, String(v));
+  }
+  {
+    // A buffer destroyed after a dispatch that reads it: the dispatch runs first, as it was sent first
+    const g = fake();
+    g.send(op(Op.CreateBuffer).u32(1).u64(4).u32(0x80 | 0x8 | 0x4));
+    g.send(op(Op.CreateBuffer).u32(2).u64(4).u32(0x80 | 0x8 | 0x4));
+    g.send(op(Op.WriteBuffer).u32(2).u64(0).bytes(new Uint8Array(new Uint32Array([41]).buffer)));
+    g.send(op(Op.CreateShader).u32(3).str(`@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+      @group(0) @binding(1) var<storage, read_write> b: array<u32>;
+      @compute @workgroup_size(1) fn copy1() { a[0] = b[0] + 1u; }`));
+    g.send(op(Op.CreatePipeline).u32(4).u32(3).str("copy1"));
+    g.send(op(Op.CreateBindGroup).u32(5).u32(4).u32(0).u32(2).u32(0).u32(1).u64(0).u64(0).u32(1).u32(2).u64(0).u64(0));
+    g.send(op(Op.Dispatch).u32(4).u32(1).u32(0).u32(5).u32(1).u32(1).u32(1));
+    g.send(op(Op.Destroy).u32(5));
+    g.send(op(Op.Destroy).u32(2));
+    g.send(op(Op.ReadBuffer).u32(1).u64(0).u64(4));
+    const r = await g.reply();
+    const v = r.ok ? new Uint32Array(r.d.rest().slice().buffer)[0] : new TextDecoder().decode(r.d.rest());
+    check("a buffer destroyed after a dispatch that reads it: the dispatch runs first", v === 42, String(v));
+  }
+  {
     // Writes queued behind a read that waits for the GPU: what is taken from the guest stays behind
     // what it sent until the read is answered (the guest waits), then catches up exactly
     let consumed = 0;

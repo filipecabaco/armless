@@ -62,6 +62,19 @@ jobs:
         run: cargo test --release --workspace
         env:
           ARMLESS_GPU_TEST_REQUIRE: "1"
+      # The guests' webgpu_cpp.h against armless-gpu-server on lavapipe: writes and reads larger
+      # than a frame, and ranges outside a buffer refused
+      - name: Guest WebGPU header against the GPU host
+        run: |
+          cargo build --release -p armless-gpu --bin armless-gpu-server
+          c++ -std=c++17 -Wall -Wextra -I gpu/guest/include gpu/guest/tests/transfers.cpp -o "$RUNNER_TEMP/transfers"
+          build/release/armless-gpu-server 127.0.0.1:7070 &
+          server=$!
+          trap 'kill $server' EXIT
+          up=
+          for _ in $(seq 50); do (echo > /dev/tcp/127.0.0.1/7070) 2>/dev/null && { up=1; break; }; sleep 0.2; done
+          [ -n "$up" ] || { echo "armless-gpu-server did not come up"; exit 1; }
+          ARMLESS_GPU=127.0.0.1:7070 "$RUNNER_TEMP/transfers"
       # The dev profile checks arithmetic for overflow; release wraps silently
       - name: Unit tests with overflow checks
         run: cargo test --workspace

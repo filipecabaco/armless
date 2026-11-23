@@ -27,6 +27,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -212,6 +213,9 @@ enum Op : uint8_t {
 };
 
 constexpr uint32_t kVersion = 2;
+/// The most bytes one write or read carries: a frame is at most 256 MiB (wire.rs MAX_FRAME), and a
+/// model's tensor can be larger. A multiple of 4, as WebGPU's writes and reads want theirs.
+constexpr size_t PIECE = size_t(64) << 20;
 constexpr uint32_t kFeatureF16 = 1, kFeatureSubgroups = 2, kFeaturePackedDot = 4;
 
 [[noreturn]] inline void die(const char * what, const std::string & why = {}) {
@@ -735,6 +739,7 @@ struct BufferImpl : armless::Obj {
     uint64_t size = 0;
     BufferUsage usage = BufferUsage::None;
     std::vector<uint8_t> shadow;  // what a map read brought, at its offset in the buffer
+    uint64_t mapped_at = 0, mapped_size = 0;  // the range mapped now (mapped_size 0: none)
     bool destroyed = false;
 };
 
@@ -980,36 +985,72 @@ template <class F> Future Buffer::MapAsync(MapMode mode, size_t offset, size_t s
     auto & l = armless::link();
     armless::Guard g(l.lock);
     auto b = p;
+    // The range must lie in the buffer (it is copied into the buffer's copy here), as WebGPU's
+    // mapAsync requires
+    if (offset > b->size || (size != kWholeMapSize && size > b->size - offset)) {
+        callback(MapAsyncStatus::Error, StringView("armless webgpu: the mapped range is outside the buffer"));
+        return l.done();
+    }
     if (size == kWholeMapSize) size = size_t(b->size - offset);
     if (mode != MapMode::Read) {
         // Mapping for writing: the guest fills the copy, Unmap would send it. Not needed so far.
         callback(MapAsyncStatus::Error, StringView("armless webgpu: only MapMode::Read is supported"));
         return l.done();
     }
-    return l.ask(armless::Enc(armless::ReadBuffer).u32(b->id).u64(offset).u64(size),
-                 [b, offset, size, callback](bool ok, const uint8_t * data, size_t n) mutable {
-                     if (!ok) {
-                         std::string msg((const char *) data, n);
-                         callback(MapAsyncStatus::Error, StringView(msg));
-                         return;
-                     }
-                     if (b->shadow.size() < b->size) b->shadow.resize(size_t(b->size));
-                     std::memcpy(b->shadow.data() + offset, data, std::min(n, size));
-                     callback(MapAsyncStatus::Success, StringView(""));
-                 });
+    // Read in pieces: a reply is one frame, at most 256 MiB (wire.rs MAX_FRAME), and a model's
+    // tensor can be larger. Each piece fills its part of the copy; the last says how the whole
+    // map went, and as replies come in order its future is the map's.
+    auto failed = std::make_shared<std::string>();
+    auto bad = std::make_shared<bool>(false);
+    auto cb = std::make_shared<F>(std::move(callback));  // one callback, whatever the pieces
+    Future last{};
+    size_t done = 0;
+    do {
+        const size_t at = offset + done;
+        const size_t n_piece = std::min(size - done, armless::PIECE);
+        done += n_piece;
+        const bool final_piece = done >= size;
+        last = l.ask(armless::Enc(armless::ReadBuffer).u32(b->id).u64(at).u64(n_piece),
+                     [b, offset, size, at, n_piece, final_piece, failed, bad, cb](bool ok, const uint8_t * data, size_t n) {
+                         if (!ok && !*bad) {
+                             *bad = true;
+                             failed->assign((const char *) data, n);
+                         }
+                         if (ok) {
+                             if (b->shadow.size() < b->size) b->shadow.resize(size_t(b->size));
+                             // (at + n_piece is within the buffer, checked above)
+                             std::memcpy(b->shadow.data() + at, data, std::min(n, n_piece));
+                         }
+                         if (final_piece) {
+                             if (*bad) {
+                                 (*cb)(MapAsyncStatus::Error, StringView(*failed));
+                             } else {
+                                 b->mapped_at = offset;
+                                 b->mapped_size = size;
+                                 (*cb)(MapAsyncStatus::Success, StringView(""));
+                             }
+                         }
+                     });
+    } while (done < size);
+    return last;
 }
 
-inline const void * Buffer::GetConstMappedRange(size_t offset, size_t) const {
-    if (p->shadow.empty()) return nullptr;
+inline const void * Buffer::GetConstMappedRange(size_t offset, size_t size) const {
+    return GetMappedRange(offset, size);
+}
+
+/// Where [offset, offset + size) of the mapped range is: null outside the range mapped now (or
+/// with nothing mapped), as WebGPU's.
+inline void * Buffer::GetMappedRange(size_t offset, size_t size) const {
+    const uint64_t at = p->mapped_at, n = p->mapped_size;
+    if (n == 0 || offset < at || offset - at > n) return nullptr;
+    if (size != kWholeMapSize && size > n - (offset - at)) return nullptr;
+    // (mapped_at + mapped_size is within the buffer, and the copy covers the whole buffer)
+    if (p->shadow.size() < at + n) return nullptr;
     return p->shadow.data() + offset;
 }
 
-inline void * Buffer::GetMappedRange(size_t offset, size_t) const {
-    if (p->shadow.empty()) return nullptr;
-    return p->shadow.data() + offset;
-}
-
-inline void Buffer::Unmap() const {}
+inline void Buffer::Unmap() const { p->mapped_size = 0; }
 
 inline void Buffer::Destroy() const {
     // Freed on the host now (bind groups and commands that hold it keep what they need there)
@@ -1087,7 +1128,15 @@ inline void Queue::Submit(size_t count, const CommandBuffer * commands) const {
 inline void Queue::WriteBuffer(const Buffer & buffer, uint64_t offset, const void * data, size_t size) const {
     auto & l = armless::link();
     armless::Guard g(l.lock);
-    l.send(armless::Enc(armless::WriteBuffer).u32(buffer.p->id).u64(offset), data, size);
+    // In pieces (armless::PIECE), in order. Each succeeds or fails on its own: a failure leaves the
+    // pieces before it written, and is reported at the next reply
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    size_t done = 0;
+    do {
+        const size_t n = std::min(size - done, armless::PIECE);
+        l.send(armless::Enc(armless::WriteBuffer).u32(buffer.p->id).u64(offset + done), bytes + done, n);
+        done += n;
+    } while (done < size);
 }
 
 template <class F> Future Queue::OnSubmittedWorkDone(CallbackMode, F callback) const {
