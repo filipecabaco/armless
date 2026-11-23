@@ -15,7 +15,8 @@ under it: it speaks a small protocol to `gpu.internal:7070`. The page answers th
 
 Each frame is a raymarched scene, a torus turning over a checkered floor and a ball bouncing round
 it, with soft shadows, ambient occlusion and fog: one WGSL compute shader, dispatched on the GPU,
-its pixels mapped back and drawn in the console two to a character. The header says which GPU
+its pixels mapped back and drawn in the console four to a character, in quadrant glyphs and
+truecolor (the two colours that fit each 2×2 block best). The header says which GPU
 answered, the frames per second and how long each frame took. Press `c` and the same scene, the
 same code line for line in C++, renders on the machine's own CPU, emulated in WebAssembly: the
 difference is the GPU. The console itself caps the frame rate, at what it can draw.

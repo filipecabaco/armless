@@ -243,32 +243,70 @@ static void on_signal(int) {
     std::_Exit(130);
 }
 
-// A 0x00BBGGRR pixel as a colour of xterm's 6x6x6 cube
-static int cube(uint32_t px) {
-    auto c = [](uint32_t v) { return int((v * 5 + 127) / 255); };
-    return 16 + 36 * c(px & 255) + 6 * c((px >> 8) & 255) + c((px >> 16) & 255);
+// Four pixels a cell, as quadrant blocks: of the 2x2 pixels, the ones in the foreground colour
+// (bit 0 top left, 1 top right, 2 bottom left, 3 bottom right) and the rest in the background's,
+// the split that loses the least of the four. Masks 8..14 are 7..1 with the colours swapped.
+static const char * const QUADRANT[16] = {
+    " ", "\xe2\x96\x98", "\xe2\x96\x9d", "\xe2\x96\x80", "\xe2\x96\x96", "\xe2\x96\x8c", "\xe2\x96\x9e", "\xe2\x96\x9b",
+    "\xe2\x96\x97", "\xe2\x96\x9a", "\xe2\x96\x90", "\xe2\x96\x9c", "\xe2\x96\x84", "\xe2\x96\x99", "\xe2\x96\x9f", "\xe2\x96\x88",
+};
+
+struct Rgb {
+    int r, g, b;
+    bool operator!=(const Rgb & o) const { return r != o.r || g != o.g || b != o.b; }
+};
+static Rgb rgb(uint32_t px) { return {int(px & 255), int((px >> 8) & 255), int((px >> 16) & 255)}; }
+
+// The cell's glyph and its two colours: every split of the four pixels into two (7 of them, and
+// all four alike), each side its mean colour, the one with the least squared error
+static void cell(const Rgb p[4], int & mask, Rgb & fg, Rgb & bg) {
+    long best = -1;
+    for (int m : {15, 1, 2, 3, 4, 5, 6, 7}) {
+        long sum[2][3] = {{0, 0, 0}, {0, 0, 0}};
+        int n[2] = {0, 0};
+        for (int i = 0; i < 4; i++) {
+            int side = (m >> i) & 1;
+            sum[side][0] += p[i].r, sum[side][1] += p[i].g, sum[side][2] += p[i].b;
+            n[side]++;
+        }
+        Rgb mean[2];
+        for (int s = 0; s < 2; s++) {
+            mean[s] = n[s] ? Rgb{int(sum[s][0] / n[s]), int(sum[s][1] / n[s]), int(sum[s][2] / n[s])} : Rgb{0, 0, 0};
+        }
+        long err = 0;
+        for (int i = 0; i < 4; i++) {
+            const Rgb & c = mean[(m >> i) & 1];
+            err += long(p[i].r - c.r) * (p[i].r - c.r) + long(p[i].g - c.g) * (p[i].g - c.g) + long(p[i].b - c.b) * (p[i].b - c.b);
+        }
+        if (best < 0 || err < best) {
+            best = err;
+            mask = m;
+            fg = mean[1];
+            bg = mean[0];
+        }
+    }
 }
 
-// Two pixels a cell (the upper half block: foreground on top, background below), a colour said
-// only when it changes, the frame drawn over the last one
+// The frame over the last one: the header, then four pixels a cell in 24-bit colour, a colour said
+// only when it changes
 static void draw(const std::vector<uint32_t> & px, uint32_t w, uint32_t h, const std::string & header) {
     std::string s = "\x1b[H\x1b[0m" + header + "\x1b[K\r\n";
-    for (uint32_t r = 0; r + 1 < h; r += 2) {
-        int fg = -1, bg = -1;
-        for (uint32_t c = 0; c < w; c++) {
-            int top = cube(px[r * w + c]), bot = cube(px[(r + 1) * w + c]);
-            char buf[32];
-            if (top != fg && bot != bg) std::snprintf(buf, sizeof buf, "\x1b[38;5;%d;48;5;%dm", top, bot);
-            else if (top != fg) std::snprintf(buf, sizeof buf, "\x1b[38;5;%dm", top);
-            else if (bot != bg) std::snprintf(buf, sizeof buf, "\x1b[48;5;%dm", bot);
-            else buf[0] = 0;
-            s += buf;
-            s += "\xe2\x96\x80";
-            fg = top;
-            bg = bot;
+    for (uint32_t y = 0; y + 1 < h; y += 2) {
+        Rgb fg{-1, -1, -1}, bg{-1, -1, -1};
+        for (uint32_t x = 0; x + 1 < w; x += 2) {
+            Rgb p[4] = {rgb(px[y * w + x]), rgb(px[y * w + x + 1]), rgb(px[(y + 1) * w + x]), rgb(px[(y + 1) * w + x + 1])};
+            int mask;
+            Rgb f, b;
+            cell(p, mask, f, b);
+            char buf[48];
+            int k = 0;
+            if (mask != 15 && b != bg) k += std::snprintf(buf + k, sizeof buf - k, "\x1b[48;2;%d;%d;%dm", b.r, b.g, b.b), bg = b;
+            if (f != fg) k += std::snprintf(buf + k, sizeof buf - k, "\x1b[38;2;%d;%d;%dm", f.r, f.g, f.b), fg = f;
+            s.append(buf, size_t(k));
+            s += QUADRANT[mask];
         }
         s += "\x1b[0m";
-        if (r + 3 < h) s += "\r\n";
+        if (y + 3 < h) s += "\r\n";
     }
     std::fwrite(s.data(), 1, s.size(), stdout);
     std::fflush(stdout);
@@ -304,8 +342,10 @@ static bool open_gpu(Gpu & g, uint32_t w, uint32_t h) {
     wgpu::AdapterInfo info;
     adapter.GetInfo(&info);
     auto str = [](wgpu::StringView v) { return std::string(std::string_view(v)); };
+    // The adapter's description, else its device (which often has its vendor's name already)
     g.name = str(info.description);
-    if (g.name.empty()) g.name = str(info.vendor) + " " + str(info.architecture) + " " + str(info.device);
+    if (g.name.empty()) g.name = str(info.device);
+    if (g.name.empty()) g.name = str(info.vendor) + " " + str(info.architecture);
     g.instance.WaitAny(adapter.RequestDevice(nullptr, wgpu::CallbackMode::WaitAnyOnly,
                                              [&](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView) {
                                                  if (s == wgpu::RequestDeviceStatus::Success) g.device = d;
@@ -390,7 +430,8 @@ int main(int argc, char ** argv) {
     else if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) cols = ws.ws_col - 1, rows = ws.ws_row - 1;
     if (cols < 20) cols = 20;
     if (rows < 8) rows = 8;
-    const uint32_t w = uint32_t(cols), h = uint32_t(rows - 1) * 2;
+    // Four pixels a cell (2x2), under a header line
+    const uint32_t w = uint32_t(cols) * 2, h = uint32_t(rows - 1) * 2;
 
     Gpu g;
     if (!open_gpu(g, w, h)) {
@@ -441,11 +482,20 @@ int main(int argc, char ** argv) {
         else if (!render_gpu(g, px, w, h, t)) break;
         double took = ms(t0, now());
         render_ms = render_ms == 0 ? took : render_ms * 0.8 + took * 0.2;
-        char header[256];
-        std::snprintf(header, sizeof header, "\x1b[1m%s\x1b[0m  %s  %4.1f fps  %6.1f ms a frame   c: %s  q: quit",
-                      on_cpu ? "this machine's CPU (emulated)" : g.name.c_str(), on_cpu ? "" : "(GPU)", fps, render_ms,
-                      on_cpu ? "back to the GPU" : "the same on the CPU");
-        draw(px, w, h, header);
+        // One line, as wide as the console at most: who rendered it (GPU <name>, which the page
+        // reads, or the CPU), how fast, and the keys
+        char header[512];
+        int len = on_cpu ? std::snprintf(header, sizeof header, "CPU, emulated \xc2\xb7 %.1f fps \xc2\xb7 %.1f ms a frame \xc2\xb7 c: back to the GPU \xc2\xb7 q: quit", fps, render_ms)
+                         : std::snprintf(header, sizeof header, "GPU %s \xc2\xb7 %.1f fps \xc2\xb7 %.1f ms a frame \xc2\xb7 c: the same on the CPU \xc2\xb7 q: quit",
+                                         g.name.c_str(), fps, render_ms);
+        std::string line(header, size_t(len > 0 ? len : 0));
+        for (size_t chars = 0, i = 0; i < line.size(); i++) {
+            if ((line[i] & 0xc0) != 0x80 && ++chars > size_t(cols)) {
+                line.resize(i);
+                break;
+            }
+        }
+        draw(px, w, h, "\x1b[1m" + line + "\x1b[0m");
         auto t1 = now();
         double frame = ms(last, t1);
         last = t1;
