@@ -15,6 +15,7 @@
 //     needs: "native",                             // a flag of demo/config.json the example needs
 //     on: { blob: fn },                            // listeners on the machine from the moment it is made
 //     scripts: ["demo/armless-gpu.js"],            // more of the build's scripts, loaded with armless.js
+//     fontSize: 9,                                 // the console's (13 unless said)
 //     made: (vm) => ArmlessGPU.attach(vm),         // the machine, as soon as it is made (before it runs)
 //   });
 //   m.vm, m.term, m.set(state, text), m.type(text), m.yours(), m.startedAt (performance.now()),
@@ -130,7 +131,7 @@
       const css = getComputedStyle(document.documentElement);
       const term = new Terminal({
         fontFamily: '"Space Mono", ui-monospace, monospace',
-        fontSize: 13,
+        fontSize: opts.fontSize ?? 13,
         cursorBlink: !reduced,
         scrollback: 2000,
         theme: {
