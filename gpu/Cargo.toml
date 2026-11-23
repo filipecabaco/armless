@@ -1,0 +1,26 @@
+[package]
+name = "armless-gpu"
+version = "0.26.0"
+edition = "2021"
+publish = false
+description = "WebGPU compute for armless guests: a small wire protocol a guest speaks over a connection, and a host that runs it on wgpu"
+license = "BSD-2-Clause"
+
+[lib]
+name = "armless_gpu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "armless-gpu-server"
+path = "src/bin/armless-gpu-server.rs"
+required-features = ["server"]
+
+[dependencies]
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
+
+[features]
+default = ["server"]
+# The host side: runs what guests send on wgpu (Vulkan, Metal, DX12 or GL). Off, the crate is only
+# the wire protocol, with no dependencies, for guest programs.
+server = ["dep:wgpu", "dep:pollster"]

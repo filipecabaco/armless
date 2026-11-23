@@ -1,6 +1,6 @@
 [package]
 name = "armless-user"
-version = "0.25.2"
+version = "0.26.0"
 edition = "2021"
 publish = false
 description = "User mode for armless: run a static aarch64 Linux ELF with no guest kernel, its syscalls answered by the host"
@@ -12,12 +12,16 @@ path = "src/main.rs"
 
 [dependencies]
 armless = { path = "..", default-features = false }
+# --gpu: the host's GPU for the program (WebGPU compute over wgpu)
+armless-gpu = { path = "../gpu", optional = true }
 
 [features]
 default = ["native-jit"]
 # Compile hot guest code to host code on native hosts (armless's native-jit, which pulls in cranelift).
 # Off, a build links no code generator.
 native-jit = ["armless/native-jit"]
+# --gpu: answer the program's connections to gpu.internal:7070 with this host's GPU (pulls in wgpu).
+gpu = ["dep:armless-gpu"]
 # Compile the wasm export layer (src/wasm.rs) natively, to type-check it without a wasm target.
 wasm-api = ["armless/wasm-api"]
 

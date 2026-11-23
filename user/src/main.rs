@@ -45,9 +45,41 @@ fn usage() -> ! {
                      a TCP connection to it (tcp://HOST:PORT) instead (repeatable; needs --net)
   --allow-private    let the program reach loopback, private and link-local addresses at
                      this host (a local tunnel endpoint, say)
+  --gpu              answer the program's connections to gpu.internal:7070 with this host's GPU
+                     (armless-gpu's WebGPU compute protocol, on wgpu; a build with the gpu
+                     feature). Without --net the program reaches the GPU and nothing else
   ARMLESS_EXEC_TRACE=1 prints every syscall, ARMLESS_EXEC_TRACE_NR=131,133 only those"
     );
     std::process::exit(2)
+}
+
+/// Answers the program's connections to gpu.internal:7070 with this host's GPU, in-process.
+#[cfg(feature = "gpu")]
+fn attach_gpu(host: &armless::native::NativeHost) {
+    let gpu =
+        Arc::new(armless_gpu::server::Gpu::new().unwrap_or_else(|| die("--gpu: no GPU adapter")));
+    let info = gpu.adapter_info();
+    eprintln!(
+        "armless-exec: gpu.internal:{} is {} ({:?})",
+        armless_gpu::DEFAULT_PORT,
+        info.name,
+        info.backend
+    );
+    let (name, port, url) = armless_gpu::link_spec();
+    host.set_links(vec![armless::native::Tunnel {
+        host: Some(name.clone()),
+        port,
+        url,
+    }]);
+    host.set_link_dialer(Arc::new(move |t: &armless::native::Tunnel| {
+        (t.port == port && t.host.as_deref() == Some(name.as_str()))
+            .then(|| armless_gpu::server::connect(gpu.clone()))
+    }));
+}
+
+#[cfg(not(feature = "gpu"))]
+fn attach_gpu(_: &armless::native::NativeHost) {
+    die("--gpu: this armless-exec was built without the gpu feature (cargo build -p armless-user --features gpu)")
 }
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -74,6 +106,7 @@ fn main() {
     let mut publish: Vec<(String, u16)> = Vec::new();
     let mut tunnels = Vec::new();
     let mut allow_private = false;
+    let mut gpu = false;
     let mut reap_orphans = false;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.peek().cloned() {
@@ -111,6 +144,7 @@ fn main() {
                 tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
             },
             "--allow-private" => allow_private = true,
+            "--gpu" => gpu = true,
             "--plain-std" => opts.std = StdStreams::Plain,
             // (an empty one is the default, as in the browser)
             "--hostname" => opts.hostname = Some(val()).filter(|h| !h.is_empty()),
@@ -132,6 +166,9 @@ fn main() {
     if guest_args.is_empty() == restore.is_none() {
         usage();
     }
+    // A network device: for the network (--net), or only for the GPU's link (--gpu alone, with
+    // nothing else let out)
+    let nic = net || gpu;
 
     // RAM on an anonymous mapping of its own, not calloc's: the process can then give the host
     // back the pages the program unmaps, and pages it never writes cost nothing.
@@ -140,7 +177,7 @@ fn main() {
         cpus,
         devices: armless::dev::DeviceConfig {
             console: false,
-            net,
+            net: nic,
             fs_tag: fs_dir.as_ref().map(|_| "host9p".to_string()),
             ..Default::default()
         },
@@ -167,14 +204,16 @@ fn main() {
             .unwrap_or_else(|e| die(e));
     }
     // The host's side of the machine: its blobs, its network
-    if fs_dir.is_some() || net {
+    if fs_dir.is_some() || nic {
         host = Some(Arc::new(armless::native::NativeHost::spawn(
             vm.board.clone(),
             armless::native::HostOptions {
                 blobs,
-                network: net,
+                network: nic,
                 egress: armless::native::Egress {
                     allow_private,
+                    // --gpu without --net: the GPU's link and nothing else
+                    deny_all: !net,
                     ..armless::native::Egress::from_env()
                 },
                 tunnels,
@@ -182,6 +221,9 @@ fn main() {
             },
             Box::new(|_| {}),
         )));
+    }
+    if gpu {
+        attach_gpu(host.as_ref().expect("a host with --gpu"));
     }
     for (addr, port) in &publish {
         let (Some(host), true) = (&host, net) else {
@@ -203,7 +245,7 @@ fn main() {
             }
         });
     }
-    let board = (fs_dir.is_some() || net).then(|| vm.board.clone());
+    let board = (fs_dir.is_some() || nic).then(|| vm.board.clone());
     if env.is_empty() {
         env = [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -272,6 +314,10 @@ fn main() {
     let smp = Smp::new(&mut p);
     let mut first_output = None;
     let mut stopped_at = None;
+    // What the host delivers to the program's sockets (a reply it waits for) shows as a new
+    // `local_gen`: with --gpu, an idle program is looked at again as soon as it moves (polled
+    // every 250 µs, so only there: other programs sleep until their deadline, as before)
+    let net_board = vm.board.clone();
     let (cpu0, others) = vm.cpus.split_at_mut(1);
     let workers = others.len();
     let cpu = &mut cpu0[0];
@@ -342,7 +388,21 @@ fn main() {
                     let wait = wake.map_or(Duration::from_millis(20), |w| {
                         w.saturating_duration_since(Instant::now())
                     });
-                    std::thread::sleep(wait.min(Duration::from_millis(20)));
+                    let wait = wait.min(Duration::from_millis(20));
+                    if gpu {
+                        // Waiting on the GPU's replies: looked at again as soon as one comes
+                        let until = Instant::now() + wait;
+                        let gen = net_board.local_gen();
+                        while net_board.local_gen() == gen {
+                            let left = until.saturating_duration_since(Instant::now());
+                            if left.is_zero() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_micros(250).min(left));
+                        }
+                    } else {
+                        std::thread::sleep(wait);
+                    }
                 },
                 Status::Exited(_) | Status::Fault(_) => break status,
             }
