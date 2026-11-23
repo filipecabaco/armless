@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>armless-gpu in the browser</title>
+<!-- Driven by gpu-browser.mjs: the GPU protocol against the page's WebGPU, then an arm64 guest
+     program (gpu/examples/vecadd.rs) in user mode, on armless.wasm, using it. -->
+<script src="../../js/armless.js"></script>
+<script src="../../js/armless-gpu.js"></script>
+<script type="module">
+import { runChecks } from "./gpu-checks.mjs";
+const results = [];
+const check = (name, ok, detail = "") => results.push({ name, ok: !!ok, detail: String(detail) });
+
+async function guest() {
+  const elf = new Uint8Array(await (await fetch("../../build/aarch64-unknown-linux-musl/release/examples/vecadd")).arrayBuffer());
+  const vm = new Armless({
+    wasm: "../../build/armless.wasm",
+    memory_mb: 256,
+    autostart: false,
+    network: true,
+    filesystem: {
+      json: { version: 3, fsroot: [["bin", 0, 0, 0o40755, 0, 0, [["vecadd", elf.length, 0, 0o100755, 0, 0, "vecadd.elf"]]], ["tmp", 0, 0, 0o41777, 0, 0, []]] },
+      fetch_blob: async () => elf,
+    },
+    user: { argv: ["/bin/vecadd"], env: ["PATH=/bin"] },
+  });
+  ArmlessGPU.attach(vm);
+  let out = "";
+  vm.on("console", (b) => (out += new TextDecoder().decode(b)));
+  await vm.ready;
+  const stop = await new Promise((resolve, reject) => {
+    setTimeout(() => reject(new Error(`no stop after 120 s; got ${JSON.stringify(out)}`)), 120000);
+    vm.on("stop", resolve);
+    vm.run();
+  });
+  out = out.replace(/\r/g, "").trim();
+  check("an arm64 guest program on armless.wasm adds vectors on the page's GPU", stop.code === 0 && /correct/.test(out), out);
+}
+
+try {
+  await runChecks({ gpu: navigator.gpu, ArmlessGPU, check });
+  await guest();
+} catch (e) {
+  check("ran", false, e.stack || e);
+}
+window.results = results;
+</script>

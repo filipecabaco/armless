@@ -346,6 +346,8 @@
         const part = bytes.subarray(i, i + (1 << 20));
         this.vm._with_bytes(part, (p, n) => this.vm._call("armless_tcp_send", this.id, p, n));
       }
+      // A guest waiting for this (in user mode, asleep until its next deadline) runs now
+      this.vm._poke();
     }
     /** Resolves once the guest has taken most of what was written. */
     async drain() {
@@ -355,6 +357,7 @@
     close() {
       if (this.state === "closed") return;
       this.vm._call("armless_tcp_close", this.id);
+      this.vm._poke();
     }
     abort() {
       if (this.state === "closed") return;

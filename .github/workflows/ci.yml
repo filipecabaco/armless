@@ -57,8 +57,11 @@ jobs:
           workspaces: ". -> build"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The workspace: armless, and user mode (user/)
+      # (armless-gpu's tests run on mesa-vulkan-drivers' lavapipe, a software Vulkan device)
       - name: Unit tests and bare-metal guest
         run: cargo test --release --workspace
+        env:
+          ARMLESS_GPU_TEST_REQUIRE: "1"
       # The dev profile checks arithmetic for overflow; release wraps silently
       - name: Unit tests with overflow checks
         run: cargo test --workspace
@@ -94,6 +97,12 @@ jobs:
       # armless.wasm: the test makes its programs as machine code and its filesystem in memory
       - name: User mode through armless.js
         run: node --test 'tests/js/*.test.mjs'
+      # armless-gpu.js on a real WebGPU: Dawn (the webgpu package) on lavapipe, which has the
+      # shader-f16 llama.cpp's WebGPU backend needs (Chromium's SwiftShader doesn't)
+      - name: armless-gpu.js on Dawn
+        run: |
+          npm install --prefix "$RUNNER_TEMP/webgpu" --no-save --no-audit --no-fund webgpu@0.6.2
+          WEBGPU_MODULE="$RUNNER_TEMP/webgpu/node_modules/webgpu/index.js" ARMLESS_GPU_TEST_REQUIRE=1 node --test tests/js/gpu.test.mjs
       - uses: actions/upload-artifact@v7
         with:
           name: armless-web
@@ -101,6 +110,7 @@ jobs:
             build/armless.wasm
             build/armless-smp.wasm
             js/armless.js
+            js/armless-gpu.js
 
   # An aarch64 host: the interpreter's floating point checked against the host FPU (src/fp.rs),
   # and the native JIT through Cranelift's arm64 backend

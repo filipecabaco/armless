@@ -30,6 +30,9 @@ fn usage() -> ! {
                        (tcp://HOST:PORT) instead (repeatable; needs --net)
   --allow-private      let the guest reach loopback and private addresses (a local
                        tunnel endpoint, say)
+  --gpu                answer the guest's connections to gpu.internal:7070 with this host's
+                       GPU (armless-gpu's WebGPU compute, on wgpu; a build with the gpu
+                       feature). Without --net the guest reaches the GPU and nothing else
   -m MB                RAM size in MiB (default 512)
   --smp N              number of CPUs (default 1; one thread each)
   --timeout SECS       stop after SECS seconds of wall time
@@ -49,6 +52,24 @@ fn usage() -> ! {
                        interpreter, and print the most common (slows those down a little)"
     );
     std::process::exit(2);
+}
+
+/// Answers the guest's connections to gpu.internal:7070 with this host's GPU, in the process.
+#[cfg(feature = "gpu")]
+fn attach_gpu(host: &NativeHost) {
+    let gpu = std::sync::Arc::new(armless_gpu::server::Gpu::new().unwrap_or_else(|| die("--gpu: no GPU adapter")));
+    let info = gpu.adapter_info();
+    eprintln!("armless-run: gpu.internal:{} is {} ({:?})", armless_gpu::DEFAULT_PORT, info.name, info.backend);
+    let (name, port, url) = armless_gpu::link_spec();
+    host.set_links(vec![armless::native::Tunnel { host: Some(name.clone()), port, url }]);
+    host.set_link_dialer(std::sync::Arc::new(move |t: &armless::native::Tunnel| {
+        (t.port == port && t.host.as_deref() == Some(name.as_str())).then(|| armless_gpu::server::connect(gpu.clone()))
+    }));
+}
+
+#[cfg(not(feature = "gpu"))]
+fn attach_gpu(_: &NativeHost) {
+    die("--gpu: this armless-run was built without the gpu feature (cargo build --features gpu)")
 }
 
 fn parse_num(s: &str) -> u64 {
@@ -79,6 +100,7 @@ fn main() {
     let mut fs_dir: Option<PathBuf> = None;
     let mut boot_fs = false;
     let mut net = false;
+    let mut gpu = false;
     let mut tunnels = Vec::new();
     let mut allow_private = false;
     let mut mem_mb = 512u64;
@@ -114,6 +136,7 @@ fn main() {
             "--fs" => fs_dir = Some(PathBuf::from(val())),
             "--boot-fs" => boot_fs = true,
             "--net" => net = true,
+            "--gpu" => gpu = true,
             "--free-page-reporting" => free_page_reporting = true,
             "--save" => save = Some(PathBuf::from(val())),
             "--save-after" => save_after = Some(val()),
@@ -143,7 +166,8 @@ fn main() {
         devices: DeviceConfig {
             console: true,
             fs_tag: fs_dir.as_ref().map(|_| "host9p".to_string()),
-            net,
+            // For the network, or only for the GPU's link
+            net: net || gpu,
             free_page_reporting,
             ..Default::default()
         },
@@ -212,14 +236,16 @@ fn main() {
     let printed = Arc::new(AtomicBool::new(false));
     let (printed2, save_text) = (printed.clone(), save_after.clone());
     let mut out_seen = Vec::new();
-    let _host = NativeHost::spawn(
+    let host = NativeHost::spawn(
         board.clone(),
         HostOptions {
             blobs,
             blob_source: None,
-            network: net,
+            network: net || gpu,
             egress: armless::native::Egress {
                 allow_private,
+                // --gpu without --net: the GPU's link and nothing else
+                deny_all: !net,
                 ..armless::native::Egress::from_env()
             },
             tunnels,
@@ -252,6 +278,9 @@ fn main() {
             }
         }),
     );
+    if gpu {
+        attach_gpu(&host);
+    }
     board.serial_input(input.as_bytes());
     if console_after.is_none() {
         board.console_input(console_input.as_bytes());

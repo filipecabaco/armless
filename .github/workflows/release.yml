@@ -4,7 +4,8 @@ name: release
 #   armless.js         the loader (classic script; also require()-able in Node)
 #   armless.wasm       the machine
 #   armless-smp.wasm   its threaded build, for cpus > 1 (needs a cross-origin isolated page)
-# plus armless-web.tar.gz with all three, the license and the docs.
+#   armless-gpu.js     WebGPU compute for guests (experimental; docs/gpu.md)
+# plus armless-web.tar.gz with all four, the license and the docs.
 # Native programs use the crate itself (a git dependency on the tag).
 #
 # A push to main that changes the crate's version releases armless-v<version>, once: a version
@@ -66,7 +67,7 @@ jobs:
         if: steps.version.outputs.tag
         run: |
           mkdir -p dist/armless-web
-          cp js/armless.js build/armless.wasm build/armless-smp.wasm LICENSE docs/armless.md dist/armless-web/
+          cp js/armless.js js/armless-gpu.js build/armless.wasm build/armless-smp.wasm LICENSE docs/armless.md docs/gpu.md dist/armless-web/
           tar -C dist -czf dist/armless-web.tar.gz armless-web
           ls -la dist/armless-web dist/armless-web.tar.gz
       - name: Publish
@@ -81,5 +82,5 @@ jobs:
           gh release create "$tag" --title "$tag" --target "$GITHUB_SHA" \
             --notes "armless $tag: an AArch64 machine for the browser (armless.js + armless.wasm) and a Rust crate for native hosts. See armless.md." \
             $( [ "$tag" = armless-snapshot ] && echo --prerelease ) \
-            dist/armless-web.tar.gz dist/armless-web/armless.js \
+            dist/armless-web.tar.gz dist/armless-web/armless.js dist/armless-web/armless-gpu.js \
             dist/armless-web/armless.wasm dist/armless-web/armless-smp.wasm

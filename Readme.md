@@ -288,7 +288,8 @@ as it is. armless.wasm is the cdylib of the `armless-user` crate, so it has user
 next to the machine's; armless-smp.wasm is armless's alone (user mode runs on one CPU).
 
 Cargo features: `native-jit` (default; Cranelift), `hypervisor` (see
-[docs/hypervisor.md](docs/hypervisor.md)) and `wasm-api` (compiles the wasm export layer
+[docs/hypervisor.md](docs/hypervisor.md)), `gpu` (`armless-run --gpu`, and `armless-exec --gpu` in
+`armless-user`: the host's GPU for the guest, see [docs/gpu.md](docs/gpu.md)) and `wasm-api` (compiles the wasm export layer
 natively, to type-check it; `armless-user` has `wasm-api` and `native-jit` of the same names,
 the latter default-on: `default-features = false` on `armless-user` (and on `armless`, if you
 depend on it too) links no Cranelift).
@@ -318,6 +319,10 @@ depend on it too) links no Cranelift).
   host's own cores where Hypervisor.framework (Apple silicon) or `/dev/kvm` (Linux arm64) is
   available, and falls back to the interpreter and JIT otherwise. See
   [docs/hypervisor.md](docs/hypervisor.md), including the macOS entitlement.
+- **GPU (experimental).** A guest program can run WebGPU compute on the host's GPU: it connects
+  to `gpu.internal:7070` and speaks a small protocol, answered natively with wgpu (`--gpu`) and in
+  the page by `armless-gpu.js`. llama.cpp's WebGPU backend runs on it unchanged, built against
+  `gpu/guest`'s header. See [docs/gpu.md](docs/gpu.md).
 - **MMU.** A software page-table walker with a direct-mapped TLB, ASID-aware; TLBI by VA
   invalidates what it names and other invalidations flush everything. With several CPUs,
   TLB shootdowns are delivered between them. Code pages written by the guest or by DMA are
