@@ -1,32 +1,24 @@
 ---
 title: The guest renders 3D on your GPU
-description: A program inside the machine raymarches a 3D scene in real time with a WebGPU compute shader on this page's GPU. Press c to render the same scene on its emulated CPU instead.
+description: A program in the machine renders a 3D scene on this page's GPU through WebGPU. Press c to render it on the emulated CPU instead.
 script: gpu.js
 pane: /bin/sh, with the GPU
-caption: Linux 6.18 with a network device for the GPU's connection alone. gpu asks gpu.internal for a GPU, and this page answers with its WebGPU. c switches renderers, q stops.
+caption: Linux 6.18. gpu connects to gpu.internal, and this page answers with WebGPU. c switches to the CPU, q stops.
 ---
 
 ## What is running
 
-`gpu` is a small C++ program in the machine's initramfs. It asks for a GPU the way a WebGPU program
-does, through `webgpu_cpp.h`, but armless's version of that header (`gpu/guest`) has no driver
-under it: it speaks a small protocol to `gpu.internal:7070`. The page answers that connection with
-`armless-gpu.js`, which makes the WebGPU calls on this browser's GPU.
+`gpu` is a small C++ program in the initramfs, written against `webgpu_cpp.h`. armless's version of
+that header sends each call to `gpu.internal:7070`, and `armless-gpu.js` runs it on this browser's
+GPU.
 
-Each frame is a raymarched scene, a torus turning over a checkered floor and a ball bouncing round
-it, with soft shadows, ambient occlusion and fog: one WGSL compute shader, dispatched on the GPU,
-its pixels mapped back and drawn in the console four to a character, in quadrant glyphs and
-truecolor (the two colours that fit each 2×2 block best). The header says which GPU
-answered, the frames per second and how long each frame took. Press `c` and the same scene, the
-same code line for line in C++, renders on the machine's own CPU, emulated in WebAssembly: the
-difference is the GPU. The console itself caps the frame rate, at what it can draw.
+The scene is a raymarched torus and ball over a checkered floor, rendered by one compute shader.
+Press `c` to run the same code on the emulated CPU and compare the frame times.
 
-The machine has a network device only for that connection: its `allow()` lets nothing else out.
-A browser without WebGPU refuses the connection, and the program says so.
+The machine's network reaches nothing but the GPU. Without WebGPU, the program says so and exits.
 
-The same header is what llama.cpp's WebGPU backend is built against, unchanged: a model's layers
-run on the visitor's GPU this way. [snowglobe's Ollama demo](https://snowglobe.build/ollama/) runs the
-official Ollama release on it.
+llama.cpp's WebGPU backend builds against the same header:
+[snowglobe's Ollama demo](https://snowglobe.build/ollama/) runs the official Ollama release this way.
 
 ## The code
 
