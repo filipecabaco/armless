@@ -40,7 +40,7 @@ const ON_IMAGE: u32 = 1 << 31;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub memory_size: usize,
+    pub memory_size: u64,
     pub cpus: usize,
     pub devices: DeviceConfig,
 }
@@ -634,8 +634,20 @@ impl<P: Platform> Vm<P> {
     }
 
     fn check(config: &Config) -> Result<(), String> {
-        if config.memory_size as u64 > crate::board::RAM_MAX || config.memory_size < 16 << 20 {
-            return Err("memory size must be between 16 MiB and 3.5 GiB".into());
+        if config.memory_size > crate::board::RAM_MAX || config.memory_size < 16 << 20 {
+            return Err(format!(
+                "memory size must be between 16 MiB and {} GiB",
+                crate::board::RAM_MAX >> 30
+            ));
+        }
+        // In a browser, RAM above 4 GiB is in memories the host makes (`crate::banks`), which
+        // one without WebAssembly's multi-memory can't
+        #[cfg(target_arch = "wasm32")]
+        if crate::banks::call::banks() < crate::banks::needed(config.memory_size) {
+            return Err(format!(
+                "more than {} GiB of memory needs a browser with WebAssembly multi-memory",
+                crate::board::LOW_RAM_MAX >> 30
+            ));
         }
         if !(1..=MAX_CPUS).contains(&config.cpus) {
             return Err(format!("1 to {MAX_CPUS} CPUs"));
@@ -753,11 +765,11 @@ impl<P: Platform> Vm<P> {
             while fb.done < start + len {
                 let off = fb.done - start;
                 let n = BOOT_WINDOW.min(len - off);
-                let at = (addr + off) as usize;
+                let at = addr + off;
                 let mem = &self.cpus[0].mem;
                 self.board.with_file(path, |fs, ino| {
                     fs.read_with(ino, off, n, |pos, d| {
-                        mem.write(at + pos, d);
+                        mem.write(at + pos as u64, d);
                     })
                 })?;
                 self.board.with_file(path, |fs, ino| {
@@ -831,7 +843,7 @@ pub fn save_state_cpus<H: Host>(
     n: usize,
 ) -> Result<Vec<u8>, String> {
     let mut saver = StateSaver::new(board, cpus, n)?;
-    let mut out = Vec::with_capacity(saver.head.len() + board.io.mem.len() / 4);
+    let mut out = Vec::with_capacity(saver.head.len() + (board.io.mem.len() / 4) as usize);
     while saver.next(board, &mut out, usize::MAX) {}
     Ok(out)
 }
@@ -875,7 +887,7 @@ impl StateSaver {
         let hint = board.devices.lock().save_size_hint(&head);
         head.0.reserve_exact(hint + (1 << 20));
         head.0.extend_from_slice(MAGIC);
-        head.u64(mem.len() as u64);
+        head.u64(mem.len());
         head.u32(n as u32);
         head.u64(0);
         let state = head.0.len();
@@ -951,10 +963,11 @@ impl StateSaver {
             return true;
         }
         let mem = &board.io.mem;
-        while self.page * PAGE < mem.len() && out.len() - start + 4 + PAGE <= max {
-            let from = self.page * PAGE;
-            let n = PAGE.min(mem.len() - from);
-            if !mem.is_zero(from, n) {
+        while out.len() - start + 4 + PAGE <= max {
+            let Some((from, n)) = ram_page(mem, &mut self.page) else {
+                break;
+            };
+            if !mem.is_zero(from, n as u64) {
                 out.extend_from_slice(&(self.page as u32).to_le_bytes());
                 let at = out.len();
                 out.resize(at + PAGE, 0);
@@ -962,7 +975,7 @@ impl StateSaver {
             }
             self.page += 1;
         }
-        if self.page * PAGE >= mem.len() && !self.done {
+        if self.page as u64 * PAGE as u64 >= mem.end() && !self.done {
             out.extend_from_slice(&END.to_le_bytes());
             self.done = true;
         }
@@ -973,15 +986,24 @@ impl StateSaver {
 /// Zero the RAM pages the snapshot didn't write. Reading an untouched page doesn't commit it (the
 /// host maps its zero page), so only pages the guest had dirtied get written.
 fn zero_unwritten(mem: &crate::ram::Ram, written: &[u64]) {
-    for (page, at) in (0..mem.len()).step_by(PAGE).enumerate() {
-        if written[page / 64] & (1 << (page % 64)) != 0 {
-            continue;
+    let mut page = 0;
+    while let Some((at, n)) = ram_page(mem, &mut page) {
+        if written[page / 64] & (1 << (page % 64)) == 0 && !mem.is_zero(at, n as u64) {
+            mem.zero(at, n as u64);
         }
-        let n = PAGE.min(mem.len() - at);
-        if !mem.is_zero(at, n) {
-            mem.zero(at, n);
-        }
+        page += 1;
     }
+}
+
+/// RAM's page number `page`, or the first RAM page after it (past the hole under the MMIO window):
+/// its address and bytes (a page, or less at RAM's end). None past RAM's end.
+fn ram_page(mem: &crate::ram::Ram, page: &mut usize) -> Option<(u64, usize)> {
+    let at = *page as u64 * PAGE as u64;
+    if at < mem.end() && !mem.holds(at, 1) {
+        *page = (crate::board::HIGH_RAM_BASE / PAGE as u64) as usize;
+    }
+    let at = *page as u64 * PAGE as u64;
+    (at < mem.end()).then(|| (at, (mem.end() - at).min(PAGE as u64) as usize))
 }
 
 /// Restore a snapshot (raw or zstd); every CPU stopped and in `cpus`.
@@ -1059,18 +1081,20 @@ pub fn split_state(data: &mut dyn std::io::Read, image: &std::fs::File) -> Resul
             break;
         }
         let from = p as u64 * PAGE as u64;
-        if from >= ram {
+        // The image is RAM laid out by physical address: up to its end, the hole under the MMIO
+        // window too if it goes past it (`Ram::from_image`)
+        if from >= crate::board::ram_end(ram) || !(from < crate::board::ram_low(ram) || from >= crate::board::HIGH_RAM_BASE) {
             return Err("snapshot page outside RAM".into());
         }
         data.read_exact(&mut page)
             .map_err(|_| "truncated snapshot")?;
-        let fit = (PAGE as u64).min(ram - from) as usize;
+        let fit = (PAGE as u64).min(crate::board::ram_end(ram) - from) as usize;
         image.write_all_at(&page[..fit], from).map_err(e)?;
     }
     if data.read(&mut [0u8; 1]).map_err(e)? != 0 {
         return Err("data after the end of the snapshot".into());
     }
-    image.set_len(ram).map_err(e)?;
+    image.set_len(crate::board::ram_end(ram)).map_err(e)?;
     out.extend_from_slice(&END.to_le_bytes());
     Ok(out)
 }
@@ -1155,7 +1179,7 @@ impl StateLoader {
                             let meta =
                                 usize::try_from(u64::from_le_bytes(b[20..28].try_into().unwrap()))
                                     .map_err(|_| "corrupt snapshot".to_string())?;
-                            if ram != mem.len() as u64 {
+                            if ram != mem.len() {
                                 return Err(format!(
                                     "the snapshot was saved with {} MiB of RAM, this machine has {} MiB",
                                     ram >> 20,
@@ -1171,7 +1195,7 @@ impl StateLoader {
                             // Pages not in the snapshot are zero, which `finish` sees to without
                             // touching the ones that already are: a fresh machine's RAM is never
                             // committed beyond what the snapshot holds
-                            self.written = vec![0; mem.len().div_ceil(PAGE).div_ceil(64)];
+                            self.written = vec![0; (mem.end().div_ceil(PAGE as u64) as usize).div_ceil(64)];
                             // A snapshot split from its RAM (`split_state`) restores onto that
                             // RAM's image, keeping its pages; any other zeroes the pages it lacks,
                             // the image's too (they would be another machine's memory)
@@ -1195,7 +1219,7 @@ impl StateLoader {
                             let p = u32::from_le_bytes(b[..4].try_into().unwrap());
                             if p == END {
                                 Stage::Done
-                            } else if (p as usize) * PAGE >= mem.len() {
+                            } else if !mem.holds(p as u64 * PAGE as u64, 1) {
                                 return Err("snapshot page outside RAM".into());
                             } else {
                                 self.written[p as usize / 64] |= 1 << (p % 64);
@@ -1213,8 +1237,8 @@ impl StateLoader {
                 },
                 Stage::PageData { page, at } => {
                     let n = (PAGE - at).min(data.len());
-                    let base = page * PAGE + at;
-                    let fit = n.min(mem.len().saturating_sub(base));
+                    let base = page as u64 * PAGE as u64 + at as u64;
+                    let fit = n.min(mem.end().saturating_sub(base) as usize);
                     mem.write(base, &data[..fit]);
                     data = &data[n..];
                     self.stage = if at + n == PAGE {
@@ -1260,7 +1284,8 @@ impl StateLoader {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod restore_tests {
-    use super::{Config, PAGE};
+    use super::Config;
+    const PAGE: u64 = super::PAGE as u64;
 
     #[test]
     fn restore_clears_what_the_snapshot_lacks_and_keeps_what_it_has() {
@@ -1290,14 +1315,38 @@ mod restore_tests {
         );
         assert!(mem.is_zero(12 * PAGE, PAGE), "untouched pages stay zero");
     }
+
+    #[test]
+    fn a_snapshot_has_the_ram_above_4_gib() {
+        use crate::board::{HIGH_RAM_BASE, LOW_RAM_MAX};
+        let (mut vm, _clock) = crate::runner::new_vm(Config {
+            memory_size: LOW_RAM_MAX + (16 << 20),
+            cpus: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let mem = vm.board.io.mem.alias();
+        let (low, high, last) = (LOW_RAM_MAX - PAGE, HIGH_RAM_BASE + 3 * PAGE, mem.end() - 8);
+        mem.store(low, 8, 0x10);
+        mem.store(high + 9, 1, 0x20);
+        mem.store(last, 8, 0x30);
+        let state = vm.save_state();
+
+        mem.store(high + 9, 1, 0x21);
+        mem.store(HIGH_RAM_BASE + 8 * PAGE, 1, 0x40);
+        vm.load_state(&state).unwrap();
+        assert_eq!((mem.load(low, 8), mem.load(high + 9, 1), mem.load(last, 8)), (0x10, 0x20, 0x30));
+        assert!(mem.is_zero(HIGH_RAM_BASE + 8 * PAGE, PAGE), "a page it lacks is zero again");
+    }
 }
 
 #[cfg(all(test, unix))]
 mod image_tests {
-    use super::{Config, PAGE};
+    use super::Config;
+    const PAGE: u64 = super::PAGE as u64;
     use crate::ram::Ram;
 
-    const MB16: usize = 16 << 20;
+    const MB16: u64 = 16 << 20;
 
     fn config() -> Config {
         Config {
@@ -1379,7 +1428,7 @@ mod image_tests {
         let rest = super::split_state(&mut &whole[..], &image).unwrap();
         assert!(rest.len() < 64 << 10, "no pages left in it: {}", rest.len());
         assert!(super::is_split_state(&rest) && !super::is_split_state(&whole));
-        assert_eq!(image.metadata().unwrap().len(), MB16 as u64);
+        assert_eq!(image.metadata().unwrap().len(), MB16);
 
         // Two machines on the image: the snapshot's RAM, each writing its own
         let mut b = on_image(&image);
@@ -1449,7 +1498,7 @@ mod image_tests {
     #[test]
     fn a_machine_takes_ram_of_its_size_only() {
         let image = temp("size");
-        image.set_len(MB16 as u64).unwrap();
+        image.set_len(MB16).unwrap();
         let clock = crate::platform::Clock::new();
         let ram = Ram::from_image(&image, MB16).unwrap();
         let bigger = Config {
@@ -1467,7 +1516,8 @@ mod image_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fresh_restore_tests {
-    use super::{Config, PAGE};
+    use super::Config;
+    const PAGE: u64 = super::PAGE as u64;
     use crate::ram::Ram;
 
     fn vm() -> crate::Vm<crate::platform::NativePlatform> {
@@ -1603,7 +1653,7 @@ mod host_fs_tests {
             .collect();
         vm.board.fs_write_file("/big", &big, 0o644).unwrap();
         vm.board.fs_write_file("/small", b"small", 0o644).unwrap();
-        vm.board.io.mem.store(3 * super::PAGE, 1, 0x5a);
+        vm.board.io.mem.store(3 * super::PAGE as u64, 1, 0x5a);
         let whole = vm.save_state();
 
         // In pieces of about 64 KiB, none of them held twice: the saver holds no copy of the file
@@ -1650,7 +1700,7 @@ mod host_fs_tests {
             let files = vm.board.fs_read_tree("/").unwrap().unwrap();
             assert!(files.contains(&("big".to_string(), big.clone())));
             assert!(files.contains(&("small".to_string(), b"small".to_vec())));
-            assert_eq!(vm.board.io.mem.load(3 * super::PAGE, 1), 0x5a);
+            assert_eq!(vm.board.io.mem.load(3 * super::PAGE as u64, 1), 0x5a);
         }
     }
 }
@@ -1672,17 +1722,17 @@ mod tests {
     /// it reserves beyond grows with the bytes that actually come.
     #[test]
     fn a_snapshot_header_alone_reserves_a_bounded_amount() {
-        const RAM: usize = 16 << 20;
+        const RAM: u64 = 16 << 20;
         let (vm, _) = crate::runner::new_vm(Config { memory_size: RAM, ..Default::default() }).unwrap();
         let mut l = StateLoader::new(&vm.board);
-        l.feed(&vm.board, &header(RAM, 1 << 40)).unwrap();
+        l.feed(&vm.board, &header(RAM as usize, 1 << 40)).unwrap();
         assert!(matches!(l.stage, Stage::Meta(n) if n == 1 << 40));
         assert!(l.buf.capacity() <= META_RESERVE, "{} reserved", l.buf.capacity());
 
         // A state just past the reserve: it grows to hold it, exactly
         let meta = META_RESERVE + 5;
         let mut l = StateLoader::new(&vm.board);
-        l.feed(&vm.board, &header(RAM, meta as u64)).unwrap();
+        l.feed(&vm.board, &header(RAM as usize, meta as u64)).unwrap();
         let chunk = vec![7u8; 1 << 20];
         let mut left = meta;
         while left > 0 {

@@ -78,7 +78,7 @@ static VM: OnceLock<Result<(usize, usize), String>> = OnceLock::new();
 /// machine must use the same RAM.
 #[allow(unsafe_code)]
 pub fn available(mem: &crate::ram::Ram) -> Result<(), String> {
-    let want = (mem.as_ptr() as usize, mem.len());
+    let want = (mem.as_ptr() as usize, mem.len() as usize);
     let got = VM.get_or_init(|| {
         // SAFETY: plain calls into Hypervisor.framework; the RAM stays mapped in this process for
         // as long as the machine (and so the VM's use of it) lives.
@@ -89,9 +89,13 @@ pub fn available(mem: &crate::ram::Ram) -> Result<(), String> {
                     "hv_vm_create: {r:#x} (is the binary signed with com.apple.security.hypervisor?)"
                 ));
             }
-            let r = ffi::hv_vm_map(want.0 as *mut u8, board::RAM_BASE, want.1, ffi::MEMORY_RWX);
-            if r != ffi::HV_SUCCESS {
-                return Err(format!("hv_vm_map of {} MiB: {r:#x}", want.1 >> 20));
+            // RAM where it is: below the MMIO hole, and above 4 GiB if it goes on there
+            for (at, n) in mem.regions() {
+                let host = (want.0 as *mut u8).wrapping_add(at as usize);
+                let r = ffi::hv_vm_map(host, board::RAM_BASE + at, n as usize, ffi::MEMORY_RWX);
+                if r != ffi::HV_SUCCESS {
+                    return Err(format!("hv_vm_map of {} MiB at {at:#x}: {r:#x}", n >> 20));
+                }
             }
         }
         Ok(want)

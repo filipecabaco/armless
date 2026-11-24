@@ -70,6 +70,9 @@ pub struct Layout {
     pub read_base: u64,
     pub write_tag: u64,
     pub write_base: u64,
+    /// Value: non-zero when RAM goes on above 4 GiB, whose pages' fast entries hold their bank
+    /// (`ram::fast_base`) and are served by the helpers, not inline.
+    pub banks: u64,
 }
 
 // What a block returns, and what the interpreter helper returns to it (a non-zero one ends the
@@ -529,6 +532,25 @@ impl Gen<'_> {
     fn tlb_probe(&mut self, tags: u64, size: u32) {
         self.tlb_compare(tags, size);
         self.c.i64_eq();
+        self.below_4g(tags);
+    }
+
+    /// With RAM above 4 GiB: and the hit pushed with whether the entry at IDX is a page below
+    /// 4 GiB, the ones this code addresses itself (the others' entries hold their bank in the low
+    /// bits, `ram::fast_base`). Machines without such RAM compile none of this.
+    fn below_4g(&mut self, tags: u64) {
+        let l = *self.l;
+        if l.banks == 0 {
+            return;
+        }
+        self.c.get(IDX);
+        self.c.i32c(2);
+        self.c.i32_shl();
+        self.c.i32_load(if tags == l.read_tag { l.read_base } else { l.write_base });
+        self.c.i32c(0xfff);
+        self.c.i32_and();
+        self.c.i32_eqz();
+        self.c.i32_and();
     }
 
     /// `tlb_probe` for a plain store: also false while an exclusive monitor is armed (the store must clear it,
@@ -543,6 +565,7 @@ impl Gen<'_> {
         self.c.i64_shl();
         self.c.i64_or();
         self.c.i64_eq();
+        self.below_4g(tags);
     }
 
     /// Push tag[idx] (sets IDX, idx = (VA >> 12) % FAST_ENTRIES) and the page of the access's last byte.

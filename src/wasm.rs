@@ -211,13 +211,7 @@ pub unsafe extern "C" fn armless_create(
     if mac_ptr != 0 {
         devices.mac.copy_from_slice(slice(mac_ptr, 6));
     }
-    // On wasm32, 4096 MiB or more would wrap to a small size, not be refused
-    let Some(memory_size) = (memory_mb as usize).checked_mul(1 << 20) else {
-        set_error(format!(
-            "{memory_mb} MiB of RAM is more than a wasm memory holds"
-        ));
-        return -1;
-    };
+    let memory_size = (memory_mb as u64) << 20;
     let config = Config {
         memory_size,
         cpus: ncpus as usize,
@@ -280,6 +274,32 @@ pub extern "C" fn armless_error_len() -> u32 {
 #[no_mangle]
 pub extern "C" fn armless_buf() -> u32 {
     BUF.with_borrow(|b| b.as_ptr() as u32)
+}
+
+// ------------------------------------------------------------ RAM banks
+
+/// The memories RAM of `memory_mb` MiB needs above 4 GiB (`crate::banks`): 0 for a machine of at
+/// most 3 GiB, which this module's memory holds.
+#[no_mangle]
+pub extern "C" fn armless_banks_needed(memory_mb: u32) -> u32 {
+    crate::banks::needed((memory_mb as u64) << 20)
+}
+
+/// The module that reaches `banks` memories for this one (at `armless_buf`, its length returned):
+/// shared ones if `shared`.
+#[no_mangle]
+pub extern "C" fn armless_bank_module(banks: u32, shared: u32) -> u32 {
+    out(crate::banks::module(banks, shared != 0))
+}
+
+/// The host made `banks` memories and put the bank module's functions in the table at
+/// `banks::SLOT_BASE`; where that is, for it to check.
+#[no_mangle]
+pub extern "C" fn armless_set_banks(banks: u32) -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    crate::banks::call::BANKS.store(banks, std::sync::atomic::Ordering::Relaxed);
+    let _ = banks;
+    crate::banks::SLOT_BASE
 }
 
 // ------------------------------------------------------------------ SMP
@@ -470,7 +490,8 @@ pub extern "C" fn armless_mem_ptr() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn armless_mem_size() -> u32 {
-    vm().board.io.mem.len() as u32
+    // In MiB-sized machines, RAM below 4 GiB: what `armless_mem_ptr` points at
+    crate::board::ram_low(vm().board.io.mem.len()) as u32
 }
 
 // --------------------------------------------------------------- boot

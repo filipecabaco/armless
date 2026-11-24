@@ -375,13 +375,14 @@ impl Machine {
     }
 
     pub fn new(memory_size: usize, ncpus: usize) -> Machine {
-        Machine::with_ram(Ram::zeroed(memory_size), ncpus)
+        Machine::with_ram(Ram::zeroed(memory_size as u64), ncpus)
     }
 
     /// A machine on `mem` (`Ram::from_image`, say) rather than on zeroed RAM.
     pub fn with_ram(mem: Ram, ncpus: usize) -> Machine {
         assert!((1..=MAX_CPUS).contains(&ncpus), "1..={MAX_CPUS} CPUs");
-        let memory_size = mem.len();
+        // Flags by physical page, to RAM's end
+        let pages = mem.end().div_ceil(4096) as usize;
         let m = Machine {
             ncpus,
             mem,
@@ -409,7 +410,7 @@ impl Machine {
             dma_code_invals: AtomicU64::new(0),
             sev: AtomicU32::new(0),
             host_cores: AtomicU32::new(0),
-            code_pages: zeroed_flags(memory_size.div_ceil(4096)),
+            code_pages: zeroed_flags(pages),
             waker: SpinLock::new(None),
         };
         // CPU 0 starts running; the others wait for PSCI CPU_ON.

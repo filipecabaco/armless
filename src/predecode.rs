@@ -1101,7 +1101,7 @@ pub struct Cache {
     hand: usize,
     /// The page `step_page` executes from: its physical base, its slot and its ops. Reset when any slot is
     /// dropped, so `step_page` never runs the ops of a dropped page.
-    pub(crate) cur_base: usize,
+    pub(crate) cur_base: u64,
     pub(crate) cur_slot: u32,
     pub(crate) cur_ptr: *mut Op,
     /// Slots at most (`MAX_SLOTS`; a larger value is capped by `alloc`, the arena has no more).
@@ -1117,9 +1117,9 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn new(memory_size: usize) -> Cache {
+    pub fn new(memory_size: u64) -> Cache {
         Cache {
-            page_slot: vec![0; memory_size.div_ceil(4096)],
+            page_slot: vec![0; memory_size.div_ceil(4096) as usize],
             slots: Vec::new(),
             #[cfg(unix)]
             arena: std::ptr::null_mut(),
@@ -1127,7 +1127,7 @@ impl Cache {
             free: Vec::new(),
             referenced: Vec::new(),
             hand: 0,
-            cur_base: usize::MAX,
+            cur_base: u64::MAX,
             cur_slot: NONE,
             cur_ptr: std::ptr::null_mut(),
             max_slots: MAX_SLOTS,
@@ -1171,7 +1171,7 @@ impl Cache {
     }
 
     /// Make `slot`, the slot of the page at physical address `base`, the current page.
-    pub(crate) fn set_current(&mut self, base: usize, slot: u32) {
+    pub(crate) fn set_current(&mut self, base: u64, slot: u32) {
         self.cur_base = base;
         self.cur_slot = slot;
         self.referenced[slot as usize] = true;
@@ -1180,7 +1180,7 @@ impl Cache {
 
     /// The ops of the current page, if `base` is that page, else null.
     #[inline(always)]
-    pub(crate) fn current(&self, base: usize) -> *mut Op {
+    pub(crate) fn current(&self, base: u64) -> *mut Op {
         if base == self.cur_base {
             self.cur_ptr
         } else {
@@ -1191,11 +1191,11 @@ impl Cache {
     /// The ops of the page at physical base `base`, made the current page, or null if it has no slot (the run
     /// of a loop that goes on in another page, see `Cpu::enter_page`).
     #[inline(always)]
-    pub(crate) fn enter(&mut self, base: usize) -> *mut Op {
+    pub(crate) fn enter(&mut self, base: u64) -> *mut Op {
         if base == self.cur_base {
             return self.cur_ptr;
         }
-        let slot = self.slot(base >> 12);
+        let slot = self.slot((base >> 12) as usize);
         if slot == NONE {
             return std::ptr::null_mut();
         }
@@ -1208,10 +1208,10 @@ impl Cache {
     /// that page the current one.
     #[inline(always)]
     #[allow(unsafe_code)]
-    pub(crate) fn bump(&mut self, base: usize, i: usize) -> u32 {
+    pub(crate) fn bump(&mut self, base: u64, i: usize) -> u32 {
         debug_assert!(i < PAGE_INSNS);
         if base != self.cur_base {
-            let slot = self.slot(base >> 12);
+            let slot = self.slot((base >> 12) as usize);
             if slot == NONE {
                 return 0;
             }
@@ -1237,7 +1237,7 @@ impl Cache {
     /// Set the count of op `i` of the page at physical base `base` to `v` (at most `COUNT_MAX`), if that is the
     /// current page, as it is after `bump` unless something since dropped it.
     #[inline(always)]
-    pub(crate) fn set_count(&mut self, base: usize, i: usize, v: u32) {
+    pub(crate) fn set_count(&mut self, base: u64, i: usize, v: u32) {
         debug_assert!(i < PAGE_INSNS && v <= COUNT_MAX);
         if base == self.cur_base {
             // SAFETY: `cur_ptr` points at the ops of the page at `cur_base`, a live slot, and `i` is an
@@ -1397,7 +1397,7 @@ impl Cache {
     }
 
     fn reset_current(&mut self) {
-        self.cur_base = usize::MAX;
+        self.cur_base = u64::MAX;
         self.cur_slot = NONE;
         self.cur_ptr = std::ptr::null_mut();
     }

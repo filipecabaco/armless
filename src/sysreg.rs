@@ -91,7 +91,8 @@ pub mod id {
     /// without half-precision arithmetic; GIC system register interface
     /// absent (memory-mapped GICv2 instead).
     pub const AA64PFR0: u64 = 0x1 | (0x1 << 4);
-    /// PARange=32 bits, 8-bit ASIDs, 4K granule only (16K/64K unsupported).
+    /// PARange=32 bits (36 with RAM above 4 GiB: `board::PA_RANGE_36`), 8-bit ASIDs, 4K granule
+    /// only (16K/64K unsupported).
     pub const AA64MMFR0: u64 = 0xF << 24;
     /// AES (with PMULL), SHA1, SHA256 and SHA512, CRC32, the LSE atomics, SHA3 (EOR3, RAX1, XAR,
     /// BCAX), SM3 and SM4.

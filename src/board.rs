@@ -1,10 +1,12 @@
 //! The armless "virt" board: physical memory map and the boundary to the host.
 //!
 //! RAM starts at physical address 0. Everything else lives in a 256 MiB MMIO
-//! hole at the top of the 32-bit space.
+//! hole at the top of the 32-bit space. RAM past 3 GiB (LOW_RAM_MAX) goes on above
+//! 4 GiB, so the first 3 GiB of any machine's RAM are where they are on a smaller one.
 //!
 //! ```text
-//! 0x0000_0000 .. memory_size   RAM (kernel Image at 0x0020_0000)
+//! 0x0000_0000 .. low           RAM, at most 3 GiB (kernel Image at 0x0020_0000)
+//! 0x1_0000_0000 ..             the rest of RAM, if any
 //! 0xE000_0000 .. 0xEFFF_FFFF   PCI 32-bit MMIO window (BARs)
 //! 0xF000_0000 .. +0x1_0000     GICv2 distributor
 //! 0xF001_0000 .. +0x1_0000     GICv2 CPU interface
@@ -17,8 +19,31 @@
 
 pub const RAM_BASE: u64 = 0;
 pub const KERNEL_OFFSET: u64 = 0x0020_0000;
-/// RAM must end below the PCI MMIO window.
-pub const RAM_MAX: u64 = 0xE000_0000;
+/// The most RAM below 4 GiB; the rest starts at HIGH_RAM_BASE. A browser keeps these 3 GiB in
+/// its first wasm memory, with armless's own data, and each 4 GiB above in a memory of its own.
+pub const LOW_RAM_MAX: u64 = 3 << 30;
+/// Where RAM past LOW_RAM_MAX goes on.
+pub const HIGH_RAM_BASE: u64 = 1 << 32;
+/// The most RAM a machine has: RAM then ends at 64 GiB, the 36-bit physical addresses it tells
+/// the guest it has (`PA_RANGE_36`) when it goes past 4 GiB.
+pub const RAM_MAX: u64 = 63 << 30;
+
+/// ID_AA64MMFR0_EL1.PARange of a machine with RAM above 4 GiB: 36 bits (0, 32 bits, otherwise).
+pub const PA_RANGE_36: u64 = 1;
+
+const _: () = assert!(ram_end(RAM_MAX) <= 1 << 36);
+
+/// Where RAM of `len` bytes ends: one past its last physical address.
+pub const fn ram_end(len: u64) -> u64 {
+    if len <= LOW_RAM_MAX { len } else { HIGH_RAM_BASE + (len - LOW_RAM_MAX) }
+}
+
+/// RAM of `len` bytes below 4 GiB.
+pub const fn ram_low(len: u64) -> u64 {
+    if len <= LOW_RAM_MAX { len } else { LOW_RAM_MAX }
+}
+
+const _: () = assert!(LOW_RAM_MAX <= PCI_MMIO_BASE);
 
 pub const PCI_MMIO_BASE: u64 = 0xE000_0000;
 pub const PCI_MMIO_SIZE: u64 = 0x1000_0000;

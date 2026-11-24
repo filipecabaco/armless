@@ -224,13 +224,13 @@ fn indirect_branches_do_what_the_interpreter_does() {
     for (what, target) in cases {
         let setup = |c: &mut Cpu<NoDevices>| {
             for &(a, w) in &words {
-                c.mem.write(a as usize, &w.to_le_bytes());
+                c.mem.write(a, &w.to_le_bytes());
             }
             // At the other page: add x0, x0, #1; ret
             c.mem
-                .write(target_page as usize, &0x9100_0400u32.to_le_bytes());
+                .write(target_page, &0x9100_0400u32.to_le_bytes());
             c.mem
-                .write(target_page as usize + 4, &0xd65f_03c0u32.to_le_bytes());
+                .write(target_page + 4, &0xd65f_03c0u32.to_le_bytes());
             (c.el, c.spsel, c.daif) = (1, true, 0x3c0);
             c.sys.vbar = VECTORS;
         };
@@ -240,7 +240,7 @@ fn indirect_branches_do_what_the_interpreter_does() {
         setup(&mut jit);
         // The page compiled with every entry at once, so that they chain to one another
         let mut page = [0u8; 0x1000];
-        jit.mem.read(CODE as usize & !0xfff, &mut page);
+        jit.mem.read(CODE & !0xfff, &mut page);
         let key = ((CODE & !0xfff) << 2) | 0b11; // EL1, SP_EL1
         let entries = vec![0, 4, 8, 12];
         let hash = crate::jit::profile::hash(&page);
@@ -294,7 +294,7 @@ fn writes_next_to_code_keep_it_and_writes_to_it_replace_it() {
     ];
     let setup = |c: &mut Cpu<NoDevices>| {
         for (i, w) in patch.iter().enumerate() {
-            c.mem.write(PATCH as usize + 4 * i, &w.to_le_bytes());
+            c.mem.write(PATCH + 4 * i as u64, &w.to_le_bytes());
         }
     };
     let run = |c: &mut Cpu<NoDevices>, pc: u64, n: u64| {
@@ -327,7 +327,7 @@ fn writes_next_to_code_keep_it_and_writes_to_it_replace_it() {
         run(c, PATCH, 3);
         run(c, CODE, 2);
         assert_eq!(c.x[0], 4);
-        assert_eq!(c.mem.load(CODE as usize + 0x808, 8), 3);
+        assert_eq!(c.mem.load(CODE + 0x808, 8), 3);
     }
     assert_eq!(
         jit.jit.compiled, compiled,
@@ -369,7 +369,7 @@ fn a_block_that_rewrites_itself_runs_the_new_instruction_after_an_isb() {
     interp.jit.enabled = false;
     for c in [&mut jit, &mut interp] {
         for (i, w) in words.iter().enumerate() {
-            c.mem.write(SMC as usize + 4 * i, &w.to_le_bytes());
+            c.mem.write(SMC + 4 * i as u64, &w.to_le_bytes());
         }
         // Compiled while its store goes to a page with no code
         (c.x[0], c.x[3], c.x[4]) = (0, 0, 0x8000);
@@ -419,7 +419,7 @@ fn a_superblock_that_rewrites_an_instruction_past_its_branch_runs_the_new_one() 
     interp.jit.enabled = false;
     for c in [&mut jit, &mut interp] {
         for (i, w) in words.iter().enumerate() {
-            c.mem.write(SMC as usize + 4 * i, &w.to_le_bytes());
+            c.mem.write(SMC + 4 * i as u64, &w.to_le_bytes());
         }
         (c.x[0], c.x[3], c.x[4], c.x[6]) = (0, 0, 0x8000, 0);
         for _ in 0..4 {
@@ -463,9 +463,9 @@ fn at_block(threshold: u32) -> Option<Cpu<NoDevices>> {
     let words = [0x9100_0400u32, 0x1400_0000 | ((EXIT - CODE - 4) / 4) as u32];
     for (i, w) in words.iter().enumerate() {
         let a = CODE as usize + 4 * i;
-        c.mem.write(a, &w.to_le_bytes());
+        c.mem.write(a as u64, &w.to_le_bytes());
     }
-    c.mem.write(EXIT as usize, &0x1400_0000u32.to_le_bytes());
+    c.mem.write(EXIT, &0x1400_0000u32.to_le_bytes());
     (c.el, c.spsel, c.daif) = (1, true, 0x3c0);
     Some(c)
 }
@@ -510,7 +510,7 @@ fn a_profile_prewarms_the_same_code_and_skips_changed_pages() {
 
     // Other code on the page: nothing compiled for it, and it still runs (interpreted)
     let mut c = at_block(u32::MAX).unwrap();
-    c.mem.write(CODE as usize, &0x9100_0800u32.to_le_bytes());
+    c.mem.write(CODE, &0x9100_0800u32.to_le_bytes());
     assert_eq!(c.jit_prewarm(&profile), profile.len() - 1);
     c.wait_native_jit();
     let runs = c.jit.block_runs;
@@ -559,7 +559,7 @@ fn a_jit_that_compiles_here_has_its_code_at_once_and_keeps_it_on_a_thread() {
     let back = ((EXIT as i64 - (OTHER + 4) as i64) / 4) as u32 & 0x3ff_ffff;
     let words = [0x9100_0c00u32, 0x1400_0000 | back];
     for (i, w) in words.iter().enumerate() {
-        b.mem.write(OTHER as usize + 4 * i, &w.to_le_bytes());
+        b.mem.write(OTHER + 4 * i as u64, &w.to_le_bytes());
     }
     b.jit.threshold = 1;
     for _ in 0..3 {

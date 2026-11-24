@@ -220,6 +220,16 @@
       };
       const instance = new WebAssembly.Instance(msg.module, { env });
       exports = instance.exports;
+      // RAM above 4 GiB: this thread's own instance of the module that reaches it, in the slots
+      // the page's has (the machine calls them by slot)
+      if (msg.banks) {
+        const b = msg.banks;
+        const imports = { m0: memory };
+        b.memories.forEach((m, i) => { imports["m" + (i + 1)] = m; });
+        const fns = new WebAssembly.Instance(b.module, { e: imports }).exports;
+        if (table.length < b.base + b.count) table.grow(b.base + b.count - table.length);
+        for (let i = 0; i < b.count; i++) table.set(b.base + i, fns["f" + i]);
+      }
       exports.__stack_pointer.value = msg.stack_top;
       exports.__wasm_init_tls(msg.tls);
       exports.armless_smp_attach(index);
@@ -589,6 +599,10 @@
         armless_jit_interp: e.armless_jit_interp,
         armless_jit_fp3: e.armless_jit_fp3,
       };
+
+      // RAM past 3 GiB goes on above 4 GiB, in memories of its own (4 GiB each)
+      const banks = e.armless_banks_needed ? e.armless_banks_needed(o.memory_mb) : 0;
+      if (banks) await this._make_banks(banks, smp);
 
       const flags = (o.console !== false ? DEV_CONSOLE : 0) | (o.filesystem ? DEV_FS : 0) | (o.network ? DEV_NET : 0)
         | (o.free_page_reporting ? DEV_BALLOON : 0);
@@ -1184,8 +1198,41 @@
           stack_top: stack + STACK_SIZE, tls, ctrl: this._ctrl.buffer, stats: this._stats.buffer,
           time_origin: performance.timeOrigin, table_size: TABLE_SIZE,
           jit: this.options.jit, jit_threshold: this.options.jit_threshold | 0, budget: BUDGET,
+          banks: this._banks || null,
         });
       }
+    }
+
+    // RAM above 4 GiB: `count` memories of up to 4 GiB each (shared with the vCPU workers if
+    // `shared`), and the module the machine reaches them through, its functions in the table where
+    // the machine calls them. A browser without WebAssembly's multi-memory can't compile that
+    // module: the machine is then refused, as larger than it can hold.
+    async _make_banks(count, shared) {
+      const e = this.exports;
+      const high = this.options.memory_mb * 2 ** 20 - 3 * 2 ** 30;
+      const memories = [];
+      for (let k = 0; k < count; k++) {
+        const pages = Math.ceil(Math.min(2 ** 32, high - k * 2 ** 32) / 65536);
+        memories.push(new WebAssembly.Memory({ initial: pages, maximum: pages, shared }));
+      }
+      const n = e.armless_bank_module(count, shared ? 1 : 0);
+      const bytes = new Uint8Array(this.memory.buffer, e.armless_buf() >>> 0, n).slice();
+      let module;
+      try {
+        module = await WebAssembly.compile(bytes);
+      } catch {
+        return;
+      }
+      const imports = { m0: this.memory };
+      memories.forEach((m, i) => { imports["m" + (i + 1)] = m; });
+      const fns = (await WebAssembly.instantiate(module, { e: imports })).exports;
+      let functions = 0;
+      while (fns["f" + functions]) functions++;
+      const base = e.armless_set_banks(0);
+      if (this.table.length < base + functions) this.table.grow(base + functions - this.table.length);
+      for (let i = 0; i < functions; i++) this.table.set(base + i, fns["f" + i]);
+      e.armless_set_banks(count);
+      this._banks = { module, memories, base, count: functions };
     }
 
     _worker_message(i, msg) {

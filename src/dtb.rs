@@ -194,15 +194,14 @@ pub fn board_dtb(cfg: &BoardConfig) -> Vec<u8> {
 
     f.begin(&format!("memory@{:x}", board::RAM_BASE));
     f.prop_str("device_type", "memory");
-    f.prop_cells(
-        "reg",
-        &[
-            hi(board::RAM_BASE),
-            lo(board::RAM_BASE),
-            hi(cfg.memory_size),
-            lo(cfg.memory_size),
-        ],
-    );
+    // RAM below the MMIO hole, and the rest, if any, above 4 GiB
+    let low = board::ram_low(cfg.memory_size);
+    let mut reg = vec![hi(board::RAM_BASE), lo(board::RAM_BASE), hi(low), lo(low)];
+    if cfg.memory_size > low {
+        let high = cfg.memory_size - low;
+        reg.extend([hi(board::HIGH_RAM_BASE), lo(board::HIGH_RAM_BASE), hi(high), lo(high)]);
+    }
+    f.prop_cells("reg", &reg);
     f.end();
 
     f.begin("cpus");
@@ -407,6 +406,39 @@ pub fn pci_intx_to_intid(slot: u32, pin: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cells of the second property of the node named `node` (the memory node's `reg`, after
+    /// its `device_type`).
+    fn reg(dtb: &[u8], node: &str) -> Vec<u32> {
+        const PROP: [u8; 4] = 3u32.to_be_bytes();
+        let word = |at: usize| u32::from_be_bytes(dtb[at..at + 4].try_into().unwrap()) as usize;
+        let at = dtb.windows(node.len()).position(|w| w == node.as_bytes()).unwrap();
+        // Each property: FDT_PROP, its length, its name's offset, its value padded to 4 bytes
+        let first = at + dtb[at..].windows(4).position(|w| w == PROP).unwrap();
+        let second = first + 12 + word(first + 4).next_multiple_of(4);
+        assert_eq!(dtb[second..second + 4], PROP);
+        dtb[second + 12..second + 12 + word(second + 4)]
+            .chunks(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn memory_is_one_range_or_two_around_the_mmio_hole() {
+        let cfg = |memory_size| BoardConfig {
+            memory_size,
+            cmdline: "",
+            initrd: None,
+            ncpus: 1,
+            rng_seed: &[],
+            gic_v3: false,
+        };
+        assert_eq!(reg(&board_dtb(&cfg(512 << 20)), "memory@0"), [0, 0, 0, 512 << 20]);
+        assert_eq!(
+            reg(&board_dtb(&cfg(6 << 30)), "memory@0"),
+            [0, 0, 0, 3 << 30, 1, 0, 0, 3 << 30]
+        );
+    }
 
     #[test]
     fn header_is_well_formed() {

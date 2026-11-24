@@ -62,7 +62,7 @@ impl<H: Host> Cpu<H> {
         let mut i = idx;
         let mut n = 0;
         loop {
-            let insn = self.ram_load(base + i * 4, 4) as u32;
+            let insn = self.ram_load(base + i as u64 * 4, 4) as u32;
             let op = decode(insn, i);
             *ops.add(i) = op;
             // A compare and a conditional branch after it run as one op, whichever of them is decoded last.
@@ -114,10 +114,10 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] as usize + off as usize;
+                let a = crate::ram::fast_page(f.write_base[i]) + off;
                 let words = [v1 as u64, (v1 >> 64) as u64, v2 as u64, (v2 >> 64) as u64];
                 for (k, w) in words.into_iter().enumerate() {
-                    self.ram_store(a + 8 * k, 8, w);
+                    self.ram_store(a + 8 * k as u64, 8, w);
                 }
                 return true;
             }

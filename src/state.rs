@@ -65,7 +65,7 @@ impl<H: Host> Cpu<H> {
         };
         w.0.extend_from_slice(MAGIC);
         w.u32(version);
-        w.u64(m.mem.len() as u64);
+        w.u64(m.mem.len());
         w.u32(n as u32);
         w.u64(counter);
         if version >= VERSION_FREQ {
@@ -140,7 +140,7 @@ impl<H: Host> Cpu<H> {
             return Some(Err(format!("unsupported CPU state version {version}")));
         }
         let mem = r.u64()?;
-        if mem != m.mem.len() as u64 {
+        if mem != m.mem.len() {
             return Some(Err(format!(
                 "state was saved with {} MiB of RAM but this machine has {} MiB",
                 mem >> 20,

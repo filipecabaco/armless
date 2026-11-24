@@ -763,7 +763,7 @@ impl Process {
             return Err(ExecError::Fail(format!("{hostname:?}: not a hostname")));
         }
         let ram = cpu.mem().alias();
-        let ram_size = ram.len() as u64;
+        let ram_size = ram.len();
         let layout = Layout::of(&image, board.as_deref())?;
         // What the CPUs decoded from a page of RAM is dropped when its frame is freed or the host
         // writes it
@@ -1150,7 +1150,7 @@ impl Process {
     /// Guest pages that hold anything: what of RAM a snapshot carries. (Reads all of RAM.)
     pub fn guest_pages(&self) -> u64 {
         (0..self.ram_size / PAGE)
-            .filter(|&i| !self.ram.is_zero((i * PAGE) as usize, PAGE as usize))
+            .filter(|&i| !self.ram.is_zero(i * PAGE, PAGE))
             .count() as u64
     }
 
@@ -1735,7 +1735,7 @@ impl Process {
         let mut r = R(rest);
         let ram = cpu.mem().alias();
         let ram_size = r.u()?;
-        if ram_size != ram.len() as u64 {
+        if ram_size != ram.len() {
             return Err(format!(
                 "the process had {ram_size} bytes of RAM, the machine {}",
                 ram.len()
