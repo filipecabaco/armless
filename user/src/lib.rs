@@ -38,6 +38,7 @@ mod elf;
 mod errno;
 mod exec;
 mod files;
+mod loadavg;
 mod locks;
 pub mod host;
 mod mm;
@@ -276,6 +277,16 @@ pub(crate) struct Proc {
     pub aio: BTreeMap<u64, aio::Aio>,
     /// The most (kB) any of its children that ended had resident, for getrusage(RUSAGE_CHILDREN)
     pub child_maxrss: u64,
+    /// The CPU time (ns) its children that ended used, theirs and their own children's: what
+    /// /proc/<pid>/stat's cutime, times() and getrusage(RUSAGE_CHILDREN) report
+    pub child_cpu: u64,
+    /// When it started, on the monotonic clock (ns): /proc/<pid>/stat's starttime
+    pub started: u64,
+    /// Its environment as it was given at exec, each string with its NUL (/proc/<pid>/environ)
+    pub environ: Vec<u8>,
+    /// Its auxiliary vector as it was given at exec, (type, value) pairs to AT_NULL's
+    /// (/proc/<pid>/auxv)
+    pub auxv: Vec<u8>,
 }
 
 /// Who a process is: its real, effective and saved user and group ids. A program starts as root;
@@ -808,6 +819,11 @@ impl Process {
                 groups: Vec::new(),
                 aio: BTreeMap::new(),
                 child_maxrss: 0,
+                child_cpu: 0,
+                // (The monotonic clock's reading as the machine starts: `mono_base`)
+                started: 1_000_000_000,
+                environ: Vec::new(),
+                auxv: Vec::new(),
             },
             procs: BTreeMap::new(),
             threads: Vec::new(),
@@ -944,6 +960,22 @@ impl Process {
         }
         // (Every program image is loaded here: the first, execve's, the host's own processes)
         self.p.cmdline = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
+        self.p.environ = env.iter().flat_map(|e| e.bytes().chain([0])).collect();
+        // The auxiliary vector, as the stack has it: after argc, argv's pointers and NULL, and
+        // envp's pointers and NULL, pairs up to AT_NULL's
+        let mut at = sp + 8 * (args.len() + env.len() + 3) as u64;
+        self.p.auxv.clear();
+        for _ in 0..64 {
+            let (Some(k), Some(v)) = (self.u64_at(at), self.u64_at(at + 8)) else {
+                break;
+            };
+            self.p.auxv.extend_from_slice(&k.to_le_bytes());
+            self.p.auxv.extend_from_slice(&v.to_le_bytes());
+            at += 16;
+            if k == 0 {
+                break;
+            }
+        }
         Ok((entry, sp))
     }
 
@@ -1662,6 +1694,20 @@ impl Process {
         w.u(self.reap_orphans as u64);
         w.u((self.std == StdStreams::Plain) as u64);
         w.b(self.hostname.as_bytes());
+        // ARMLUSRC's section, then its length
+        let mut sec = W(Vec::new());
+        let kept: Vec<&Proc> = self.proc_list().filter(|p| !p.reap).collect();
+        sec.u(kept.len() as u64);
+        for p in kept {
+            sec.u(p.pid as u64);
+            sec.u(p.started);
+            sec.u(p.child_cpu);
+            sec.b(&p.environ);
+            sec.b(&p.auxv);
+        }
+        let len = sec.0.len() as u64;
+        w.0.extend_from_slice(&sec.0);
+        w.u(len);
         w.0
     }
 
@@ -1677,7 +1723,7 @@ impl Process {
     ) -> Result<Process, String> {
         // (At most the longest a timer is set for, so the clocks it moves don't overflow)
         let asleep = timer::clamp(asleep.as_nanos());
-        // Which format it is (MAGIC says what each adds): 5 to 11
+        // Which format it is (MAGIC says what each adds): 5 to 12
         let Some((ver, rest)) = MAGICS
             .iter()
             .enumerate()
@@ -1767,6 +1813,11 @@ impl Process {
                     groups,
                     aio,
                     child_maxrss: 0,
+                    // (ARMLUSRC's section at the end has these)
+                    child_cpu: 0,
+                    started: 1_000_000_000,
+                    environ: Vec::new(),
+                    auxv: Vec::new(),
                 },
             );
         }
@@ -1886,6 +1937,25 @@ impl Process {
         } else {
             "armless".into()
         };
+        // ARMLUSRC's section: each process's start time, children's CPU time, environment and
+        // auxiliary vector (before, the machine's start, none, and nothing), then its length
+        if ver >= 12 {
+            let before = r.0.len();
+            for _ in 0..r.u()? {
+                let pid = r.u()? as i64;
+                let (started, child_cpu) = (r.u()?, r.u()?);
+                let (environ, auxv) = (r.b()?.to_vec(), r.b()?.to_vec());
+                let p = all.get_mut(&pid).ok_or("the section of a process that isn't there")?;
+                p.started = started;
+                p.child_cpu = child_cpu;
+                p.environ = environ;
+                p.auxv = auxv;
+            }
+            let read = (before - r.0.len()) as u64;
+            if r.u()? != read {
+                return Err("a section of the wrong length".into());
+            }
+        }
         files.check_refs(all.values().map(|p| &p.fds))?;
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
@@ -1984,7 +2054,10 @@ fn valid_hostname(name: &str) -> bool {
     name.len() <= 64 && !name.contains('\0')
 }
 
-/// The process state's format: ARMLUSRB (0.20) has whether there is a terminal and the hostname
+/// The process state's format: ARMLUSRC (0.26) has, at the very end, a section with each process's start
+/// time, its children's CPU time, its environment and auxiliary vector, followed by the section's
+/// length (so a state cut back to ARMLUSRB is what is before it), and descriptions of directories
+/// made here (files.rs, kind 16); ARMLUSRB (0.20) has whether there is a terminal and the hostname
 /// (at the end, after whether orphans are reaped); ARMLUSRA has whether the first process reaps
 /// orphans (at the end, after the file locks) and each process's orphan flag (after its command
 /// line); ARMLUSR9 (0.19) has each process's command line (after its AIO contexts); ARMLUSR8
@@ -1993,9 +2066,10 @@ fn valid_hostname(name: &str) -> bool {
 /// count (timer.rs, at the end); ARMLUSR6 (0.15) has none of that; ARMLUSR5 (0.14) has neither
 /// the ids, timers, shared memory, shared file pages nor descriptors in flight of 0.15. Each
 /// still loads.
-const MAGIC: &[u8; 8] = b"ARMLUSRB";
-const MAGICS: [&[u8; 8]; 7] = [
-    b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", b"ARMLUSR9", b"ARMLUSRA", MAGIC,
+const MAGIC: &[u8; 8] = b"ARMLUSRC";
+const MAGICS: [&[u8; 8]; 8] = [
+    b"ARMLUSR5", b"ARMLUSR6", b"ARMLUSR7", b"ARMLUSR8", b"ARMLUSR9", b"ARMLUSRA", b"ARMLUSRB",
+    MAGIC,
 ];
 
 const _: () = {

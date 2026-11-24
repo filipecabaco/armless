@@ -136,6 +136,11 @@ impl Process {
                 groups: Vec::new(),
                 aio: BTreeMap::new(),
                 child_maxrss: 0,
+                child_cpu: 0,
+                started: self.now_ns(1),
+                // (load_image sets them)
+                environ: Vec::new(),
+                auxv: Vec::new(),
             },
         );
         // Its program loaded into its address space, which is the one the process that runs has

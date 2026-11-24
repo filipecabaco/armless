@@ -250,6 +250,8 @@ impl Process {
             .filter(|t| t.pid == pid)
             .map(|t| t.tid)
             .collect();
+        // Its CPU time and its children's, for its parent's cutime
+        let used = self.timers.proc_cpu_ns(pid).saturating_add(self.p.child_cpu);
         self.timers.end(pid, &tids);
         self.release_vfork(pid);
         // Its children go to the first process. When that one reaps orphans they are no one's to
@@ -284,6 +286,7 @@ impl Process {
         let (ppid, exit_signal) = (self.p.ppid, self.p.exit_signal);
         if let Some(q) = self.proc_mut(ppid) {
             q.child_maxrss = q.child_maxrss.max(peak_kb);
+            q.child_cpu = q.child_cpu.saturating_add(used);
         }
         if self.p.orphan || self.proc_ref(ppid).is_some_and(|q| q.sig.children_vanish()) {
             self.p.reap = true;
@@ -674,6 +677,10 @@ impl Process {
             groups: self.p.groups.clone(),
             aio: BTreeMap::new(),
             child_maxrss: 0,
+            child_cpu: 0,
+            started: self.now_ns(1),
+            environ: self.p.environ.clone(),
+            auxv: self.p.auxv.clone(),
         };
         self.procs.insert(id, child);
         self.threads.push(Thread {
