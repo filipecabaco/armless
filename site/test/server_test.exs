@@ -22,6 +22,7 @@ end
 
 content = %{
   version: "9.9.9",
+  build: "0123456789ab",
   demo?: true,
   embed: "&lt;script&gt;",
   pages: [page.("index", "Overview"), page.("design", "Design notes")],
@@ -78,12 +79,16 @@ defmodule SiteServerTest do
   test "a page links from the site's root, so it reads the same with or without a trailing slash" do
     list = get("/examples").resp_body
     assert list =~ ~s(href="/examples/one")
-    assert list =~ ~s(href="/style.css")
+    assert list =~ ~s(href="/style.css?v=0123456789ab")
     refute list =~ ~r/(href|src)="(?!\/|#|https?:)/
 
     ex = get("/examples/one").resp_body
     assert ex =~ ~s(href="/examples/two")
-    assert ex =~ ~s(src="/race.js")
+    # The build on every script a page loads: machine.js puts it on the files it fetches, so a
+    # deploy changes every URL and no cache serves the one before
+    assert ex =~ ~s(src="/race.js?v=0123456789ab")
+    assert ex =~ ~s(src="/machine.js?v=0123456789ab")
+    assert ex =~ ~s(src="/site.js?v=0123456789ab")
     assert ex =~ ~s(data-machine="race")
     refute ex =~ ~r/(href|src)="(?!\/|#|https?:)/
 

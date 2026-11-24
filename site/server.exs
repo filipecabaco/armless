@@ -168,7 +168,11 @@ defmodule Site do
 
   defp not_found(conn), do: html(conn, 404, Templates.not_found(repo: @repo))
 
-  defp common(c), do: [version: c.version, repo: @repo, site: @site]
+  defp common(c), do: [version: c.version, v: version_query(c), repo: @repo, site: @site]
+
+  # ?v=<build> on the scripts and styles a page loads (a build without the id has none)
+  defp version_query(%{build: build}) when is_binary(build) and build != "", do: "?v=" <> build
+  defp version_query(_), do: ""
 
   defp machine(demo?, name, pane, caption, side) do
     Templates.machine(
