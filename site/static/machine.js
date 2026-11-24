@@ -26,7 +26,14 @@
 // page at any depth finds demo/, cpus.js and sw.js.
 (() => {
   const BASE = new URL(".", document.currentScript.src);
-  const at = (path) => new URL(path, BASE).href;
+  // The deploy this page is from (?v= on this script): every file asked for carries it, so no
+  // cache hands a page a file of the deploy before. (A directory, a base for others, doesn't.)
+  const V = new URL(document.currentScript.src).searchParams.get("v");
+  const at = (path) => {
+    const url = new URL(path, BASE);
+    if (V && !path.endsWith("/")) url.searchParams.set("v", V);
+    return url.href;
+  };
   const MIB = 1048576;
   const WINDOW_S = 120;
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -55,7 +62,7 @@
       if (crossOriginIsolated) { sessionStorage.removeItem(key); return true; }
       if (!("serviceWorker" in navigator) || !isSecureContext || sessionStorage.getItem(key)) return false;
       try {
-        await navigator.serviceWorker.register(at("sw.js"));
+        await navigator.serviceWorker.register(new URL("sw.js", BASE).href);
         await navigator.serviceWorker.ready;
         sessionStorage.setItem(key, "1");
         location.reload();
@@ -129,9 +136,14 @@
       if (cores) text("m-cores", `of ${cores} core${cores > 1 ? "s" : ""} on this device`);
 
       const css = getComputedStyle(document.documentElement);
+      // The console's font, loaded before the terminal measures its cells: measured with the
+      // fallback, a row is shorter than Space Mono's, so the terminal fits a row too many, tells
+      // the guest so, and a program that fills it scrolls its top line away once the font comes
+      const fontSize = opts.fontSize ?? 13;
+      await Promise.race([document.fonts?.load(`${fontSize}px "Space Mono"`).catch(() => {}), sleep(3000)]);
       const term = new Terminal({
         fontFamily: '"Space Mono", ui-monospace, monospace',
-        fontSize: opts.fontSize ?? 13,
+        fontSize,
         cursorBlink: !reduced,
         scrollback: 2000,
         theme: {

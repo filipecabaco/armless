@@ -89,6 +89,7 @@ defmodule Site.Build do
 
     %{
       version: version(Path.join(root, "Cargo.toml")),
+      build: build_id(Path.join(__DIR__, "static")),
       demo?: File.exists?(Path.join([__DIR__, "static", "demo", "config.json"])),
       embed: embed(readme),
       pages: pages,
@@ -96,7 +97,23 @@ defmodule Site.Build do
     }
   end
 
+  # What this build serves, as a short hash of every file under static/ (demo/ included): the
+  # pages ask for their scripts with ?v= it, and machine.js for its files, so a deploy changes
+  # each URL and no cache (Cloudflare keeps scripts hours) serves the one before
+  defp build_id(dir) do
+    Path.wildcard(Path.join(dir, "**/*"), match_dot: false)
+    |> Enum.filter(&File.regular?/1)
+    |> Enum.sort()
+    |> Enum.reduce(:crypto.hash_init(:sha256), fn f, h ->
+      h |> :crypto.hash_update(Path.relative_to(f, dir)) |> :crypto.hash_update(File.read!(f))
+    end)
+    |> :crypto.hash_final()
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 12)
+  end
+
   # ---- examples ------------------------------------------------------------
+
 
   @example_keys ~w(title description script pane caption)
 

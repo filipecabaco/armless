@@ -11,7 +11,14 @@
 // same line into both.
 (() => {
   const BASE = new URL(".", document.currentScript.src);
-  const at = (path) => new URL(path, BASE).href;
+  // The deploy this page is from (?v= on this script): every file asked for carries it, so no
+  // cache hands a page a file of the deploy before. (A directory, a base for others, doesn't.)
+  const V = new URL(document.currentScript.src).searchParams.get("v");
+  const at = (path) => {
+    const url = new URL(path, BASE);
+    if (V && !path.endsWith("/")) url.searchParams.set("v", V);
+    return url.href;
+  };
   const page = document.querySelector('[data-machine="race"]');
   const second = document.querySelector('[data-machine="race-b"]');
   const race = page.querySelector("[data-race]");
