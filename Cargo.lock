@@ -102,7 +102,7 @@ checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
 name = "armless"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "aes-gcm",
  "armless-gpu",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "armless-gpu"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "pollster",
  "wgpu",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "armless-user"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "armless",
  "armless-gpu",

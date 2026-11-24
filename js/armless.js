@@ -375,6 +375,12 @@
   // the page's own fetch() and WebSocket.
 
   const HTTP_SKIP = /^(content-encoding|content-length|transfer-encoding|keep-alive|connection)$/i;
+  // How a request for a range goes: past the browser's HTTP cache, to the server. Chrome answers a
+  // range from a cached response the server compressed by the compressed bytes' length
+  // (Content-Range: bytes 0-0/3743 for a file of 11343) and hands back the decoded body, so a
+  // client sizing a download by it (Ollama) wrote only the first 3743 bytes. A server doesn't
+  // compress the range it sends, so its answer is in the body's own bytes.
+  const RANGE_CACHE = "no-store";
 
   function web_options(network) {
     const o = typeof network === "object" && network ? network : {};
@@ -1521,16 +1527,15 @@
       this._with_bytes(utf8.encode(s), (p, n) => this._call(name, id, ...rest, p, n));
     }
 
-    /** One of the guest's HTTP(S) requests, made with fetch(). */
     // The length of what's at a URL, from a request for its first byte (Content-Range: bytes 0-0/N),
-    // or null when the server doesn't say
+    // or null when the server doesn't say. Asked of the server, not the browser's cache (RANGE_CACHE)
     async _http_length(url, headers, w) {
       const h = new Headers(headers);
       h.set("range", "bytes=0-0");
       try {
         const r = await this._web_options.fetch(url, {
           method: "GET", headers: h, signal: w.abort?.signal,
-          credentials: "omit", referrerPolicy: "no-referrer", redirect: "follow",
+          credentials: "omit", referrerPolicy: "no-referrer", redirect: "follow", cache: RANGE_CACHE,
         });
         const total = r.status === 206 ? /\/(\d+)\s*$/.exec(r.headers.get("content-range") || "")?.[1] : null;
         r.body?.cancel().catch(() => {});
@@ -1540,6 +1545,7 @@
       }
     }
 
+    /** One of the guest's HTTP(S) requests, made with fetch(). */
     async _http(id, method, url, headers, body) {
       const o = this._web_options;
       const w = { abort: typeof AbortController === "function" ? new AbortController() : null };
@@ -1574,6 +1580,8 @@
           // Where fetch() hands back redirects (not in a browser, which hides them), they go to
           // the guest, whose next request is checked as this one was
           redirect: SERVER_SIDE ? "manual" : "follow",
+          // A range of the server's bytes, not the browser's cache's (RANGE_CACHE)
+          ...(h.has("range") ? { cache: RANGE_CACHE } : {}),
         });
       } catch (err) {
         return fail(`the browser could not fetch ${target} (the server must allow CORS): ${err}`);
