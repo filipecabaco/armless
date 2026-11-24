@@ -13,13 +13,25 @@
 //! guaranteed to be zero, so a large RAM costs nothing to set up (zeroing it
 //! through the allocator took ~0.5 ms per MiB). Grown memory cannot be given
 //! back, so dropping such a buffer leaks it; the wasm build creates one CPU.
+//!
+//! Addresses here are physical addresses. RAM past `board::LOW_RAM_MAX` is above 4 GiB
+//! (`board::HIGH_RAM_BASE`), so RAM has a hole, the MMIO one, when there is that much of it;
+//! on the host it is one buffer as long as RAM's end, whose part under the hole nothing touches
+//! (it costs no memory: it is never written).
 
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
+use crate::board;
+
 pub struct Ram {
     ptr: *mut u8,
-    len: usize,
+    /// Bytes of RAM, below and above the hole.
+    len: u64,
+    /// Bytes of RAM below 4 GiB (all of it on a machine of at most `board::LOW_RAM_MAX`).
+    low: u64,
+    /// One past RAM's last address.
+    end: u64,
     /// What the global allocator returned, to free it with (none for memory.grow and aliases).
     alloc: Option<(*mut u8, std::alloc::Layout)>,
     /// A mapping of `len` bytes to unmap when this is dropped (`from_image`; aliases have none).
@@ -36,6 +48,22 @@ pub struct Ram {
 
 pub const PAGE: usize = 4096;
 
+/// A RAM page's physical address as the CPU's fast tables keep it, in a u32 (the JIT reads 4-byte
+/// entries): its low 32 bits, and its 4 GiB bank (`page >> 32`) in the low 12 bits, which a page's
+/// address leaves zero. Pages below 4 GiB keep their address as it is.
+#[inline(always)]
+pub const fn fast_base(page: u64) -> u32 {
+    page as u32 | (page >> 32) as u32
+}
+
+/// The physical address a fast table entry (`fast_base`) stands for.
+#[inline(always)]
+pub const fn fast_page(base: u32) -> u64 {
+    ((base & 0xfff) as u64) << 32 | (base & !0xfff) as u64
+}
+
+const _: () = assert!(board::RAM_MAX <= 0xfff << 32);
+
 // SAFETY: a Ram is a pointer and a length to memory that lives as long as its owner (aliases are
 // held by things that keep the owner, the machine, alive); every access is a bounds-checked
 // copy, a load or store of one width, or an atomic, so sharing it between threads is what
@@ -45,20 +73,36 @@ unsafe impl Send for Ram {}
 unsafe impl Sync for Ram {}
 
 impl Ram {
-    pub fn zeroed(len: usize) -> Ram {
+    fn at(ptr: *mut u8, len: u64) -> Ram {
+        Ram {
+            ptr,
+            len,
+            low: board::ram_low(len),
+            end: board::ram_end(len),
+            alloc: None,
+            mapped: false,
+            image: false,
+            fresh: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// The host bytes RAM of `len` bytes takes: up to its end, hole included.
+    fn span(len: u64) -> usize {
+        usize::try_from(board::ram_end(len)).expect("RAM larger than the host's address space")
+    }
+
+    pub fn zeroed(len: u64) -> Ram {
         #[cfg(target_arch = "wasm32")]
         {
-            let pages = len.div_ceil(65536).max(1);
+            // Only RAM below 4 GiB lives in this module's memory; the host made the rest's
+            assert!(
+                crate::banks::call::banks() >= crate::banks::needed(len),
+                "RAM above 4 GiB, and no memories for it"
+            );
+            let pages = (board::ram_low(len) as usize).div_ceil(65536).max(1);
             let old = core::arch::wasm32::memory_grow(0, pages);
             if old != usize::MAX {
-                return Ram {
-                    ptr: (old * 65536) as *mut u8,
-                    len,
-                    alloc: None,
-                    mapped: false,
-                    image: false,
-                    fresh: Arc::new(AtomicBool::new(true)),
-                };
+                return Ram::at((old * 65536) as *mut u8, len);
             }
         }
         // Page-aligned, so naturally aligned guest addresses are aligned on the
@@ -67,19 +111,15 @@ impl Ram {
         // all of RAM up front. With its own alignment a zeroed allocation this
         // size is calloc's fresh zero pages, which cost nothing until the guest
         // touches them; one page more leaves room to align by hand.
-        let layout = std::alloc::Layout::from_size_align(len.max(1) + PAGE, 8).expect("RAM size");
+        let layout =
+            std::alloc::Layout::from_size_align(Self::span(len).max(1) + PAGE, 8).expect("RAM size");
         // SAFETY: the layout's size is at least one page, never zero.
         let raw = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!raw.is_null(), "out of memory allocating guest RAM");
-        Ram {
-            // At most PAGE - 1 bytes in: the allocation has PAGE bytes to spare.
-            ptr: raw.wrapping_add(raw.align_offset(PAGE)),
-            len,
-            alloc: Some((raw, layout)),
-            mapped: false,
-            image: false,
-            fresh: Arc::new(AtomicBool::new(true)),
-        }
+        // At most PAGE - 1 bytes in: the allocation has PAGE bytes to spare.
+        let mut ram = Ram::at(raw.wrapping_add(raw.align_offset(PAGE)), len);
+        ram.alloc = Some((raw, layout));
+        ram
     }
 
     /// RAM on a private anonymous mapping of its own: every page reads as zero and is backed on
@@ -87,7 +127,7 @@ impl Ram {
     /// `discard` can always map fresh pages over a range, macOS included, since no allocator owns
     /// it.
     #[cfg(unix)]
-    pub fn mapped(len: usize) -> std::io::Result<Ram> {
+    pub fn mapped(len: u64) -> std::io::Result<Ram> {
         if len == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "RAM of 0 bytes"));
         }
@@ -96,7 +136,7 @@ impl Ram {
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                len,
+                Self::span(len),
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
                 -1,
@@ -106,18 +146,14 @@ impl Ram {
         if ptr == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Ram {
-            ptr: ptr.cast(),
-            len,
-            alloc: None,
-            mapped: true,
-            image: false,
-            fresh: Arc::new(AtomicBool::new(true)),
-        })
+        let mut ram = Ram::at(ptr.cast(), len);
+        ram.mapped = true;
+        Ok(ram)
     }
 
-    /// RAM whose pages are an image's: `file` holds RAM as it is, `len` bytes, with holes where it
-    /// is zero (`split_state` writes one). It is mapped copy-on-write, private to this RAM:
+    /// RAM whose pages are an image's: `file` holds RAM as it is, `len` bytes laid out by physical
+    /// address (`end()` bytes: the hole under the MMIO window too, if RAM goes past it), with
+    /// holes where it is zero (`split_state` writes one). It is mapped copy-on-write, private to this RAM:
     /// machines made from one image share the pages none of them writes (the host's page cache),
     /// a page a machine writes becomes its own, and nothing is ever written to the file.
     ///
@@ -130,21 +166,21 @@ impl Ram {
     /// than write to it. A file cut shorter than RAM would crash the machine at the first touch of
     /// a page past its end.
     #[cfg(unix)]
-    pub fn from_image(file: &std::fs::File, len: usize) -> std::io::Result<Ram> {
+    pub fn from_image(file: &std::fs::File, len: u64) -> std::io::Result<Ram> {
         use std::os::fd::AsRawFd;
         let size = file.metadata()?.len();
-        if size != len as u64 || len == 0 {
+        if size != board::ram_end(len) || len == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("the RAM image is {size} bytes, RAM {len}"),
             ));
         }
-        // SAFETY: a new mapping, at an address the kernel picks, of the whole file (it is `len`
-        // long); nothing else owns that range, and `drop` unmaps it once.
+        // SAFETY: a new mapping, at an address the kernel picks, of the whole file (it is RAM's
+        // span long); nothing else owns that range, and `drop` unmaps it once.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                len,
+                Self::span(len),
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE,
                 file.as_raw_fd(),
@@ -154,14 +190,11 @@ impl Ram {
         if ptr == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Ram {
-            ptr: ptr.cast(),
-            len,
-            alloc: None,
-            mapped: true,
-            image: true,
-            fresh: Arc::new(AtomicBool::new(false)),
-        })
+        let mut ram = Ram::at(ptr.cast(), len);
+        ram.mapped = true;
+        ram.image = true;
+        ram.fresh = Arc::new(AtomicBool::new(false));
+        Ok(ram)
     }
 
     /// Whether the pages came from an image (`from_image`).
@@ -175,6 +208,8 @@ impl Ram {
         Ram {
             ptr: self.ptr,
             len: self.len,
+            low: self.low,
+            end: self.end,
             alloc: None,
             mapped: false,
             image: self.image,
@@ -196,12 +231,24 @@ impl Ram {
         self.fresh.swap(false, Ordering::SeqCst)
     }
 
-    pub fn len(&self) -> usize {
+    /// Bytes of RAM (the hole, if any, is not RAM).
+    pub fn len(&self) -> u64 {
         self.len
     }
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// One past RAM's last physical address.
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// Where RAM is: (start, bytes) of each of its regions, below 4 GiB and above.
+    pub fn regions(&self) -> impl Iterator<Item = (u64, u64)> {
+        let high = self.len - self.low;
+        [(0, self.low), (board::HIGH_RAM_BASE, high)].into_iter().filter(|r| r.1 != 0)
     }
 
     /// Where RAM starts, for code that addresses it itself: JIT-compiled blocks (which only
@@ -210,40 +257,93 @@ impl Ram {
         self.ptr
     }
 
+    /// Whether the `n` bytes at `at` are all RAM (in one of its regions).
     #[inline(always)]
-    fn holds(&self, at: usize, n: usize) -> bool {
-        at.checked_add(n).is_some_and(|end| end <= self.len)
+    pub fn holds(&self, at: u64, n: u64) -> bool {
+        at.checked_add(n)
+            .is_some_and(|end| end <= self.low || (at >= board::HIGH_RAM_BASE && end <= self.end))
+    }
+
+    /// Where the byte at `at` (which `holds`) is on the host: below 4 GiB, or anywhere natively.
+    #[inline(always)]
+    fn host(&self, at: u64) -> *mut u8 {
+        self.ptr.wrapping_add(at as usize)
+    }
+
+    /// In a browser, the bank and offset of `at` if it is above 4 GiB, in another memory than
+    /// this module's (`crate::banks`). Never natively, where RAM is one buffer.
+    #[inline(always)]
+    fn banked(at: u64) -> Option<(u32, u32)> {
+        if cfg!(target_arch = "wasm32") && at >= board::HIGH_RAM_BASE {
+            Some(((at >> 32) as u32, at as u32))
+        } else {
+            None
+        }
+    }
+
+    /// `f(bank, offset, done, len)` for each piece of the `n` bytes at `at` (which `banked` says
+    /// are above 4 GiB) within one bank: `done` bytes of the range come before it.
+    #[cfg(target_arch = "wasm32")]
+    fn each_bank(at: u64, n: u64, mut f: impl FnMut(u32, u32, usize, u32)) {
+        let mut done = 0;
+        while done < n {
+            let a = at + done;
+            let len = (n - done).min((1 << 32) - (a & 0xffff_ffff));
+            f((a >> 32) as u32, a as u32, done as usize, len as u32);
+            done += len;
+        }
     }
 
     /// Copy RAM at `at` into `buf`. False, and nothing copied, if that is not all RAM.
-    pub fn read(&self, at: usize, buf: &mut [u8]) -> bool {
-        if !self.holds(at, buf.len()) {
+    pub fn read(&self, at: u64, buf: &mut [u8]) -> bool {
+        if !self.holds(at, buf.len() as u64) {
             return false;
         }
+        #[cfg(target_arch = "wasm32")]
+        if Self::banked(at).is_some() {
+            let to = buf.as_mut_ptr();
+            Self::each_bank(at, buf.len() as u64, |b, o, done, len| {
+                crate::banks::call::copy_out(b, o, to.wrapping_add(done), len)
+            });
+            return true;
+        }
         // SAFETY: in bounds (above); `buf` is the caller's own memory, so they don't overlap.
-        unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(at), buf.as_mut_ptr(), buf.len()) };
+        unsafe { std::ptr::copy_nonoverlapping(self.host(at), buf.as_mut_ptr(), buf.len()) };
         true
     }
 
     /// Copy `data` into RAM at `at`. False, and nothing written, if that is not all RAM.
-    pub fn write(&self, at: usize, data: &[u8]) -> bool {
-        if !self.holds(at, data.len()) {
+    pub fn write(&self, at: u64, data: &[u8]) -> bool {
+        if !self.holds(at, data.len() as u64) {
             return false;
         }
         self.mark_written();
+        #[cfg(target_arch = "wasm32")]
+        if Self::banked(at).is_some() {
+            let from = data.as_ptr();
+            Self::each_bank(at, data.len() as u64, |b, o, done, len| {
+                crate::banks::call::copy_in(b, o, from.wrapping_add(done), len)
+            });
+            return true;
+        }
         // SAFETY: as in `read`.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(at), data.len()) };
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.host(at), data.len()) };
         true
     }
 
     /// Zero `n` bytes at `at`. False, and nothing written, if that is not all RAM.
-    pub fn zero(&self, at: usize, n: usize) -> bool {
+    pub fn zero(&self, at: u64, n: u64) -> bool {
         if !self.holds(at, n) {
             return false;
         }
         self.mark_written();
+        #[cfg(target_arch = "wasm32")]
+        if Self::banked(at).is_some() {
+            Self::each_bank(at, n, |b, o, _, len| crate::banks::call::fill_zero(b, o, len));
+            return true;
+        }
         // SAFETY: in bounds.
-        unsafe { std::ptr::write_bytes(self.ptr.add(at), 0, n) };
+        unsafe { std::ptr::write_bytes(self.host(at), 0, n as usize) };
         true
     }
 
@@ -259,7 +359,7 @@ impl Ram {
     ///
     /// Nothing here drops what a CPU decoded or compiled from the range: discard data, not code
     /// a CPU may still run.
-    pub fn discard(&self, at: usize, n: usize) -> bool {
+    pub fn discard(&self, at: u64, n: u64) -> bool {
         if !self.holds(at, n) {
             return false;
         }
@@ -268,7 +368,7 @@ impl Ram {
             // SAFETY: sysconf has no preconditions.
             let host =
                 unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(PAGE as libc::c_long) as usize;
-            let (start, end) = (self.ptr as usize + at, self.ptr as usize + at + n);
+            let (start, end) = (self.host(at) as usize, self.host(at) as usize + n as usize);
             let (hs, he) = (start.next_multiple_of(host), end / host * host);
             if hs < he {
                 // SAFETY: [hs, he) is whole host pages inside RAM (`holds`, above). MAP_FIXED
@@ -287,8 +387,8 @@ impl Ram {
                     )
                 };
                 if r as usize == hs {
-                    self.zero(at, hs - start);
-                    self.zero(he - self.ptr as usize, end - he);
+                    self.zero(at, (hs - start) as u64);
+                    self.zero(at + (he - start) as u64, (end - he) as u64);
                     self.mark_written();
                     return true;
                 }
@@ -299,13 +399,21 @@ impl Ram {
 
     /// Whether the `n` bytes at `at` are all zero (and RAM). Reading a page the guest never
     /// touched does not commit it (the host maps its zero page).
-    pub fn is_zero(&self, at: usize, n: usize) -> bool {
+    pub fn is_zero(&self, at: u64, n: u64) -> bool {
         if !self.holds(at, n) {
             return false;
         }
+        if Self::banked(at).is_some() {
+            // Through a copy, a page at a time
+            let mut page = [0u8; PAGE];
+            return (0..n).step_by(PAGE).all(|i| {
+                let k = (n - i).min(PAGE as u64) as usize;
+                self.read(at + i, &mut page[..k]) && page[..k].iter().all(|&b| b == 0)
+            });
+        }
+        let n = n as usize;
         let words = n / 8;
-        // In bounds (above), so `add` would do; `wrapping_add` needs no promise
-        let p = self.ptr.wrapping_add(at);
+        let p = self.host(at);
         // SAFETY: words i < n / 8 lie within the n bytes at `p` (in bounds, above); unaligned
         // reads (`at` is usually a page)
         (0..words).all(|i| unsafe { (p as *const u64).add(i).read_unaligned() } == 0)
@@ -313,19 +421,21 @@ impl Ram {
             && (words * 8..n).all(|i| unsafe { *p.add(i) } == 0)
     }
 
-    /// A copy of all of RAM.
+    /// A copy of all of RAM's span, by physical address (the hole, if any, reads as zeros).
     pub fn to_vec(&self) -> Vec<u8> {
-        let mut v = vec![0; self.len];
-        self.read(0, &mut v);
+        let mut v = vec![0; self.end as usize];
+        for (at, n) in self.regions() {
+            self.read(at, &mut v[at as usize..(at + n) as usize]);
+        }
         v
     }
 
     /// `size` (1, 2, 4 or 8) bytes at `at`, little-endian, at any alignment. Callers have checked
-    /// that the access is RAM (a page the fast tables map, or a range compared with the RAM
-    /// size); one that isn't reads 0.
+    /// that the access is RAM (a page the fast tables map, or a range `holds`); one that isn't
+    /// reads 0.
     #[inline(always)]
-    pub fn load(&self, at: usize, size: u32) -> u64 {
-        if !self.holds(at, size as usize) {
+    pub fn load(&self, at: u64, size: u32) -> u64 {
+        if !self.holds(at, size as u64) {
             debug_assert!(false, "load of {size} at {at:#x} outside RAM");
             return 0;
         }
@@ -337,17 +447,18 @@ impl Ram {
     ///
     /// # Safety
     ///
-    /// The `size` bytes at `at` must lie in RAM (`at + size <= len`).
+    /// The `size` bytes at `at` must lie in RAM (`holds`).
     #[inline(always)]
-    pub unsafe fn load_in_page(&self, at: usize, size: u32) -> u64 {
-        debug_assert!(
-            self.holds(at, size as usize),
-            "load of {size} at {at:#x} outside RAM"
-        );
+    pub unsafe fn load_in_page(&self, at: u64, size: u32) -> u64 {
+        debug_assert!(self.holds(at, size as u64), "load of {size} at {at:#x} outside RAM");
+        #[cfg(target_arch = "wasm32")]
+        if let Some((b, o)) = Self::banked(at) {
+            return crate::banks::call::load(b, o, size);
+        }
         // SAFETY: in bounds (the caller's promise); guest accesses need not be aligned, hence
         // read_unaligned.
         unsafe {
-            let p = self.ptr.add(at);
+            let p = self.host(at);
             match size {
                 1 => *p as u64,
                 2 => u16::from_le((p as *const u16).read_unaligned()) as u64,
@@ -360,8 +471,8 @@ impl Ram {
     /// Store the low `size` (1, 2, 4 or 8) bytes of `value` at `at`; see `load`. One outside RAM
     /// is dropped.
     #[inline(always)]
-    pub fn store(&self, at: usize, size: u32, value: u64) {
-        if !self.holds(at, size as usize) {
+    pub fn store(&self, at: u64, size: u32, value: u64) {
+        if !self.holds(at, size as u64) {
             debug_assert!(false, "store of {size} at {at:#x} outside RAM");
             return;
         }
@@ -375,22 +486,23 @@ impl Ram {
     ///
     /// # Safety
     ///
-    /// The `size` bytes at `at` must lie in RAM (`at + size <= len`), and `mark_written` must
-    /// have been called on this RAM (or an alias of it) before this call: the CPU does so when it
-    /// fills the fast write entry the store goes through, and `fresh` never becomes true again.
+    /// The `size` bytes at `at` must lie in RAM (`holds`), and `mark_written` must have been
+    /// called on this RAM (or an alias of it) before this call: the CPU does so when it fills the
+    /// fast write entry the store goes through, and `fresh` never becomes true again.
     #[inline(always)]
-    pub unsafe fn store_in_page(&self, at: usize, size: u32, value: u64) {
-        debug_assert!(
-            self.holds(at, size as usize),
-            "store of {size} at {at:#x} outside RAM"
-        );
+    pub unsafe fn store_in_page(&self, at: u64, size: u32, value: u64) {
+        debug_assert!(self.holds(at, size as u64), "store of {size} at {at:#x} outside RAM");
         debug_assert!(
             !self.fresh.load(Ordering::Relaxed),
             "store before RAM was marked written"
         );
+        #[cfg(target_arch = "wasm32")]
+        if let Some((b, o)) = Self::banked(at) {
+            return crate::banks::call::store(b, o, size, value);
+        }
         // SAFETY: in bounds (the caller's promise).
         unsafe {
-            let p = self.ptr.add(at);
+            let p = self.host(at);
             match size {
                 1 => *p = value as u8,
                 2 => (p as *mut u16).write_unaligned((value as u16).to_le()),
@@ -403,17 +515,21 @@ impl Ram {
     /// The atomic at `at` (naturally aligned, in RAM), or None.
     #[inline(always)]
     fn atomic<T>(&self, at: u64, size: u32, f: impl FnOnce(*mut u8) -> T) -> Option<T> {
-        let at = usize::try_from(at).ok()?;
-        if !at.is_multiple_of(size as usize) || !self.holds(at, size as usize) {
+        if !at.is_multiple_of(size as u64) || !self.holds(at, size as u64) {
             return None;
         }
-        // SAFETY: in bounds. RAM is page-aligned on the host, so a naturally aligned guest
-        // address is aligned for an atomic of its size too.
-        Some(f(unsafe { self.ptr.add(at) }))
+        // RAM is page-aligned on the host, so a naturally aligned guest address is aligned for an
+        // atomic of its size too.
+        Some(f(self.host(at)))
     }
 
     /// Atomic load of `size` bytes at a naturally aligned `at`. None if not aligned or not RAM.
     pub fn load_atomic(&self, at: u64, size: u32) -> Option<u64> {
+        #[cfg(target_arch = "wasm32")]
+        if let Some((b, o)) = Self::banked(at) {
+            let ok = at.is_multiple_of(size as u64) && self.holds(at, size as u64);
+            return ok.then(|| crate::banks::call::atomic_load(b, o, size));
+        }
         let o = Ordering::SeqCst;
         // SAFETY: `atomic` hands over an aligned pointer into RAM, which lives as long as `self`.
         self.atomic(at, size, |p| unsafe {
@@ -429,8 +545,17 @@ impl Ram {
     /// Atomic compare-and-swap of `size` bytes at a naturally aligned `at`: whether `new` was
     /// stored. None if not aligned or not RAM.
     pub fn cmpxchg(&self, at: u64, size: u32, expected: u64, new: u64) -> Option<bool> {
-        let o = Ordering::SeqCst;
         self.mark_written();
+        #[cfg(target_arch = "wasm32")]
+        if let Some((b, o)) = Self::banked(at) {
+            if !at.is_multiple_of(size as u64) || !self.holds(at, size as u64) {
+                return None;
+            }
+            let mask = if size == 8 { u64::MAX } else { (1 << (8 * size)) - 1 };
+            let old = crate::banks::call::cmpxchg(b, o, size, expected & mask, new & mask);
+            return Some(old == expected & mask);
+        }
+        let o = Ordering::SeqCst;
         // SAFETY: as in `load_atomic`.
         self.atomic(at, size, |p| unsafe {
             match size {
@@ -460,19 +585,20 @@ impl Drop for Ram {
         #[cfg(unix)]
         if self.mapped {
             // SAFETY: the mapping `mapped` or `from_image` made, unmapped once (aliases have none).
-            unsafe { libc::munmap(self.ptr.cast(), self.len) };
+            unsafe { libc::munmap(self.ptr.cast(), board::ram_end(self.len) as usize) };
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Ram, PAGE};
+    use super::Ram;
+    const PAGE: u64 = super::PAGE as u64;
 
     #[test]
     fn ram_is_page_aligned_zero_and_writable() {
         let ram = Ram::zeroed(64 << 20);
-        assert_eq!(ram.as_ptr() as usize % PAGE, 0);
+        assert_eq!(ram.as_ptr() as u64 % PAGE, 0);
         assert_eq!(ram.len(), 64 << 20);
         assert!(ram.is_zero(0, ram.len()));
         ram.store(0, 1, 1);
@@ -490,13 +616,13 @@ mod tests {
         assert!(!ram.read(end - 4, &mut buf));
         assert_eq!(buf, [7; 8], "nothing copied");
         assert!(!ram.write(end - 4, &buf));
-        assert!(!ram.write(usize::MAX, &buf), "no wrap-around");
+        assert!(!ram.write(u64::MAX, &buf), "no wrap-around");
         assert!(!ram.zero(end, 1));
         assert!(ram.zero(end, 0));
         assert!(ram.is_zero(0, end));
-        assert_eq!(ram.load_atomic(end as u64, 4), None);
+        assert_eq!(ram.load_atomic(end, 4), None);
         assert_eq!(ram.load_atomic(u64::MAX - 3, 4), None);
-        assert_eq!(ram.cmpxchg(end as u64 - 8, 8, 0, 1), Some(true));
+        assert_eq!(ram.cmpxchg(end - 8, 8, 0, 1), Some(true));
         assert_eq!(ram.load(end - 8, 8), 1);
     }
 
@@ -519,7 +645,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn image(len: usize, pages: &[(usize, u8)]) -> std::fs::File {
+    fn image(len: u64, pages: &[(usize, u8)]) -> std::fs::File {
         use std::os::unix::fs::FileExt;
         // Tests run in parallel, several with the same length: a path of its own for each call,
         // or one would remove the file another just made
@@ -535,9 +661,9 @@ mod tests {
             .open(&path)
             .unwrap();
         std::fs::remove_file(&path).unwrap();
-        f.set_len(len as u64).unwrap();
+        f.set_len(len).unwrap();
         for &(page, b) in pages {
-            f.write_all_at(&[b; PAGE], (page * PAGE) as u64).unwrap();
+            f.write_all_at(&[b; super::PAGE], page as u64 * PAGE).unwrap();
         }
         f
     }
@@ -559,9 +685,9 @@ mod tests {
         assert_eq!((a.load(2 * PAGE, 1), a.load(7 * PAGE, 1)), (0xaa, 0x77));
         assert_eq!((b.load(2 * PAGE, 1), b.load(7 * PAGE, 1)), (0x22, 0));
         let mut on_disk = [0u8; 1];
-        std::os::unix::fs::FileExt::read_exact_at(&f, &mut on_disk, (2 * PAGE) as u64).unwrap();
+        std::os::unix::fs::FileExt::read_exact_at(&f, &mut on_disk, 2 * PAGE).unwrap();
         assert_eq!(on_disk, [0x22]);
-        assert_eq!(a.cmpxchg((5 * PAGE) as u64, 4, 0x5555_5555, 1), Some(true));
+        assert_eq!(a.cmpxchg(5 * PAGE, 4, 0x5555_5555, 1), Some(true));
         assert_eq!(b.load(5 * PAGE, 4), 0x5555_5555);
     }
 
@@ -609,8 +735,8 @@ mod tests {
         // kinds of RAM: the allocator's, and a mapping
         let check = |ram: Ram| {
             for i in 0..64 {
-                ram.store(i * PAGE, 8, 0x1111 + i as u64);
-                ram.store(i * PAGE + PAGE - 8, 8, 0x2222 + i as u64);
+                ram.store(i * PAGE, 8, 0x1111 + i);
+                ram.store(i * PAGE + PAGE - 8, 8, 0x2222 + i);
             }
             assert!(ram.discard(3 * PAGE, 40 * PAGE));
             for i in 0..64 {
@@ -620,7 +746,7 @@ mod tests {
                 if kept {
                     assert_eq!(
                         (head, tail),
-                        (0x1111 + i as u64, 0x2222 + i as u64),
+                        (0x1111 + i, 0x2222 + i),
                         "page {i}"
                     );
                 }
@@ -643,12 +769,50 @@ mod tests {
     #[test]
     fn mapped_ram_is_zero_fresh_and_no_image() {
         let ram = Ram::mapped(64 << 20).unwrap();
-        assert_eq!(ram.as_ptr() as usize % PAGE, 0);
+        assert_eq!(ram.as_ptr() as u64 % PAGE, 0);
         assert!(!ram.is_image());
         assert!(ram.is_zero(0, ram.len()));
         assert!(ram.take_fresh(), "nothing has written it");
         ram.store(ram.len() - 8, 8, 9);
         assert_eq!(ram.load(ram.len() - 8, 8), 9);
         assert!(Ram::mapped(0).is_err());
+    }
+
+    #[test]
+    fn fast_entries_keep_a_page_and_its_bank() {
+        for page in [0, 0x1000, 0xbfff_f000, 1 << 32, (1 << 32) + 0x7000, (15 << 32) + 0xffff_f000] {
+            assert_eq!(super::fast_page(super::fast_base(page)), page);
+        }
+        assert_eq!(super::fast_base(0xbfff_f000), 0xbfff_f000, "below 4 GiB, the address itself");
+        assert_eq!(super::fast_base((1 << 32) + 0x5000) & 0xfff, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ram_past_3_gib_goes_on_above_4_gib() {
+        use crate::board::{HIGH_RAM_BASE, LOW_RAM_MAX};
+        let ram = Ram::mapped(LOW_RAM_MAX + (8 << 20)).unwrap();
+        assert_eq!(ram.end(), HIGH_RAM_BASE + (8 << 20));
+        assert_eq!(
+            ram.regions().collect::<Vec<_>>(),
+            [(0, LOW_RAM_MAX), (HIGH_RAM_BASE, 8 << 20)]
+        );
+        // RAM on either side of the hole; not the hole, nor a range across it or past the end
+        assert!(ram.holds(LOW_RAM_MAX - 8, 8) && ram.holds(HIGH_RAM_BASE, 8 << 20));
+        assert!(!ram.holds(LOW_RAM_MAX, 1) && !ram.holds(HIGH_RAM_BASE - 1, 1));
+        assert!(!ram.holds(LOW_RAM_MAX - 4, 8) && !ram.holds(ram.end() - 4, 8));
+        assert!(!ram.write(LOW_RAM_MAX, &[1]) && !ram.write(HIGH_RAM_BASE - 1, &[1, 2]));
+
+        let top = HIGH_RAM_BASE + (8 << 20) - PAGE;
+        ram.store(top + 8, 8, 0x1122_3344_5566_7788);
+        assert_eq!(ram.load(top + 8, 8), 0x1122_3344_5566_7788);
+        assert!(ram.write(HIGH_RAM_BASE + 3, b"above"));
+        let mut b = [0u8; 5];
+        assert!(ram.read(HIGH_RAM_BASE + 3, &mut b) && &b == b"above");
+        assert_eq!(ram.cmpxchg(top + 8, 8, 0x1122_3344_5566_7788, 5), Some(true));
+        assert_eq!(ram.load_atomic(top + 8, 8), Some(5));
+        assert!(!ram.is_zero(top, PAGE));
+        assert!(ram.discard(top, PAGE) && ram.is_zero(top, PAGE));
+        assert!(ram.is_zero(HIGH_RAM_BASE + PAGE, PAGE), "untouched");
     }
 }

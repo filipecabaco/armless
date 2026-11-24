@@ -3,13 +3,19 @@
 ## The machine
 
 ```text
-0x0000_0000 .. memory_size   RAM (kernel Image at 0x0020_0000; DTB and initrd at the top)
+0x0000_0000 .. low           RAM, at most 3 GiB (kernel Image at 0x0020_0000; DTB and initrd at its top)
+0x1_0000_0000 ..             the rest of RAM, if there is more than 3 GiB (up to 63 GiB in all)
 0xE000_0000 .. 0xEFFF_FFFF   PCI MMIO window (virtio BARs, 0x10000 per slot)
 0xF000_0000                  GICv2 distributor     0xF001_0000  GICv2 CPU interface
 0xF010_0000                  16550 UART (ttyS0)    0xF011_0000  PL031 RTC
 0xF012_0000                  VM generation ID (16 bytes, SPI 40, edge)
 0xF100_0000 .. +0x10_0000    PCI ECAM, bus 0
 ```
+
+A machine with RAM above 4 GiB has two `memory` ranges in its device tree and tells the guest
+it has 36-bit physical addresses (ID_AA64MMFR0_EL1.PARange); a smaller one keeps one range and
+32 bits, as before. RAM is addressed by physical address throughout (`ram.rs`): natively it is one
+host buffer as long as RAM's end, whose part under the hole is never touched.
 
 Linux boots the arm64 way: the kernel is at a 2 MiB-aligned base, x0 holds the
 device tree, the MMU is off, and everything runs at EL1h. Kernels can be raw `Image`,
@@ -253,6 +259,9 @@ meta: CPUs, GIC, timers, RTC (state.rs), then the devices (UART, PCI functions,
 RAM:  (u32 page, 4096 bytes) for every non-zero page, then u32 0xffffffff
 ```
 
+Pages are numbered by physical address (page 0x100000 is 4 GiB), so a machine with RAM above
+4 GiB has none under the MMIO hole. An image `split_state` writes is laid out the same way.
+
 `StateLoader` streams this, zstd-compressed or not, straight into guest memory.
 Blobs are not saved; the guest's unmodified files are fetched again after a restore.
 Chunked files are a new content kind in the tree, so older armless can't load a snapshot
@@ -279,6 +288,24 @@ writes and frees 200 MiB in a 512 MiB machine: on 2026-11-17 its snapshot was 22
 free page reporting and 59.5 MB with it. It is off by default because the devices are
 part of what a snapshot must be restored onto. A range is zeroed only where it is all RAM, and a
 guest that reports a page it still uses only loses its own data.
+
+## RAM above 4 GiB in the browser
+
+A wasm memory holds 4 GiB, and armless.wasm's holds its own data with the RAM below 4 GiB. RAM
+above 4 GiB is in memories of its own, one for each 4 GiB (bank k for physical addresses
+k × 4 GiB on), which only code written for them can reach: Rust compiles to memory 0 alone. The
+machine makes a small module (`banks.rs`) that imports memory 0 and the banks' memories and
+exports loads, stores, copies to and from memory 0, a fill and the atomics, each taking a bank
+and an offset. armless.js makes the memories, instantiates that module (in the page and in each
+vCPU worker) and puts its functions in the function table after the JIT's slots, where `Ram`
+calls them for any address above 4 GiB.
+
+The CPU's fast tables keep a page above 4 GiB as its low 32 bits with its bank in the 12 bits a
+page address leaves free (`ram::fast_base`). The interpreter's hits go through `Ram` as any
+access does. Compiled blocks address memory 0 alone: on a machine with RAM above 4 GiB they
+check an entry's bank bits as they probe it, and a page above 4 GiB takes the helper path, as a
+miss does. A browser without WebAssembly multi-memory can't compile the module: the machine is
+then refused, as more than it can hold.
 
 ## SMP in the browser
 

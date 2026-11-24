@@ -161,7 +161,7 @@ fn main() {
     }
 
     let config = Config {
-        memory_size: (mem_mb << 20) as usize,
+        memory_size: mem_mb << 20,
         cpus: ncpus,
         devices: DeviceConfig {
             console: true,

@@ -174,7 +174,7 @@ fn a_pair_of_simd_stores_is_stored_whole_or_not_at_all() {
         assert!(c.vwrite_pair(0x40010, scale, v1, v2));
         let got = |c: &Cpu<NoDevices>, a: usize| {
             let mut b = [0u8; 16];
-            c.mem.read(a, &mut b[..size]);
+            c.mem.read(a as u64, &mut b[..size]);
             u128::from_le_bytes(b)
         };
         let mask = if scale == 4 { u128::MAX } else { (1u128 << (8 * size)) - 1 };
@@ -190,7 +190,7 @@ fn the_loop_agrees_with_execute_on_random_instructions() {
     // The data pages only: a copy of all of RAM after each of the 400 000 instructions took minutes
     let data = |c: &Cpu<NoDevices>| {
         let mut v = vec![0; DATA.len()];
-        c.mem.read(DATA.start, &mut v);
+        c.mem.read(DATA.start as u64, &mut v);
         v
     };
     for _ in 0..400 {
@@ -202,14 +202,14 @@ fn the_loop_agrees_with_execute_on_random_instructions() {
         b.sys.cpacr = fpen;
         for i in DATA {
             let v = rng.next() as u8;
-            a.mem.write(i, &[v]);
-            b.mem.write(i, &[v]);
+            a.mem.write(i as u64, &[v]);
+            b.mem.write(i as u64, &[v]);
         }
         for j in 0..1000usize {
             let insn = rng.insn();
             let pc = 0x1000 + 4 * j as u64;
             for c in [&mut a, &mut b] {
-                c.mem.write(pc as usize, &insn.to_le_bytes());
+                c.mem.write(pc, &insn.to_le_bytes());
             }
             // The word was written behind the cache's back: the block decoded from the instruction
             // before this one has the old (zero) word in its place.
@@ -298,7 +298,7 @@ fn the_loop_agrees_with_execute_on_flag_sequences() {
         b.sys.cpacr = 3 << 20;
         for (j, w) in code.iter().enumerate() {
             for c in [&mut a, &mut b] {
-                c.mem.write(0x1000 + 4 * j, &w.to_le_bytes());
+                c.mem.write((0x1000 + 4 * j) as u64, &w.to_le_bytes());
             }
         }
         for round in 0..4 {
@@ -327,7 +327,7 @@ fn the_loop_agrees_with_execute_on_flag_sequences() {
             for _ in 0..budget {
                 let pc = b.pc;
                 let insn =
-                    b.mem.load(pc as usize, 4) as u32;
+                    b.mem.load(pc, 4) as u32;
                 b.next_pc = pc + 4;
                 match b.execute(insn).map(|()| b.next_pc) {
                     Ok(next) => b.pc = next,
@@ -433,7 +433,7 @@ fn the_loop_agrees_with_execute_on_system_sequences() {
         let mut b = Cpu::new(4 << 20, NoDevices);
         for (j, w) in code.iter().enumerate() {
             for c in [&mut a, &mut b] {
-                c.mem.write(0x1000 + 4 * j, &w.to_le_bytes());
+                c.mem.write((0x1000 + 4 * j) as u64, &w.to_le_bytes());
             }
         }
         for round in 0..4 {
@@ -465,7 +465,7 @@ fn the_loop_agrees_with_execute_on_system_sequences() {
             for _ in 0..budget {
                 let pc = b.pc;
                 let insn =
-                    b.mem.load(pc as usize, 4) as u32;
+                    b.mem.load(pc, 4) as u32;
                 b.next_pc = pc + 4;
                 match b.execute(insn).map(|()| b.next_pc) {
                     Ok(next) => b.pc = next,
@@ -560,7 +560,7 @@ const CODE: u64 = 0x10000;
 const PAGES: usize = 4;
 
 fn put<H: Host>(c: &mut Cpu<H>, at: u64, word: u32) {
-    c.mem.write(at as usize, &word.to_le_bytes());
+    c.mem.write(at, &word.to_le_bytes());
 }
 
 /// `B to` at address `from`.
@@ -572,7 +572,7 @@ fn branch(from: u64, to: u64) -> u32 {
 /// MMU is off in the machine, so the pc is the address in memory.
 fn step_ref<H: Host>(b: &mut Cpu<H>) {
     let pc = b.pc;
-    let insn = b.mem.load(pc as usize, 4) as u32;
+    let insn = b.mem.load(pc, 4) as u32;
     b.next_pc = pc + 4;
     match b.execute(insn).map(|()| b.next_pc) {
         Ok(next) => b.pc = next,
@@ -903,7 +903,7 @@ fn compiled_accesses_that_cross_into_a_page_mapped_elsewhere_reach_it() {
         map(c, 0x11, (0x15 << 12) | 0x403);
         for (base, fill) in [(0x10000usize, 0x10u8), (0x11000, 0x77), (0x15000, 0x55)] {
             let bytes: Vec<u8> = (0..0x1000).map(|i| fill ^ (i as u8)).collect();
-            c.mem.write(base, &bytes);
+            c.mem.write(base as u64, &bytes);
         }
         // ldr x5, [x1]; ldrh w7, [x3]; str x6, [x2]; strh w6, [x4]; add x6, x6, #1; b code
         for (k, w) in [0xf940_0025u32, 0x7940_0067, 0xf900_0046, 0x7900_0086, 0x9100_04c6].iter().enumerate() {
@@ -958,7 +958,7 @@ fn mapped() -> Cpu<Takes> {
 /// The descriptor of the level 3 table for virtual page `page`.
 fn map(c: &mut Cpu<Takes>, page: u64, desc: u64) {
     let at = 0x82000 + 8 * page as usize;
-    c.mem.write(at, &desc.to_le_bytes());
+    c.mem.write(at as u64, &desc.to_le_bytes());
 }
 
 /// `a` runs `n` instructions in one call, `b` one at a time (so that no run of it goes from a page to
@@ -1092,7 +1092,7 @@ fn an_entry_that_the_jit_refused_is_counted_again_from_below_the_threshold() {
     assert_eq!(differ(&a, &b), None);
     assert_eq!(a.x[1], 3000);
     assert!(a.jit.compiled >= 1, "the loop was never compiled");
-    let ops = a.jit.pre.enter(CODE as usize);
+    let ops = a.jit.pre.enter(CODE);
     assert!(!ops.is_null());
     // SAFETY: `ops` is the ops of the page at CODE, a live slot of 1024 ops or more.
     let hottest = (0..1024).map(|i| unsafe { (*ops.add(i)).cnt }).max().unwrap();

@@ -233,7 +233,7 @@ pub fn spi_line(intid: u32, level: bool) {
 /// use the same RAM.
 #[allow(unsafe_code)]
 pub fn available(mem: &crate::ram::Ram, ncpus: usize, gic_v3: bool) -> Result<(), String> {
-    let want = (mem.as_ptr() as usize, mem.len());
+    let want = (mem.as_ptr() as usize, mem.len() as usize);
     let got = VM.get_or_init(|| {
         let e = |what: &str, r: std::io::Error| format!("{what}: {r}");
         let (vm, run_size) = new_vm()?;
@@ -268,15 +268,18 @@ pub fn available(mem: &crate::ram::Ram, ncpus: usize, gic_v3: bool) -> Result<()
             memory_size: u64,
             userspace_addr: u64,
         }
-        let r = Region {
-            slot: 0,
-            flags: 0,
-            guest_phys_addr: board::RAM_BASE,
-            memory_size: want.1 as u64,
-            userspace_addr: want.0 as u64,
-        };
-        ioctl(vm, KVM_SET_USER_MEMORY_REGION, &r as *const Region as u64)
-            .map_err(|r| e("KVM_SET_USER_MEMORY_REGION", r))?;
+        // RAM where it is: below the MMIO hole, and above 4 GiB if it goes on there
+        for (slot, (at, n)) in mem.regions().enumerate() {
+            let r = Region {
+                slot: slot as u32,
+                flags: 0,
+                guest_phys_addr: board::RAM_BASE + at,
+                memory_size: n,
+                userspace_addr: want.0 as u64 + at,
+            };
+            ioctl(vm, KVM_SET_USER_MEMORY_REGION, &r as *const Region as u64)
+                .map_err(|r| e("KVM_SET_USER_MEMORY_REGION", r))?;
+        }
         let gic = if gic_v3 {
             let mut dev = [KVM_DEV_TYPE_ARM_VGIC_V3, 0, 0];
             ioctl(vm, KVM_CREATE_DEVICE, dev.as_mut_ptr() as u64).map_err(|r| e("vGICv3", r))?;

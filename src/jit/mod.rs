@@ -273,7 +273,7 @@ impl Jit {
         (tables + maps, self.pages.len())
     }
 
-    pub fn new(memory_size: usize) -> Jit {
+    pub fn new(memory_size: u64) -> Jit {
         Jit {
             enabled: false,
             sync_compile: false,
@@ -294,7 +294,7 @@ impl Jit {
             slot_state: vec![SlotState::Free; SLOTS as usize],
             free: (0..SLOTS).rev().collect(),
             page_keys: HashMap::new(),
-            code_page: vec![0; memory_size.div_ceil(4096)],
+            code_page: vec![0; memory_size.div_ceil(4096) as usize],
             pre: crate::predecode::Cache::new(memory_size),
             covered: HashMap::new(),
             decoded_writes_limit: std::env::var("ARMLESS_JIT_DECODED_WRITES")
@@ -564,7 +564,7 @@ impl<H: Host> Cpu<H> {
         }
         let f = &self.fast[self.el as usize];
         if self.pc >> 12 == f.code_page {
-            Some(f.code_base as u64 + (self.pc & 0xfff))
+            Some(f.code_base + (self.pc & 0xfff))
         } else {
             None
         }
@@ -581,12 +581,12 @@ impl<H: Host> Cpu<H> {
     /// interpreter, which counts the executions of the entries itself: the count at which `jit_step` warms an
     /// entry, the one at which it compiles it, and whether the page has modules (one of which may hold the entry).
     #[inline(always)]
-    pub(crate) fn page_counts(&self, base: usize) -> (u32, u32, bool) {
+    pub(crate) fn page_counts(&self, base: u64) -> (u32, u32, bool) {
         let hot = self.hot_threshold();
         (
             hot.div_ceil(4).max(1),
             hot,
-            self.jit.code_page[base >> 12] & 1 != 0,
+            self.jit.code_page[(base >> 12) as usize] & 1 != 0,
         )
     }
 
@@ -613,11 +613,11 @@ impl<H: Host> Cpu<H> {
         // Count this execution of the entry in its predecoded slot (`Cache::bump`): the line is
         // the one the interpreter reads next.
         let i = ((pa & 0xfff) >> 2) as usize;
-        let mut c = self.jit.pre.bump(pa as usize & !0xfff, i);
+        let mut c = self.jit.pre.bump(pa & !0xfff, i);
         if c == 0 {
             // Not decoded yet: decode it now (the interpreter would next), and count it.
             let _ = self.fetch_decoded_slow(self.pc);
-            c = self.jit.pre.bump(pa as usize & !0xfff, i);
+            c = self.jit.pre.bump(pa & !0xfff, i);
         }
         // The counts are exact, so what a workload runs a few thousand times each, in more places than the
         // modules can hold, would be compiled, flushed and compiled again. Every 8 flushes the threshold
@@ -639,7 +639,7 @@ impl<H: Host> Cpu<H> {
                     // found by the loop itself, see `has_module`, whatever the count.)
                     let warm = threshold.div_ceil(4).max(1);
                     if warm + 1 < threshold {
-                        self.jit.pre.set_count(pa as usize & !0xfff, i, warm + 1);
+                        self.jit.pre.set_count(pa & !0xfff, i, warm + 1);
                     }
                 },
                 // Nothing to wait for. The count is in the predecoded slot, which every context of the
@@ -739,7 +739,7 @@ impl<H: Host> Cpu<H> {
             return Compile::Waiting;
         };
         // flush_all may have removed the page info
-        let page_pa = (page_key >> 2) as usize;
+        let page_pa = page_key >> 2;
         let mut page = [0u8; 0x1000];
         if !self.mem.read(page_pa, &mut page) {
             self.jit.free.push(slot);
@@ -756,7 +756,7 @@ impl<H: Host> Cpu<H> {
         let code =
             gen::translate_page_code(&layout, &words, &entries, MAX_BLOCK, self.jit_additive());
 
-        let page = page_pa >> 12;
+        let page = (page_pa >> 12) as usize;
         // The words these blocks were translated from: writes to them drop the page's code
         let covered = self
             .jit
@@ -857,7 +857,8 @@ impl<H: Host> Cpu<H> {
                 self as *const Self as u64,
                 std::mem::size_of::<Self>() as u64,
             ),
-            (self.mem.as_ptr() as u64, self.mem.len() as u64),
+            // What blocks address themselves: RAM below 4 GiB (`gen::Layout::banks`)
+            (self.mem.as_ptr() as u64, crate::board::ram_low(self.mem.len())),
             rt,
             rb,
             wt,
@@ -996,7 +997,7 @@ impl<H: Host> Cpu<H> {
     fn jit_page_hash(&self, page_key: u64) -> Option<u64> {
         let mut page = [0u8; 0x1000];
         self.mem
-            .read((page_key >> 2) as usize, &mut page)
+            .read(page_key >> 2, &mut page)
             .then(|| profile::hash(&page))
     }
 
@@ -1113,6 +1114,7 @@ impl<H: Host> Cpu<H> {
             read_base: a(f.read_base_ptr()),
             write_tag: a(f.write_tag_ptr()),
             write_base: a(f.write_base_ptr()),
+            banks: (self.mem.end() > crate::board::HIGH_RAM_BASE) as u64,
         }
     }
 
@@ -1455,18 +1457,18 @@ mod tests {
         let mut c = Cpu::new(4 << 20, Takes);
         c.jit.enabled = true;
         c.jit.threshold = THRESHOLD;
-        c.mem.write(CODE as usize, &0x1400_0000u32.to_le_bytes());
+        c.mem.write(CODE, &0x1400_0000u32.to_le_bytes());
         c.pc = CODE;
         // The first step decodes the entry and counts it once.
         assert!(matches!(c.jit_step(1), JitStep::NotCompiled));
         c.jit
             .pre
-            .set_count(CODE as usize & !0xfff, 0, THRESHOLD - 1);
+            .set_count(CODE & !0xfff, 0, THRESHOLD - 1);
         c.jit
             .pages
             .insert(page_of(Jit::key(CODE, c.el, c.spsel)), info);
         assert!(matches!(c.jit_step(1), JitStep::NotCompiled));
-        let ops = c.jit.pre.enter(CODE as usize);
+        let ops = c.jit.pre.enter(CODE);
         assert!(!ops.is_null());
         // SAFETY: `ops` is the ops of the page at CODE, a live slot of 1024 ops or more.
         unsafe { (*ops).cnt as u32 }
@@ -1507,7 +1509,7 @@ mod tests {
     fn a_write_that_misses_the_compiled_words_drops_the_ops_of_the_words_it_writes() {
         let mut c = Cpu::new(4 << 20, Takes);
         let w = |c: &Cpu<Takes>, i: usize, insn: u32| {
-            c.mem.write(0x1000 + 4 * i, &insn.to_le_bytes());
+            c.mem.write((0x1000 + 4 * i) as u64, &insn.to_le_bytes());
         };
         for (i, insn) in [SUBS_X1, B_NE_BACK, MOVZ_X0_7, MOVZ_X2_9]
             .into_iter()

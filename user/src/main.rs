@@ -173,7 +173,7 @@ fn main() {
     // RAM on an anonymous mapping of its own, not calloc's: the process can then give the host
     // back the pages the program unmaps, and pages it never writes cost nothing.
     let config = Config {
-        memory_size: (mem_mb << 20) as usize,
+        memory_size: mem_mb << 20,
         cpus,
         devices: armless::dev::DeviceConfig {
             console: false,
@@ -182,7 +182,7 @@ fn main() {
             ..Default::default()
         },
     };
-    let ram = Ram::mapped((mem_mb << 20) as usize).unwrap_or_else(|e| die(e));
+    let ram = Ram::mapped(mem_mb << 20).unwrap_or_else(|e| die(e));
     let (mut vm, _clock) = armless::runner::new_vm_on(config, Some(ram)).unwrap_or_else(|e| die(e));
 
     // The filesystem, its blobs served from the directory by armless's native host

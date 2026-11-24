@@ -728,7 +728,15 @@ impl<H: Host> Cpu<H> {
             },
             sr::REVIDR_EL1 => 0,
             sr::ID_AA64PFR0_EL1 => id::AA64PFR0,
-            sr::ID_AA64MMFR0_EL1 => id::AA64MMFR0,
+            // Physical addresses past 32 bits only for a machine with RAM up there
+            sr::ID_AA64MMFR0_EL1 => {
+                id::AA64MMFR0
+                    | if self.mem.end() > crate::board::HIGH_RAM_BASE {
+                        crate::board::PA_RANGE_36
+                    } else {
+                        0
+                    }
+            },
             sr::ID_AA64DFR0_EL1 => id::AA64DFR0,
             sr::ID_AA64ISAR0_EL1 => id::AA64ISAR0,
             sr::ID_AA64MMFR1_EL1 | sr::ID_AA64MMFR2_EL1 => 0,

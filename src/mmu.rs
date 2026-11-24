@@ -276,7 +276,7 @@ impl<H: Host> Cpu<H> {
             let index = (va_in >> shift) & 0x1ff;
             let desc_addr = table.wrapping_add(index * 8);
             let desc = match self.phys_read(desc_addr, 8) {
-                Some(d) if (desc_addr as usize) < self.mem.len() => d,
+                Some(d) if self.mem.holds(desc_addr, 8) => d,
                 _ => return Err(Fault::Translation(level as u8)),
             };
             if desc & 1 == 0 {
@@ -437,7 +437,7 @@ mod tests {
     /// Tables at `base` (level 1, 2, 3 in consecutive pages) mapping VA to `pa`, and the VA one
     /// page up (VA + 0x1000) to `global_pa`, global.
     fn tables(c: &Cpu<NoDevices>, base: u64, pa: u64, global_pa: u64) {
-        let w = |at: u64, v: u64| c.mem.write(at as usize, &v.to_le_bytes());
+        let w = |at: u64, v: u64| c.mem.write(at, &v.to_le_bytes());
         w(base + 8 * (VA >> 30), (base + 0x1000) | 3);
         w(
             base + 0x1000 + 8 * ((VA >> 21) & 0x1ff),

@@ -305,22 +305,19 @@ fn each_filled(filled: &[u16], chunks: u64, mut f: impl FnMut(usize)) {
     }
 }
 
-/// The fast table's RAM offsets are u32: RAM never reaches 4 GiB (board::RAM_MAX), so every
-/// page's offset fits, and none aliases a lower one.
-const _: () = assert!(board::RAM_MAX <= 1 << 32);
-
-/// Virtual page -> offset of the page in `mem`, for pages known to be RAM
+/// Virtual page -> the RAM page it maps to, for pages known to be RAM
 /// with the needed permission at one exception level.
 pub(crate) struct FastTlb {
     read_tag: Vec<u64>,
-    /// Page offsets in RAM (u32 in every build: the JIT's code reads them as 4-byte entries).
+    /// RAM pages, as `ram::fast_base` keeps them (u32 in every build: the JIT's code reads them
+    /// as 4-byte entries).
     read_base: Vec<u32>,
     write_tag: Vec<u64>,
     write_base: Vec<u32>,
     pub(crate) code_page: u64,
-    pub(crate) code_base: usize,
+    pub(crate) code_base: u64,
     code_tag: Vec<u64>,
-    code_bases: Vec<usize>,
+    code_bases: Vec<u64>,
     /// Read and write slots filled since the last flush (repeats possible), while there are at
     /// most FILLED_MAX of them.
     filled: Vec<u16>,
@@ -348,19 +345,19 @@ impl FastTlb {
 
     /// Serve reads of virtual page `page` from the RAM page at `base`.
     #[inline]
-    fn fill_read(&mut self, page: u64, base: usize) {
+    fn fill_read(&mut self, page: u64, base: u64) {
         let i = page as usize & (FAST_ENTRIES - 1);
         self.read_tag[i] = page;
-        self.read_base[i] = base as u32;
+        self.read_base[i] = crate::ram::fast_base(base);
         self.filled(i);
     }
 
     /// Serve writes to virtual page `page` from the RAM page at `base`.
     #[inline]
-    fn fill_write(&mut self, page: u64, base: usize) {
+    fn fill_write(&mut self, page: u64, base: u64) {
         let i = page as usize & (FAST_ENTRIES - 1);
         self.write_tag[i] = page;
-        self.write_base[i] = base as u32;
+        self.write_base[i] = crate::ram::fast_base(base);
         self.filled(i);
     }
 
@@ -404,10 +401,11 @@ impl FastTlb {
     }
 
     /// Remove write entries mapping to the physical page at `base`.
-    pub(crate) fn forget_write_page(&mut self, base: usize) {
+    pub(crate) fn forget_write_page(&mut self, base: u64) {
+        let base = crate::ram::fast_base(base);
         // Only filled slots can hold an entry
         each_filled(&self.filled, self.chunks, |i| {
-            if self.write_tag[i] != u64::MAX && self.write_base[i] as usize == base {
+            if self.write_tag[i] != u64::MAX && self.write_base[i] == base {
                 self.write_tag[i] = u64::MAX;
             }
         });
@@ -474,7 +472,7 @@ impl<H: Host> Cpu<H> {
     pub fn new(memory_size: usize, host: H) -> Cpu<H> {
         assert!(
             memory_size as u64 <= board::RAM_MAX,
-            "RAM would overlap the MMIO window"
+            "more RAM than a machine has"
         );
         Self::new_smp(Arc::new(Machine::new(memory_size, 1)), 0, host)
     }
@@ -483,7 +481,8 @@ impl<H: Host> Cpu<H> {
     /// running; the others stay off until PSCI CPU_ON.
     pub fn new_smp(machine: Arc<Machine>, index: usize, host: H) -> Cpu<H> {
         assert!(index < machine.ncpus);
-        let memory_size = machine.mem.len();
+        // Tables by physical page go to RAM's end
+        let memory_size = machine.mem.end();
         let attn = &machine.cpus[index].attn as *const AtomicU8;
         let mut cpu = Cpu {
             x: [0; 33],
@@ -1333,7 +1332,7 @@ impl<H: Host> Cpu<H> {
         let f = &self.fast[self.el as usize];
         if same_aligned_page(pc, f.code_page) {
             // The current code page lies in RAM (see `fetch_slow`).
-            return Ok(self.ram_load(f.code_base + (pc & 0xffc) as usize, 4) as u32);
+            return Ok(self.ram_load(f.code_base + (pc & 0xffc), 4) as u32);
         }
         self.fetch_slow(pc)
     }
@@ -1350,7 +1349,7 @@ impl<H: Host> Cpu<H> {
             return Ok(std::ptr::null_mut());
         }
         let base = f.code_base;
-        let page = base >> 12;
+        let page = (base >> 12) as usize;
         let mut slot = self.jit.pre.slot(page);
         if slot == crate::predecode::NONE {
             slot = self.jit.pre.alloc(page);
@@ -1393,17 +1392,14 @@ impl<H: Host> Cpu<H> {
         if f.code_tag[i] == pc >> 12 {
             f.code_page = pc >> 12;
             f.code_base = f.code_bases[i];
-            let a = f.code_base + (pc & 0xffc) as usize;
+            let a = f.code_base + (pc & 0xffc);
             return Ok(self.mem.load(a, 4) as u32);
         }
         let pa = self.translate(pc, crate::mmu::Access::Exec, false)?;
-        let a = pa as usize;
-        if a.checked_add(4).is_some_and(|end| end <= self.mem.len()) {
-            let page = (pa & !0xfff) as usize;
-            if page
-                .checked_add(0x1000)
-                .is_some_and(|end| end <= self.mem.len())
-            {
+        let a = pa;
+        if self.mem.holds(a, 4) {
+            let page = pa & !0xfff;
+            if self.mem.holds(page, 0x1000) {
                 let f = &mut self.fast[self.el as usize];
                 f.code_page = pc >> 12;
                 f.code_base = page;
@@ -1426,15 +1422,15 @@ impl<H: Host> Cpu<H> {
 
     /// Physical read. `None` = nothing there.
     pub fn phys_read(&mut self, pa: u64, size: u32) -> Option<u64> {
-        if (pa as u128) + (size as u128) <= self.mem.len() as u128 {
-            return Some(self.mem.load(pa as usize, size));
+        if self.mem.holds(pa, size as u64) {
+            return Some(self.mem.load(pa, size));
         }
         self.mmio_read(pa, size)
     }
 
     pub fn phys_write(&mut self, pa: u64, size: u32, value: u64) -> bool {
-        if (pa as u128) + (size as u128) <= self.mem.len() as u128 {
-            self.mem.store(pa as usize, size, value);
+        if self.mem.holds(pa, size as u64) {
+            self.mem.store(pa, size, value);
             return true;
         }
         self.mmio_write(pa, size, value)
@@ -1505,13 +1501,13 @@ impl<H: Host> Cpu<H> {
     /// Load `size` bytes of RAM at `a`, which every caller has checked lies in RAM (a page the
     /// fast tables hold, with the access inside it, or a range compared with the RAM size).
     #[inline(always)]
-    fn ram_load(&self, a: usize, size: u32) -> u64 {
+    fn ram_load(&self, a: u64, size: u32) -> u64 {
         self.mem.load(a, size)
     }
 
     /// Store `size` bytes of RAM at `a`, which the caller has checked lies in RAM.
     #[inline(always)]
-    fn ram_store(&mut self, a: usize, size: u32, value: u64) {
+    fn ram_store(&mut self, a: u64, size: u32, value: u64) {
         self.mem.store(a, size, value)
     }
 
@@ -1521,11 +1517,10 @@ impl<H: Host> Cpu<H> {
     /// # Safety
     ///
     /// `a + size` must not pass the end of the page of a fast read entry. `fill_read` only
-    /// takes pages with `page + 0x1000 <= mem.len()`, and RAM's length never changes, so the
-    /// access is then in RAM.
+    /// takes pages RAM `holds`, and RAM never changes, so the access is then in RAM.
     #[allow(unsafe_code)]
     #[inline(always)]
-    unsafe fn ram_load_in_page(&self, a: usize, size: u32) -> u64 {
+    unsafe fn ram_load_in_page(&self, a: u64, size: u32) -> u64 {
         // SAFETY: in RAM (the caller's promise).
         unsafe { self.mem.load_in_page(a, size) }
     }
@@ -1539,7 +1534,7 @@ impl<H: Host> Cpu<H> {
     /// store can go through it.
     #[allow(unsafe_code)]
     #[inline(always)]
-    unsafe fn ram_store_in_page(&mut self, a: usize, size: u32, value: u64) {
+    unsafe fn ram_store_in_page(&mut self, a: u64, size: u32, value: u64) {
         // SAFETY: in RAM (the caller's promise), and marked written when the entry was filled.
         unsafe { self.mem.store_in_page(a, size, value) }
     }
@@ -1562,7 +1557,7 @@ impl<H: Host> Cpu<H> {
         let sev = m.sev.load(Ordering::Relaxed);
         let watch = self
             .excl()
-            .filter(|&pa| pa + self.excl_size as u64 <= self.mem.len() as u64);
+            .filter(|&pa| self.mem.holds(pa, self.excl_size as u64));
         let oversubscribed = m.oversubscribed();
         let spins = if oversubscribed { 32 } else { 4000 };
         for _ in 0..spins {
@@ -1571,7 +1566,7 @@ impl<H: Host> Cpu<H> {
                 return;
             }
             if let Some(pa) = watch {
-                if self.ram_load(pa as usize, self.excl_size) != self.excl_value {
+                if self.ram_load(pa, self.excl_size) != self.excl_value {
                     self.end_wfe_wait();
                     return;
                 }
@@ -1644,7 +1639,7 @@ impl<H: Host> Cpu<H> {
             return Err(self.alignment_fault(va));
         }
         let pa = self.translate(va, crate::mmu::Access::Write, false)?;
-        if self.machine.ncpus > 1 && pa + size as u64 <= self.mem.len() as u64 {
+        if self.machine.ncpus > 1 && self.mem.holds(pa, size as u64) {
             // Several CPUs: compare-and-swap until no other CPU got in between.
             let mut old = self.ram_load_atomic(pa, size);
             loop {
@@ -1697,7 +1692,7 @@ impl<H: Host> Cpu<H> {
             if f.read_tag[i] == va >> 12 {
                 // SAFETY: a read hit, with `off + size <= 0x1000` checked above.
                 return Ok(unsafe {
-                    self.ram_load_in_page(f.read_base[i] as usize + off as usize, size)
+                    self.ram_load_in_page(crate::ram::fast_page(f.read_base[i]) + off, size)
                 });
             }
         }
@@ -1716,7 +1711,7 @@ impl<H: Host> Cpu<H> {
             if f.read_tag[i] == va >> 12 {
                 // SAFETY: a read hit, with `off + size <= 0x1000` checked above.
                 return Some(unsafe {
-                    self.ram_load_in_page(f.read_base[i] as usize + off as usize, size)
+                    self.ram_load_in_page(crate::ram::fast_page(f.read_base[i]) + off, size)
                 });
             }
         }
@@ -1732,12 +1727,12 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.read_tag[i] == va >> 12 {
-                let a = f.read_base[i] as usize + off as usize;
+                let a = crate::ram::fast_page(f.read_base[i]) + off;
                 // SAFETY: a read hit, with `off + 2 * size <= 0x1000` checked above.
                 return Some(unsafe {
                     (
                         self.ram_load_in_page(a, size),
-                        self.ram_load_in_page(a + size as usize, size),
+                        self.ram_load_in_page(a + size as u64, size),
                     )
                 });
             }
@@ -1749,12 +1744,8 @@ impl<H: Host> Cpu<H> {
     fn read_slow(&mut self, va: u64, size: u32, unpriv: bool) -> Res<u64> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
             let pa = self.translate(va, crate::mmu::Access::Read, unpriv)?;
-            let page = (pa & !0xfff) as usize;
-            if !unpriv
-                && page
-                    .checked_add(0x1000)
-                    .is_some_and(|end| end <= self.mem.len())
-            {
+            let page = pa & !0xfff;
+            if !unpriv && self.mem.holds(page, 0x1000) {
                 self.fast[self.el as usize].fill_read(va >> 12, page);
             }
             return self
@@ -1778,7 +1769,7 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] as usize + off as usize;
+                let a = crate::ram::fast_page(f.write_base[i]) + off;
                 // SAFETY: a write hit, with `off + size <= 0x1000` checked above.
                 unsafe { self.ram_store_in_page(a, size, value) };
                 return Ok(());
@@ -1797,7 +1788,7 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] as usize + off as usize;
+                let a = crate::ram::fast_page(f.write_base[i]) + off;
                 // SAFETY: a write hit, with `off + size <= 0x1000` checked above.
                 unsafe { self.ram_store_in_page(a, size, value) };
                 return true;
@@ -1816,11 +1807,11 @@ impl<H: Host> Cpu<H> {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
             if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] as usize + off as usize;
+                let a = crate::ram::fast_page(f.write_base[i]) + off;
                 // SAFETY: a write hit, with `off + 2 * size <= 0x1000` checked above.
                 unsafe {
                     self.ram_store_in_page(a, size, first);
-                    self.ram_store_in_page(a + size as usize, size, second);
+                    self.ram_store_in_page(a + size as u64, size, second);
                 }
                 return true;
             }
@@ -1832,15 +1823,11 @@ impl<H: Host> Cpu<H> {
     fn write_slow(&mut self, va: u64, size: u32, value: u64, unpriv: bool) -> Res<()> {
         if (va & 0xfff) + size as u64 <= 0x1000 {
             let pa = self.translate(va, crate::mmu::Access::Write, unpriv)?;
-            let page = (pa & !0xfff) as usize;
-            let has_code = self.jit.code_page.get(page >> 12).is_some_and(|&b| b != 0);
+            let page = pa & !0xfff;
+            let has_code = self.jit.code_page.get((page >> 12) as usize).is_some_and(|&b| b != 0);
             if has_code {
                 self.code_written(pa, size);
-            } else if !unpriv
-                && page
-                    .checked_add(0x1000)
-                    .is_some_and(|end| end <= self.mem.len())
-            {
+            } else if !unpriv && self.mem.holds(page, 0x1000) {
                 // Stores through the entry skip `mark_written` (`ram_store_in_page`): mark it
                 // here, before the first one. RAM never becomes fresh again.
                 self.mem.mark_written();
@@ -1961,7 +1948,7 @@ mod fast_tlb_tests {
     use super::*;
 
     /// Fill `pages` (read and write) at `base`; every slot must hold its entry.
-    fn fill(f: &mut FastTlb, pages: impl Iterator<Item = u64>, base: usize) -> Vec<u64> {
+    fn fill(f: &mut FastTlb, pages: impl Iterator<Item = u64>, base: u64) -> Vec<u64> {
         let pages: Vec<u64> = pages.collect();
         for &p in &pages {
             f.fill_read(p, base);

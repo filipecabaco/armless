@@ -139,7 +139,7 @@ impl Queue {
         // The lengths are the driver's: a chain can't cover more than all of RAM each way, so
         // its totals (and the buffers devices size from them) stay within what RAM can hold.
         let (mut readable, mut writable) = (0usize, 0usize);
-        let limit = io.mem.len();
+        let limit = usize::try_from(io.mem.len()).unwrap_or(usize::MAX);
         loop {
             if i >= table_size || steps > 4096 {
                 return Some(chain); // malformed: give back what we have

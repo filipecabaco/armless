@@ -113,7 +113,9 @@ pub(crate) struct Frames {
 
 impl Frames {
     pub(crate) fn new(ram: Ram, purge: Box<dyn Fn(u64) + Send>) -> Frames {
-        let n = ram.len() / PAGE as usize;
+        // By physical page, to RAM's end: past 3 GiB, RAM goes on above 4 GiB, and the frames
+        // under the MMIO hole between are never handed out
+        let n = ram.end().div_ceil(PAGE) as usize;
         Frames {
             ram,
             refs: vec![0; n],
@@ -130,6 +132,9 @@ impl Frames {
         let f = match self.free.pop() {
             Some(f) => f,
             None if self.next < self.refs.len() as u64 => {
+                if !self.ram.holds(self.next * PAGE, PAGE) {
+                    self.next = armless::board::HIGH_RAM_BASE / PAGE;
+                }
                 self.next += 1;
                 self.next - 1
             },
@@ -190,7 +195,7 @@ impl Frames {
                 n += 1;
             }
             self.ram
-                .discard((start * PAGE) as usize, (n * PAGE) as usize);
+                .discard(start * PAGE, n * PAGE);
             for p in start..start + n {
                 (self.purge)(p);
             }
@@ -206,17 +211,17 @@ impl Frames {
     }
 
     fn get(&self, at: u64) -> u64 {
-        self.ram.load(at as usize, 8)
+        self.ram.load(at, 8)
     }
 
     fn put(&self, at: u64, v: u64) {
-        self.ram.store(at as usize, 8, v);
+        self.ram.store(at, 8, v);
     }
 
     fn copy(&self, from: u64, to: u64) {
         let mut b = vec![0u8; PAGE as usize];
-        self.ram.read(from as usize, &mut b);
-        self.ram.write(to as usize, &b);
+        self.ram.read(from, &mut b);
+        self.ram.write(to, &b);
     }
 
     pub(crate) fn save(&mut self, w: &mut W) {
@@ -245,14 +250,14 @@ impl Frames {
         self.live = 0;
         for _ in 0..r.u()? {
             let (f, c) = (r.u()? as usize, r.u()? as u32);
-            if f >= self.next as usize || c == 0 {
+            if f >= self.next as usize || c == 0 || !self.ram.holds(f as u64 * PAGE, PAGE) {
                 return Err("bad frame pool".into());
             }
             self.refs[f] = c;
             self.live += 1;
         }
         self.free = (0..self.next)
-            .filter(|&f| self.refs[f as usize] == 0)
+            .filter(|&f| self.refs[f as usize] == 0 && self.ram.holds(f * PAGE, PAGE))
             .rev()
             .collect();
         Ok(())
@@ -1341,7 +1346,7 @@ impl Process {
                 return Err(Miss::Oom);
             };
             if !data.is_empty() {
-                self.ram.write(pa as usize, &data);
+                self.ram.write(pa, &data);
             }
             let cached = cache.filter(|_| !data.is_empty());
             if !mm.set(&mut f, page, pa | bits(vma.prot, cached.is_none())) {
@@ -1392,7 +1397,7 @@ impl Process {
         let now = self.now_secs();
         for ((ino, off), pa) in unmapped {
             let mut page = vec![0u8; PAGE as usize];
-            self.ram.read(pa as usize, &mut page);
+            self.ram.read(pa, &mut page);
             self.fs(|fs| {
                 let size = fs.get(ino).map_or(0, |i| i.size);
                 let n = size.saturating_sub(off).min(PAGE) as usize;
@@ -1506,7 +1511,7 @@ impl Process {
             let Some(pa) = self.host_pa(va, Acc::Read) else {
                 return false;
             };
-            if !self.ram.read(pa as usize, &mut buf[done..done + n]) {
+            if !self.ram.read(pa, &mut buf[done..done + n]) {
                 return false;
             }
             done += n;
@@ -1534,7 +1539,7 @@ impl Process {
             let Some(pa) = self.host_pa(va, acc) else {
                 return false;
             };
-            if !self.ram.write(pa as usize, &data[done..done + n]) {
+            if !self.ram.write(pa, &data[done..done + n]) {
                 return false;
             }
             self.frames.borrow().purge(pa);
@@ -2228,7 +2233,17 @@ mod tests {
     const RAM: u64 = 64 * PAGE;
 
     fn frames() -> Frames {
-        Frames::new(Ram::zeroed(RAM as usize), Box::new(|_| {}))
+        Frames::new(Ram::zeroed(RAM), Box::new(|_| {}))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frames_past_3_gib_are_above_4_gib() {
+        use armless::board::{HIGH_RAM_BASE, LOW_RAM_MAX};
+        let mut f = Frames::new(Ram::mapped(LOW_RAM_MAX + 2 * PAGE).unwrap(), Box::new(|_| {}));
+        let pas: Vec<u64> = std::iter::from_fn(|| f.alloc()).collect();
+        assert_eq!(pas.len() as u64, LOW_RAM_MAX / PAGE + 2, "every frame, and no more");
+        assert_eq!(pas[pas.len() - 3..], [LOW_RAM_MAX - PAGE, HIGH_RAM_BASE, HIGH_RAM_BASE + PAGE]);
     }
 
     /// A space with a page mapped at 0x1000: the space, and the page's frame

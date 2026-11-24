@@ -26,7 +26,7 @@ fn cpu() -> Cpu<NoDevices> {
 }
 
 fn put(c: &mut Cpu<NoDevices>, addr: usize, insn: u32) {
-    c.mem.write(addr, &insn.to_le_bytes());
+    c.mem.write(addr as u64, &insn.to_le_bytes());
 }
 
 /// Runs the one instruction at `pc`.

@@ -24,6 +24,7 @@
 
 pub(crate) mod a64;
 pub(crate) mod advsimd;
+pub mod banks;
 pub(crate) mod bits;
 pub mod board;
 pub mod cpu;
@@ -187,7 +188,8 @@ pub fn plan_linux<H: Host>(
         // Pre-3.17 kernels: unknown size, assume the file plus generous bss.
         image_size = image_len as u64 + (16 << 20);
     }
-    let mem_size = cpu.mem.len() as u64;
+    // What's loaded goes below 4 GiB: in RAM a machine of any size has there
+    let mem_size = board::ram_low(cpu.mem.len());
     let kernel_addr = board::RAM_BASE + board::KERNEL_OFFSET + text_offset;
     let kernel_end = kernel_addr + image_size.max(image_len as u64);
     if kernel_end > mem_size {
@@ -207,7 +209,7 @@ pub fn plan_linux<H: Host>(
         None => None,
     };
     let dtb = dtb::board_dtb(&dtb::BoardConfig {
-        memory_size: mem_size,
+        memory_size: cpu.mem.len(),
         cmdline,
         initrd: initrd_range,
         ncpus: cpu.machine.ncpus,
@@ -230,9 +232,9 @@ pub fn plan_linux<H: Host>(
 
 /// Copy `data` into RAM at `addr`.
 fn load<H: Host>(cpu: &Cpu<H>, addr: u64, data: &[u8]) -> Result<(), String> {
-    match usize::try_from(addr) {
-        Ok(a) if cpu.mem.write(a, data) => Ok(()),
-        _ => Err(format!(
+    match cpu.mem.write(addr, data) {
+        true => Ok(()),
+        false => Err(format!(
             "{} bytes at {addr:#x} do not fit in RAM",
             data.len()
         )),
@@ -243,13 +245,14 @@ fn load<H: Host>(cpu: &Cpu<H>, addr: u64, data: &[u8]) -> Result<(), String> {
 /// x0 points at a device tree, like for Linux, so tests can find devices.
 pub fn boot_raw<H: Host>(cpu: &mut Cpu<H>, bin: &[u8], addr: u64) -> Result<BootLayout, String> {
     let end = addr + bin.len() as u64;
-    let mem_size = cpu.mem.len() as u64;
+    // What's loaded goes below 4 GiB: in RAM a machine of any size has there
+    let mem_size = board::ram_low(cpu.mem.len());
     if end > mem_size {
         return Err("binary does not fit in RAM".into());
     }
     let dtb_addr = align_down(mem_size - (2 << 20), 2 << 20);
     let dtb = dtb::board_dtb(&dtb::BoardConfig {
-        memory_size: mem_size,
+        memory_size: cpu.mem.len(),
         cmdline: "",
         initrd: None,
         ncpus: cpu.machine.ncpus,

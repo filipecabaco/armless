@@ -197,12 +197,12 @@ impl Io {
 
     /// Copy guest memory out. False if the range is not RAM.
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        usize::try_from(addr).is_ok_and(|a| self.mem.read(a, buf))
+        self.mem.read(addr, buf)
     }
 
     /// Copy into guest memory (DMA), dropping JIT code of the pages written.
     pub fn write(&self, addr: u64, data: &[u8]) -> bool {
-        if !usize::try_from(addr).is_ok_and(|a| self.mem.write(a, data)) {
+        if !self.mem.write(addr, data) {
             return false;
         }
         self.drop_code(addr, data.len() as u64);
@@ -213,10 +213,7 @@ impl Io {
     /// where it can (`Ram::discard`), and drop JIT code of those pages on every CPU. False, and
     /// nothing done, if the range is not all RAM.
     pub fn discard(&self, addr: u64, len: u64) -> bool {
-        let (Ok(a), Ok(n)) = (usize::try_from(addr), usize::try_from(len)) else {
-            return false;
-        };
-        if !self.mem.discard(a, n) {
+        if !self.mem.discard(addr, len) {
             return false;
         }
         self.drop_code(addr, len);
@@ -256,14 +253,10 @@ impl Io {
     }
     /// Ring bookkeeping writes (not code).
     pub fn write_u16(&self, addr: u64, v: u16) {
-        if let Ok(a) = usize::try_from(addr) {
-            self.mem.write(a, &v.to_le_bytes());
-        }
+        self.mem.write(addr, &v.to_le_bytes());
     }
     pub fn write_u32(&self, addr: u64, v: u32) {
-        if let Ok(a) = usize::try_from(addr) {
-            self.mem.write(a, &v.to_le_bytes());
-        }
+        self.mem.write(addr, &v.to_le_bytes());
     }
 }
 
