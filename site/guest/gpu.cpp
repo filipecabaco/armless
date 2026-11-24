@@ -21,6 +21,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <algorithm>
 #include <vector>
 
 // ------------------------------------------------------------------------------------- the scene
@@ -387,7 +388,10 @@ static bool open_gpu(Gpu & g, uint32_t w, uint32_t h) {
     return true;
 }
 
+// A frame of w x h, at most the size open_gpu made the buffers for (the console can shrink)
 static bool render_gpu(Gpu & g, std::vector<uint32_t> & px, uint32_t w, uint32_t h, float t) {
+    const size_t n = size_t(w) * h * 4;
+    if (n > g.bytes) return false;
     Params pv{w, h, t, 0};
     g.queue.WriteBuffer(g.params, 0, &pv, sizeof pv);
     wgpu::CommandEncoder enc = g.device.CreateCommandEncoder();
@@ -396,15 +400,15 @@ static bool render_gpu(Gpu & g, std::vector<uint32_t> & px, uint32_t w, uint32_t
     pass.SetBindGroup(0, g.group);
     pass.DispatchWorkgroups((w + 7) / 8, (h + 7) / 8);
     pass.End();
-    enc.CopyBufferToBuffer(g.out, 0, g.back, 0, g.bytes);
+    enc.CopyBufferToBuffer(g.out, 0, g.back, 0, n);
     wgpu::CommandBuffer cmds = enc.Finish();
     g.queue.Submit(1, &cmds);
     bool mapped = false;
-    g.instance.WaitAny(g.back.MapAsync(wgpu::MapMode::Read, 0, g.bytes, wgpu::CallbackMode::WaitAnyOnly,
+    g.instance.WaitAny(g.back.MapAsync(wgpu::MapMode::Read, 0, n, wgpu::CallbackMode::WaitAnyOnly,
                                        [&](wgpu::MapAsyncStatus s, wgpu::StringView) { mapped = s == wgpu::MapAsyncStatus::Success; }),
                        UINT64_MAX);
-    const uint32_t * got = mapped ? static_cast<const uint32_t *>(g.back.GetConstMappedRange(0, g.bytes)) : nullptr;
-    if (got) std::memcpy(px.data(), got, g.bytes);
+    const uint32_t * got = mapped ? static_cast<const uint32_t *>(g.back.GetConstMappedRange(0, n)) : nullptr;
+    if (got) std::memcpy(px.data(), got, n);
     g.back.Unmap();
     return got != nullptr;
 }
@@ -475,11 +479,24 @@ int main(int argc, char ** argv) {
     bool on_cpu = false;
     double fps = 0, render_ms = 0;
     auto start = now(), last = start;
+    // The frame fits the console as it is now, not only as it was when the program started: a
+    // console that shrank under a frame drawn for its old size would scroll a line every frame
+    int was_cols = cols, was_rows = rows;
     for (;;) {
+        int fc = cols, fr = rows;
+        if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 1 && ws.ws_row > 2) {
+            fc = std::min(fc, int(ws.ws_col) - 1);
+            fr = std::min(fr, int(ws.ws_row) - 1);
+        }
+        if (fc != was_cols || fr != was_rows) {
+            std::fputs("\x1b[2J", stdout);
+            was_cols = fc, was_rows = fr;
+        }
+        const uint32_t fw = uint32_t(fc) * 2, fh = uint32_t(fr - 1) * 2;
         float t = float(ms(start, now()) / 1000.0);
         auto t0 = now();
-        if (on_cpu) render_cpu(px, w, h, t);
-        else if (!render_gpu(g, px, w, h, t)) break;
+        if (on_cpu) render_cpu(px, fw, fh, t);
+        else if (!render_gpu(g, px, fw, fh, t)) break;
         double took = ms(t0, now());
         render_ms = render_ms == 0 ? took : render_ms * 0.8 + took * 0.2;
         // One line, as wide as the console at most: who rendered it (GPU <name>, which the page
@@ -490,12 +507,12 @@ int main(int argc, char ** argv) {
                                          g.name.c_str(), fps, render_ms);
         std::string line(header, size_t(len > 0 ? len : 0));
         for (size_t chars = 0, i = 0; i < line.size(); i++) {
-            if ((line[i] & 0xc0) != 0x80 && ++chars > size_t(cols)) {
+            if ((line[i] & 0xc0) != 0x80 && ++chars > size_t(fc)) {
                 line.resize(i);
                 break;
             }
         }
-        draw(px, w, h, "\x1b[1m" + line + "\x1b[0m");
+        draw(px, fw, fh, "\x1b[1m" + line + "\x1b[0m");
         auto t1 = now();
         double frame = ms(last, t1);
         last = t1;
