@@ -136,9 +136,14 @@
       if (cores) text("m-cores", `of ${cores} core${cores > 1 ? "s" : ""} on this device`);
 
       const css = getComputedStyle(document.documentElement);
+      // The console's font, loaded before the terminal measures its cells: measured with the
+      // fallback, a row is shorter than Space Mono's, so the terminal fits a row too many, tells
+      // the guest so, and a program that fills it scrolls its top line away once the font comes
+      const fontSize = opts.fontSize ?? 13;
+      await Promise.race([document.fonts?.load(`${fontSize}px "Space Mono"`).catch(() => {}), sleep(3000)]);
       const term = new Terminal({
         fontFamily: '"Space Mono", ui-monospace, monospace',
-        fontSize: opts.fontSize ?? 13,
+        fontSize,
         cursorBlink: !reduced,
         scrollback: 2000,
         theme: {
